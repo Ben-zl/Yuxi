@@ -1,0 +1,136 @@
+"""运行时配置投影统一夹具（迁移工单 03 · Seam 2 入口）。
+
+给定 yuxi 库夹具（Agent/子智能体/模型供应商/Skill），断言统一投影
+产出的完整运行时对象集合；LITE 模式裁剪知识库投影；配置缺失显式失败。
+后续工具/Skills/MCP/Team 工单的夹具一律复用本入口，不另起炉灶。
+"""
+
+import pytest
+from sqlalchemy import delete
+
+from yuxi.agentscope.config_projection import project_runtime
+from yuxi.storage.postgres.manager import pg_manager
+from yuxi.storage.postgres.models_business import Agent, ModelProvider, Skill
+
+CHATBOT_SLUG = "it-proj-chatbot"
+SUBAGENT_SLUG = "it-proj-subagent"
+PROVIDER_ID = "it-proj-openai-mock"
+MODEL_SPEC = f"{PROVIDER_ID}:mock-chat-model"
+
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+async def db_session():
+    pg_manager.initialize()
+    await pg_manager.ensure_business_schema()
+    async with pg_manager.get_async_session_context() as session:
+        session.add_all(
+            [
+                Agent(
+                    slug=CHATBOT_SLUG,
+                    name="投影测试智能体",
+                    backend_id="ChatbotAgent",
+                    config_json={
+                        "context": {
+                            "model": MODEL_SPEC,
+                            "system_prompt": "你是投影测试助手。",
+                            "skills": None,
+                            "mcps": ["it-proj-mcp"],
+                            "knowledges": ["kb-a"],
+                        }
+                    },
+                    share_config={},
+                ),
+                Agent(
+                    slug=SUBAGENT_SLUG,
+                    name="投影测试子智能体",
+                    description="子智能体描述",
+                    backend_id="SubAgentBackend",
+                    is_subagent=True,
+                    config_json={"context": {}},
+                    share_config={},
+                ),
+                ModelProvider(
+                    provider_id=PROVIDER_ID,
+                    display_name="投影测试供应商",
+                    provider_type="openai",
+                    base_url="http://openai-mock:8080/v1",
+                    api_key="it-proj-key",
+                    capabilities=["chat"],
+                    enabled_models=[{"id": "mock-chat-model", "type": "chat"}],
+                    is_enabled=True,
+                ),
+                Skill(
+                    slug="it-proj-skill",
+                    name="投影测试技能",
+                    description="投影测试技能",
+                    tool_dependencies=[],
+                    mcp_dependencies=[],
+                    skill_dependencies=[],
+                    dir_path="workspace/skills/it-proj-skill",
+                    share_config={},
+                    enabled=True,
+                ),
+            ]
+        )
+        await session.commit()
+        yield session
+        await session.execute(delete(Agent).where(Agent.slug.like("it-proj-%")))
+        await session.execute(
+            delete(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID)
+        )
+        await session.execute(delete(Skill).where(Skill.slug == "it-proj-skill"))
+        await session.commit()
+    await pg_manager.close()
+    pg_manager._initialized = False
+
+
+async def test_project_runtime_covers_all_components(db_session):
+    projection = await project_runtime(
+        db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG
+    )
+
+    assert projection.model_spec == MODEL_SPEC
+    assert projection.agent_request == {
+        "name": "投影测试智能体",
+        "system_prompt": "你是投影测试助手。",
+    }
+    assert projection.credential_data["type"] == "openai_credential"
+    assert projection.credential_data["api_key"] == "it-proj-key"
+    assert projection.credential_data["base_url"] == "http://openai-mock:8080/v1"
+    assert projection.chat_model_config["model"] == "mock-chat-model"
+    assert projection.chat_model_config["credential_id"] is None  # 由创建方回填
+
+    # skills=None 表示全部可用：投影为全部可见 Skill（dev 库存量技能 + 夹具技能）
+    assert "it-proj-skill" in projection.skill_slugs
+    assert projection.mcp_server_names == ["it-proj-mcp"]
+    assert projection.knowledge_slugs == ["kb-a"]
+
+    template_types = {t["type"] for t in projection.subagent_templates}
+    assert SUBAGENT_SLUG in template_types
+
+
+async def test_project_runtime_lite_trims_knowledge(db_session, monkeypatch):
+    monkeypatch.setenv("LITE_MODE", "true")
+    projection = await project_runtime(
+        db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG
+    )
+    assert projection.knowledge_slugs == []
+    # 纯聊天核心不受 LITE 影响
+    assert projection.chat_model_config["model"] == "mock-chat-model"
+    assert projection.agent_request["system_prompt"] == "你是投影测试助手。"
+
+
+async def test_project_runtime_fails_explicitly(db_session):
+    with pytest.raises(ValueError, match="不存在"):
+        await project_runtime(db_session, uid="it-proj-user", agent_slug="no-such-agent")
+    with pytest.raises(ValueError, match="未配置模型"):
+        await project_runtime(db_session, uid="it-proj-user", agent_slug=SUBAGENT_SLUG)
+    with pytest.raises(ValueError, match="不存在"):
+        await project_runtime(
+            db_session,
+            uid="it-proj-user",
+            agent_slug=CHATBOT_SLUG,
+            model_spec="no-such-provider:m",
+        )

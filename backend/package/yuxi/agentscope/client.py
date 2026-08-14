@@ -38,11 +38,9 @@ class AgentScopeServiceClient:
             )
         return resp
 
-    async def create_agent(self, uid: str, name: str, system_prompt: str) -> str:
-        """创建智能体记录，返回 agent_id。幂等由映射层保证，本方法总是新建。"""
-        resp = await self._request(
-            "POST", "/agent/", uid, json={"name": name, "system_prompt": system_prompt}
-        )
+    async def create_agent(self, uid: str, agent_request: dict) -> str:
+        """按投影载荷创建智能体记录，返回 agent_id。幂等由映射层保证。"""
+        resp = await self._request("POST", "/agent/", uid, json=agent_request)
         return resp.json()["agent_id"]
 
     async def create_credential(self, uid: str, data: dict) -> str:

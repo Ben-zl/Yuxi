@@ -16,10 +16,9 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agentscope.client import AgentScopeServiceClient
-from yuxi.agentscope.projection import project_chat_model, split_model_spec
+from yuxi.agentscope.config_projection import project_runtime
 from yuxi.repositories import agentscope_thread_sessions as thread_session_repo
 from yuxi.repositories.agentscope_thread_sessions import AgentScopeThreadSession
-from yuxi.storage.postgres.models_business import ModelProvider
 
 # 订阅建立后的等待窗口：覆盖 HTTP 连接与回放建立，早于 chat 触发即可
 SUBSCRIBE_SETTLE_SECONDS = 0.5
@@ -40,21 +39,19 @@ async def ensure_thread_session(
     uid: str,
     thread_id: str,
     agent_slug: str,
-    model_spec: str,
-    provider: ModelProvider,
-    system_prompt: str,
+    model_spec: str | None = None,
 ) -> AgentScopeThreadSession:
     """保障线程映射的 session 存在；命中映射直接返回，缺失则投影并创建。"""
     existing = await thread_session_repo.get_thread_session(db, uid=uid, thread_id=thread_id)
     if existing is not None:
         return existing
 
-    _, model_id = split_model_spec(model_spec)
-    credential_data, chat_model_config = project_chat_model(provider, model_id)
-
-    credential_id = await client.create_credential(uid, credential_data)
-    agent_id = await client.create_agent(uid, f"{uid}:{agent_slug}", system_prompt)
-    chat_model_config["credential_id"] = credential_id
+    projection = await project_runtime(
+        db, uid=uid, agent_slug=agent_slug, model_spec=model_spec
+    )
+    credential_id = await client.create_credential(uid, projection.credential_data)
+    agent_id = await client.create_agent(uid, projection.agent_request)
+    chat_model_config = {**projection.chat_model_config, "credential_id": credential_id}
     session_id = await client.create_session(uid, agent_id, chat_model_config)
 
     record = await thread_session_repo.create_thread_session(
@@ -62,7 +59,7 @@ async def ensure_thread_session(
         uid=uid,
         thread_id=thread_id,
         agent_slug=agent_slug,
-        model_spec=model_spec,
+        model_spec=projection.model_spec,
         agentscope_agent_id=agent_id,
         agentscope_credential_id=credential_id,
         agentscope_session_id=session_id,

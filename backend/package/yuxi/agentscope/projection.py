@@ -1,13 +1,12 @@
-"""yuxi 模型供应商 → agentscope 运行时对象的投影（工单 02 最小实现）。
+"""yuxi 配置 → agentscope 运行时对象的投影（纯函数集合）。
 
-把 ModelProvider 与模型标识（provider_id:model_id）投影为 agentscope 的
-credential 数据与 ChatModelConfig；Agent/Skill/MCP/子智能体模板等完整
-配置投影在工单 03 收口为统一入口。
-"""
+模型供应商投影为 credential 数据与 ChatModelConfig；Agent 行投影为
+agent 创建请求与子智能体模板载荷。统一入口见 config_projection.py，
+本模块只做无副作用的形状转换。"""
 
 import os
 
-from yuxi.storage.postgres.models_business import ModelProvider
+from yuxi.storage.postgres.models_business import Agent, ModelProvider
 
 # yuxi provider_type → agentscope credential 判别值
 _CREDENTIAL_TYPE_BY_PROVIDER = {
@@ -15,6 +14,35 @@ _CREDENTIAL_TYPE_BY_PROVIDER = {
     "anthropic": "anthropic_credential",
     "gemini": "gemini_credential",
 }
+
+
+def is_lite_mode() -> bool:
+    """是否处于 LITE 模式（无知识库/图谱依赖的轻量部署）。"""
+    return os.getenv("LITE_MODE", "false").lower() in {"true", "1"}
+
+
+def agent_context(agent: Agent) -> dict:
+    """读取 Agent 行的运行时上下文配置（BaseContext 字段的 JSON 形态）。"""
+    return (agent.config_json or {}).get("context") or {}
+
+
+def project_agent_request(agent: Agent) -> dict:
+    """投影为 agentscope 的 agent 创建请求。"""
+    context = agent_context(agent)
+    return {
+        "name": agent.name,
+        "system_prompt": context.get("system_prompt") or "You are a helpful assistant.",
+    }
+
+
+def project_subagent_template(agent: Agent) -> dict:
+    """投影管理员配置的子智能体为 Team worker 模板载荷（装配在 Team 工单）。"""
+    context = agent_context(agent)
+    return {
+        "type": agent.slug,
+        "description": agent.description or agent.name,
+        "system_prompt_template": context.get("system_prompt") or "You are a helpful assistant.",
+    }
 
 
 def _resolve_api_key(provider: ModelProvider) -> str:

@@ -1,41 +1,29 @@
-"""最小对话纵切 e2e（迁移工单 02）。
+"""最小对话纵切 e2e（迁移工单 02/03）。
 
-验证新链路的完整回路：映射保障（Thread↔Session）→ 模型供应商投影 →
-credential/agent/session 创建 → 触发 chat → 事件流收集文本 → 历史持久化 →
-用户隔离。模型端点使用 OpenAI 兼容流式 mock（真实 HTTP 链路，确定性回复），
-付费模型的验证在切换门禁执行。
+验证新链路的完整回路：统一配置投影（yuxi 库夹具）→ 映射保障
+（Thread↔Session）→ credential/agent/session 创建 → 触发 chat →
+事件流收集文本 → 历史持久化 → 用户隔离。模型端点使用 OpenAI 兼容
+流式 mock（真实 HTTP 链路，确定性回复），付费模型验证在切换门禁执行。
 """
 
 import os
 import uuid
 
 import pytest
+from sqlalchemy import delete
 
 from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError
 from yuxi.agentscope.runner import collect_chat_round, ensure_thread_session
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import ModelProvider
+from yuxi.storage.postgres.models_business import Agent, ModelProvider
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
-MOCK_MODEL_SPEC = "e2e-openai-mock:mock-chat-model"
+CHATBOT_SLUG = "e2e-tracer-chatbot"
+PROVIDER_ID = "e2e-openai-mock"
 MOCK_REPLY_TEXT = "你好，我是 e2e mock 模型"
 
 pytestmark = pytest.mark.e2e
-
-
-def _mock_provider() -> ModelProvider:
-    """内存构造的 OpenAI 兼容供应商，不写入业务表。"""
-    return ModelProvider(
-        provider_id="e2e-openai-mock",
-        display_name="e2e mock provider",
-        provider_type="openai",
-        base_url=os.getenv("OPENAI_MOCK_BASE_URL", "http://openai-mock:8080/v1"),
-        api_key="e2e-mock-key",
-        capabilities=["chat"],
-        enabled_models=[{"id": "mock-chat-model", "type": "chat"}],
-        is_enabled=True,
-    )
 
 
 @pytest.fixture
@@ -43,7 +31,49 @@ async def db_session():
     pg_manager.initialize()
     await pg_manager.ensure_business_schema()
     async with pg_manager.get_async_session_context() as session:
+        # 投影夹具：智能体、子智能体与 OpenAI 兼容供应商（命名空间隔离，用毕清理）
+        session.add_all(
+            [
+                Agent(
+                    slug=CHATBOT_SLUG,
+                    name="e2e 纵切智能体",
+                    backend_id="ChatbotAgent",
+                    config_json={
+                        "context": {
+                            "model": f"{PROVIDER_ID}:mock-chat-model",
+                            "system_prompt": "你是 e2e 测试助手。",
+                        }
+                    },
+                    share_config={},
+                ),
+                Agent(
+                    slug="e2e-tracer-subagent",
+                    name="e2e 子智能体",
+                    description="e2e 子智能体描述",
+                    backend_id="SubAgentBackend",
+                    is_subagent=True,
+                    config_json={"context": {}},
+                    share_config={},
+                ),
+                ModelProvider(
+                    provider_id=PROVIDER_ID,
+                    display_name="e2e mock provider",
+                    provider_type="openai",
+                    base_url=os.getenv("OPENAI_MOCK_BASE_URL", "http://openai-mock:8080/v1"),
+                    api_key="e2e-mock-key",
+                    capabilities=["chat"],
+                    enabled_models=[{"id": "mock-chat-model", "type": "chat"}],
+                    is_enabled=True,
+                ),
+            ]
+        )
+        await session.commit()
         yield session
+        await session.execute(delete(Agent).where(Agent.slug.like("e2e-tracer-%")))
+        await session.execute(
+            delete(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID)
+        )
+        await session.commit()
     # pytest-asyncio 每个测试使用独立事件循环，连接池不能跨循环复用：
     # 用毕释放并重置单例，让下一个测试在自己的循环上重新初始化
     await pg_manager.close()
@@ -60,16 +90,10 @@ async def test_minimal_chat_roundtrip(db_session, client):
     thread_id = f"e2e-tracer-{uuid.uuid4().hex[:12]}"
 
     mapping = await ensure_thread_session(
-        db_session,
-        client,
-        uid=uid,
-        thread_id=thread_id,
-        agent_slug="chatbot",
-        model_spec=MOCK_MODEL_SPEC,
-        provider=_mock_provider(),
-        system_prompt="你是 e2e 测试助手。",
+        db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG
     )
     assert mapping.agentscope_session_id
+    assert mapping.model_spec == f"{PROVIDER_ID}:mock-chat-model"
 
     result = await collect_chat_round(
         client,
@@ -104,14 +128,7 @@ async def test_thread_session_isolated_per_user(db_session, client):
     thread_id = f"e2e-tracer-{uuid.uuid4().hex[:12]}"
 
     mapping = await ensure_thread_session(
-        db_session,
-        client,
-        uid=uid,
-        thread_id=thread_id,
-        agent_slug="chatbot",
-        model_spec=MOCK_MODEL_SPEC,
-        provider=_mock_provider(),
-        system_prompt="你是 e2e 测试助手。",
+        db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG
     )
 
     # 其他用户读取同一线程映射：yuxi 侧按 uid 隔离，查不到记录
