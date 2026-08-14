@@ -705,6 +705,23 @@ class ConfigOption(Base):
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
 
 
+class AgentScopeThreadSession(Base):
+    """线程与 agentscope session 的一一映射事实（uid+thread 唯一）。"""
+
+    __tablename__ = "agentscope_thread_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    uid = Column(String(64), nullable=False)
+    thread_id = Column(String(64), nullable=False)
+    agent_slug = Column(String(64), nullable=False)
+    model_spec = Column(String(200), nullable=False)
+    agentscope_agent_id = Column(String(64), nullable=False)
+    agentscope_credential_id = Column(String(64), nullable=False)
+    agentscope_session_id = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=utc_now_naive)
+    updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
+
+
 class TaskRecord(Base):
     __tablename__ = "tasks"
 

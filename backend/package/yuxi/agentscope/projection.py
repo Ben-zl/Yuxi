@@ -1,0 +1,67 @@
+"""yuxi 模型供应商 → agentscope 运行时对象的投影（工单 02 最小实现）。
+
+把 ModelProvider 与模型标识（provider_id:model_id）投影为 agentscope 的
+credential 数据与 ChatModelConfig；Agent/Skill/MCP/子智能体模板等完整
+配置投影在工单 03 收口为统一入口。
+"""
+
+import os
+
+from yuxi.storage.postgres.models_business import ModelProvider
+
+# yuxi provider_type → agentscope credential 判别值
+_CREDENTIAL_TYPE_BY_PROVIDER = {
+    "openai": "openai_credential",
+    "anthropic": "anthropic_credential",
+    "gemini": "gemini_credential",
+}
+
+
+def _resolve_api_key(provider: ModelProvider) -> str:
+    """解析供应商 API Key：优先直接配置，其次环境变量；缺失即显式失败。"""
+    if provider.api_key:
+        return provider.api_key
+    if provider.api_key_env and os.getenv(provider.api_key_env):
+        return os.getenv(provider.api_key_env)
+    raise ValueError(
+        f"模型供应商 {provider.provider_id} 未配置 API Key"
+        f"（api_key 为空且环境变量 {provider.api_key_env or '<未指定>'} 未设置）"
+    )
+
+
+def project_chat_model(provider: ModelProvider, model_id: str) -> tuple[dict, dict]:
+    """投影为 (credential_data, chat_model_config)。
+
+    credential_data 的 type 是 agentscope credential 联合的判别键；
+    chat_model_config 的 credential_id 由调用方在创建凭据后回填。
+    """
+    credential_type = _CREDENTIAL_TYPE_BY_PROVIDER.get(provider.provider_type)
+    if credential_type is None:
+        raise ValueError(
+            f"模型供应商 {provider.provider_id} 的类型 {provider.provider_type}"
+            " 暂不支持投影到 agentscope"
+        )
+
+    credential_data = {
+        "type": credential_type,
+        "api_key": _resolve_api_key(provider),
+        "name": f"yuxi:{provider.provider_id}",
+    }
+    if provider.base_url:
+        credential_data["base_url"] = provider.base_url
+
+    chat_model_config = {
+        "type": credential_type,
+        "credential_id": None,
+        "model": model_id,
+        "parameters": {},
+    }
+    return credential_data, chat_model_config
+
+
+def split_model_spec(model_spec: str) -> tuple[str, str]:
+    """拆分 provider_id:model_id（model_id 允许包含斜杠）。"""
+    provider_id, _, model_id = model_spec.partition(":")
+    if not provider_id or not model_id:
+        raise ValueError(f"模型标识格式应为 provider_id:model_id，收到：{model_spec}")
+    return provider_id, model_id

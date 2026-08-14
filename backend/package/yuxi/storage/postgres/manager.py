@@ -911,6 +911,21 @@ class PostgresManager(metaclass=SingletonMeta):
             ON agent_run_requests(uid, agent_slug, conversation_thread_id, status, created_at, id)
             """,
             "CREATE INDEX IF NOT EXISTS ix_agent_run_requests_dispatched_run_id ON agent_run_requests(dispatched_run_id)",  # noqa: E501
+            """
+            CREATE TABLE IF NOT EXISTS agentscope_thread_sessions (
+                id SERIAL PRIMARY KEY,
+                uid VARCHAR(64) NOT NULL,
+                thread_id VARCHAR(64) NOT NULL,
+                agent_slug VARCHAR(64) NOT NULL,
+                model_spec VARCHAR(200) NOT NULL,
+                agentscope_agent_id VARCHAR(64) NOT NULL,
+                agentscope_credential_id VARCHAR(64) NOT NULL,
+                agentscope_session_id VARCHAR(64) NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_agentscope_thread_sessions_thread ON agentscope_thread_sessions(uid, thread_id)",
         ]
         async with self.async_engine.begin() as conn:
             # 历史未绑定用户的 API Key 会在下方迁移语句里被静默删除，先计数告警
