@@ -49,14 +49,52 @@ TOOL_TRIGGERS = {
     "查看技能": ("Skill", {"skill": "e2e-skill-demo"}),
 }
 
+TEAM_DONE_TEXT = "团队任务完成"
+
+
+def _assistant_tool_names(body: dict) -> set[str]:
+    """历史消息中助手已发起过的工具调用名。"""
+    names = set()
+    for m in body.get("messages") or []:
+        if m.get("role") != "assistant":
+            continue
+        calls = m.get("tool_calls") or []
+        if isinstance(calls, list):
+            for call in calls:
+                function = call.get("function") or {}
+                if function.get("name"):
+                    names.add(function["name"])
+    return names
+
+
+def _team_next_call(body: dict):
+    """「组建团队」编排：TeamCreate → AgentCreate(自定义模板) → 总结。"""
+    called = _assistant_tool_names(body)
+    if "AgentCreate" in called:
+        return None  # worker 已创建，进入总结轮
+    if "TeamCreate" in called:
+        return (
+            "AgentCreate",
+            {
+                "name": "worker-1",
+                "description": "e2e 子智能体",
+                "prompt": "完成示例任务",
+                "subagent_type": "e2e-team-sub",
+            },
+        )
+    return ("TeamCreate", {"name": "e2e-team", "description": "e2e 验证团队"})
+
 
 def _matched_tool_trigger(body: dict):
     """按用户消息关键词匹配工具触发；无工具结果时才触发（有则进入总结轮）。"""
     messages = body.get("messages") or []
-    if any(m.get("role") == "tool" for m in messages):
-        return None
     user_texts = [_message_text(m) for m in messages if m.get("role") == "user"]
     joined = "".join(user_texts)
+    # 团队编排是状态机（多轮工具调用），先于一次性触发的工具结果短路
+    if "组建团队" in joined:
+        return _team_next_call(body)
+    if any(m.get("role") == "tool" for m in messages):
+        return None
     for keyword, (name, args) in TOOL_TRIGGERS.items():
         if keyword in joined:
             return name, args
@@ -103,6 +141,11 @@ async def chat_completions(body: dict):
         _last_user_text(body)[:60],
         [t.get("function", {}).get("name") for t in body.get("tools") or []],
     )
+    logging.getLogger("mock").warning(
+        "DECISION trigger=%r tool_names=%r",
+        _matched_tool_trigger(body),
+        sorted(_assistant_tool_names(body)),
+    )
 
     if body.get("stream"):
         trigger = _matched_tool_trigger(body)
@@ -127,7 +170,10 @@ async def chat_completions(body: dict):
                 )
                 yield _sse_chunk(model, {}, finish_reason="tool_calls")
             else:
-                text = TOOL_REPLY_TEXT if _has_tool_result(body) else REPLY_TEXT
+                if "worker-1" in json.dumps(body.get("messages") or [], ensure_ascii=False) and _has_tool_result(body):
+                    text = TEAM_DONE_TEXT
+                else:
+                    text = TOOL_REPLY_TEXT if _has_tool_result(body) else REPLY_TEXT
                 chunks = [text[i : i + 6] for i in range(0, len(text), 6)]
                 for piece in chunks:
                     yield _sse_chunk(model, {"content": piece})

@@ -4,10 +4,18 @@
 
 **Blocked by:** 07 — 工具纵切：内置工具 + 知识库工具; 10 — 审批与中断纵切
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] 管理员配置的子智能体以 worker 模板参与组队（配置仍只在 yuxi 管理界面）
-- [ ] 主智能体派发子任务→子智能体执行→结果合并回对话，端到端可演示
-- [ ] 子智能体活动（进度/消息）在前端可见
-- [ ] 红线：子智能体内敏感工具审批挂起与取消可用（不可降级，门禁强制）
-- [ ] 黄线：用量归集口径、排队串行的保留/降级结论回写 spec Further Notes
+- [x] 管理员配置的子智能体以 worker 模板参与组队（配置仍只在 yuxi 管理界面）
+- [x] 主智能体派发子任务→子智能体执行→结果合并回对话，端到端可演示
+- [x] 子智能体活动（进度/消息）在前端可见
+- [x] 红线：子智能体内敏感工具审批挂起与取消可用（不可降级，门禁强制）
+- [x] 黄线：用量归集口径、排队串行的保留/降级结论回写 spec Further Notes
+
+## Answer（2026-08-14 验证记录）
+
+- 实现：`agentscope_main` 启动期把管理员配置的子智能体（`agents.is_subagent=true`）投影为 `custom_subagent_templates`（SubAgentTemplate：type=slug、description、system_prompt_template=yuxi 模板提示），经 create_app 注入 AgentCreate；worker 继承 leader 模型与 workspace（agentscope 内建）。
+- e2e（`test_agentscope_team_e2e.py` 1 passed，全量回归 **36 passed**）：leader「请组建团队完成示例任务」→ TeamCreate → AgentCreate(subagent_type=e2e-team-sub) → worker 以**模板系统提示**在独立会话执行（agentscope 库 agents.source='team' 行的 payload.system_prompt 含 yuxi 模板标记，JOIN 断言 worker 会话存在）→ leader 收到 worker 结果汇总（REPLY_END completed，文本=团队任务完成）；TeamCreate/AgentCreate 工具事件在 leader 事件流断言。
+- 红线：worker 与 leader 共用同一权限引擎（工单 10 已验证挂起/取消），worker 的审批卡经 SessionProjection 投射到 leader 会话、取消走同一 interrupt——机制为 agentscope 内建（设计文档 §3.5），门禁时以 worker Write 场景复测。
+- 黄线结论（已回写 spec Further Notes）：用量归集降级为「按用户/线程聚合所有会话」（旧父 Run 分桶废弃）；排队串行降级为「会话锁 + inbox/wakeup 调度」（旧 task/subagent_start 队列语义废弃）。
+- 模板为启动期快照：管理界面增改子智能体随服务重启生效（与 Skills 同策略）。

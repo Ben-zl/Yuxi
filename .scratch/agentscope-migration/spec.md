@@ -80,6 +80,13 @@ Yuxi 的智能体域运行在 langchain/langgraph/deepagents 生态上，升级�
 ## Further Notes
 
 - Team 之上黄线项（用量口径、排队串行）的降级结论在子智能体工单产出并回写本 spec；红线项（审批挂起、取消）不进入降级讨论，切换门禁强制检查。
+
+### Team 黄线结论（工单 11 · 2026-08-14）
+
+- **审批挂起（红线）**：保留。worker 会话与 leader 共用同一权限引擎；worker 的敏感工具挂起经 SessionProjection 把 HITL 卡片投射到 leader 会话（agentscope 内建），取消通道同一 interrupt 机制（工单 10 已验证该引擎）。
+- **取消（红线）**：保留。worker 会话与普通会话同构，interrupt_session 幂等可用。
+- **用量归集（黄线·降级）**：Team worker 用量分散在各 worker 会话的 Msg.usage/trace 中，不再聚合为父 Run 的单一账目；Dashboard 汇总口径切换为「按用户/线程聚合所有会话」，父 Run 归集口径不迁移（旧栈 TokenUsageMiddleware 分桶语义废弃）。
+- **排队串行（黄线·降级）**：子智能体不再经过 yuxi 线程队列（旧栈 task/subagent_start 语义废弃），由 agentscope 会话锁与 inbox/wakeup 调度；同线程互斥语义由「leader 挂起互斥 + worker 会话锁」承担。
 - `max_execution_steps`（300）与 `ReActConfig.max_iters` 的行为等价性在切换门禁验证。
 - fork 升级走显式 bump：更新 commit、重跑配置投影与协议转换测试。
 - 实施顺序与切换门禁 checklist 见迁移方案文档（docs/vibe/2026-08-14）。

@@ -99,6 +99,25 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
     return tools
 
 
+def _subagent_templates(rows: list) -> list:
+    """把管理员配置的子智能体投影为 Team worker 模板（创建期快照）。"""
+    from agentscope.app import SubAgentTemplate
+
+    from yuxi.agentscope.projection import project_subagent_template
+
+    templates = []
+    for row in rows:
+        payload = project_subagent_template(row)
+        templates.append(
+            SubAgentTemplate(
+                type=payload["type"],
+                description=payload["description"],
+                system_prompt_template=payload["system_prompt_template"],
+            )
+        )
+    return templates
+
+
 async def _resolve_skill_paths() -> list[str]:
     """读取启用的 Skill 源目录（相对 save_dir），作为 workspace 技能种子。
 
@@ -124,6 +143,20 @@ async def _resolve_skill_paths() -> list[str]:
     return paths
 
 
+async def _resolve_subagent_rows() -> list:
+    """读取管理员配置的子智能体定义（Team worker 模板源，启动期快照）。"""
+    from sqlalchemy import select
+
+    from yuxi.storage.postgres.manager import pg_manager
+    from yuxi.storage.postgres.models_business import Agent
+
+    async with pg_manager.get_async_session_context() as db:
+        rows = (
+            await db.execute(select(Agent).where(Agent.is_subagent.is_(True)))
+        ).scalars().all()
+    return list(rows)
+
+
 def _create_service_app_sync():
     """构造 agentscope service app，并在构造前确保独立 database 存在。
 
@@ -133,6 +166,7 @@ def _create_service_app_sync():
     """
     bootstrap_error = []
     skill_paths: list[str] = []
+    subagent_rows: list = []
 
     async def _bootstrap() -> list[str]:
         await _ensure_database_exists(AGENTSCOPE_DATABASE_URL)
@@ -142,6 +176,7 @@ def _create_service_app_sync():
         pg_manager.initialize()
         await pg_manager.ensure_business_schema()
         skills = await _resolve_skill_paths()
+        subagent_rows.extend(await _resolve_subagent_rows())
         await pg_manager.close()
         pg_manager._initialized = False
         return skills
@@ -182,6 +217,7 @@ def _create_service_app_sync():
             password=redis_parsed.password,
         ),
         extra_agent_tools=_extra_agent_tools,
+        custom_subagent_templates=_subagent_templates(subagent_rows),
         workspace_manager=workspace_manager,
         title="Yuxi AgentScope Service",
     )
