@@ -92,10 +92,10 @@ async def test_project_runtime_covers_all_components(db_session):
     )
 
     assert projection.model_spec == MODEL_SPEC
-    assert projection.agent_request == {
-        "name": "投影测试智能体",
-        "system_prompt": "你是投影测试助手。",
-    }
+    assert projection.agent_request["name"] == "投影测试智能体"
+    assert projection.agent_request["system_prompt"] == "你是投影测试助手。"
+    # ReAct 迭代上限对齐旧栈 recursion_limit（默认 300）
+    assert projection.agent_request["react_config"] == {"max_iters": 300}
     assert projection.credential_data["type"] == "openai_credential"
     assert projection.credential_data["api_key"] == "it-proj-key"
     assert projection.credential_data["base_url"] == "http://openai-mock:8080/v1"

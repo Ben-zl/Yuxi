@@ -26,12 +26,18 @@ def agent_context(agent: Agent) -> dict:
     return (agent.config_json or {}).get("context") or {}
 
 
+# yuxi 旧栈 recursion_limit 默认值（BaseContext.max_execution_steps）
+DEFAULT_MAX_EXECUTION_STEPS = 300
+
+
 def project_agent_request(agent: Agent) -> dict:
-    """投影为 agentscope 的 agent 创建请求。"""
+    """投影为 agentscope 的 agent 创建请求（含 ReAct 迭代上限对齐）。"""
     context = agent_context(agent)
+    max_steps = int(context.get("max_execution_steps") or DEFAULT_MAX_EXECUTION_STEPS)
     return {
         "name": agent.name,
         "system_prompt": context.get("system_prompt") or "You are a helpful assistant.",
+        "react_config": {"max_iters": max_steps},
     }
 
 
