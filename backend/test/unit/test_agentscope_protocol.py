@@ -124,3 +124,22 @@ def test_tool_event_converter_streams_call_and_result():
     assert finished[0]["event"]["data"]["output"]["content"] == "结果"
 
     assert converter.feed({"type": "MODEL_CALL_START", "reply_id": "r1"}) == []
+
+
+def test_require_user_confirm_maps_to_approval_chunk():
+    from yuxi.agentscope.protocol import event_to_chunks
+
+    chunks = event_to_chunks(
+        {
+            "type": "REQUIRE_USER_CONFIRM",
+            "reply_id": "r1",
+            "tool_calls": [
+                {"id": "tc1", "name": "Write", "inputs": {"file_path": "/workspace/a.txt"}}
+            ],
+        },
+        request_id=REQUEST_ID,
+    )
+    assert chunks[0]["status"] == "human_approval_required"
+    assert chunks[0]["action_requests"] == [
+        {"action": "Write", "args": {"file_path": "/workspace/a.txt"}}
+    ]

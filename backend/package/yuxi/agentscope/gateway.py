@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.protocol import (
     ToolEventConverter,
+    make_chunk,
     event_to_chunks,
     init_chunk,
     reply_end_to_terminal,
@@ -28,6 +29,7 @@ class GatewayRoundResult:
     text: str
     reasoning: str
     event_count: int
+    parked: str | None = None  # 挂起原因（permission=等待工具审批）
 
 
 async def stream_round_to_run_events(
@@ -86,6 +88,27 @@ async def stream_round_to_run_events(
             if isinstance(event, Exception):
                 raise event
             event_type = str(event.get("type", "")).upper()
+            if event_type == "REQUIRE_USER_CONFIRM":
+                # 工具审批挂起：run 进入 interrupted 终态（挂起互斥依据），
+                # 审批结果经新一轮 resume 请求续跑（与旧栈 resume 语义一致）
+                chunks = event_to_chunks(event, request_id=request_id)
+                await append_run_stream_event(
+                    run_id, "messages", {"items": chunks}, thread_id=thread_id
+                )
+                terminal_chunk = make_chunk(request_id, status="interrupted", message="等待工具审批")
+                await append_run_stream_event(
+                    run_id,
+                    "end",
+                    {"status": "interrupted", "chunk": terminal_chunk},
+                    thread_id=thread_id,
+                )
+                return GatewayRoundResult(
+                    run_status="interrupted",
+                    text="".join(text_parts),
+                    reasoning="".join(reasoning_parts),
+                    event_count=event_count + 1,
+                    parked="permission",
+                )
             if event_type == "REPLY_END":
                 terminal = reply_end_to_terminal(event, request_id=request_id)
                 await append_run_stream_event(

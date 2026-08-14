@@ -136,10 +136,15 @@ def _create_service_app_sync():
 
     async def _bootstrap() -> list[str]:
         await _ensure_database_exists(AGENTSCOPE_DATABASE_URL)
-        # initialize 需在事件循环内执行（内部创建 asyncpg/psycopg 连接池）
+        # initialize 需在事件循环内执行（内部创建 asyncpg/psycopg 连接池）；
+        # 用毕立即释放并复位，避免连接池绑定 bootstrap 线程的循环——
+        # 服务主循环内的首次使用（extra_agent_tools）会按需重新初始化
         pg_manager.initialize()
         await pg_manager.ensure_business_schema()
-        return await _resolve_skill_paths()
+        skills = await _resolve_skill_paths()
+        await pg_manager.close()
+        pg_manager._initialized = False
+        return skills
 
     def _run_bootstrap():
         loop = asyncio.new_event_loop()

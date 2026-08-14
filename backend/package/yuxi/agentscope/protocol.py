@@ -12,14 +12,14 @@ from dataclasses import dataclass
 ASSISTANT_MSG_TYPE = "AIMessageChunk"
 
 
-def _chunk(request_id: str, **kwargs) -> dict:
+def make_chunk(request_id: str, **kwargs) -> dict:
     """构造与现有 chat_service.make_chunk 等价的 chunk dict。"""
     return {"request_id": request_id, "response": None, "thread_id": None, **kwargs}
 
 
 def init_chunk(request_id: str, *, text: str, message_type: str = "text") -> dict:
     """用户消息的 init chunk（请求受理时首先发出）。"""
-    return _chunk(
+    return make_chunk(
         request_id,
         status="init",
         msg={
@@ -39,10 +39,26 @@ def event_to_chunks(event: dict, *, request_id: str) -> list[dict]:
 
     if event_type == "REPLY_START":
         return [
-            _chunk(
+            make_chunk(
                 request_id,
                 status="loading",
                 msg={"id": reply_id, "type": ASSISTANT_MSG_TYPE, "content": ""},
+            )
+        ]
+    if event_type == "REQUIRE_USER_CONFIRM":
+        # 工具审批挂起：前端按 action_requests 渲染审批卡片（与旧栈一致）
+        action_requests = [
+            {
+                "action": call.get("name", ""),
+                "args": call.get("inputs") or {},
+            }
+            for call in event.get("tool_calls") or []
+        ]
+        return [
+            make_chunk(
+                request_id,
+                status="human_approval_required",
+                action_requests=action_requests,
             )
         ]
     if event_type in {"TEXT_BLOCK_DELTA", "THINKING_BLOCK_DELTA"}:
@@ -52,7 +68,7 @@ def event_to_chunks(event: dict, *, request_id: str) -> list[dict]:
             msg["content"] = event.get("delta", "")
         else:
             msg["reasoning_content"] = event.get("delta", "")
-        return [_chunk(request_id, status="loading", msg=msg)]
+        return [make_chunk(request_id, status="loading", msg=msg)]
     return []
 
 
@@ -73,7 +89,7 @@ def reply_end_to_terminal(event: dict, *, request_id: str) -> TerminalConversion
     if reason in {"error", "exceed_max_iters"}:
         return TerminalConversion(
             run_status="failed",
-            chunk=_chunk(
+            chunk=make_chunk(
                 request_id,
                 status="error",
                 error_type=reason,
@@ -83,11 +99,11 @@ def reply_end_to_terminal(event: dict, *, request_id: str) -> TerminalConversion
     if reason == "interrupted":
         return TerminalConversion(
             run_status="interrupted",
-            chunk=_chunk(request_id, status="interrupted", message="对话已中断"),
+            chunk=make_chunk(request_id, status="interrupted", message="对话已中断"),
         )
     return TerminalConversion(
         run_status="completed",
-        chunk=_chunk(request_id, status="finished"),
+        chunk=make_chunk(request_id, status="finished"),
     )
 
 
@@ -113,24 +129,24 @@ class ToolEventConverter:
             name = event.get("tool_call_name", "")
             self._tool_names[tool_call_id] = name
             self._args_fragments[tool_call_id] = []
-            return [self._tool_call_chunk(tool_call_id, args="")]
+            return [self._tool_callmake_chunk(tool_call_id, args="")]
         if event_type == "TOOL_CALL_DELTA":
             fragment = event.get("delta", "")
             self._args_fragments.setdefault(tool_call_id, []).append(fragment)
-            return [self._tool_call_chunk(tool_call_id, args=fragment)]
+            return [self._tool_callmake_chunk(tool_call_id, args=fragment)]
         if event_type == "TOOL_CALL_END":
             # 完整参数 chunk：前端按 tool_call 类型消费完整 args 字符串
             complete_args = "".join(self._args_fragments.get(tool_call_id, []))
-            return [self._tool_call_chunk(tool_call_id, args=complete_args, complete=True)]
+            return [self._tool_callmake_chunk(tool_call_id, args=complete_args, complete=True)]
         if event_type == "TOOL_RESULT_TEXT_DELTA":
             self._result_fragments.setdefault(tool_call_id, []).append(event.get("delta", ""))
             return []
         if event_type == "TOOL_RESULT_END":
             output_text = "".join(self._result_fragments.get(tool_call_id, []))
-            return [self._tool_finished_chunk(tool_call_id, output_text)]
+            return [self._tool_finishedmake_chunk(tool_call_id, output_text)]
         return []
 
-    def _tool_call_chunk(self, tool_call_id: str, *, args: str, complete: bool = False) -> dict:
+    def _tool_callmake_chunk(self, tool_call_id: str, *, args: str, complete: bool = False) -> dict:
         name = self._tool_names.get(tool_call_id, "")
         fragment = {
             "index": 0,
@@ -147,10 +163,10 @@ class ToolEventConverter:
         if complete:
             # 完整调用：args 为完整 JSON 字符串（前端 tool_call 类型消费）
             msg["tool_calls"] = [fragment]
-        return _chunk(self._request_id, status="loading", msg=msg)
+        return make_chunk(self._request_id, status="loading", msg=msg)
 
-    def _tool_finished_chunk(self, tool_call_id: str, output_text: str) -> dict:
-        return _chunk(
+    def _tool_finishedmake_chunk(self, tool_call_id: str, output_text: str) -> dict:
+        return make_chunk(
             self._request_id,
             status="stream_event",
             event={

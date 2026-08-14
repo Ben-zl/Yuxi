@@ -44,6 +44,10 @@ async def execute_run(
     await AgentRunRepository(db).set_terminal_status(
         run.id,
         status=result.run_status,
-        error_message=None if result.run_status == "completed" else "运行失败",
+        error_message=(
+            "等待工具审批" if result.parked == "permission"
+            else None if result.run_status == "completed"
+            else "运行失败"
+        ),
     )
     return result

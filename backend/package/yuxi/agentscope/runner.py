@@ -31,6 +31,7 @@ class ChatRoundResult:
 
     events: list[dict]
     text: str
+    parked: str | None = None  # 挂起原因（permission=等待工具审批）
 
 
 async def ensure_thread_session(
@@ -111,11 +112,17 @@ async def collect_chat_round(
 
         events: list[dict] = []
         span_start = -1
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         while True:
             event = await asyncio.wait_for(queue.get(), timeout=read_timeout)
             if isinstance(event, Exception):
                 raise event
             event_type = str(event.get("type", "")).lower()
+            if event_type == "text_block_delta":
+                text_parts.append(event.get("delta", ""))
+            elif event_type == "thinking_block_delta":
+                reasoning_parts.append(event.get("delta", ""))
             if event_type == "reply_start":
                 span_start = len(events)
                 events.append(event)
@@ -123,12 +130,14 @@ async def collect_chat_round(
             if span_start < 0:
                 continue  # 订阅前残留的无关事件
             events.append(event)
-            if event_type == "reply_end":
-                round_text = "".join(
-                    ev.get("delta", "")
-                    for ev in events[span_start:]
-                    if str(ev.get("type", "")).lower() == "text_block_delta"
+            if str(event.get("type", "")).lower() == "require_user_confirm":
+                return ChatRoundResult(
+                    events=events[span_start:] + [event],
+                    text="".join(text_parts),
+                    parked="permission",
                 )
+            if event_type == "reply_end":
+                round_text = "".join(text_parts)
                 return ChatRoundResult(events=events[span_start:], text=round_text)
     finally:
         pump_task.cancel()

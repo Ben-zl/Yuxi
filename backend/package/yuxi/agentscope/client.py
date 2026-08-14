@@ -100,6 +100,41 @@ class AgentScopeServiceClient:
             json={"agent_id": agent_id, "session_id": session_id, "input": msg},
         )
 
+    async def resume_confirm(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        *,
+        reply_id: str,
+        tool_calls: list[dict],
+        confirmed: bool,
+    ) -> None:
+        """恢复审批挂起的运行：对全部待确认工具调用给出同一决定。"""
+        confirm_results = [
+            {"confirmed": confirmed, "tool_call": call} for call in tool_calls
+        ]
+        input_event = {
+            "type": "USER_CONFIRM_RESULT",
+            "reply_id": reply_id,
+            "confirm_results": confirm_results,
+        }
+        await self._request(
+            "POST",
+            "/chat/",
+            uid,
+            json={"agent_id": agent_id, "session_id": session_id, "input": input_event},
+        )
+
+    async def interrupt_session(self, uid: str, agent_id: str, session_id: str) -> None:
+        """请求中断运行中或审批挂起中的会话（幂等）。"""
+        await self._request(
+            "POST",
+            f"/sessions/{session_id}/interrupt",
+            uid,
+            params={"agent_id": agent_id},
+        )
+
     async def list_messages(self, uid: str, agent_id: str, session_id: str) -> list:
         """读回会话消息历史（运行结束时已持久化）。"""
         resp = await self._request(
