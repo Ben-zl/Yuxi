@@ -9,18 +9,17 @@ import os
 import uuid
 
 import pytest
-from sqlalchemy import delete
+from test.e2e.agentscope_e2e_fixtures import PROVIDER_ID, cleanup_fixture_agents, upsert_mock_provider
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.gateway import stream_round_to_run_events
 from yuxi.agentscope.runner import ensure_thread_session
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Agent, ModelProvider
+from yuxi.storage.postgres.models_business import Agent
 from yuxi.storage.redis.manager import close_async_redis_client, get_async_redis_client
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
 CHATBOT_SLUG = "e2e-proto-chatbot"
-PROVIDER_ID = "e2e-openai-mock"
 
 pytestmark = pytest.mark.e2e
 
@@ -30,6 +29,7 @@ async def db_session():
     pg_manager.initialize()
     await pg_manager.ensure_business_schema()
     async with pg_manager.get_async_session_context() as session:
+        await cleanup_fixture_agents(session, CHATBOT_SLUG)
         session.add_all(
             [
                 Agent(
@@ -44,25 +44,12 @@ async def db_session():
                     },
                     share_config={},
                 ),
-                ModelProvider(
-                    provider_id=PROVIDER_ID,
-                    display_name="e2e mock provider",
-                    provider_type="openai",
-                    base_url=os.getenv("OPENAI_MOCK_BASE_URL", "http://openai-mock:8080/v1"),
-                    api_key="e2e-mock-key",
-                    capabilities=["chat"],
-                    enabled_models=[{"id": "mock-chat-model", "type": "chat"}],
-                    is_enabled=True,
-                ),
             ]
         )
+        await upsert_mock_provider(session)
         await session.commit()
         yield session
-        await session.execute(delete(Agent).where(Agent.slug == CHATBOT_SLUG))
-        await session.execute(
-            delete(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID)
-        )
-        await session.commit()
+        await cleanup_fixture_agents(session, CHATBOT_SLUG)
     await pg_manager.close()
     pg_manager._initialized = False
 

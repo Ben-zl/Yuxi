@@ -60,6 +60,18 @@ class AgentScopeServiceClient:
         )
         return resp.json()["session_id"]
 
+    async def set_permission_mode(
+        self, uid: str, agent_id: str, session_id: str, mode: str
+    ) -> None:
+        """设置会话权限模式（如 accept_edits，跳过文件写工具的人工确认）。"""
+        await self._request(
+            "PATCH",
+            f"/sessions/{session_id}",
+            uid,
+            params={"agent_id": agent_id},
+            json={"permission_mode": mode},
+        )
+
     async def trigger_chat(
         self, uid: str, agent_id: str, session_id: str, text: str
     ) -> None:

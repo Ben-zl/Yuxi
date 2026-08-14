@@ -140,6 +140,7 @@ services:
       - ./.env:/app/.env
       - ./backend/pyproject.toml:/app/pyproject.toml
       - ./backend/uv.lock:/app/uv.lock
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - app-network
     env_file:
@@ -147,7 +148,8 @@ services:
     environment:
       <<: *api-worker-env
       AGENTSCOPE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/agentscope
-      AGENTSCOPE_WORKSPACE_BASEDIR: /app/saves/agentscope-workspaces
+      AGENTSCOPE_WORKSPACE_BASEDIR: ${AGENTSCOPE_WORKSPACE_BASEDIR:-/app/saves/agentscope-workspaces}
+      AGENTSCOPE_WORKSPACE_BACKEND: ${AGENTSCOPE_WORKSPACE_BACKEND:-local}
     command: uv run --no-sync --no-dev uvicorn server.agentscope_main:app --host 0.0.0.0 --port 8100 --reload --reload-dir /app/server --reload-dir /app/package --timeout-graceful-shutdown 5
     restart: unless-stopped
     ports:

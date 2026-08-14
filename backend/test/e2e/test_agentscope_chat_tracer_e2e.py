@@ -11,16 +11,16 @@ import uuid
 
 import pytest
 from sqlalchemy import delete
+from test.e2e.agentscope_e2e_fixtures import PROVIDER_ID, upsert_mock_provider
 
 from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError
 from yuxi.agentscope.runner import collect_chat_round, ensure_thread_session
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Agent, ModelProvider
+from yuxi.storage.postgres.models_business import Agent
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
 CHATBOT_SLUG = "e2e-tracer-chatbot"
-PROVIDER_ID = "e2e-openai-mock"
 MOCK_REPLY_TEXT = "你好，我是 e2e mock 模型"
 
 pytestmark = pytest.mark.e2e
@@ -31,6 +31,8 @@ async def db_session():
     pg_manager.initialize()
     await pg_manager.ensure_business_schema()
     async with pg_manager.get_async_session_context() as session:
+        await session.execute(delete(Agent).where(Agent.slug.like("e2e-tracer-%")))
+        await session.commit()
         # 投影夹具：智能体、子智能体与 OpenAI 兼容供应商（命名空间隔离，用毕清理）
         session.add_all(
             [
@@ -55,24 +57,13 @@ async def db_session():
                     config_json={"context": {}},
                     share_config={},
                 ),
-                ModelProvider(
-                    provider_id=PROVIDER_ID,
-                    display_name="e2e mock provider",
-                    provider_type="openai",
-                    base_url=os.getenv("OPENAI_MOCK_BASE_URL", "http://openai-mock:8080/v1"),
-                    api_key="e2e-mock-key",
-                    capabilities=["chat"],
-                    enabled_models=[{"id": "mock-chat-model", "type": "chat"}],
-                    is_enabled=True,
-                ),
             ]
         )
+        await upsert_mock_provider(session)
         await session.commit()
         yield session
+        # 智能体行按前缀清理（含夹具创建的子智能体）；共用供应商由 upsert 维护
         await session.execute(delete(Agent).where(Agent.slug.like("e2e-tracer-%")))
-        await session.execute(
-            delete(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID)
-        )
         await session.commit()
     # pytest-asyncio 每个测试使用独立事件循环，连接池不能跨循环复用：
     # 用毕释放并重置单例，让下一个测试在自己的循环上重新初始化
