@@ -13,6 +13,8 @@ from urllib.parse import quote, urlparse
 
 import asyncpg
 import uvicorn
+
+from yuxi.storage.postgres.manager import pg_manager
 from agentscope.app import create_app
 from agentscope.app.message_bus import RedisMessageBus
 from agentscope.app.storage import AsyncSQLAlchemyStorage
@@ -31,6 +33,8 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 AGENTSCOPE_WORKSPACE_BASEDIR = os.getenv(
     "AGENTSCOPE_WORKSPACE_BASEDIR", "/app/saves/agentscope-workspaces"
 )
+# yuxi 挂载的 saves 目录（Skill 源目录相对其解析）
+AGENTSCOPE_SAVE_DIR = os.getenv("YUXI_SAVE_DIR", "/app/saves")
 # docker 后端的 basedir 必须是 docker daemon 视角的路径（Docker Desktop 下
 # 为宿主路径，需将同一路径自镜像挂载进本容器）
 AGENTSCOPE_WORKSPACE_BACKEND = os.getenv("AGENTSCOPE_WORKSPACE_BACKEND", "local")
@@ -64,7 +68,6 @@ async def _thread_knowledge_slugs(agentscope_agent_id: str) -> list[str] | None:
     from yuxi.repositories.agentscope_thread_sessions import (
         get_thread_session_by_agentscope_agent,
     )
-    from yuxi.storage.postgres.manager import pg_manager
     from yuxi.storage.postgres.models_business import Agent
     from sqlalchemy import select
 
@@ -96,6 +99,31 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
     return tools
 
 
+async def _resolve_skill_paths() -> list[str]:
+    """读取启用的 Skill 源目录（相对 save_dir），作为 workspace 技能种子。
+
+    渐进披露由 agentscope 的 SkillViewer 机制承担（模型按需查看
+    SKILL.md），替代旧栈「读到激活」语义；目录在服务启动期快照。
+    """
+    import os
+
+    from sqlalchemy import select
+
+    from yuxi.storage.postgres.manager import pg_manager
+    from yuxi.storage.postgres.models_business import Skill
+
+    async with pg_manager.get_async_session_context() as db:
+        rows = (
+            await db.execute(select(Skill.slug, Skill.dir_path).where(Skill.enabled.is_(True)))
+        ).all()
+    paths = []
+    for _, dir_path in rows:
+        absolute = os.path.join(AGENTSCOPE_SAVE_DIR, dir_path)
+        if os.path.isdir(absolute):
+            paths.append(absolute)
+    return paths
+
+
 def _create_service_app_sync():
     """构造 agentscope service app，并在构造前确保独立 database 存在。
 
@@ -104,11 +132,19 @@ def _create_service_app_sync():
     持久存储指向独立 database，实时 bus 走 Redis，workspace 先用本地目录。
     """
     bootstrap_error = []
+    skill_paths: list[str] = []
+
+    async def _bootstrap() -> list[str]:
+        await _ensure_database_exists(AGENTSCOPE_DATABASE_URL)
+        # initialize 需在事件循环内执行（内部创建 asyncpg/psycopg 连接池）
+        pg_manager.initialize()
+        await pg_manager.ensure_business_schema()
+        return await _resolve_skill_paths()
 
     def _run_bootstrap():
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(_ensure_database_exists(AGENTSCOPE_DATABASE_URL))
+            skill_paths.extend(loop.run_until_complete(_bootstrap()))
         except Exception as exc:  # noqa: BLE001 - 线程内异常需带回主线程
             bootstrap_error.append(exc)
         finally:
@@ -126,9 +162,12 @@ def _create_service_app_sync():
         workspace_manager = DockerWorkspaceManager(
             basedir=AGENTSCOPE_WORKSPACE_BASEDIR,
             isolation=IsolationPolicy.PER_SESSION,
+            skill_paths=skill_paths,
         )
     else:
-        workspace_manager = LocalWorkspaceManager(basedir=AGENTSCOPE_WORKSPACE_BASEDIR)
+        workspace_manager = LocalWorkspaceManager(
+            basedir=AGENTSCOPE_WORKSPACE_BASEDIR, skill_paths=skill_paths
+        )
     return create_app(
         storage=AsyncSQLAlchemyStorage(AGENTSCOPE_DATABASE_URL, create_tables=True),
         message_bus=RedisMessageBus(
