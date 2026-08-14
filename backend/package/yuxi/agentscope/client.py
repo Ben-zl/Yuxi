@@ -60,6 +60,18 @@ class AgentScopeServiceClient:
         )
         return resp.json()["session_id"]
 
+    async def add_workspace_mcp(
+        self, uid: str, agent_id: str, session_id: str, mcp_client: dict
+    ) -> None:
+        """把 MCP 客户端配置绑定到会话 workspace（同名冲突返回 409）。"""
+        await self._request(
+            "POST",
+            "/workspace/mcp",
+            uid,
+            params={"agent_id": agent_id, "session_id": session_id},
+            json=mcp_client,
+        )
+
     async def set_permission_mode(
         self, uid: str, agent_id: str, session_id: str, mode: str
     ) -> None:

@@ -219,3 +219,55 @@ def build_web_search_tool():
     from agentscope.tool import FunctionTool
 
     return FunctionTool(web_search, name="web_search", description="搜索互联网获取最新信息")
+
+
+async def bind_thread_mcps(
+    db,
+    client,
+    *,
+    uid: str,
+    mcp_server_names: list[str] | None,
+    agent_id: str,
+    session_id: str,
+) -> int:
+    """把 yuxi 的 MCP 服务器投影绑定到会话 workspace（会话创建期一次性）。
+
+    仅投影启用且 sse/streamable_http 的服务器（stdio 约束在 yuxi 源头
+    强制：用户不可创建 stdio）；重名冲突视为已绑定跳过。
+    """
+    from sqlalchemy import select
+
+    from yuxi.agentscope.client import AgentScopeServiceError
+    from yuxi.storage.postgres.models_business import MCPServer
+
+    stmt = select(MCPServer)
+    if mcp_server_names is not None:
+        if not mcp_server_names:
+            return 0
+        stmt = stmt.where(MCPServer.slug.in_(mcp_server_names))
+    rows = (await db.execute(stmt)).scalars().all()
+
+    bound = 0
+    for row in rows:
+        if not row.enabled or row.transport not in ("sse", "streamable_http") or not row.url:
+            continue
+        mcp_config = {"type": "http_mcp", "url": row.url}
+        if row.headers:
+            mcp_config["headers"] = row.headers
+        if row.timeout:
+            mcp_config["timeout"] = float(row.timeout)
+        payload = {
+            "name": row.slug,
+            "is_stateful": False,
+            "mcp_config": mcp_config,
+        }
+        if row.disabled_tools:
+            payload["disable_tools"] = list(row.disabled_tools)
+        try:
+            await client.add_workspace_mcp(uid, agent_id, session_id, payload)
+            bound += 1
+        except AgentScopeServiceError as exc:
+            if "409" in str(exc):
+                continue  # 同名 MCP 已绑定
+            raise
+    return bound

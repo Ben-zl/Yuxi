@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.config_projection import project_runtime
+from yuxi.agentscope.tools import bind_thread_mcps
 from yuxi.repositories import agentscope_thread_sessions as thread_session_repo
 from yuxi.repositories.agentscope_thread_sessions import AgentScopeThreadSession
 
@@ -53,6 +54,14 @@ async def ensure_thread_session(
     agent_id = await client.create_agent(uid, projection.agent_request)
     chat_model_config = {**projection.chat_model_config, "credential_id": credential_id}
     session_id = await client.create_session(uid, agent_id, chat_model_config)
+    await bind_thread_mcps(
+        db,
+        client,
+        uid=uid,
+        mcp_server_names=projection.mcp_server_names,
+        agent_id=agent_id,
+        session_id=session_id,
+    )
 
     record = await thread_session_repo.create_thread_session(
         db,

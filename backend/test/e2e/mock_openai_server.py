@@ -45,6 +45,7 @@ def _last_user_text(body: dict) -> str:
 TOOL_TRIGGERS = {
     "写文件": ("Write", {"file_path": WRITE_FILE_PATH, "content": WRITE_FILE_CONTENT}),
     "列出知识库": ("list_kbs", {}),
+    "调用回声": ("mcp__e2e-echo-mcp__echo", {"text": "hi-mcp"}),
 }
 
 
