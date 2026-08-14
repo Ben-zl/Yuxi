@@ -43,3 +43,15 @@ async def create_thread_session(
     db.add(record)
     await db.flush()
     return record
+
+
+async def get_thread_session_by_agentscope_agent(
+    db: AsyncSession, *, agentscope_agent_id: str
+) -> AgentScopeThreadSession | None:
+    """按 agentscope agent_id 反查映射（extra_agent_tools 工厂使用）。"""
+    result = await db.execute(
+        select(AgentScopeThreadSession).where(
+            AgentScopeThreadSession.agentscope_agent_id == agentscope_agent_id
+        )
+    )
+    return result.scalar_one_or_none()

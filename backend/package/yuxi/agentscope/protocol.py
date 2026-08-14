@@ -45,31 +45,14 @@ def event_to_chunks(event: dict, *, request_id: str) -> list[dict]:
                 msg={"id": reply_id, "type": ASSISTANT_MSG_TYPE, "content": ""},
             )
         ]
-    if event_type == "TEXT_BLOCK_DELTA":
-        return [
-            _chunk(
-                request_id,
-                status="loading",
-                msg={
-                    "id": reply_id,
-                    "type": ASSISTANT_MSG_TYPE,
-                    "content": event.get("delta", ""),
-                },
-            )
-        ]
-    if event_type == "THINKING_BLOCK_DELTA":
-        return [
-            _chunk(
-                request_id,
-                status="loading",
-                msg={
-                    "id": reply_id,
-                    "type": ASSISTANT_MSG_TYPE,
-                    "content": "",
-                    "reasoning_content": event.get("delta", ""),
-                },
-            )
-        ]
+    if event_type in {"TEXT_BLOCK_DELTA", "THINKING_BLOCK_DELTA"}:
+        # 文本与思考增量同构：思考块走 reasoning_content 字段区分
+        msg = {"id": reply_id, "type": ASSISTANT_MSG_TYPE, "content": ""}
+        if event_type == "TEXT_BLOCK_DELTA":
+            msg["content"] = event.get("delta", "")
+        else:
+            msg["reasoning_content"] = event.get("delta", "")
+        return [_chunk(request_id, status="loading", msg=msg)]
     return []
 
 
@@ -106,3 +89,79 @@ def reply_end_to_terminal(event: dict, *, request_id: str) -> TerminalConversion
         run_status="completed",
         chunk=_chunk(request_id, status="finished"),
     )
+
+
+class ToolEventConverter:
+    """工具事件 → 前端工具 chunk 的有状态转换器（按 tool_call_id 累积）。
+
+    覆盖工具调用增量（tool_call_chunks）与工具结果完成
+    （stream_event.tool-finished，与既有 run_worker 事件形状一致）。
+    每轮对话使用一个实例；feed 返回 0..n 个 chunk。
+    """
+
+    def __init__(self, request_id: str):
+        self._request_id = request_id
+        self._args_fragments: dict[str, list[str]] = {}
+        self._result_fragments: dict[str, list[str]] = {}
+        self._tool_names: dict[str, str] = {}
+
+    def feed(self, event: dict) -> list[dict]:
+        event_type = str(event.get("type", "")).upper()
+        tool_call_id = event.get("tool_call_id")
+
+        if event_type == "TOOL_CALL_START":
+            name = event.get("tool_call_name", "")
+            self._tool_names[tool_call_id] = name
+            self._args_fragments[tool_call_id] = []
+            return [self._tool_call_chunk(tool_call_id, args="")]
+        if event_type == "TOOL_CALL_DELTA":
+            fragment = event.get("delta", "")
+            self._args_fragments.setdefault(tool_call_id, []).append(fragment)
+            return [self._tool_call_chunk(tool_call_id, args=fragment)]
+        if event_type == "TOOL_CALL_END":
+            # 完整参数 chunk：前端按 tool_call 类型消费完整 args 字符串
+            complete_args = "".join(self._args_fragments.get(tool_call_id, []))
+            return [self._tool_call_chunk(tool_call_id, args=complete_args, complete=True)]
+        if event_type == "TOOL_RESULT_TEXT_DELTA":
+            self._result_fragments.setdefault(tool_call_id, []).append(event.get("delta", ""))
+            return []
+        if event_type == "TOOL_RESULT_END":
+            output_text = "".join(self._result_fragments.get(tool_call_id, []))
+            return [self._tool_finished_chunk(tool_call_id, output_text)]
+        return []
+
+    def _tool_call_chunk(self, tool_call_id: str, *, args: str, complete: bool = False) -> dict:
+        name = self._tool_names.get(tool_call_id, "")
+        fragment = {
+            "index": 0,
+            "id": tool_call_id,
+            "name": name,
+            "args": args,
+        }
+        msg = {
+            "id": None,
+            "type": ASSISTANT_MSG_TYPE,
+            "content": "",
+            "tool_call_chunks": [fragment],
+        }
+        if complete:
+            # 完整调用：args 为完整 JSON 字符串（前端 tool_call 类型消费）
+            msg["tool_calls"] = [fragment]
+        return _chunk(self._request_id, status="loading", msg=msg)
+
+    def _tool_finished_chunk(self, tool_call_id: str, output_text: str) -> dict:
+        return _chunk(
+            self._request_id,
+            status="stream_event",
+            event={
+                "method": "tools",
+                "data": {
+                    "event": "tool-finished",
+                    "output": {
+                        "tool_call_id": tool_call_id,
+                        "content": output_text,
+                    },
+                    "tool_call_id": tool_call_id,
+                },
+            },
+        )

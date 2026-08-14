@@ -58,6 +58,44 @@ async def _ensure_database_exists(database_url: str) -> None:
         await conn.close()
 
 
+async def _thread_knowledge_slugs(agentscope_agent_id: str) -> list[str] | None:
+    """按 agentscope agent_id 反查线程的会话启用知识库集（None=全部）。"""
+    from yuxi.agentscope.projection import agent_context
+    from yuxi.repositories.agentscope_thread_sessions import (
+        get_thread_session_by_agentscope_agent,
+    )
+    from yuxi.storage.postgres.manager import pg_manager
+    from yuxi.storage.postgres.models_business import Agent
+    from sqlalchemy import select
+
+    async with pg_manager.get_async_session_context() as db:
+        mapping = await get_thread_session_by_agentscope_agent(
+            db, agentscope_agent_id=agentscope_agent_id
+        )
+        if mapping is None:
+            return None
+        row = (
+            await db.execute(select(Agent).where(Agent.slug == mapping.agent_slug))
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        knowledges = agent_context(row).get("knowledges")
+        return None if knowledges is None else list(knowledges)
+
+
+async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> list:
+    """每轮 chat 按会话注入 yuxi 工具（KB 工具按可见性，LITE 自动裁剪）。"""
+    from yuxi.agentscope.tools import build_kb_tools, build_web_search_tool
+
+    tools = await build_kb_tools(
+        uid=user_id, knowledge_slugs=await _thread_knowledge_slugs(agent_id)
+    )
+    web_search_tool = build_web_search_tool()
+    if web_search_tool is not None:
+        tools.append(web_search_tool)
+    return tools
+
+
 def _create_service_app_sync():
     """构造 agentscope service app，并在构造前确保独立 database 存在。
 
@@ -99,6 +137,7 @@ def _create_service_app_sync():
             db=int(redis_parsed.path.lstrip("/") or 0),
             password=redis_parsed.password,
         ),
+        extra_agent_tools=_extra_agent_tools,
         workspace_manager=workspace_manager,
         title="Yuxi AgentScope Service",
     )

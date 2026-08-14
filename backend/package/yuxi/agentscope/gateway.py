@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.protocol import (
+    ToolEventConverter,
     event_to_chunks,
     init_chunk,
     reply_end_to_terminal,
@@ -79,6 +80,7 @@ async def stream_round_to_run_events(
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         event_count = 0
+        tool_converter = ToolEventConverter(request_id)
         while True:
             event = await asyncio.wait_for(queue.get(), timeout=read_timeout)
             if isinstance(event, Exception):
@@ -103,6 +105,7 @@ async def stream_round_to_run_events(
             elif event_type == "THINKING_BLOCK_DELTA":
                 reasoning_parts.append(event.get("delta", ""))
             chunks = event_to_chunks(event, request_id=request_id)
+            chunks.extend(tool_converter.feed(event))
             if chunks:
                 event_count += 1
                 await append_run_stream_event(

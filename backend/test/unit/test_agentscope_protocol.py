@@ -99,3 +99,28 @@ def test_reply_end_interrupted_and_max_iters():
     )
     assert max_iters.run_status == "failed"
     assert max_iters.chunk["error_type"] == "exceed_max_iters"
+
+
+def test_tool_event_converter_streams_call_and_result():
+    from yuxi.agentscope.protocol import ToolEventConverter
+
+    converter = ToolEventConverter(REQUEST_ID)
+    start = converter.feed(
+        {"type": "TOOL_CALL_START", "tool_call_id": "tc1", "tool_call_name": "query_kb"}
+    )
+    assert start[0]["status"] == "loading"
+    assert start[0]["msg"]["tool_call_chunks"][0]["name"] == "query_kb"
+
+    delta = converter.feed({"type": "TOOL_CALL_DELTA", "tool_call_id": "tc1", "delta": '{"kb_'})
+    assert delta[0]["msg"]["tool_call_chunks"][0]["args"] == '{"kb_'
+
+    end = converter.feed({"type": "TOOL_CALL_END", "tool_call_id": "tc1"})
+    assert end[0]["msg"]["tool_calls"][0]["args"] == '{"kb_'
+
+    assert converter.feed({"type": "TOOL_RESULT_TEXT_DELTA", "tool_call_id": "tc1", "delta": "结果"}) == []
+    finished = converter.feed({"type": "TOOL_RESULT_END", "tool_call_id": "tc1"})
+    assert finished[0]["status"] == "stream_event"
+    assert finished[0]["event"]["data"]["event"] == "tool-finished"
+    assert finished[0]["event"]["data"]["output"]["content"] == "结果"
+
+    assert converter.feed({"type": "MODEL_CALL_START", "reply_id": "r1"}) == []

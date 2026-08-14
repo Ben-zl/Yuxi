@@ -41,16 +41,24 @@ def _last_user_text(body: dict) -> str:
     return user_texts[-1] if user_texts else ""
 
 
-def _wants_tool_call(body: dict) -> bool:
-    """任一用户消息要求写文件，且尚无工具结果（否则是第二轮总结）。
+# 关键词 → (工具名, 参数 dict)；e2e 按用户消息文本驱动确定性工具调用
+TOOL_TRIGGERS = {
+    "写文件": ("Write", {"file_path": WRITE_FILE_PATH, "content": WRITE_FILE_CONTENT}),
+    "列出知识库": ("list_kbs", {}),
+}
 
-    注意 agentscope 会把 workspace 提示以 <system-reminder> 追加为
-    额外的 user 消息，不能只看最后一条。
-    """
+
+def _matched_tool_trigger(body: dict):
+    """按用户消息关键词匹配工具触发；无工具结果时才触发（有则进入总结轮）。"""
     messages = body.get("messages") or []
-    has_tool_result = any(m.get("role") == "tool" for m in messages)
+    if any(m.get("role") == "tool" for m in messages):
+        return None
     user_texts = [_message_text(m) for m in messages if m.get("role") == "user"]
-    return any("写文件" in text for text in user_texts) and not has_tool_result
+    joined = "".join(user_texts)
+    for keyword, (name, args) in TOOL_TRIGGERS.items():
+        if keyword in joined:
+            return name, args
+    return None
 
 
 def _has_tool_result(body: dict) -> bool:
@@ -95,14 +103,12 @@ async def chat_completions(body: dict):
     )
 
     if body.get("stream"):
-        tool_round = _wants_tool_call(body)
+        trigger = _matched_tool_trigger(body)
 
         async def stream_chunks():
-            if tool_round:
-                args = json.dumps(
-                    {"file_path": WRITE_FILE_PATH, "content": WRITE_FILE_CONTENT},
-                    ensure_ascii=False,
-                )
+            if trigger:
+                tool_name, tool_args = trigger
+                args = json.dumps(tool_args, ensure_ascii=False)
                 yield _sse_chunk(model, {"role": "assistant", "content": None})
                 yield _sse_chunk(
                     model,
@@ -110,9 +116,9 @@ async def chat_completions(body: dict):
                         "tool_calls": [
                             {
                                 "index": 0,
-                                "id": "call_mock_write",
+                                "id": f"call_mock_{tool_name}",
                                 "type": "function",
-                                "function": {"name": "Write", "arguments": args},
+                                "function": {"name": tool_name, "arguments": args},
                             }
                         ]
                     },
@@ -129,7 +135,8 @@ async def chat_completions(body: dict):
 
         return StreamingResponse(stream_chunks(), media_type="text/event-stream")
 
-    if _wants_tool_call(body):
+    trigger = _matched_tool_trigger(body)
+    if trigger:
         return {
             "id": "chatcmpl-mock",
             "object": "chat.completion",
@@ -143,17 +150,11 @@ async def chat_completions(body: dict):
                         "content": None,
                         "tool_calls": [
                             {
-                                "id": "call_mock_write",
+                                "id": f"call_mock_{trigger[0]}",
                                 "type": "function",
                                 "function": {
-                                    "name": "Write",
-                                    "arguments": json.dumps(
-                                        {
-                                            "file_path": WRITE_FILE_PATH,
-                                            "content": WRITE_FILE_CONTENT,
-                                        },
-                                        ensure_ascii=False,
-                                    ),
+                                    "name": trigger[0],
+                                    "arguments": json.dumps(trigger[1], ensure_ascii=False),
                                 },
                             }
                         ],
