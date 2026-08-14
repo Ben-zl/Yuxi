@@ -188,8 +188,7 @@ def _create_service_app_sync():
         await pg_manager.ensure_business_schema()
         skills = await _resolve_skill_paths()
         subagent_rows.extend(await _resolve_subagent_rows())
-        await pg_manager.close()
-        pg_manager._initialized = False
+        await pg_manager.reset()
         return skills
 
     def _run_bootstrap():

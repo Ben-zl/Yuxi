@@ -61,35 +61,16 @@ def _confirm_event(result) -> dict:
     pytest.fail(f"未收到审批挂起事件: {[e.get('type') for e in result.events]}")
 
 
-async def test_sensitive_tool_parks_and_resume_approves(db_session):
-    uid = "e2e-approval"
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-
-    # 默认权限模式：Write 触发审批挂起
-    mapping = await ensure_thread_session(
-        db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG
-    )
-    park_round = await collect_chat_round(
-        client,
-        uid=uid,
-        agent_id=mapping.agentscope_agent_id,
-        session_id=mapping.agentscope_session_id,
-        text="请写文件到 outputs 目录",
-    )
-    assert park_round.parked == "permission"
-
-    confirm_event = _confirm_event(park_round)
-    assert confirm_event["tool_calls"][0]["name"] == "Write"
-
-    # 批准后 resume 续跑到终态，Write 真实执行
+async def _resume_and_collect(client, mapping, uid, confirm_event, confirmed):
+    """订阅在先、恢复在后，收集到 REPLY_END 返回 (事件类型列表, 结束原因)。"""
     import asyncio
 
     queue = asyncio.Queue()
 
     async def _pump():
         async for event in client.stream_events(
-            uid, mapping.agentscope_agent_id, mapping.agentscope_session_id, read_timeout=120.0
+            uid, mapping.agentscope_agent_id, mapping.agentscope_session_id,
+            read_timeout=120.0,
         ):
             await queue.put(event)
 
@@ -102,7 +83,7 @@ async def test_sensitive_tool_parks_and_resume_approves(db_session):
             mapping.agentscope_session_id,
             reply_id=confirm_event["reply_id"],
             tool_calls=confirm_event["tool_calls"],
-            confirmed=True,
+            confirmed=confirmed,
         )
         types = []
         while True:
@@ -110,84 +91,74 @@ async def test_sensitive_tool_parks_and_resume_approves(db_session):
             event_type = str(event.get("type", "")).upper()
             types.append(event_type)
             if event_type == "REPLY_END":
-                assert str(event.get("finished_reason", "")).lower() == "completed"
-                break
-        assert "TOOL_RESULT_END" in types, types
+                return types, str(event.get("finished_reason", "")).lower()
     finally:
         pump.cancel()
+
+
+async def _park_round(client, mapping, uid):
+    """默认权限模式触发 Write 审批挂起，返回挂起轮次与确认事件。"""
+    park_round = await collect_chat_round(
+        client,
+        uid=uid,
+        agent_id=mapping.agentscope_agent_id,
+        session_id=mapping.agentscope_session_id,
+        text="请写文件到 outputs 目录",
+    )
+    assert park_round.parked == "permission"
+    return park_round, _confirm_event(park_round)
+
+
+async def _new_thread(db_session, client, uid):
+    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
+    mapping = await ensure_thread_session(
+        db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG
+    )
+    return mapping
+
+
+async def test_sensitive_tool_parks_and_resume_approves(db_session):
+    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
+    mapping = await _new_thread(db_session, client, "e2e-approval")
+
+    _, confirm_event = await _park_round(client, mapping, "e2e-approval")
+    assert confirm_event["tool_calls"][0]["name"] == "Write"
+
+    types, finished = await _resume_and_collect(
+        client, mapping, "e2e-approval", confirm_event, confirmed=True
+    )
+    assert finished == "completed"
+    assert "TOOL_RESULT_END" in types, types
 
 
 async def test_reject_ends_round(db_session):
-    uid = "e2e-approval-reject"
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
     client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = await ensure_thread_session(
-        db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG
+    mapping = await _new_thread(db_session, client, "e2e-approval-reject")
+
+    _, confirm_event = await _park_round(client, mapping, "e2e-approval-reject")
+
+    # 拒绝后 agentscope 原生行为：模型收到拒绝说明并结束本轮（与旧栈
+    # 「直接中断」的差异已记录为黄线项）
+    _, finished = await _resume_and_collect(
+        client, mapping, "e2e-approval-reject", confirm_event, confirmed=False
     )
-    park_round = await collect_chat_round(
-        client,
-        uid=uid,
-        agent_id=mapping.agentscope_agent_id,
-        session_id=mapping.agentscope_session_id,
-        text="请写文件到 outputs 目录",
-    )
-    assert park_round.parked == "permission"
-    confirm_event = _confirm_event(park_round)
-
-    import asyncio
-
-    queue = asyncio.Queue()
-
-    async def _pump():
-        async for event in client.stream_events(
-            uid, mapping.agentscope_agent_id, mapping.agentscope_session_id, read_timeout=120.0
-        ):
-            await queue.put(event)
-
-    pump = asyncio.create_task(_pump())
-    try:
-        await asyncio.sleep(0.5)
-        await client.resume_confirm(
-            uid,
-            mapping.agentscope_agent_id,
-            mapping.agentscope_session_id,
-            reply_id=confirm_event["reply_id"],
-            tool_calls=confirm_event["tool_calls"],
-            confirmed=False,
-        )
-        while True:
-            event = await asyncio.wait_for(queue.get(), timeout=120.0)
-            if str(event.get("type", "")).upper() == "REPLY_END":
-                # 拒绝后 agentscope 原生行为：模型收到拒绝说明并结束本轮
-                assert str(event.get("finished_reason", "")).lower() == "completed"
-                break
-    finally:
-        pump.cancel()
+    assert finished == "completed"
 
 
 async def test_parked_session_can_be_cancelled(db_session):
-    uid = "e2e-approval-cancel"
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = await ensure_thread_session(
-        db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG
-    )
-    park_round = await collect_chat_round(
-        client,
-        uid=uid,
-        agent_id=mapping.agentscope_agent_id,
-        session_id=mapping.agentscope_session_id,
-        text="请写文件到 outputs 目录",
-    )
-    assert park_round.parked == "permission"
-
     import asyncio
+
+    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
+    mapping = await _new_thread(db_session, client, "e2e-approval-cancel")
+
+    await _park_round(client, mapping, "e2e-approval-cancel")
 
     queue = asyncio.Queue()
 
     async def _pump():
         async for event in client.stream_events(
-            uid, mapping.agentscope_agent_id, mapping.agentscope_session_id, read_timeout=60.0
+            "e2e-approval-cancel", mapping.agentscope_agent_id,
+            mapping.agentscope_session_id, read_timeout=60.0,
         ):
             await queue.put(event)
 
@@ -195,7 +166,8 @@ async def test_parked_session_can_be_cancelled(db_session):
     try:
         await asyncio.sleep(0.5)
         await client.interrupt_session(
-            uid, mapping.agentscope_agent_id, mapping.agentscope_session_id
+            "e2e-approval-cancel", mapping.agentscope_agent_id,
+            mapping.agentscope_session_id,
         )
         while True:
             event = await asyncio.wait_for(queue.get(), timeout=60.0)

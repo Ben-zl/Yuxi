@@ -129,24 +129,24 @@ class ToolEventConverter:
             name = event.get("tool_call_name", "")
             self._tool_names[tool_call_id] = name
             self._args_fragments[tool_call_id] = []
-            return [self._tool_callmake_chunk(tool_call_id, args="")]
+            return [self._tool_call_make_chunk(tool_call_id, args="")]
         if event_type == "TOOL_CALL_DELTA":
             fragment = event.get("delta", "")
             self._args_fragments.setdefault(tool_call_id, []).append(fragment)
-            return [self._tool_callmake_chunk(tool_call_id, args=fragment)]
+            return [self._tool_call_make_chunk(tool_call_id, args=fragment)]
         if event_type == "TOOL_CALL_END":
             # 完整参数 chunk：前端按 tool_call 类型消费完整 args 字符串
             complete_args = "".join(self._args_fragments.get(tool_call_id, []))
-            return [self._tool_callmake_chunk(tool_call_id, args=complete_args, complete=True)]
+            return [self._tool_call_make_chunk(tool_call_id, args=complete_args, complete=True)]
         if event_type == "TOOL_RESULT_TEXT_DELTA":
             self._result_fragments.setdefault(tool_call_id, []).append(event.get("delta", ""))
             return []
         if event_type == "TOOL_RESULT_END":
             output_text = "".join(self._result_fragments.get(tool_call_id, []))
-            return [self._tool_finishedmake_chunk(tool_call_id, output_text)]
+            return [self._tool_finished_make_chunk(tool_call_id, output_text)]
         return []
 
-    def _tool_callmake_chunk(self, tool_call_id: str, *, args: str, complete: bool = False) -> dict:
+    def _tool_call_make_chunk(self, tool_call_id: str, *, args: str, complete: bool = False) -> dict:
         name = self._tool_names.get(tool_call_id, "")
         fragment = {
             "index": 0,
@@ -165,7 +165,7 @@ class ToolEventConverter:
             msg["tool_calls"] = [fragment]
         return make_chunk(self._request_id, status="loading", msg=msg)
 
-    def _tool_finishedmake_chunk(self, tool_call_id: str, output_text: str) -> dict:
+    def _tool_finished_make_chunk(self, tool_call_id: str, output_text: str) -> dict:
         return make_chunk(
             self._request_id,
             status="stream_event",

@@ -6,7 +6,7 @@
 
 **Status:** resolved
 
-- [x] Langfuse 收到主链路 trace：一次对话含模型与工具 span，Team worker 有归属
+- [ ] Langfuse 收到主链路 trace：一次对话含模型与工具 span，Team worker 有归属（本环境无 Langfuse 实例，TracingMiddleware 挂载为零回归验证；真实 span 上报在切换门禁）
 - [x] token 用量按用户/线程归集，与迁移前账目口径一致或与 11 黄线结论一致
 - [x] Dashboard 用量视图有数据（或明确的降级结论记录在 spec）
 

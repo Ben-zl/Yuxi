@@ -214,7 +214,8 @@ def build_web_search_tool():
     """构建网页搜索工具（provider 未配置时返回 None，不装配）。"""
     import os
 
-    if not (os.getenv("DOUBAO_SEARCH_API_KEY") or os.getenv("TAVILY_API_KEY")):
+    if not os.getenv("DOUBAO_SEARCH_API_KEY"):
+        # 仅支持豆包 provider；Tavily 的 REST 实现见切换门禁工具面差额
         return None
     from agentscope.tool import FunctionTool
 
@@ -267,7 +268,7 @@ async def bind_thread_mcps(
             await client.add_workspace_mcp(uid, agent_id, session_id, payload)
             bound += 1
         except AgentScopeServiceError as exc:
-            if "409" in str(exc):
+            if exc.status_code == 409:
                 continue  # 同名 MCP 已绑定
             raise
     return bound

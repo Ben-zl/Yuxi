@@ -16,6 +16,10 @@ from yuxi.utils import logger
 class AgentScopeServiceError(RuntimeError):
     """agentscope service 返回非成功状态。"""
 
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class AgentScopeServiceClient:
     """薄客户端：不缓存业务状态，映射与幂等由调用方（runner/投影层）负责。"""
@@ -34,7 +38,8 @@ class AgentScopeServiceClient:
             resp = await client.request(method, path, headers=self._headers(uid), **kwargs)
         if resp.status_code >= 400:
             raise AgentScopeServiceError(
-                f"{method} {path} 失败：{resp.status_code} {resp.text[:300]}"
+                f"{method} {path} 失败：{resp.status_code} {resp.text[:300]}",
+                status_code=resp.status_code,
             )
         return resp
 

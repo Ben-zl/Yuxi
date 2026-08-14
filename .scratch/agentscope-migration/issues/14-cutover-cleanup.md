@@ -33,8 +33,9 @@
 - **③ 付费模型验证缺失**：本环境无可用密钥（dev 库供应商全部 disabled、.env 无 key），全链路以 OpenAI 兼容 mock 验证；真实模型/长循环/usage 数值待补。
 - **④ Langfuse 实证缺失**：OTel→Langfuse span 上报为配置面接线（无本地实例）；Dashboard 数据视图未接。
 - **⑤ workspace 网络接线**：MCP 在 workspace 容器内连接，默认 bridge 无 DNS；需 fork 给 DockerWorkspaceManager 加网络参数（或生产侧经可达地址发布 MCP）——e2e 以 bridge IP 绕过。
-- **⑥ 旧栈移除与文档**：依赖树仍含 langchain/langgraph（uv.lock 各 6 处，检查留证）；agents 模块/chat_service/run_worker 删除、旧 e2e 套件改造、ARCHITECTURE.md 重写未执行——依赖 ①②③④ 全部通过后才允许。
+- **⑥ 工具面差额（Spec 评审补充）**：spec 声明 7 个 KB 工具，已交付 6 个（download_kb_file 顺延——产出区语义并入 workspace）；OCR/present_artifacts/Tavily web_search 未迁移；steer（旧栈提前结束语义）在工单 05 声明「由 11 重定义」但 11 未处理——四项均须在 GO 前补齐或正式降级记录。
+- **⑦ 旧栈移除与文档**：依赖树仍含 langchain/langgraph（uv.lock 各 6 处，检查留证）；agents 模块/chat_service/run_worker 删除、旧 e2e 套件改造、ARCHITECTURE.md 重写未执行——依赖 ①②③④ 全部通过后才允许。
 
 ### 结论
 
-**条件性 NO-GO**：技术链路已全量打通并实证（38 tests green），但按本工单自身的门禁定义（红线/真实模型/前端联调/存量行为），破坏性切换（翻转+删除）不得在本环境执行。下一步：在有付费模型 key 与 Langfuse 的环境中补 ③④，实现 ①② 并以真实前端联调，随后分批执行 ⑥ 并复跑全量门禁。
+**条件性 NO-GO**：技术链路已全量打通并实证（38 tests green），但按本工单自身的门禁定义（红线/真实模型/前端联调/存量行为），破坏性切换（翻转+删除）不得在本环境执行。下一步：在有付费模型 key 与 Langfuse 的环境中补 ③④，实现 ①② 并以真实前端联调，补齐/降级 ⑥ 工具面差额，随后分批执行 ⑦ 并复跑全量门禁。

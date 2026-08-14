@@ -1006,6 +1006,11 @@ class PostgresManager(metaclass=SingletonMeta):
         finally:
             await session.close()
 
+    async def reset(self):
+        """释放连接并复位初始化标记（跨事件循环复用前调用）。"""
+        await self.close()
+        self._initialized = False
+
     async def close(self):
         """关闭引擎"""
         if self.async_engine:

@@ -130,9 +130,9 @@ async def collect_chat_round(
             if span_start < 0:
                 continue  # 订阅前残留的无关事件
             events.append(event)
-            if str(event.get("type", "")).lower() == "require_user_confirm":
+            if event_type == "require_user_confirm":
                 return ChatRoundResult(
-                    events=events[span_start:] + [event],
+                    events=events[span_start:],
                     text="".join(text_parts),
                     parked="permission",
                 )

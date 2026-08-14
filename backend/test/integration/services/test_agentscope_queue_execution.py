@@ -225,7 +225,7 @@ async def test_intake_is_idempotent_per_request_id(env):
 
 async def test_recovery_scan_promotes_orphaned_queue(env):
     first = await _intake(env, f"itq-r1-{uuid.uuid4().hex[:8]}", "恢复第一条")
-    second = await _intake(env, f"itq-r2-{uuid.uuid4().hex[:8]}", "恢复第二条")
+    await _intake(env, f"itq-r2-{uuid.uuid4().hex[:8]}", "恢复第二条")
 
     # 模拟执行器崩溃：Run 1 停在 pending。恢复扫描应重新投递 pending run，
     # 排队请求按 FIFO 语义继续等待（不越队），run 1 完成后才被升级派发。
@@ -238,7 +238,7 @@ async def test_recovery_scan_promotes_orphaned_queue(env):
     promoted = await agent_request_queue_service.dispatch_next_request(
         uid=env["uid"], agent_slug=env["agent_slug"], thread_id=env["thread_id"]
     )
-    assert promoted == second.run_id or promoted is not None
+    assert promoted is not None
 
     async with env["session_factory"]() as db:
         orphan = await db.execute(
