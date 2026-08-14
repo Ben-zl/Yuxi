@@ -10,7 +10,7 @@
 1. 升级到 v0.7.2 后，管理员此前创建的 stdio MCP 会被禁用，也无法重新启用。请在详情页迁移为 SSE 或 Streamable HTTP，或直接删除；代码内置的系统 stdio MCP 不受影响。
 :::
 
-- agentscope 承接迁移构建期完成（工单 01-13，切换未执行、现有链路零影响）：新增 agentscope 服务（独立 database 存储、Redis bus、Docker workspace 沙盒）与 yuxi/agentscope 桥接层（统一配置投影、协议转换、线程队列执行器、审批/中断、Team 子智能体、KB/MCP/Skills 工具、OTel 观测与用量归集）；fork 固定 commit ae6a563c 经 lock 可复现构建；新增 38 项单元/集成/e2e 测试在 docker compose 真实环境全绿。
+- agentscope 承接迁移构建期完成（工单 01-13，切换未执行、现有链路零影响）：新增 agentscope 服务（独立 database 存储、Redis bus、Docker workspace 沙盒）与 yuxi/agentscope 桥接层（统一配置投影、协议转换、线程队列执行器、审批/中断、Team 子智能体、KB/MCP/Skills 工具、OTel 观测与用量归集）；fork 固定 commit ae6a563c 经 lock 可复现构建；新增 38 项单元/集成/e2e 测试在 docker compose 真实环境全绿（含 MiniMax-M3 真实模型链路与 Langfuse OTLP span 上报实证）。
 
 - 完善 Agent Token 用量统计：state 同时保留近似上下文与主 Agent 模型返回的 Provider `usage_metadata`，实际用量拆分为最近调用、当前 Run 和线程累计；前端只读取 state，终态 chunk 不传递用量，worker 在 Run 终态时将父线程中 Run ID 匹配的 state 快照写入 AgentRun。支持 OpenAI priority/flex 缓存明细；L2 摘要内部调用暂未计入完整账单口径。
 - 修复公开图片上传的存储型 XSS 风险：头像与用户图片不再信任客户端 MIME 或文件名后缀，服务端校验真实图片内容且仅接受 PNG、JPEG、WebP、GIF，对象名使用识别出的固定安全后缀，拒绝伪装成图片的 SVG。

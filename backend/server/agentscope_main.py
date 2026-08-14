@@ -168,6 +168,30 @@ async def _resolve_subagent_rows() -> list:
     return list(rows)
 
 
+def _setup_otel_if_configured() -> None:
+    """按 OTel 标准环境变量初始化全局 TracerProvider（未配置则跳过）。
+
+    TracingMiddleware 使用全局 tracer；OTLP exporter 自动读取
+    OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_HEADERS——
+    Langfuse v3+ 原生收 OTLP（Basic 认证 = 项目 pk:sk）。
+    """
+    if not os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        return
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    provider = TracerProvider(
+        resource=Resource.create(
+            {"service.name": os.getenv("OTEL_SERVICE_NAME", "yuxi-agentscope")}
+        )
+    )
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(provider)
+
+
 def _create_service_app_sync():
     """构造 agentscope service app，并在构造前确保独立 database 存在。
 
@@ -199,6 +223,8 @@ def _create_service_app_sync():
             bootstrap_error.append(exc)
         finally:
             loop.close()
+
+    _setup_otel_if_configured()
 
     bootstrap_thread = threading.Thread(target=_run_bootstrap)
     bootstrap_thread.start()
