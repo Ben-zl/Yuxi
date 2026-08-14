@@ -143,3 +143,10 @@ def test_require_user_confirm_maps_to_approval_chunk():
     assert chunks[0]["action_requests"] == [
         {"action": "Write", "args": {"file_path": "/workspace/a.txt"}}
     ]
+
+
+def test_usage_aggregation_shape():
+    from yuxi.agentscope.gateway import _usage
+
+    usage = _usage(3, 5)
+    assert usage == {"input_tokens": 3, "output_tokens": 5, "total_tokens": 8}

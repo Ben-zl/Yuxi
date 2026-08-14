@@ -86,6 +86,17 @@ async def _thread_knowledge_slugs(agentscope_agent_id: str) -> list[str] | None:
         return None if knowledges is None else list(knowledges)
 
 
+async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str) -> list:
+    """每轮 chat 注入观测中间件（OTel GenAI 语义；未配置 provider 时近零开销）。
+
+    Langfuse 对接：设置 OTEL_EXPORTER_OTLP_ENDPOINT 等 OTel 环境变量即可
+    （Langfuse v3 原生收 OTLP），主链路 reply/model/tool span 自动上报。
+    """
+    from agentscope.middleware import TracingMiddleware
+
+    return [TracingMiddleware()]
+
+
 async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> list:
     """每轮 chat 按会话注入 yuxi 工具（KB 工具按可见性，LITE 自动裁剪）。"""
     from yuxi.agentscope.tools import build_kb_tools, build_web_search_tool
@@ -216,6 +227,7 @@ def _create_service_app_sync():
             db=int(redis_parsed.path.lstrip("/") or 0),
             password=redis_parsed.password,
         ),
+        extra_agent_middlewares=_extra_agent_middlewares,
         extra_agent_tools=_extra_agent_tools,
         custom_subagent_templates=_subagent_templates(subagent_rows),
         workspace_manager=workspace_manager,

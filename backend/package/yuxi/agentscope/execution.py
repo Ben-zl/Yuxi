@@ -49,5 +49,6 @@ async def execute_run(
             else None if result.run_status == "completed"
             else "运行失败"
         ),
+        token_usage=result.usage or {},
     )
     return result

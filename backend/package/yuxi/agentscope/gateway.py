@@ -21,6 +21,15 @@ from yuxi.agentscope.runner import SUBSCRIBE_SETTLE_SECONDS
 from yuxi.services.run_queue_service import append_run_stream_event
 
 
+def _usage(input_tokens: int, output_tokens: int) -> dict:
+    """按 AgentRun.token_usage 口径聚合一轮对话的模型用量。"""
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
 @dataclass
 class GatewayRoundResult:
     """网关一轮对话的运行结果摘要。"""
@@ -30,6 +39,7 @@ class GatewayRoundResult:
     reasoning: str
     event_count: int
     parked: str | None = None  # 挂起原因（permission=等待工具审批）
+    usage: dict | None = None  # 聚合的 token 用量（input/output/total）
 
 
 async def stream_round_to_run_events(
@@ -82,6 +92,8 @@ async def stream_round_to_run_events(
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         event_count = 0
+        input_tokens = 0
+        output_tokens = 0
         tool_converter = ToolEventConverter(request_id)
         while True:
             event = await asyncio.wait_for(queue.get(), timeout=read_timeout)
@@ -108,6 +120,7 @@ async def stream_round_to_run_events(
                     reasoning="".join(reasoning_parts),
                     event_count=event_count + 1,
                     parked="permission",
+                    usage=_usage(input_tokens, output_tokens),
                 )
             if event_type == "REPLY_END":
                 terminal = reply_end_to_terminal(event, request_id=request_id)
@@ -122,11 +135,15 @@ async def stream_round_to_run_events(
                     text="".join(text_parts),
                     reasoning="".join(reasoning_parts),
                     event_count=event_count,
+                    usage=_usage(input_tokens, output_tokens),
                 )
             if event_type == "TEXT_BLOCK_DELTA":
                 text_parts.append(event.get("delta", ""))
             elif event_type == "THINKING_BLOCK_DELTA":
                 reasoning_parts.append(event.get("delta", ""))
+            elif event_type == "MODEL_CALL_END":
+                input_tokens += int(event.get("input_tokens") or 0)
+                output_tokens += int(event.get("output_tokens") or 0)
             chunks = event_to_chunks(event, request_id=request_id)
             chunks.extend(tool_converter.feed(event))
             if chunks:

@@ -248,3 +248,37 @@ async def test_recovery_scan_promotes_orphaned_queue(env):
             )
         )
         assert orphan.first() is None, "队头完成后不应残留孤儿排队请求"
+
+
+async def test_execute_run_records_token_usage_and_audit_facts(env):
+    """审计投影：终态/时长/用量随执行回写 AgentRun（工单 12/13）。"""
+    from yuxi.agentscope.execution import execute_run
+    from yuxi.storage.postgres.models_business import AgentRun as AgentRunModel
+
+    request_id = f"itq-audit-{uuid.uuid4().hex[:8]}"
+    await _intake(env, request_id, "审计投影消息")
+
+    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
+    async with env["session_factory"]() as db:
+        run = await AgentRunRepository(db).get_run_by_request_id(request_id)
+        assert run.status == "pending" and run.finished_at is None
+        await AgentRunRepository(db).mark_running(run.id)
+        await db.commit()
+
+        result = await execute_run(db, client, run=run, text="审计投影消息")
+        await db.commit()
+
+        audited = await AgentRunRepository(db).get_run_by_request_id(request_id)
+        assert audited.status == result.run_status == "completed"
+        assert audited.finished_at is not None
+        assert set(audited.token_usage) >= {"input_tokens", "output_tokens", "total_tokens"}
+
+    from sqlalchemy import select as _select
+
+    async with env["session_factory"]() as db:
+        rows = (
+            await db.execute(
+                _select(AgentRunModel.status).where(AgentRunModel.request_id == request_id)
+            )
+        ).all()
+        assert rows == [("completed",)]
