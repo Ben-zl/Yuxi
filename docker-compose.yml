@@ -125,6 +125,46 @@ services:
       sandbox-provisioner:
         condition: service_healthy
 
+  # region agentscope 承接迁移（工单 01）：会话服务骨架，切换工单收口前与旧 worker 并存
+  agentscope:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: yuxi-api:${YUXI_VERSION:-0.7.1}
+    container_name: agentscope-dev
+    working_dir: /app
+    volumes:
+      - ./backend/server:/app/server
+      - ./backend/package:/app/package
+      - ./docker/volumes/yuxi:/app/saves
+      - ./.env:/app/.env
+      - ./backend/pyproject.toml:/app/pyproject.toml
+      - ./backend/uv.lock:/app/uv.lock
+    networks:
+      - app-network
+    env_file:
+      - .env
+    environment:
+      <<: *api-worker-env
+      AGENTSCOPE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/agentscope
+      AGENTSCOPE_WORKSPACE_BASEDIR: /app/saves/agentscope-workspaces
+    command: uv run --no-sync --no-dev uvicorn server.agentscope_main:app --host 0.0.0.0 --port 8100 --reload --reload-dir /app/server --reload-dir /app/package --timeout-graceful-shutdown 5
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8100:8100"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -H 'X-User-ID: compose-healthcheck' http://localhost:8100/health || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 8
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  # endregion agentscope
+
   sandbox-provisioner:
     build:
       context: ./docker/sandbox_provisioner

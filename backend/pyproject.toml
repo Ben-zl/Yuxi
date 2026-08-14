@@ -13,6 +13,8 @@ dependencies = [
     "uvicorn[standard]>=0.34.2",
     "arq>=0.26.3",
     "yuxi",
+    # agentscope 承接迁移（工单 01）：固定 commit 的 fork，经 lock 锁定，升级必须显式 bump
+    "agentscope[service,storage-sql] @ git+https://github.com/Ben-zl/agentscope.git@ae6a563c",
 ]
 [tool.ruff]
 line-length = 120  # 代码最大行宽
