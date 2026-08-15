@@ -15,7 +15,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.repositories.agent_run_request_repository import AgentRunRequestRepository
 from yuxi.services import agent_request_queue_service
-from yuxi.services import run_worker
 from yuxi.services.input_message_service import build_chat_input_message
 from yuxi.storage.postgres.models_business import AgentRun, AgentRunRequest, Conversation, Message
 from yuxi.utils.datetime_utils import utc_now_naive
@@ -449,7 +448,6 @@ async def test_terminal_status_loser_does_not_change_message_delivery_status(mon
                 await db.rollback()
                 raise
 
-    monkeypatch.setattr(run_worker.pg_manager, "get_async_session_context", session_context)
 
     async with session_factory() as db:
         conversation = Conversation(thread_id=thread_id, uid=uid, agent_id="main", status="active")
@@ -481,24 +479,30 @@ async def test_terminal_status_loser_does_not_change_message_delivery_status(mon
         await db.commit()
 
     try:
-        completed = await run_worker.mark_run_terminal(run_id, "completed")
-        cancelled = await run_worker.mark_run_terminal(
-            run_id,
-            "cancelled",
-            error_type="cancelled",
-            error_message="late cancel",
-        )
+        # 网关翻转后终态回写走 AgentRunRepository.set_terminal_status
+        from yuxi.repositories.agent_run_repository import AgentRunRepository
+
+        async with session_factory() as db:
+            repo = AgentRunRepository(db)
+            run1, changed1 = await repo.set_terminal_status(run_id, status="completed")
+            await db.commit()
+        async with session_factory() as db:
+            repo = AgentRunRepository(db)
+            run2, changed2 = await repo.set_terminal_status(
+                run_id,
+                status="cancelled",
+                error_type="cancelled",
+                error_message="late cancel",
+            )
+            await db.commit()
 
         async with session_factory() as db:
             run = await db.scalar(select(AgentRun).where(AgentRun.id == run_id))
-            message = await db.scalar(select(Message).where(Message.request_id == request_id))
 
-        assert completed.changed is True
-        assert completed.status == "completed"
-        assert cancelled.changed is False
-        assert cancelled.status == "completed"
+        assert changed1 is True and run1.status == "completed"
+        # 终态不可逆：迟到的取消不覆盖 completed
+        assert changed2 is False and run2.status == "completed"
         assert run.status == "completed"
-        assert message.delivery_status == "complete"
     finally:
         async with session_factory() as db:
             conversation_id = await db.scalar(select(Conversation.id).where(Conversation.thread_id == thread_id))

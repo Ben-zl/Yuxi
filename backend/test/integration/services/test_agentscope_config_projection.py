@@ -123,10 +123,14 @@ async def test_project_runtime_lite_trims_knowledge(db_session, monkeypatch):
     assert projection.agent_request["system_prompt"] == "你是投影测试助手。"
 
 
-async def test_project_runtime_fails_explicitly(db_session):
+async def test_project_runtime_fails_explicitly(db_session, monkeypatch):
     with pytest.raises(ValueError, match="不存在"):
         await project_runtime(db_session, uid="it-proj-user", agent_slug="no-such-agent")
-    # 无模型智能体回落系统默认对话模型（与旧栈一致）
+    # 无模型智能体回落系统默认对话模型（与旧栈一致）；
+    # 默认模型的 key 由环境提供，测试内打桩避免依赖本地 .env
+    from yuxi.agentscope import projection as proj
+
+    monkeypatch.setattr(proj, "_resolve_api_key", lambda provider: "test-key")
     projection = await project_runtime(db_session, uid="it-proj-user", agent_slug=SUBAGENT_SLUG)
     assert projection.model_spec == config.default_model
     with pytest.raises(ValueError, match="不存在"):

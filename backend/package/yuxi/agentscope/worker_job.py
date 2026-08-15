@@ -88,10 +88,10 @@ async def execute_agent_run_job(run_id: str) -> None:
                 result = await execute_run(
                     db, client, run=run, text=input_message.content, model_spec=model_spec
                 )
-                if result.parked == "permission" and result.pending_confirm:
-                    await store_pending_confirm(
-                        run.conversation_thread_id, result.pending_confirm
-                    )
+            if result.parked == "permission" and result.pending_confirm:
+                await store_pending_confirm(
+                    run.conversation_thread_id, result.pending_confirm
+                )
 
             # yuxi 消息表落库：前端线程历史视图的数据源
             if result.text:

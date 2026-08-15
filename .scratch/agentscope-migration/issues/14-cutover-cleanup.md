@@ -57,3 +57,24 @@
 - 审批挂起时若整页刷新，模态框不恢复（前端 pendingInterrupt 仅内存态；Redis 挂起缓存 24h 有效，重开会话发送新消息可走 resume 链路）。
 - failed run 的错误信息不在会话内持久展示（前端既有产品行为，非迁移回归）。
 - MiniMax 经 Anthropic 兼容端点 input_tokens 上报为 0（output 正常）。
+
+## 第二轮浏览器全量验证记录（2026-08-15，commit 86dcca83）
+
+覆盖并发/长任务/取消/技能/MCP/知识库/Agent Team，发现并修复 3 个执行面缺陷：
+
+1. **Run 取消信号零消费者**：旧栈消费者随网关翻转移除，点停止后 run 继续跑完并误标 completed。修复：网关流循环与 resume 收集各挂取消监听器（收到信号→中断会话），`finalize_run` 将终态归一 `cancelled`。验证：取消后 ~2s 会话中断、run=cancelled、UI 回空闲。
+2. **run 级模型选择丢失**：worker 从不读 `run.input_payload.model_spec`，无模型智能体（deep-research）忽略用户显式选择的模型、回落系统默认。修复：model_spec 贯通三处调用链。
+3. **「深度研究」提示词教旧栈工具**：提示词指挥 `task` 工具（已不存在），模型用 AgentCreate 建完成员就结束回合、子智能体从不执行。修复：改为 TeamCreate/AgentCreate/TeamSay 工具链描述。验证：Team 编排全链路（建队→建成员→派发→成员回报→≤150字综合报告）成功落库并渲染。
+
+**通过项（真实浏览器 + MiniMax-M3）**：
+- 并发：3 线程 run 时间戳交错重叠执行、全部 completed
+- 长任务：3000 字长文完整生成（4608 字符）多次；运行中取消
+- 技能：模型逐字复述 e2e-skill-demo SKILL.md（渐进披露工作正常）
+- MCP：echo 工具绑定→模型调用→审批弹窗（参数显示）→允许→mcp-mock 收到 CallTool→回复精确回显
+- 知识库：list_kbs 真实调用（事件流 6 处 tool_call + tool-finished），返回 0 库
+- Team：见上
+
+**环境备注（非代码缺陷）**：
+- `SILICONFLOW_API_KEY` 在本地 .env 为空值带中文行内注释（docker env_file 不剥离），作为"密钥"进 Authorization 头触发 UnicodeEncodeError 500；建议清理该行为空。
+- docker workspace 后端下 MCP URL 必须为可路由地址（⑤既定结论的实证复现）；e2e 已参数化 MCP_MOCK_URL。
+- 知识库真实索引需 Milvus（本环境无），浏览器级验证止于工具面；KB 工具管线由 e2e 覆盖。
