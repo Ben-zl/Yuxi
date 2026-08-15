@@ -99,10 +99,17 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
 
 async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> list:
     """每轮 chat 按会话注入 yuxi 工具（KB 工具按可见性，LITE 自动裁剪）。"""
-    from yuxi.agentscope.tools import build_kb_tools, build_web_search_tool
+    from yuxi.agentscope.tools import build_extra_tools, build_kb_tools, build_web_search_tool
 
-    tools = await build_kb_tools(
-        uid=user_id, knowledge_slugs=await _thread_knowledge_slugs(agent_id)
+    knowledge_slugs = await _thread_knowledge_slugs(agent_id)
+    tools = await build_kb_tools(uid=user_id, knowledge_slugs=knowledge_slugs)
+    tools.extend(
+        await build_extra_tools(
+            uid=user_id,
+            knowledge_slugs=knowledge_slugs,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
     )
     web_search_tool = build_web_search_tool()
     if web_search_tool is not None:

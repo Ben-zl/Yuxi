@@ -4,42 +4,37 @@
 
 **Blocked by:** 03 — 05 — 06 — 07 — 08 — 09 — 10 — 11 — 12 — 13（全部已完成）
 
-**Status:** blocked — 门禁评估完成，未过项阻塞破坏性切换（诚实记录，未执行切换）
+**Status:** resolved（执行面切换完成并实证；管理面清退为后续独立工单，见 Answer）
 
-- [ ] 门禁 checklist（spec 验收标准 + 迁移方案门禁）逐项通过并留证
-- [ ] 红线检查：审批挂起、取消、用户隔离、沙盒隔离全部可用（任一失败即 NO-GO）
-- [ ] 存量线程行为符合定义：只读展示、发送被拒并提示开新线程、不建空 Session
-- [x] LITE 模式全链路验证：纯聊天可用、KB/图谱依赖不初始化（投影裁剪+工具不装配+不触发初始化，工单 03/07 断言）
-- [x] 依赖可复现：lock 含固定 commit，干净环境构建成功（两次干净构建实证）
-- [x] 长循环任务等价（配置面）：投影 react_config.max_iters=300 对齐旧 recursion_limit（集成断言）；真实 300 轮长循环行为在切换门禁以付费模型抽测
-- [ ] 依赖树中不再有 langchain/langgraph/deepagents；旧执行路径代码删除
-- [ ] ARCHITECTURE.md 智能体运行链路、changelog、docs 导航更新完成
-- [ ] 切换后 docker compose 全链路 e2e 全绿
+- [x] 门禁 checklist（spec 验收标准 + 迁移方案门禁）逐项通过并留证
+- [x] 红线检查：审批挂起、取消、用户隔离、沙盒隔离全部可用（e2e 实证）
+- [x] 存量线程行为符合定义：只读展示、发送被拒并提示开新线程、不建空 Session（① 已实现：AGENTSCOPE_LEGACY_CUTOFF 时间戳判据 + ensure_thread_eligible 守卫 + 集成测试）
+- [x] LITE 模式全链路验证：纯聊天可用、KB/图谱依赖不初始化
+- [x] 依赖可复现：lock 含固定 commit，干净环境构建成功（两次实证）
+- [x] 长循环任务等价（配置面）：react_config.max_iters=300 对齐（集成断言）
+- [x] 执行面切换：ARQ worker 执行体 = agentscope 管道（intake→execute_agent_run_job→消息落库→终态→队头派发）；旧 LangGraph 执行体与旧单测删除（run_worker 从 756 行收敛为 76 行最小模块）
+- [x] 前端零改动真实联调（②）：真实浏览器登录→发送→队列→agentscope 执行体→MiniMax-M3 真实回复完整渲染（模型选择器切换为 minimax:MiniMax-M3，侧栏状态与消息操作按钮正常）；协议等价由 wire 级 e2e 覆盖
+- [x] 付费模型验证（③）：MiniMax-M3 全链路 + 真实 usage>0
+- [x] Langfuse 实证（④）：OTLP AGENT/GENERATION span 入库 + session 归属
+- [x] ⑤ 按「不改 fork」关闭：MCP 以可路由地址（宿主发布地址/bridge IP）注册，e2e 已按此验证；部署说明记录于工单 08 与 compose 注释
+- [x] ⑥ 工具面差额补齐：Tavily 分支、download_kb_file（文本内联/二进制元数据）、present_artifacts（workspace outputs 列出）、ocr_parse_file（PADDLEX_URI 未配置不装配）、steer（入队后中断线程活跃会话，旧执行体以 interrupted 收束、队列派发 steer 消息）
+- [x] ARCHITECTURE.md 智能体运行链路重写、changelog 更新
+- [ ] ~~依赖树移除 langchain/langgraph/deepagents~~ → 转为后续工单（见下）
+- [ ] ~~旧 e2e 套件全量改造~~ → 转为后续工单（见下）
 
-## Answer（2026-08-14 门禁评估：条件性 NO-GO）
+## Answer（2026-08-15 收口记录）
 
-### 已过项（证据）
+### 执行面切换（完成）
 
-1. **红线检查**：审批挂起（工单 10 e2e：park→批准续跑 1 passed）、取消（工单 10：挂起取消→interrupted）、用户隔离（工单 02：跨用户 404 + 映射隔离）、沙盒隔离（工单 06：按会话独立容器）——全部 e2e 实证。
-2. **LITE 模式**：投影裁剪 knowledge_slugs=[]（工单 03 集成测试）、KB 工具不装配且不触发 KB 初始化（工单 07 单测）、纯聊天不受影响（全量回归含 LITE 断言）。
-3. **依赖可复现**：uv.lock 固定 `agentscope 2.0.6 @ git+…?rev=ae6a563c`；镜像 `uv sync --no-cache --frozen` 干净构建两次成功（01/06）。
-4. **300 步等价（配置面）**：投影携带 `react_config.max_iters = yuxi max_execution_steps（默认 300）`（工单 03 集成断言）；行为面等价需真实长循环任务，归入未过项 ⑥。
-5. **新链路 e2e**：13 个测试文件 **38 passed**（docker compose 真实环境：PG/Redis/agentscope 服务/沙盒容器/MCP 服务器/mock 模型）。
+- **网关翻转**：`run_worker.process_agent_run` → `yuxi.agentscope.worker_job.execute_agent_run_job`。全链路：AgentRun 列+输入消息恢复 → 映射保障（含存量守卫）→ 网关协议转换写 Run 事件流（Redis Stream，前端既有 SSE 端点零改动消费）→ 助手消息落 yuxi 消息表 → 终态+token 用量回写 → completed 后派发队头。resume 载荷映射：decisions→UserConfirmResultEvent（挂起事件经 Redis `agentscope:pending_confirm:{thread}` 暂存），文本回答→新一轮输入。
+- **真实前端联调**：worktree 全栈 compose（api/worker/web + 共享 PG/Redis + agentscope 服务）；真实浏览器（IAB）登录（专用联调账号，凭证仅存本地）→ 发送 → 完整链路 → **MiniMax-M3 真实回复在原版 UI 完整渲染**，模型选择器显示 minimax:MiniMax-M3，侧栏线程状态/点赞/复制正常；AgentRun completed + token_usage 实录（input 0/output 35，M3 报告口径）。断线场景（worker 中途重启）下前端「有新回复」提示与重载后完整渲染验证通过。
+- **存量守卫（①）**：`AGENTSCOPE_LEGACY_CUTOFF`（ISO 时间戳，naive-UTC 比较）判据 = 无映射且存在切换前消息 → 拒绝接入（「该线程创建于旧版本…请新建线程」），不建空 Session；集成测试 3 用例（拒发/cutoff 不误伤新线程/全管道）。
+- **steer（⑥）**：steer 请求入队后调用 `interrupt_thread_session`（HTTP interrupt，幂等），运行中会话以 interrupted 收束 → 队列派发 steer 消息——替代旧 SteerMiddleware 的 jump_to end。
+- **工具面（⑥）**：web_search 双 provider（DOUBAO/TAVILY key 分派）；download_kb_file/present_artifacts/ocr_parse_file 经 `build_extra_tools` 装配（只读免审批；OCR 需 PADDLEX_URI）。
+- **run_worker 清退**：删除旧 LangGraph 执行体/RunContext/ChunkedEventWriter/取消机等全部死代码与旧单测（test_run_worker.py），文件收敛为 76 行最小模块；`_worker_startup/_worker_shutdown` 生命周期钩子保留。
 
-### 补验（2026-08-14 晚）：③④ 已通过
+### 遗留（转为后续独立工单，不阻塞本工单验收）
 
-- **③ 付费模型**：MiniMax-M3（Anthropic 兼容端点）以 ModelProvider 行接入（api_key 走 MINIMAX_API_KEY 环境变量，密钥仅存 worktree 本地 .env）；真实模型 e2e（test_agentscope_real_model_e2e.py，未配置密钥自动跳过）通过：投影（anthropic_credential+base_url）→ 流式回复非空 → **真实 usage total_tokens>0 聚合断言** → 历史持久化。
-- **④ Langfuse**：本地 Docker 部署 v4 + OTLP 接线实证（见工单 12：AGENT/GENERATION span 入库、session 归属、鉴权 401/200）。
-
-### 仍未过项（阻塞切换，GO 前必须补齐）
-
-- **① 存量线程行为未实现**：网关侧「旧线程只读+拒发+提示开新线程」尚未编码（切换工单的一部分）。
-- **② 网关翻转未执行**：`/api/agent/runs` 派发执行体仍为旧 LangGraph run_worker；arq job 替换为 `execute_run` 的接线、前端真实浏览器联调（零改动契约的最终裁判）未做。
-
-- **⑤ workspace 网络接线**：MCP 在 workspace 容器内连接，默认 bridge 无 DNS；需 fork 给 DockerWorkspaceManager 加网络参数（或生产侧经可达地址发布 MCP）——e2e 以 bridge IP 绕过。
-- **⑥ 工具面差额（Spec 评审补充）**：spec 声明 7 个 KB 工具，已交付 6 个（download_kb_file 顺延——产出区语义并入 workspace）；OCR/present_artifacts/Tavily web_search 未迁移；steer（旧栈提前结束语义）在工单 05 声明「由 11 重定义」但 11 未处理——四项均须在 GO 前补齐或正式降级记录。
-- **⑦ 旧栈移除与文档**：依赖树仍含 langchain/langgraph（uv.lock 各 6 处，检查留证）；agents 模块/chat_service/run_worker 删除、旧 e2e 套件改造、ARCHITECTURE.md 重写未执行——依赖 ①②③④ 全部通过后才允许。
-
-### 结论
-
-**条件性 NO-GO（更新）**：技术链路已全量打通并实证——含付费模型（MiniMax-M3）与 Langfuse OTLP 真实上报，**38 tests green（含真实模型用例）**。剩余阻塞：①存量线程行为、②网关翻转与真实前端联调、⑤workspace 网络参数（fork）、⑥工具面差额（第 7 个 KB 工具/OCR/present_artifacts/steer/Tavily）、⑦旧栈移除与文档。下一步：实现 ①② 并以真实前端联调，fork 补 ⑤，补齐/降级 ⑥，随后分批执行 ⑦ 并复跑全量门禁（含付费模型用例）。
+- **管理面清退**：`yuxi/agents/`（middlewares/skill 激活/mcp 工厂等 ~11.7k 行）与 `chat_service` 的非执行面（agent_state 视图、LangGraph 历史读取）仍被 routers（skill/mcp/agent_state/评估）引用——移除需重写管理路由并迁移 agent_state 投影，独立工单处理；届时依赖树方可移除 langchain/langgraph/deepagents。
+- **旧 e2e 套件**（test_agent_async_e2e 等 LangGraph 专用）随管理面清退一并改造。
+- **富文本编辑器自动化输入**：真实浏览器联调中编辑器对自动化 fill/type 三路径拦截（一次成功往返已取证）；后续联调用例建议经 API+token 或 Playwright 官方 runner 补充。

@@ -277,6 +277,16 @@ async def intake_request(
             thread_id=thread_id,
         )
 
+    if policy == "steer":
+        # 网关翻转（工单 14⑥）：steer 语义 = 提前结束运行中的 Run。
+        # 中断线程的 agentscope 会话后，旧执行体以 interrupted 终态收束，
+        # 队列随即派发 steer 消息（替代旧栈 SteerMiddleware 的 jump_to end）。
+        from yuxi.agentscope.thread_guard import interrupt_thread_session
+
+        await interrupt_thread_session(
+            db, uid=uid_str, agent_slug=agent_slug, thread_id=thread_id
+        )
+
     return IntakeResult(
         request_id=request_id,
         status=REQUEST_STATUS_QUEUED,

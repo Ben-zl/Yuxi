@@ -183,8 +183,32 @@ async def _check_target_visible(
     return None
 
 
+async def _doubao_search(query: str, count: int, api_key: str) -> str:
+    """豆包搜索 provider（Bearer 认证）。"""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://open.feedcoopapi.com/search_api/web_search",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"query": query, "count": count, "content_format": "text"},
+        )
+        resp.raise_for_status()
+    return _json(resp.json())
+
+
+async def _tavily_search(query: str, count: int, api_key: str) -> str:
+    """Tavily 搜索 provider（REST API）。"""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"query": query, "max_results": count},
+        )
+        resp.raise_for_status()
+    return _json(resp.json())
+
+
 async def web_search(query: str, count: int = 10) -> str:
-    """网页搜索（豆包 provider；返回标题、链接与摘要）。
+    """网页搜索（豆包/Tavily 按配置分派；返回标题、链接与摘要）。
 
     Args:
         query: 搜索关键词
@@ -192,30 +216,20 @@ async def web_search(query: str, count: int = 10) -> str:
     """
     import os
 
-    api_key = os.getenv("DOUBAO_SEARCH_API_KEY")
-    if not api_key:
-        return "web_search 未配置（缺少 DOUBAO_SEARCH_API_KEY）"
-    payload = {
-        "query": query,
-        "count": count,
-        "content_format": "text",
-    }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            "https://open.feedcoopapi.com/search_api/web_search",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=payload,
-        )
-        resp.raise_for_status()
-    return _json(resp.json())
+    doubao_key = os.getenv("DOUBAO_SEARCH_API_KEY")
+    if doubao_key:
+        return await _doubao_search(query, count, doubao_key)
+    tavily_key = os.getenv("TAVILY_API_KEY")
+    if tavily_key:
+        return await _tavily_search(query, count, tavily_key)
+    return "web_search 未配置（缺少 DOUBAO_SEARCH_API_KEY 或 TAVILY_API_KEY）"
 
 
 def build_web_search_tool():
     """构建网页搜索工具（provider 未配置时返回 None，不装配）。"""
     import os
 
-    if not os.getenv("DOUBAO_SEARCH_API_KEY"):
-        # 仅支持豆包 provider；Tavily 的 REST 实现见切换门禁工具面差额
+    if not (os.getenv("DOUBAO_SEARCH_API_KEY") or os.getenv("TAVILY_API_KEY")):
         return None
     from agentscope.tool import FunctionTool
 
@@ -272,3 +286,136 @@ async def bind_thread_mcps(
                 continue  # 同名 MCP 已绑定
             raise
     return bound
+
+
+async def build_extra_tools(
+    *, uid: str, knowledge_slugs: list[str] | None, agent_id: str, session_id: str
+) -> list:
+    """装配补充工具：download_kb_file / present_artifacts / ocr_parse_file。
+
+    KB 相关工具按可见性约束；LITE 下不装配 KB 部分。
+    """
+    if await _ensure_kb_manager_ready():
+        extra = [_download_kb_file_tool(uid, knowledge_slugs)]
+    else:
+        extra = []
+    extra.append(_present_artifacts_tool(uid, agent_id, session_id))
+    ocr_tool = _ocr_parse_file_tool()
+    if ocr_tool is not None:
+        extra.append(ocr_tool)
+    return extra
+
+
+def _download_kb_file_tool(uid: str, knowledge_slugs: list[str] | None):
+    """下载知识库文件工具（文本内联返回；二进制返回元数据与说明）。"""
+    from agentscope.tool import FunctionTool
+
+    async def download_kb_file(kb_id: str, file_id: str) -> str:
+        """读取知识库文件内容。文本文件返回内容；其他类型返回文件信息。
+
+        Args:
+            kb_id: 知识库 ID
+            file_id: 文件 ID
+        """
+        from yuxi.knowledge.runtime import knowledge_base
+
+        target_error = await _check_target_visible(uid, knowledge_slugs, kb_id)
+        if target_error:
+            return target_error
+        info = await knowledge_base.get_file_download(kb_id, file_id, variant="original")
+        if not isinstance(info, dict):
+            return _json(info)
+        data = info.get("data")
+        media_type = str(info.get("media_type") or "")
+        # 文本类内容直接内联（模型可读）；二进制返回元数据
+        if data is not None and media_type.startswith("text/") or media_type in (
+            "application/json",
+            "text/markdown",
+        ):
+            try:
+                return data.decode("utf-8") if isinstance(data, bytes) else str(data)
+            except UnicodeDecodeError:
+                pass
+        return _json(
+            {
+                "file_id": file_id,
+                "kb_id": kb_id,
+                "media_type": media_type,
+                "size_bytes": info.get("size_bytes"),
+                "filename": info.get("filename"),
+                "note": "非文本文件不支持内联读取，请引导用户在工作区文件列表中下载",
+            }
+        )
+
+    return FunctionTool(
+        download_kb_file,
+        name="download_kb_file",
+        description="读取知识库文件内容（文本内联，二进制返回信息）",
+        is_read_only=True,
+    )
+
+
+def _present_artifacts_tool(uid: str, agent_id: str, session_id: str):
+    """产出物展示工具：列出线程工作区 outputs 目录的文件。"""
+    import os
+
+    from agentscope.tool import FunctionTool
+
+    base_url = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
+
+    async def present_artifacts() -> str:
+        """列出工作区产出目录（/workspace/outputs）中的文件，供用户查看与下载。"""
+        try:
+            async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as http:
+                resp = await http.get(
+                    "/workspace/directories",
+                    params={
+                        "agent_id": agent_id,
+                        "session_id": session_id,
+                        "path": "/workspace/outputs",
+                    },
+                    headers={"X-User-ID": uid},
+                )
+                resp.raise_for_status()
+                return _json(resp.json())
+        except httpx.HTTPError as exc:
+            return f"读取产出目录失败：{exc}"
+
+    return FunctionTool(
+        present_artifacts,
+        name="present_artifacts",
+        description="列出智能体生成的产出文件（用户可在工作区下载）",
+        is_read_only=True,
+    )
+
+
+def _ocr_parse_file_tool():
+    """OCR 工具（经 PaddleOCR 服务解析图片文本；服务未配置时不装配）。"""
+    import os
+
+    from agentscope.tool import FunctionTool
+
+    paddlex_uri = os.getenv("PADDLEX_URI")
+    if not paddlex_uri:
+        return None
+
+    async def ocr_parse_file(image_base64: str) -> str:
+        """对图片执行 OCR 并返回识别文本。
+
+        Args:
+            image_base64: 图片的 base64 编码内容（不含 data: 前缀）
+        """
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{paddlex_uri}/ocr",
+                json={"image": image_base64},
+            )
+            resp.raise_for_status()
+            return _json(resp.json())
+
+    return FunctionTool(
+        ocr_parse_file,
+        name="ocr_parse_file",
+        description="对图片执行 OCR 识别，返回图片中的文本",
+        is_read_only=True,
+    )

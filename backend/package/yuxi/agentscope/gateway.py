@@ -40,6 +40,7 @@ class GatewayRoundResult:
     event_count: int
     parked: str | None = None  # 挂起原因（permission=等待工具审批）
     usage: dict | None = None  # 聚合的 token 用量（input/output/total）
+    pending_confirm: dict | None = None  # 审批挂起原始事件（resume 用）
 
 
 async def stream_round_to_run_events(
@@ -121,6 +122,7 @@ async def stream_round_to_run_events(
                     event_count=event_count + 1,
                     parked="permission",
                     usage=_usage(input_tokens, output_tokens),
+                    pending_confirm=event,
                 )
             if event_type == "REPLY_END":
                 terminal = reply_end_to_terminal(event, request_id=request_id)

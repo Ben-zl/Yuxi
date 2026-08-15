@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.config_projection import project_runtime
+from yuxi.agentscope.thread_guard import ensure_thread_eligible
 from yuxi.agentscope.tools import bind_thread_mcps
 from yuxi.repositories import agentscope_thread_sessions as thread_session_repo
 from yuxi.repositories.agentscope_thread_sessions import AgentScopeThreadSession
@@ -43,10 +44,14 @@ async def ensure_thread_session(
     agent_slug: str,
     model_spec: str | None = None,
 ) -> AgentScopeThreadSession:
-    """保障线程映射的 session 存在；命中映射直接返回，缺失则投影并创建。"""
+    """保障线程映射的 session 存在；命中映射直接返回，缺失则投影并创建。
+
+    存量线程守卫：旧栈历史且无映射的线程拒绝接入（只读+提示开新线程）。
+    """
     existing = await thread_session_repo.get_thread_session(db, uid=uid, thread_id=thread_id)
     if existing is not None:
         return existing
+    await ensure_thread_eligible(db, uid=uid, thread_id=thread_id)
 
     projection = await project_runtime(
         db, uid=uid, agent_slug=agent_slug, model_spec=model_spec

@@ -75,20 +75,16 @@ Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平�
 
 ## 智能体运行链路
 
-一次普通智能体请求经过以下边界：
+一次普通智能体请求经过以下边界（agentscope 执行体，详见 `yuxi/agentscope/` 与迁移方案 docs/vibe/2026-08-14）：
 
 1. `AgentView` 和 `AgentChatComponent` 收集文本、图片、附件、模型与审批配置。
-2. `web/src/apis/agent_api.js` 调用 `POST /api/agent/runs`。
-3. `server/routers/agent_router.py` 校验用户和智能体，将请求交给 `agent_request_queue_service`。
-4. 服务在同一数据库事务中创建用户消息和 AgentRunRequest，并按用户、智能体和线程检查活跃 Run 与 FIFO 队头。
-5. 请求可以立即派发、进入等待队列或按 `reject` 策略拒绝；只有数据库提交成功后才向 ARQ 投递 Run。
-6. `worker-dev` 中的 `run_worker` 加载 AgentRun、智能体配置和运行上下文，执行对应 LangGraph。
-7. 智能体通过 middleware 组合沙盒文件系统、附件、Skills、MCP、SubAgent、审批、摘要和工具能力。知识库能力主要由内置 `knowledge-base` Skill 及其依赖工具按需开放。
-8. Run 事件写入 Redis Stream，取消通过 Redis key/pubsub 传递；AgentRun、消息投递状态和最终结果写入 PostgreSQL。
-9. 前端在排队阶段消费 Request SSE，派发后切换到 Run SSE，并根据数据库状态处理断线恢复和终态补偿。
-10. 附件和对象数据保存在 MinIO；智能体需要操作的文件映射到线程隔离的沙盒路径，生成物写入用户可见的输出目录。
+2. `web/src/apis/agent_api.js` 调用 `POST /api/agent/runs`，由请求队列服务在同一数据库事务落库运行事实（排队、互斥、幂等），提交后才投递 ARQ。
+4. `worker-dev` 的 `process_agent_run`（`yuxi/services/run_worker.py`）执行 `yuxi.agentscope.worker_job`：统一配置投影（`config_projection`）→ 线程会话保障（Thread↔Session 映射，存量线程按 cutover 时间戳只读拒发）→ `gateway` 协议转换把 agentscope 事件流实时写入 `run:events:{run_id}`（复用既有 SSE 投递与断线续传）。
+5. 会话执行在独立的 agentscope 服务（`server/agentscope_main.py`）：Docker workspace 沙盒按线程隔离；KB/MCP/Skills/内置工具经 `extra_agent_tools` 装配；Team 子智能体由管理员配置投影为 worker 模板；审批挂起经 REQUIRE_USER_CONFIRM 映射为 `human_approval_required` chunk，resume 载荷转换为 UserConfirmResultEvent。
+6. 执行结束：助手消息落回 yuxi 消息表（前端历史视图数据源），AgentRun 终态与 token 用量回写，队头完成后派发下一条排队请求。
+7. 前端在排队阶段消费 Request SSE，派发后消费 Run SSE；断线经 `Last-Event-ID` 从 Redis Stream 续传。
 
-审批或人机输入产生的 resume 请求会从 LangGraph checkpoint 恢复，并创建新的 AgentRun；它不重新进入普通消息 FIFO 接入流程。
+审批或人机输入的 resume 请求仍经队列创建新 AgentRun，worker 将 decisions 载荷映射为审批恢复、文本回答映射为新输入。旧 LangGraph 执行路径已从 worker 移除；旧栈管理面（Skills/MCP/agent_state 视图）的清退计划见迁移工单 14。
 
 ## 架构不变量
 
