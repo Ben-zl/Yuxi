@@ -78,6 +78,10 @@ class IntakeResult:
     run_id: str | None = None
     # FIFO 队内位置；未在排队（dispatched/rejected/已存在）时为 None。
     queue_position: int | None = None
+    # steer 请求提交后需中断活跃会话（由 finalize_intake 在提交后执行）
+    needs_interrupt: bool = False
+    uid: str | None = None
+    agent_slug: str | None = None
 
 
 @dataclass(frozen=True)
@@ -177,7 +181,12 @@ async def intake_request(
         conversation_thread_id=thread_id,
     )
     if latest_run is not None and latest_run.status == "interrupted":
-        raise _queue_conflict("run_interrupted", "线程正在等待用户回答或审批")
+        # 审批挂起时保持冲突；steer 中断（无挂起审批）允许继续入队，
+        # 否则引导请求被删除后线程将永久锁死在 interrupted 状态。
+        from yuxi.agentscope.thread_guard import has_pending_confirm
+
+        if await has_pending_confirm(thread_id):
+            raise _queue_conflict("run_interrupted", "线程正在等待用户回答或审批")
     if policy == "steer" and active_run is not None and not await _is_steerable_message_run(db=db, run=active_run):
         raise _queue_conflict("run_not_steerable", "当前运行不支持引导")
     if policy == "steer" and await repo.get_pending_steer(
@@ -277,16 +286,6 @@ async def intake_request(
             thread_id=thread_id,
         )
 
-    if policy == "steer":
-        # 网关翻转（工单 14⑥）：steer 语义 = 提前结束运行中的 Run。
-        # 中断线程的 agentscope 会话后，旧执行体以 interrupted 终态收束，
-        # 队列随即派发 steer 消息（替代旧栈 SteerMiddleware 的 jump_to end）。
-        from yuxi.agentscope.thread_guard import interrupt_thread_session
-
-        await interrupt_thread_session(
-            db, uid=uid_str, agent_slug=agent_slug, thread_id=thread_id
-        )
-
     return IntakeResult(
         request_id=request_id,
         status=REQUEST_STATUS_QUEUED,
@@ -294,6 +293,11 @@ async def intake_request(
         message_id=persisted_message.id,
         thread_id=thread_id,
         queue_position=await repo.get_queue_position(request_id),
+        # steer 请求在提交后中断活跃会话（网关翻转工单 14⑥），
+        # 使运行中的 Run 以 interrupted 终态收束、队列随即派发引导消息。
+        needs_interrupt=policy == "steer",
+        uid=uid_str,
+        agent_slug=agent_slug,
     )
 
 
@@ -385,6 +389,17 @@ async def finalize_intake(*, db: AsyncSession, intake: IntakeResult) -> None:
         else None
     )
     await finalize_dispatch(db=db, dispatch=dispatch)
+    if intake.needs_interrupt:
+        # steer 中断必须在提交后执行：先让排队行对 worker 可见，
+        # 再中断活跃会话触发终态后的队头派发，避免派发扑空的竞态。
+        from yuxi.agentscope.thread_guard import interrupt_thread_session
+
+        await interrupt_thread_session(
+            db,
+            uid=intake.uid,
+            agent_slug=intake.agent_slug,
+            thread_id=intake.thread_id,
+        )
 
 
 async def finalize_dispatch(*, db: AsyncSession, dispatch: DispatchResult | None) -> None:
@@ -796,6 +811,12 @@ async def _get_queue_state(
         uid=str(uid), agent_slug=agent_slug, conversation_thread_id=thread_id
     )
     if latest_run and latest_run.status == "interrupted":
+        # interrupted 有两种语义：审批挂起（有 pending_confirm，保持等待，
+        # 由 resume 请求解除）与 steer 中断（无挂起，队头立即可派发）。
+        from yuxi.agentscope.thread_guard import has_pending_confirm
+
+        if not await has_pending_confirm(thread_id):
+            return "ready", {"paused_reason": None, "blocking_run_id": None, "can_continue": False}
         return "interrupted", {
             "paused_reason": None,
             "blocking_run_id": latest_run.id,

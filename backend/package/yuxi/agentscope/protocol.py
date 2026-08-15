@@ -7,6 +7,7 @@
 - 终态映射：REPLY_END.finished_reason → run 状态 + finished/error/interrupted chunk。
 """
 
+import json
 from dataclasses import dataclass
 
 ASSISTANT_MSG_TYPE = "AIMessageChunk"
@@ -46,11 +47,13 @@ def event_to_chunks(event: dict, *, request_id: str) -> list[dict]:
             )
         ]
     if event_type == "REQUIRE_USER_CONFIRM":
-        # 工具审批挂起：前端按 action_requests 渲染审批卡片（与旧栈一致）
+        # 工具审批挂起：前端 useApproval 从 chunk.approval 下读取
+        # action_requests，并要求 review_configs 与其等长（旧栈契约）。
+        # fork 的 ToolCallBlock.input 是原始 JSON 字符串，需解析为 dict。
         action_requests = [
             {
                 "action": call.get("name", ""),
-                "args": call.get("inputs") or {},
+                "args": json.loads(call.get("input") or "{}"),
             }
             for call in event.get("tool_calls") or []
         ]
@@ -58,7 +61,10 @@ def event_to_chunks(event: dict, *, request_id: str) -> list[dict]:
             make_chunk(
                 request_id,
                 status="human_approval_required",
-                action_requests=action_requests,
+                approval={
+                    "action_requests": action_requests,
+                    "review_configs": [{} for _ in action_requests],
+                },
             )
         ]
     if event_type in {"TEXT_BLOCK_DELTA", "THINKING_BLOCK_DELTA"}:

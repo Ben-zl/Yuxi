@@ -41,14 +41,26 @@ async def execute_run(
         thread_id=run.conversation_thread_id,
         read_timeout=read_timeout,
     )
+    await finalize_run(db, run, result)
+    return result
+
+
+def _terminal_error_message(result: GatewayRoundResult) -> str | None:
+    """终态错误文案：审批挂起/中断/失败分别给出可区分的语义。"""
+    if result.parked == "permission":
+        return "等待工具审批"
+    if result.run_status == "completed":
+        return None
+    if result.run_status == "interrupted":
+        return "会话已中断"
+    return "运行失败"
+
+
+async def finalize_run(db: AsyncSession, run: AgentRun, result: GatewayRoundResult) -> None:
+    """按运行结果写 AgentRun 终态（执行路径与 resume 路径共用）。"""
     await AgentRunRepository(db).set_terminal_status(
         run.id,
         status=result.run_status,
-        error_message=(
-            "等待工具审批" if result.parked == "permission"
-            else None if result.run_status == "completed"
-            else "运行失败"
-        ),
+        error_message=_terminal_error_message(result),
         token_usage=result.usage or {},
     )
-    return result

@@ -187,6 +187,12 @@ async def test_fifo_serial_dispatch_and_execution(env):
 
 
 async def test_interrupted_run_blocks_intake(env):
+    """审批挂起（pending_confirm 存在）阻塞 intake；steer 中断（无挂起）放行。"""
+    from yuxi.agentscope.thread_guard import (
+        load_pending_confirm,
+        store_pending_confirm,
+    )
+
     async with env["session_factory"]() as db:
         db.add(
             AgentRun(
@@ -202,9 +208,16 @@ async def test_interrupted_run_blocks_intake(env):
         )
         await db.commit()
 
+    # 审批挂起：保持 409 冲突，等待 resume 解除
+    await store_pending_confirm(env["thread_id"], {"reply_id": "r1", "tool_calls": []})
     with pytest.raises(HTTPException) as exc_info:
         await _intake(env, f"itq-blocked-{uuid.uuid4().hex[:8]}", "挂起后的新消息")
     assert exc_info.value.status_code == 409
+
+    # steer 中断（无挂起审批）：不阻塞，可继续入队
+    await load_pending_confirm(env["thread_id"])
+    result = await _intake(env, f"itq-open-{uuid.uuid4().hex[:8]}", "中断后的新消息")
+    assert result.status in {"queued", "dispatched"}
 
 
 async def test_intake_is_idempotent_per_request_id(env):

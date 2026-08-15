@@ -44,8 +44,10 @@ async def _worker_startup(ctx):
 
 
 async def _worker_shutdown(ctx):
-    """释放 worker 依赖。"""
-    sys_config.stop_runtime_sync()
+    """释放 worker 依赖。
+
+    runtime sync 线程为 daemon（cache.py 无 stop API），随进程退出结束。
+    """
     await pg_manager.close()
 
 

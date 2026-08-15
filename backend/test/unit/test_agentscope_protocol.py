@@ -127,6 +127,10 @@ def test_tool_event_converter_streams_call_and_result():
 
 
 def test_require_user_confirm_maps_to_approval_chunk():
+    """审批 chunk 需符合前端 useApproval 契约：approval 包装 + review_configs 等长。
+
+    fork 的 ToolCallBlock.input 是原始 JSON 字符串（非 inputs dict）。
+    """
     from yuxi.agentscope.protocol import event_to_chunks
 
     chunks = event_to_chunks(
@@ -134,12 +138,14 @@ def test_require_user_confirm_maps_to_approval_chunk():
             "type": "REQUIRE_USER_CONFIRM",
             "reply_id": "r1",
             "tool_calls": [
-                {"id": "tc1", "name": "Write", "inputs": {"file_path": "/workspace/a.txt"}}
+                {"id": "tc1", "name": "Write", "input": '{"file_path": "/workspace/a.txt"}'}
             ],
         },
         request_id=REQUEST_ID,
     )
+    approval = chunks[0]["approval"]
     assert chunks[0]["status"] == "human_approval_required"
-    assert chunks[0]["action_requests"] == [
+    assert approval["action_requests"] == [
         {"action": "Write", "args": {"file_path": "/workspace/a.txt"}}
     ]
+    assert len(approval["review_configs"]) == len(approval["action_requests"])

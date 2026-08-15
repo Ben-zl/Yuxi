@@ -12,10 +12,15 @@ import os
 from sqlalchemy import select
 
 from yuxi.agentscope.client import AgentScopeServiceClient
-from yuxi.agentscope.execution import execute_run
+from yuxi.agentscope.execution import execute_run, finalize_run
 from yuxi.agentscope.gateway import GatewayRoundResult
 from yuxi.agentscope.runner import ensure_thread_session
-from yuxi.agentscope.thread_guard import LEGACY_THREAD_MESSAGE
+from yuxi.agentscope.thread_guard import (
+    LEGACY_THREAD_MESSAGE,
+    has_pending_confirm,
+    load_pending_confirm,
+    store_pending_confirm,
+)
 from yuxi.repositories.agent_run_repository import (
     TERMINAL_RUN_STATUSES,
     AgentRunRepository,
@@ -24,35 +29,9 @@ from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.services.agent_request_queue_service import dispatch_next_request
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Message
-from yuxi.storage.redis.manager import get_async_redis_client
 from yuxi.utils import logger
 
-# 审批挂起事件缓存（thread 维度，resume 时取回 reply_id/tool_calls）
-PENDING_CONFIRM_KEY = "agentscope:pending_confirm:{thread_id}"
-PENDING_CONFIRM_TTL_SECONDS = 86400
-
 _EMPTY_USAGE = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-
-
-async def store_pending_confirm(thread_id: str, confirm_event: dict) -> None:
-    """缓存审批挂起事件，供 resume 请求构造 UserConfirmResultEvent。"""
-    redis = await get_async_redis_client()
-    await redis.set(
-        PENDING_CONFIRM_KEY.format(thread_id=thread_id),
-        json.dumps(confirm_event, ensure_ascii=False),
-        ex=PENDING_CONFIRM_TTL_SECONDS,
-    )
-
-
-async def load_pending_confirm(thread_id: str) -> dict | None:
-    """读取并清除线程的审批挂起事件。"""
-    redis = await get_async_redis_client()
-    key = PENDING_CONFIRM_KEY.format(thread_id=thread_id)
-    raw = await redis.get(key)
-    if not raw:
-        return None
-    await redis.delete(key)
-    return json.loads(raw)
 
 
 async def execute_agent_run_job(run_id: str) -> None:
@@ -64,7 +43,10 @@ async def execute_agent_run_job(run_id: str) -> None:
             logger.warning(f"Run not found: {run_id}")
             return
         if run.status in TERMINAL_RUN_STATUSES:
-            if run.status == "completed":
+            if run.status == "completed" or (
+                run.status == "interrupted"
+                and not await has_pending_confirm(run.conversation_thread_id)
+            ):
                 await dispatch_next_request(
                     uid=run.uid,
                     agent_slug=run.agent_slug,
@@ -134,8 +116,12 @@ async def execute_agent_run_job(run_id: str) -> None:
             await _fail_run(db, run_repo, run, f"执行失败: {exc}")
             return
 
-        # 挂起/中断终态补发 end 帧（前端收尾依赖）；完成后派发队头
-        if result.run_status == "completed":
+        # 挂起/中断终态补发 end 帧（前端收尾依赖）；completed 与 steer 中断
+        #（非审批挂起）派发队头：引导消息需在被中断的 Run 结束后立即执行。
+        if result.run_status == "completed" or (
+            result.run_status == "interrupted"
+            and not await has_pending_confirm(run.conversation_thread_id)
+        ):
             await dispatch_next_request(
                 uid=run.uid,
                 agent_slug=run.agent_slug,
@@ -185,9 +171,12 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
             for d in decisions
             if isinstance(d, dict)
         )
-        return await _resume_and_collect(
+        result = await _resume_and_collect(
             client, run, mapping, confirm_event, approved
         )
+        # resume 路径同样必须回写终态，否则 Run 永远停在 running
+        await finalize_run(db, run, result)
+        return result
 
     # 文本回答（ask_user 语义）：作为新一轮用户输入执行
     answer = resume_input.get("answer") if isinstance(resume_input, dict) else None

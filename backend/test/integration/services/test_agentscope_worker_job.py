@@ -219,3 +219,65 @@ async def test_worker_job_full_pipeline(env):
         assert "user" in roles and "assistant" in roles
         assistant = next(m for m in messages if m.role == "assistant")
         assert assistant.content.startswith("你好，我是 e2e mock 模型")
+
+
+async def test_steer_interrupted_run_dispatches_queue_head(env, monkeypatch):
+    """steer 中断（非审批挂起）终态后必须派发队头，否则引导消息永久滞留。"""
+    from yuxi.agentscope import worker_job
+    from yuxi.agentscope.gateway import GatewayRoundResult
+
+    first = await _intake(env, f"itj-s1-{uuid.uuid4().hex[:8]}", "被中断的第一条")
+    assert first.status == "dispatched"
+    second = await _intake(env, f"itj-s2-{uuid.uuid4().hex[:8]}", "排队的引导消息")
+    assert second.status == "queued"
+
+    dispatched: list[str] = []
+
+    async def _capture_dispatch(**kwargs):
+        dispatched.append(kwargs.get("thread_id"))
+
+    async def _interrupted_run(db, client, *, run, text, read_timeout=180.0):
+        return GatewayRoundResult(
+            run_status="interrupted", text="", reasoning="", event_count=1
+        )
+
+    monkeypatch.setattr(worker_job, "dispatch_next_request", _capture_dispatch)
+    monkeypatch.setattr(worker_job, "execute_run", _interrupted_run)
+
+    await worker_job.execute_agent_run_job(first.run_id)
+    assert dispatched == [env["thread_id"]]
+
+
+async def test_approval_parked_interrupted_run_holds_queue(env, monkeypatch):
+    """审批挂起同为 interrupted 终态，但队列必须等待审批结果而不派发。"""
+    from yuxi.agentscope import worker_job
+    from yuxi.agentscope.gateway import GatewayRoundResult
+
+    first = await _intake(env, f"itj-p1-{uuid.uuid4().hex[:8]}", "挂起审批的第一条")
+    assert first.status == "dispatched"
+    second = await _intake(env, f"itj-p2-{uuid.uuid4().hex[:8]}", "排队等待的消息")
+    assert second.status == "queued"
+
+    dispatched: list[str] = []
+
+    async def _capture_dispatch(**kwargs):
+        dispatched.append(kwargs.get("thread_id"))
+
+    async def _parked_run(db, client, *, run, text, read_timeout=180.0):
+        return GatewayRoundResult(
+            run_status="interrupted",
+            text="",
+            reasoning="",
+            event_count=1,
+            parked="permission",
+            pending_confirm={"reply_id": "r-park", "tool_calls": []},
+        )
+
+    monkeypatch.setattr(worker_job, "dispatch_next_request", _capture_dispatch)
+    monkeypatch.setattr(worker_job, "execute_run", _parked_run)
+
+    try:
+        await worker_job.execute_agent_run_job(first.run_id)
+        assert dispatched == []
+    finally:
+        await worker_job.load_pending_confirm(env["thread_id"])

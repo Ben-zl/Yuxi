@@ -7,6 +7,7 @@ steer 钩子：排队 steer 请求后中断该线程的活跃 agentscope 会话�
 的 Run 提前结束（interrupted 终态），队列随即派发 steer 消息。
 """
 
+import json
 import os
 from datetime import datetime, UTC
 
@@ -16,11 +17,47 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session
 from yuxi.storage.postgres.models_business import Conversation, Message
+from yuxi.storage.redis.manager import get_async_redis_client
 from yuxi.utils import logger
 
 LEGACY_THREAD_MESSAGE = (
     "该线程创建于旧版本，已归档为只读。请新建线程继续对话（历史记录仍可查看）。"
 )
+
+# 审批挂起事件缓存（thread 维度，resume 时取回 reply_id/tool_calls）
+PENDING_CONFIRM_KEY = "agentscope:pending_confirm:{thread_id}"
+PENDING_CONFIRM_TTL_SECONDS = 86400
+
+
+async def store_pending_confirm(thread_id: str, confirm_event: dict) -> None:
+    """缓存审批挂起事件，供 resume 请求构造 UserConfirmResultEvent。"""
+    redis = await get_async_redis_client()
+    await redis.set(
+        PENDING_CONFIRM_KEY.format(thread_id=thread_id),
+        json.dumps(confirm_event, ensure_ascii=False),
+        ex=PENDING_CONFIRM_TTL_SECONDS,
+    )
+
+
+async def load_pending_confirm(thread_id: str) -> dict | None:
+    """读取并清除线程的审批挂起事件。"""
+    redis = await get_async_redis_client()
+    key = PENDING_CONFIRM_KEY.format(thread_id=thread_id)
+    raw = await redis.get(key)
+    if not raw:
+        return None
+    await redis.delete(key)
+    return json.loads(raw)
+
+
+async def has_pending_confirm(thread_id: str) -> bool:
+    """线程是否处于审批挂起。
+
+    interrupted 终态有两种语义：审批挂起（有缓存键，队列/intake 保持等待）
+    与 steer 中断（无缓存键，队头应立即可派发）。
+    """
+    redis = await get_async_redis_client()
+    return await redis.exists(PENDING_CONFIRM_KEY.format(thread_id=thread_id)) > 0
 
 
 def _legacy_cutoff() -> datetime | None:
