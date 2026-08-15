@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import contextlib
 import json
 import os
 
@@ -13,7 +14,7 @@ from sqlalchemy import select
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.execution import execute_run, finalize_run
-from yuxi.agentscope.gateway import GatewayRoundResult
+from yuxi.agentscope.gateway import GatewayRoundResult, start_cancel_watcher
 from yuxi.agentscope.runner import ensure_thread_session
 from yuxi.agentscope.thread_guard import (
     LEGACY_THREAD_MESSAGE,
@@ -75,15 +76,17 @@ async def execute_agent_run_job(run_id: str) -> None:
             if run.run_type == "resume":
                 result = await _execute_resume(db, client, run, input_message)
             else:
+                model_spec = (run.input_payload or {}).get("model_spec")
                 await ensure_thread_session(
                     db,
                     client,
                     uid=run.uid,
                     thread_id=run.conversation_thread_id,
                     agent_slug=run.agent_slug,
+                    model_spec=model_spec,
                 )
                 result = await execute_run(
-                    db, client, run=run, text=input_message.content
+                    db, client, run=run, text=input_message.content, model_spec=model_spec
                 )
                 if result.parked == "permission" and result.pending_confirm:
                     await store_pending_confirm(
@@ -160,6 +163,7 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
         uid=run.uid,
         thread_id=run.conversation_thread_id,
         agent_slug=run.agent_slug,
+        model_spec=(run.input_payload or {}).get("model_spec"),
     )
     resume_input = (input_message.extra_metadata or {}).get("resume") or {}
 
@@ -181,7 +185,9 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
     # 文本回答（ask_user 语义）：作为新一轮用户输入执行
     answer = resume_input.get("answer") if isinstance(resume_input, dict) else None
     text = answer if isinstance(answer, str) and answer.strip() else input_message.content
-    return await execute_run(db, client, run=run, text=text)
+    return await execute_run(
+        db, client, run=run, text=text, model_spec=(run.input_payload or {}).get("model_spec")
+    )
 
 
 async def _resume_and_collect(
@@ -200,6 +206,13 @@ async def _resume_and_collect(
             await queue.put(event)
 
     pump = asyncio.create_task(_pump())
+    cancel_task = start_cancel_watcher(
+        client,
+        uid=run.uid,
+        agent_id=mapping.agentscope_agent_id,
+        session_id=mapping.agentscope_session_id,
+        run_id=run.id,
+    )
     try:
         await asyncio.sleep(0.5)
         await client.resume_confirm(
@@ -232,6 +245,11 @@ async def _resume_and_collect(
                 )
     finally:
         pump.cancel()
+        cancel_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancel_task
 
 
 async def _emit_end_event(run_id: str, thread_id: str, payload: dict) -> None:

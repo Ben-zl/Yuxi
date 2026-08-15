@@ -21,6 +21,7 @@ async def execute_run(
     run: AgentRun,
     text: str,
     read_timeout: float = 180.0,
+    model_spec: str | None = None,
 ) -> GatewayRoundResult:
     """执行一个已派发的 Run：事件写入 Redis Stream，终态回写 AgentRun。"""
     mapping = await ensure_thread_session(
@@ -29,6 +30,7 @@ async def execute_run(
         uid=run.uid,
         thread_id=run.conversation_thread_id,
         agent_slug=run.agent_slug,
+        model_spec=model_spec,
     )
     result = await stream_round_to_run_events(
         client,
@@ -49,7 +51,7 @@ def _terminal_error_message(result: GatewayRoundResult) -> str | None:
     """终态错误文案：审批挂起/中断/失败分别给出可区分的语义。"""
     if result.parked == "permission":
         return "等待工具审批"
-    if result.run_status == "completed":
+    if result.run_status in {"completed", "cancelled"}:
         return None
     if result.run_status == "interrupted":
         return "会话已中断"
@@ -57,7 +59,16 @@ def _terminal_error_message(result: GatewayRoundResult) -> str | None:
 
 
 async def finalize_run(db: AsyncSession, run: AgentRun, result: GatewayRoundResult) -> None:
-    """按运行结果写 AgentRun 终态（执行路径与 resume 路径共用）。"""
+    """按运行结果写 AgentRun 终态（执行路径与 resume 路径共用）。
+
+    存在取消信号时终态归一为 cancelled（清除信号避免残留）——取消由
+    网关的取消监听器中断会话触发，REPLY_END 呈现为 interrupted。
+    """
+    from yuxi.services.run_queue_service import clear_cancel_signal, has_cancel_signal
+
+    if result.run_status != "completed" and await has_cancel_signal(run.id):
+        await clear_cancel_signal(run.id)
+        result.run_status = "cancelled"
     await AgentRunRepository(db).set_terminal_status(
         run.id,
         status=result.run_status,

@@ -51,7 +51,9 @@ async def env(monkeypatch):
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     monkeypatch.setattr(
-        agent_request_queue_service, "resolve_agent_run_config", lambda *a: ("model", "default")
+        agent_request_queue_service,
+        "resolve_agent_run_config",
+        lambda *a: ("e2e-openai-mock:mock-chat-model", "default"),
     )
     enqueued: list[str] = []
 
@@ -236,7 +238,7 @@ async def test_steer_interrupted_run_dispatches_queue_head(env, monkeypatch):
     async def _capture_dispatch(**kwargs):
         dispatched.append(kwargs.get("thread_id"))
 
-    async def _interrupted_run(db, client, *, run, text, read_timeout=180.0):
+    async def _interrupted_run(db, client, *, run, text, read_timeout=180.0, model_spec=None):
         return GatewayRoundResult(
             run_status="interrupted", text="", reasoning="", event_count=1
         )
@@ -263,7 +265,7 @@ async def test_approval_parked_interrupted_run_holds_queue(env, monkeypatch):
     async def _capture_dispatch(**kwargs):
         dispatched.append(kwargs.get("thread_id"))
 
-    async def _parked_run(db, client, *, run, text, read_timeout=180.0):
+    async def _parked_run(db, client, *, run, text, read_timeout=180.0, model_spec=None):
         return GatewayRoundResult(
             run_status="interrupted",
             text="",
@@ -281,3 +283,28 @@ async def test_approval_parked_interrupted_run_holds_queue(env, monkeypatch):
         assert dispatched == []
     finally:
         await worker_job.load_pending_confirm(env["thread_id"])
+
+
+async def test_finalize_run_normalizes_cancel_signal_to_cancelled(env):
+    """存在取消信号时终态归一为 cancelled 并清除信号（执行/resume 共用路径）。"""
+    from yuxi.agentscope.execution import finalize_run
+    from yuxi.agentscope.gateway import GatewayRoundResult
+    from yuxi.services.run_queue_service import has_cancel_signal, publish_cancel_signal
+
+    first = await _intake(env, f"itj-c1-{uuid.uuid4().hex[:8]}", "被取消的请求")
+    assert first.status == "dispatched"
+    async with env["session_factory"]() as db:
+        from yuxi.repositories.agent_run_repository import AgentRunRepository
+
+        run = await AgentRunRepository(db).get_run(first.run_id)
+        await publish_cancel_signal(run.id)
+        result = GatewayRoundResult(
+            run_status="interrupted", text="部分输出", reasoning="", event_count=2
+        )
+        await finalize_run(db, run, result)
+        await db.commit()
+        assert result.run_status == "cancelled"
+        refreshed = await AgentRunRepository(db).get_run(run.id)
+        assert refreshed.status == "cancelled"
+        assert refreshed.error_message is None
+    assert not (await has_cancel_signal(first.run_id))

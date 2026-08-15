@@ -79,6 +79,12 @@ async def project_runtime(
 
     spec = model_spec or context.get("model")
     if not spec:
+        # 与旧栈一致：请求与智能体均未指定模型时，回落系统默认对话模型
+        #（前端新线程首条消息不携带 model_spec，无模型智能体依赖此兜底）
+        from yuxi.config import config as sys_config
+
+        spec = sys_config.default_model or ""
+    if not spec:
         raise ValueError(f"智能体 {agent_slug} 未配置模型（context.model 为空）")
     provider_id, model_id = split_model_spec(spec)
     provider = await _load_provider(db, provider_id)

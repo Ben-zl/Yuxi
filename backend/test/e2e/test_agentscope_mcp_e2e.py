@@ -154,7 +154,7 @@ async def test_stdio_and_disabled_mcps_not_bound(db_session):
                     slug="e2e-disabled-mcp",
                     name="已禁用",
                     transport="streamable_http",
-                    url="http://mcp-mock:9000/mcp",
+                    url=os.getenv("MCP_MOCK_URL", "http://mcp-mock:9000/mcp"),
                     enabled=0,
                     disabled_tools=[],
                     created_by="e2e",

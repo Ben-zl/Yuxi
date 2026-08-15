@@ -43,6 +43,37 @@ class GatewayRoundResult:
     pending_confirm: dict | None = None  # 审批挂起原始事件（resume 用）
 
 
+def start_cancel_watcher(
+    client: AgentScopeServiceClient,
+    *,
+    uid: str,
+    agent_id: str,
+    session_id: str,
+    run_id: str,
+    poll_seconds: float = 1.0,
+) -> asyncio.Task:
+    """监听 run 取消信号，收到即中断会话使事件流尽快终止。
+
+    与事件流消费并行运行；中断后 REPLY_END(interrupted) 自然结束本轮，
+    终态由 finalize_run 依据取消信号归一为 cancelled。
+    """
+    from yuxi.services.run_queue_service import has_cancel_signal
+
+    async def _watch() -> None:
+        while True:
+            await asyncio.sleep(poll_seconds)
+            try:
+                if await has_cancel_signal(run_id):
+                    await client.interrupt_session(uid, agent_id, session_id)
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 监听失败重试下一周期
+                continue
+
+    return asyncio.create_task(_watch())
+
+
 async def stream_round_to_run_events(
     client: AgentScopeServiceClient,
     *,
@@ -86,6 +117,9 @@ async def stream_round_to_run_events(
             await queue.put(exc)
 
     pump_task = asyncio.create_task(_pump())
+    cancel_task = start_cancel_watcher(
+        client, uid=uid, agent_id=agent_id, session_id=session_id, run_id=run_id
+    )
     try:
         await asyncio.sleep(SUBSCRIBE_SETTLE_SECONDS)
         await client.trigger_chat(uid, agent_id, session_id, text)
@@ -155,6 +189,9 @@ async def stream_round_to_run_events(
                 )
     finally:
         pump_task.cancel()
+        cancel_task.cancel()
         # 等待取消传播完成，让 httpx 流上下文在协程栈展开中正常关闭
         with contextlib.suppress(asyncio.CancelledError):
             await pump_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancel_task

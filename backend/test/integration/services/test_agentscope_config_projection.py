@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import delete
 
 from yuxi.agentscope.config_projection import project_runtime
+from yuxi.config import config
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Agent, ModelProvider, Skill
 
@@ -125,8 +126,9 @@ async def test_project_runtime_lite_trims_knowledge(db_session, monkeypatch):
 async def test_project_runtime_fails_explicitly(db_session):
     with pytest.raises(ValueError, match="不存在"):
         await project_runtime(db_session, uid="it-proj-user", agent_slug="no-such-agent")
-    with pytest.raises(ValueError, match="未配置模型"):
-        await project_runtime(db_session, uid="it-proj-user", agent_slug=SUBAGENT_SLUG)
+    # 无模型智能体回落系统默认对话模型（与旧栈一致）
+    projection = await project_runtime(db_session, uid="it-proj-user", agent_slug=SUBAGENT_SLUG)
+    assert projection.model_spec == config.default_model
     with pytest.raises(ValueError, match="不存在"):
         await project_runtime(
             db_session,

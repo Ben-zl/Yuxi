@@ -38,3 +38,22 @@
 - **管理面清退**：`yuxi/agents/`（middlewares/skill 激活/mcp 工厂等 ~11.7k 行）与 `chat_service` 的非执行面（agent_state 视图、LangGraph 历史读取）仍被 routers（skill/mcp/agent_state/评估）引用——移除需重写管理路由并迁移 agent_state 投影，独立工单处理；届时依赖树方可移除 langchain/langgraph/deepagents。
 - **旧 e2e 套件**（test_agent_async_e2e 等 LangGraph 专用）随管理面清退一并改造。
 - **富文本编辑器自动化输入**：真实浏览器联调中编辑器对自动化 fill/type 三路径拦截（一次成功往返已取证）；后续联调用例建议经 API+token 或 Playwright 官方 runner 补充。
+
+## 真实浏览器全量验证记录（2026-08-15，commit a47b62dc）
+
+在 docker compose 全栈 + MiniMax-M3 真实模型下以 GUI 黑盒方式验证主链路与边界，发现并修复 4 个执行面缺陷（均已回归 + 浏览器复验）：
+
+1. **审批 chunk 契约断裂**：网关发出的 `human_approval_required` 为顶层 `action_requests`，前端 `useApproval` 要求 `approval.action_requests` + 等长 `review_configs`，且 fork 的 `ToolCallBlock.input` 是 JSON 字符串（非 `inputs` dict）→ 模态框永不弹出、参数不显示。修复于 `protocol.py`。
+2. **resume 路径不写终态**：审批恢复 run 永远停在 running（消息已落库但 Run 卡死，前端一直转圈）。新增 `execution.finalize_run` 供执行/resume 共用。
+3. **steer 中断后队列停摆**：`_get_queue_state` 把一切 interrupted 视为"等待回答或审批"→ 引导消息永不派发；删除排队请求后线程还会死锁（intake 409）。现在 interrupted 仅在 `pending_confirm` 存在（审批挂起）时保持等待。
+4. **steer 中断竞态**：中断原先在 intake 事务内触发，worker 终态后派发可能早于排队行提交而扑空。中断移至 `finalize_intake` 提交后。
+
+另有：worker 关机钩子调用不存在的 `stop_runtime_sync`（重写引入）已移除。
+
+**验证通过项**：登录、模型选择器（minimax:MiniMax-M3）、新线程流式往返、多轮会话记忆、侧边栏运行状态、审批批准/拒绝双路径（文件真实落盘/未落盘）、存量线程只读拒发（run failed + 精确文案 + 零映射）、运行中刷新页面重连（全文完整）、steer 端到端（长文 3.6s 被中断 → 引导 run 32ms 派发 → 回复到达）。34 项测试全绿。
+
+**已知边界（未修，后续观察）**：
+- fork（不改）新会话**首轮**运行中 steer 中断可能不生效（agentscope `UserInterruptEvent` reply_id 不匹配被跳过，run 跑完；引导消息仍会在其完成后派发）；第二轮起正常。
+- 审批挂起时若整页刷新，模态框不恢复（前端 pendingInterrupt 仅内存态；Redis 挂起缓存 24h 有效，重开会话发送新消息可走 resume 链路）。
+- failed run 的错误信息不在会话内持久展示（前端既有产品行为，非迁移回归）。
+- MiniMax 经 Anthropic 兼容端点 input_tokens 上报为 0（output 正常）。
