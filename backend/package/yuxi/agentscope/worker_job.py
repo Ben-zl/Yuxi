@@ -190,6 +190,42 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
     )
 
 
+async def _collect_asking_tool_calls(
+    client: AgentScopeServiceClient,
+    *,
+    uid: str,
+    agent_id: str,
+    session_id: str,
+    reply_id: str,
+) -> list[dict]:
+    """从会话 reply 消息收集全部 asking 状态的工具调用。
+
+    并行多工具审批时，REQUIRE_USER_CONFIRM 事件可能只含先完成解析的
+    调用（fork 流式时序）；以会话消息事实为准补全确认集合，避免其余
+    调用永久滞留 asking。读取失败时返回空列表，调用方回退事件载荷。
+    """
+    try:
+        messages = await client.list_messages(uid, agent_id, session_id)
+    except Exception as exc:  # noqa: BLE001 - 补全失败回退事件载荷
+        logger.warning(f"读取会话消息补全审批集合失败: {exc}")
+        return []
+    for msg in reversed(messages or []):
+        if not isinstance(msg, dict) or msg.get("id") != reply_id:
+            continue
+        return [
+            {
+                "id": b.get("id"),
+                "name": b.get("name"),
+                "input": b.get("input"),
+            }
+            for b in msg.get("content") or []
+            if isinstance(b, dict)
+            and b.get("type") == "tool_call"
+            and str(b.get("state", "")).lower() == "asking"
+        ]
+    return []
+
+
 async def _resume_and_collect(
     client, run, mapping, confirm_event, approved: bool
 ) -> GatewayRoundResult:
@@ -213,20 +249,61 @@ async def _resume_and_collect(
         session_id=mapping.agentscope_session_id,
         run_id=run.id,
     )
+    # 停滞自愈：并行多工具审批时，REQUIRE 事件与会话落库存在时序差，
+    # 个别 tool_call 可能在确认后才进入 asking。事件流停滞期间周期性
+    # 检查会话，发现滞留 asking 即按本次决定补发确认。
+    stall_poll_seconds = 15.0
+    total_deadline = asyncio.get_running_loop().time() + 180.0
     try:
         await asyncio.sleep(0.5)
+        # 发出确认前先以会话中仍处 asking 的完整集合为准
+        tool_calls = confirm_event.get("tool_calls") or []
+        asking = await _collect_asking_tool_calls(
+            client,
+            uid=run.uid,
+            agent_id=mapping.agentscope_agent_id,
+            session_id=mapping.agentscope_session_id,
+            reply_id=confirm_event.get("reply_id", ""),
+        )
+        if asking:
+            tool_calls = asking
         await client.resume_confirm(
             run.uid,
             mapping.agentscope_agent_id,
             mapping.agentscope_session_id,
             reply_id=confirm_event.get("reply_id", ""),
-            tool_calls=confirm_event.get("tool_calls") or [],
+            tool_calls=tool_calls,
             confirmed=approved,
         )
         text_parts: list[str] = []
         event_count = 0
+        loop = asyncio.get_running_loop()
         while True:
-            event = await asyncio.wait_for(queue.get(), timeout=180.0)
+            remaining = total_deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError("resume 收集超时：会话长时间无事件")
+            try:
+                event = await asyncio.wait_for(
+                    queue.get(), timeout=min(stall_poll_seconds, remaining)
+                )
+            except asyncio.TimeoutError:
+                asking = await _collect_asking_tool_calls(
+                    client,
+                    uid=run.uid,
+                    agent_id=mapping.agentscope_agent_id,
+                    session_id=mapping.agentscope_session_id,
+                    reply_id=confirm_event.get("reply_id", ""),
+                )
+                if asking:
+                    await client.resume_confirm(
+                        run.uid,
+                        mapping.agentscope_agent_id,
+                        mapping.agentscope_session_id,
+                        reply_id=confirm_event.get("reply_id", ""),
+                        tool_calls=asking,
+                        confirmed=approved,
+                    )
+                continue
             if isinstance(event, Exception):
                 raise event
             event_count += 1

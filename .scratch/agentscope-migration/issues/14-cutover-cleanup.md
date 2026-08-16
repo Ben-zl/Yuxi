@@ -78,3 +78,21 @@
 - `SILICONFLOW_API_KEY` 在本地 .env 为空值带中文行内注释（docker env_file 不剥离），作为"密钥"进 Authorization 头触发 UnicodeEncodeError 500；建议清理该行为空。
 - docker workspace 后端下 MCP URL 必须为可路由地址（⑤既定结论的实证复现）；e2e 已参数化 MCP_MOCK_URL。
 - 知识库真实索引需 Milvus（本环境无），浏览器级验证止于工具面；KB 工具管线由 e2e 覆盖。
+
+## 第三轮验证记录：Team 多轮 / 沙盒 / 子智能体 / 审批中断深化 / KB+内置工具（2026-08-16，commit e1595701）
+
+**通过项（真实环境）**：
+- 沙盒 Bash：审批→允许→python3 真实执行输出 42 回传
+- 沙盒文件套：Write→Read→Bash ls 三工具链完整（文件 20 字节与内容吻合；ls 只读命令免审批）
+- 沙盒隔离：每线程独立 workspace（27 个目录），测试文件仅存在于创建线程
+- 子智能体（通用型）：general-purpose 子智能体执行 2**20=1048576 并回报
+- 审批挂起时输入区完全禁用（UI 阻断；API 层 409 由回归覆盖）
+- Team 长任务运行中取消：4.4 秒 cancelled（取消监听器对 team 会话同样生效）
+- KB 空库降级：list_kbs 返回空、模型如实报告；web_search 未配置时不装配工具、模型给出替代路径
+
+**修复（e1595701）**：resume 续跑中再次挂起审批时事件被丢弃（弹窗不出现→180s 超时误判失败）；现已写入审批 chunk 并返回 parked，pending_confirm 存储对 resume 生效。
+
+**已知缺口（未修，建议后续工单）**：
+1. **多工具并行审批确认丢失（fork 时序）**：模型一轮并行两个 Write 时，REQUIRE_USER_CONFIRM 事件仅含第一个调用；approve 后第二个停在 asking 且无补充事件 → 180s 超时失败。anthropic 通道无 parallel_tool_calls 参数可规避。方向：worker 在 resume 收集超时中途检查会话 asking 状态补发 confirm；或 fork 侧补齐事件（需改 fork，当前约束不改）。
+2. **Team 异步回报无回流**：多轮调研中模型若提前结束轮次（叙述"已派发"），成员回报与最终综合仅写入 agentscope 会话，不回流 yuxi 线程。方向：worker 对 team 会话延长订阅窗口或轮询会话消息补投。
+3. 前端观察（既有行为，非迁移回归）：选中非默认智能体后"新建对话"发送会落入该智能体最近线程；审批挂起中断后偶发会话残留 running 需 interrupt 恢复。

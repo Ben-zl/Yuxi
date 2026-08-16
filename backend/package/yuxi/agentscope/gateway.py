@@ -7,6 +7,7 @@ Stream（run:events:{run_id}），复用既有 XRANGE(after_seq) 断线重连续
 
 import asyncio
 import contextlib
+import time
 from dataclasses import dataclass
 
 from yuxi.agentscope.client import AgentScopeServiceClient
@@ -19,6 +20,14 @@ from yuxi.agentscope.protocol import (
 )
 from yuxi.agentscope.runner import SUBSCRIBE_SETTLE_SECONDS
 from yuxi.services.run_queue_service import append_run_stream_event
+
+
+# team 编排轮次的静默收束参数：REPLY_END 后成员回报（wakeup）可能驱动
+# 会话续写，无新事件持续 QUIESCE 秒才真正结束；续写可多次触发，总预算
+# 不超过 EXTENSION_BUDGET。
+TEAM_TOOL_NAMES = {"TeamCreate", "AgentCreate", "TeamSay", "TeamInvite"}
+TEAM_QUIESCE_SECONDS = 45.0
+TEAM_EXTENSION_BUDGET_SECONDS = 600.0
 
 
 def _usage(input_tokens: int, output_tokens: int) -> dict:
@@ -130,8 +139,23 @@ async def stream_round_to_run_events(
         input_tokens = 0
         output_tokens = 0
         tool_converter = ToolEventConverter(request_id)
+        team_tool_seen = False
+        pending_terminal = None  # team 静默期内暂存的终态，收束时落 end 帧
+        team_deadline = 0.0
         while True:
-            event = await asyncio.wait_for(queue.get(), timeout=read_timeout)
+            if pending_terminal is not None:
+                remaining = team_deadline - time.monotonic()
+                if remaining <= 0:
+                    break  # 续写总预算耗尽：以暂存终态收束
+                wait_seconds = min(TEAM_QUIESCE_SECONDS, remaining)
+            else:
+                wait_seconds = read_timeout
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=wait_seconds)
+            except asyncio.TimeoutError:
+                if pending_terminal is None:
+                    raise
+                break  # 静默窗口到期：以暂存终态收束
             if isinstance(event, Exception):
                 raise event
             event_type = str(event.get("type", "")).upper()
@@ -158,21 +182,34 @@ async def stream_round_to_run_events(
                     usage=_usage(input_tokens, output_tokens),
                     pending_confirm=event,
                 )
+            if event_type == "TOOL_CALL_START" and str(
+                event.get("tool_call_name", "")
+            ) in TEAM_TOOL_NAMES:
+                team_tool_seen = True
             if event_type == "REPLY_END":
                 terminal = reply_end_to_terminal(event, request_id=request_id)
-                await append_run_stream_event(
-                    run_id,
-                    "end",
-                    {"status": terminal.run_status, "chunk": terminal.chunk},
-                    thread_id=thread_id,
-                )
-                return GatewayRoundResult(
-                    run_status=terminal.run_status,
-                    text="".join(text_parts),
-                    reasoning="".join(reasoning_parts),
-                    event_count=event_count,
-                    usage=_usage(input_tokens, output_tokens),
-                )
+                if not team_tool_seen:
+                    await append_run_stream_event(
+                        run_id,
+                        "end",
+                        {"status": terminal.run_status, "chunk": terminal.chunk},
+                        thread_id=thread_id,
+                    )
+                    return GatewayRoundResult(
+                        run_status=terminal.run_status,
+                        text="".join(text_parts),
+                        reasoning="".join(reasoning_parts),
+                        event_count=event_count,
+                        usage=_usage(input_tokens, output_tokens),
+                    )
+                # team 轮次：暂存终态，等待成员回报驱动的续写（静默窗口）
+                if pending_terminal is None:
+                    team_deadline = time.monotonic() + TEAM_EXTENSION_BUDGET_SECONDS
+                pending_terminal = terminal
+                continue
+            if pending_terminal is not None:
+                # 续写活动到达：取消静默计时，回到正常收集
+                pending_terminal = None
             if event_type == "TEXT_BLOCK_DELTA":
                 text_parts.append(event.get("delta", ""))
             elif event_type == "THINKING_BLOCK_DELTA":
@@ -187,6 +224,20 @@ async def stream_round_to_run_events(
                 await append_run_stream_event(
                     run_id, "messages", {"items": chunks}, thread_id=thread_id
                 )
+        # team 静默收束：end 帧 + 聚合结果（含续写文本与用量）
+        await append_run_stream_event(
+            run_id,
+            "end",
+            {"status": pending_terminal.run_status, "chunk": pending_terminal.chunk},
+            thread_id=thread_id,
+        )
+        return GatewayRoundResult(
+            run_status=pending_terminal.run_status,
+            text="".join(text_parts),
+            reasoning="".join(reasoning_parts),
+            event_count=event_count,
+            usage=_usage(input_tokens, output_tokens),
+        )
     finally:
         pump_task.cancel()
         cancel_task.cancel()
