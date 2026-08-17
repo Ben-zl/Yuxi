@@ -13,7 +13,7 @@ from server.utils.auth_middleware import get_db, get_required_user
 from yuxi import config as conf
 from yuxi.agents.tool_approval import ToolApprovalMode
 from yuxi.models import select_model
-from yuxi.services.chat_service import get_agent_state_view
+from yuxi.services.thread_state_service import get_thread_state_view
 from yuxi.services.conversation_service import (
     confirm_tmp_thread_attachments_view,
     create_thread_view,
@@ -104,7 +104,7 @@ async def get_thread_state(
 ):
     """获取对话当前状态（需要登录）"""
     try:
-        return await get_agent_state_view(
+        return await get_thread_state_view(
             thread_id=thread_id,
             current_user=current_user,
             db=db,

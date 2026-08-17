@@ -6,11 +6,11 @@ Stream（run:events:{run_id}），复用既有 XRANGE(after_seq) 断线重连续
 """
 
 import asyncio
-import contextlib
 import time
 from dataclasses import dataclass
 
 from yuxi.agentscope.client import AgentScopeServiceClient
+from yuxi.agentscope.event_stream import cancel_tasks, start_event_pump
 from yuxi.agentscope.protocol import (
     ToolEventConverter,
     make_chunk,
@@ -77,8 +77,8 @@ def start_cancel_watcher(
                     return
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - 监听失败重试下一周期
-                continue
+            except Exception as exc:  # noqa: BLE001 - 监听失效必须终止当前执行
+                raise RuntimeError("取消信号监听失败") from exc
 
     return asyncio.create_task(_watch())
 
@@ -112,23 +112,14 @@ async def stream_round_to_run_events(
         thread_id=thread_id,
     )
 
-    queue: asyncio.Queue = asyncio.Queue()
-
-    async def _pump() -> None:
-        try:
-            async for event in client.stream_events(
-                uid, agent_id, session_id, read_timeout=read_timeout
-            ):
-                await queue.put(event)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - 泵任务异常需带回消费方
-            await queue.put(exc)
-
-    pump_task = asyncio.create_task(_pump())
-    cancel_task = start_cancel_watcher(
-        client, uid=uid, agent_id=agent_id, session_id=session_id, run_id=run_id
+    queue, pump_task = start_event_pump(
+        client,
+        uid=uid,
+        agent_id=agent_id,
+        session_id=session_id,
+        read_timeout=read_timeout,
     )
+    cancel_task = start_cancel_watcher(client, uid=uid, agent_id=agent_id, session_id=session_id, run_id=run_id)
     try:
         await asyncio.sleep(SUBSCRIBE_SETTLE_SECONDS)
         await client.trigger_chat(uid, agent_id, session_id, text)
@@ -152,21 +143,21 @@ async def stream_round_to_run_events(
                 wait_seconds = read_timeout
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=wait_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 if pending_terminal is None:
                     raise
                 break  # 静默窗口到期：以暂存终态收束
             if isinstance(event, Exception):
                 raise event
             event_type = str(event.get("type", "")).upper()
-            if event_type == "REQUIRE_USER_CONFIRM":
+            if event_type in {"REQUIRE_USER_CONFIRM", "REQUIRE_EXTERNAL_EXECUTION"}:
                 # 工具审批挂起：run 进入 interrupted 终态（挂起互斥依据），
                 # 审批结果经新一轮 resume 请求续跑（与旧栈 resume 语义一致）
                 chunks = event_to_chunks(event, request_id=request_id)
-                await append_run_stream_event(
-                    run_id, "messages", {"items": chunks}, thread_id=thread_id
-                )
-                terminal_chunk = make_chunk(request_id, status="interrupted", message="等待工具审批")
+                await append_run_stream_event(run_id, "messages", {"items": chunks}, thread_id=thread_id)
+                parked = "permission" if event_type == "REQUIRE_USER_CONFIRM" else "external"
+                message = "等待工具审批" if parked == "permission" else "等待用户回答"
+                terminal_chunk = make_chunk(request_id, status="interrupted", message=message)
                 await append_run_stream_event(
                     run_id,
                     "end",
@@ -178,13 +169,11 @@ async def stream_round_to_run_events(
                     text="".join(text_parts),
                     reasoning="".join(reasoning_parts),
                     event_count=event_count + 1,
-                    parked="permission",
+                    parked=parked,
                     usage=_usage(input_tokens, output_tokens),
                     pending_confirm=event,
                 )
-            if event_type == "TOOL_CALL_START" and str(
-                event.get("tool_call_name", "")
-            ) in TEAM_TOOL_NAMES:
+            if event_type == "TOOL_CALL_START" and str(event.get("tool_call_name", "")) in TEAM_TOOL_NAMES:
                 team_tool_seen = True
             if event_type == "REPLY_END":
                 terminal = reply_end_to_terminal(event, request_id=request_id)
@@ -221,9 +210,7 @@ async def stream_round_to_run_events(
             chunks.extend(tool_converter.feed(event))
             if chunks:
                 event_count += 1
-                await append_run_stream_event(
-                    run_id, "messages", {"items": chunks}, thread_id=thread_id
-                )
+                await append_run_stream_event(run_id, "messages", {"items": chunks}, thread_id=thread_id)
         # team 静默收束：end 帧 + 聚合结果（含续写文本与用量）
         await append_run_stream_event(
             run_id,
@@ -239,10 +226,4 @@ async def stream_round_to_run_events(
             usage=_usage(input_tokens, output_tokens),
         )
     finally:
-        pump_task.cancel()
-        cancel_task.cancel()
-        # 等待取消传播完成，让 httpx 流上下文在协程栈展开中正常关闭
-        with contextlib.suppress(asyncio.CancelledError):
-            await pump_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await cancel_task
+        await cancel_tasks(pump_task, cancel_task)

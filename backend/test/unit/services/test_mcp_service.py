@@ -39,7 +39,7 @@ class _FakeClient:
     def __init__(self, tools):
         self._tools = tools
 
-    async def get_tools(self):
+    async def list_tools(self):
         return self._tools
 
 
@@ -171,7 +171,7 @@ async def test_runtime_configs_exclude_user_created_stdio_servers(mcp_session):
     )
     await mcp_session.commit()
 
-    configs = await mcp_service._load_enabled_mcp_server_configs(db=mcp_session)
+    configs = await mcp_service.load_enabled_mcp_server_configs(db=mcp_session)
     slugs = await mcp_service.get_enabled_mcp_server_slugs(db=mcp_session)
 
     assert set(configs) == {"mcp-server-chart", "remote-http"}
@@ -348,7 +348,7 @@ async def test_get_tools_from_all_servers_loads_names_from_db_once(monkeypatch):
         calls.append((server_name, additional_servers or {}))
         return [server_name]
 
-    monkeypatch.setattr(mcp_service, "_load_enabled_mcp_server_configs", fake_load_enabled_mcp_server_configs)
+    monkeypatch.setattr(mcp_service, "load_enabled_mcp_server_configs", fake_load_enabled_mcp_server_configs)
     monkeypatch.setattr(mcp_service, "get_mcp_tools", fake_get_mcp_tools)
 
     tools = await mcp_service.get_tools_from_all_servers()
@@ -360,7 +360,7 @@ async def test_get_tools_from_all_servers_loads_names_from_db_once(monkeypatch):
     ]
 
 
-async def test_get_mcp_tools_sets_handle_tool_error(monkeypatch):
+async def test_get_mcp_tools_sets_stable_management_id(monkeypatch):
     mcp_service.clear_mcp_cache()
 
     config = {"transport": "stdio", "command": "demo-tool", "disabled_tools": []}
@@ -378,6 +378,6 @@ async def test_get_mcp_tools_sets_handle_tool_error(monkeypatch):
 
     tools = await mcp_service.get_mcp_tools("demo")
     assert len(tools) == 1
-    assert tools[0].handle_tool_error is True
+    assert tools[0].metadata["id"] == "mcp__demo__demoTool"
 
     mcp_service.clear_mcp_cache()

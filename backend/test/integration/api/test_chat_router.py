@@ -191,20 +191,13 @@ async def test_agent_detail_filters_configurable_items_by_role(
     user_agent_response = await test_client.get(f"/api/agent/{agent_id}", headers=standard_user["headers"])
     assert user_agent_response.status_code == 200, user_agent_response.text
     user_items = user_agent_response.json()["agent"].get("configurable_items", {})
-    assert "summary_threshold" not in user_items
-    assert "summary_keep_messages" not in user_items
-    assert "summary_prompt" not in user_items
-    assert "summary_tool_result_token_limit" not in user_items
     assert "max_execution_steps" not in user_items
 
     admin_agent_response = await test_client.get(f"/api/agent/{agent_id}", headers=admin_headers)
     assert admin_agent_response.status_code == 200, admin_agent_response.text
     admin_items = admin_agent_response.json()["agent"].get("configurable_items", {})
-    assert "summary_threshold" in admin_items
-    assert "summary_keep_messages" in admin_items
-    assert "summary_prompt" in admin_items
-    assert "summary_tool_result_token_limit" in admin_items
     assert "max_execution_steps" in admin_items
+    assert admin_items["max_execution_steps"]["name"] == "最大 ReAct 迭代次数"
 
 
 async def test_setting_default_agent_requires_admin(test_client, admin_headers, standard_user):

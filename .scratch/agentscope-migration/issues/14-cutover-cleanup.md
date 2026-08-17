@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 — 05 — 06 — 07 — 08 — 09 — 10 — 11 — 12 — 13（全部已完成）
 
-**Status:** resolved（执行面切换完成并实证；管理面清退为后续独立工单，见 Answer）
+**Status:** resolved（执行面与管理面清退完成；HTTP MCP 服务进程方案和依赖移除已实证）
 
 - [x] 门禁 checklist（spec 验收标准 + 迁移方案门禁）逐项通过并留证
 - [x] 红线检查：审批挂起、取消、用户隔离、沙盒隔离全部可用（e2e 实证）
@@ -19,8 +19,8 @@
 - [x] ⑤ 按「不改 fork」关闭：MCP 以可路由地址（宿主发布地址/bridge IP）注册，e2e 已按此验证；部署说明记录于工单 08 与 compose 注释
 - [x] ⑥ 工具面差额补齐：Tavily 分支、download_kb_file（文本内联/二进制元数据）、present_artifacts（workspace outputs 列出）、ocr_parse_file（PADDLEX_URI 未配置不装配）、steer（入队后中断线程活跃会话，旧执行体以 interrupted 收束、队列派发 steer 消息）
 - [x] ARCHITECTURE.md 智能体运行链路重写、changelog 更新
-- [ ] ~~依赖树移除 langchain/langgraph/deepagents~~ → 转为后续工单（见下）
-- [ ] ~~旧 e2e 套件全量改造~~ → 转为后续工单（见下）
+- [x] 依赖树移除 langchain/langgraph/deepagents/langsmith，lock 在干净镜像可复现
+- [x] 旧 e2e 套件清理或改造，AgentScope 主链路、HTTP MCP、workspace 和真实模型回归通过
 
 ## Answer（2026-08-15 收口记录）
 
@@ -33,10 +33,12 @@
 - **工具面（⑥）**：web_search 双 provider（DOUBAO/TAVILY key 分派）；download_kb_file/present_artifacts/ocr_parse_file 经 `build_extra_tools` 装配（只读免审批；OCR 需 PADDLEX_URI）。
 - **run_worker 清退**：删除旧 LangGraph 执行体/RunContext/ChunkedEventWriter/取消机等全部死代码与旧单测（test_run_worker.py），文件收敛为 76 行最小模块；`_worker_startup/_worker_shutdown` 生命周期钩子保留。
 
-### 遗留（转为后续独立工单，不阻塞本工单验收）
+### 原遗留项清退（2026-08-17）
 
-- **管理面清退**：`yuxi/agents/`（middlewares/skill 激活/mcp 工厂等 ~11.7k 行）与 `chat_service` 的非执行面（agent_state 视图、LangGraph 历史读取）仍被 routers（skill/mcp/agent_state/评估）引用——移除需重写管理路由并迁移 agent_state 投影，独立工单处理；届时依赖树方可移除 langchain/langgraph/deepagents。
-- **旧 e2e 套件**（test_agent_async_e2e 等 LangGraph 专用）随管理面清退一并改造。
+- **管理面清退**：删除旧 graph、middlewares、chat_service、checkpoint 初始化和旧 resume/stream；Agent backend 仅保留配置元数据，线程状态统一由 `ThreadStateService` 从 Message/AgentRun/Redis pending/workspace 产物聚合。
+- **依赖清退**：替换 LangChain message/PDF/MCP 消费者，移除 LangChain/LangGraph/DeepAgents/LangSmith 直接依赖并重建 lock；干净容器确认依赖树无残留。
+- **HTTP MCP**：通过 `extra_agent_tools` 在 AgentScope 服务进程逐轮创建无状态 `MCPClient`。workspace 不加入业务网络，不获得 URL/Header/凭据或 `.mcp`；配置更新、禁用工具、删除和不可达失败均有真实 E2E。
+- **测试结果**：干净 Docker 环境 unit `958 passed, 2 skipped`；AgentScope integration `14 passed, 3 skipped`；AgentScope E2E `18 passed`；MiniMax-M3 真实链路 `1 passed`；HTTP MCP E2E `3 passed`。
 - **富文本编辑器自动化输入**：真实浏览器联调中编辑器对自动化 fill/type 三路径拦截（一次成功往返已取证）；后续联调用例建议经 API+token 或 Playwright 官方 runner 补充。
 
 ## 真实浏览器全量验证记录（2026-08-15，commit a47b62dc）
@@ -96,3 +98,19 @@
 1. **多工具并行审批确认丢失（fork 时序）**：模型一轮并行两个 Write 时，REQUIRE_USER_CONFIRM 事件仅含第一个调用；approve 后第二个停在 asking 且无补充事件 → 180s 超时失败。anthropic 通道无 parallel_tool_calls 参数可规避。方向：worker 在 resume 收集超时中途检查会话 asking 状态补发 confirm；或 fork 侧补齐事件（需改 fork，当前约束不改）。
 2. **Team 异步回报无回流**：多轮调研中模型若提前结束轮次（叙述"已派发"），成员回报与最终综合仅写入 agentscope 会话，不回流 yuxi 线程。方向：worker 对 team 会话延长订阅窗口或轮询会话消息补投。
 3. 前端观察（既有行为，非迁移回归）：选中非默认智能体后"新建对话"发送会落入该智能体最近线程；审批挂起中断后偶发会话残留 running 需 interrupt 恢复。
+
+## 缺口修复记录（2026-08-16，commit f779c241）
+
+**缺口1（多工具并行审批确认丢失）— 已修复并真实环境闭环**：
+- 机制：① resume 确认发出前，以会话消息中仍处 `asking` 的完整 tool_call 集合替代事件载荷；② 停滞自愈——事件流停滞期间每 15 秒复查会话，发现滞留 asking 即按本次决定补发确认（兜住确认后才落库的调用），180 秒总封顶。
+- 复验（真实环境 API 全链路）：双 Write 并行请求 → 挂起审批 → approve → 两个文件均真实落盘（g2-a.txt=AAA / g2-b.txt=BBB）→ resume completed、回复确认双成功。修复前同场景 180s 超时 failed。
+
+**缺口2（team 异步回报无回流）— 已修复，单元级验证通过，真实端到端未闭环**：
+- 机制：本轮事件出现 TeamCreate/AgentCreate/TeamSay 时启用静默收束——REPLY_END 后等待 45 秒，成员回报（wakeup）驱动的续写事件（文本/用量）聚合进同一 run，end 帧一次落定；续写可多次触发，总预算 600 秒；普通轮次行为逐字节不变（单测断言）。
+- 验证：3 项单元测试（team 轮次续写聚合、普通轮次首个 REPLY_END 即收束、asking 补全）；真实端到端复验三次尝试均停滞在**模型侧**（deep-research 会话输出叙述后无工具调用无终态、或 AgentCreate 病态循环 60 次），另有 f369 会话经多次中断后进入 "session could not be prepared" 不可恢复态（fork 会话级韧性问题，独立记录）。待模型侧行为稳定后补端到端复验。
+
+**新增观察（fork/模型侧，未修）**：
+- 会话经反复中断/team 操作后可能进入不可恢复态（interrupt 无法救回），报 "The session could not be prepared"；需要新会话规避。
+- MiniMax-M3 在 team 编排指令下偶发停滞（无工具调用无终态直至 180s read_timeout）或 AgentCreate 病态重试循环。
+
+回归：47 passed + 4 skipped 全绿。

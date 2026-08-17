@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.e2e, pytest.mark.slow]
 
 POLL_INTERVAL_SECONDS = float(os.getenv("E2E_RUN_POLL_INTERVAL_SECONDS", "2"))
 RUN_TIMEOUT_SECONDS = int(os.getenv("E2E_RUN_TIMEOUT_SECONDS", "240"))
-EXPECTED_OUTPUT = "ASYNC_AGENT_E2E_OK"
+EXPECTED_OUTPUT = os.getenv("E2E_EXPECTED_OUTPUT", "ASYNC_AGENT_E2E_OK")
 
 
 def _postgres_dsn() -> str:
@@ -37,8 +37,9 @@ async def _create_agent(client: httpx.AsyncClient, headers: dict[str, str], uid:
         "skills": [],
         "subagents": [],
     }
-    if default_context.get("model"):
-        context["model"] = default_context["model"]
+    model_spec = os.getenv("E2E_MODEL_SPEC") or default_context.get("model")
+    if model_spec:
+        context["model"] = model_spec
 
     response = await client.post(
         "/api/agent",

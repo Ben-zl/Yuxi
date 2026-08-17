@@ -16,8 +16,8 @@ from typing import Any
 import aiofiles
 from docling.datamodel.base_models import InputFormat
 from docling.document_converter import DocumentConverter
-from langchain_community.document_loaders import PyPDFLoader
 from markdownify import markdownify as md_convert
+from pypdf import PdfReader
 
 from yuxi.knowledge.parser.zip_utils import process_zip_file as _process_zip_file
 from yuxi.knowledge.utils.pdf_utils import validate_pdf_page_tree_loadable
@@ -221,10 +221,8 @@ def pdfreader(file_path, params=None):
     assert file_path.exists(), "File not found"
     assert file_path.suffix.lower() == ".pdf", "File format not supported"
 
-    loader = PyPDFLoader(str(file_path))
-    docs = loader.load()
-    text = "\n\n".join([d.page_content for d in docs])
-    return text
+    reader = PdfReader(file_path)
+    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
 
 
 def parse_pdf(file, params=None):
@@ -357,11 +355,7 @@ async def parse_resolved_document(source: str, params: dict | None = None) -> Ma
             result = await asyncio.to_thread(_convert_with_docling, file_path_obj, params=params)
 
         elif file_ext == ".doc":
-            from langchain_community.document_loaders import UnstructuredWordDocumentLoader
-
-            loader = UnstructuredWordDocumentLoader(str(file_path_obj))
-            docs = await asyncio.to_thread(loader.load)
-            result = "\n".join(doc.page_content for doc in docs).strip()
+            raise ValueError("不支持旧版 .doc 文件，请先转换为 .docx")
 
         elif file_ext in [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]:
             text = await parse_image_async(str(file_path_obj), params=params)

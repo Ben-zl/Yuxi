@@ -130,7 +130,7 @@ async def test_state_command_does_not_submit(monkeypatch: pytest.MonkeyPatch):
         return {"agent_state": {"todos": []}}
 
     monkeypatch.setattr(router, "submit_run_command", fail_submit)
-    monkeypatch.setattr(router, "get_agent_state_view", fake_state)
+    monkeypatch.setattr(router, "get_thread_state_view", fake_state)
     result = await router.receive_channel_message(
         _payload("/state"),
         current_user=SimpleNamespace(uid="user-1"),

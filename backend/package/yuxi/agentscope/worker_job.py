@@ -6,18 +6,17 @@
 """
 
 import asyncio
-import contextlib
-import json
 import os
-
-from sqlalchemy import select
+from pathlib import Path
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.execution import execute_run, finalize_run
+from yuxi.agentscope.event_stream import cancel_tasks, start_event_pump
 from yuxi.agentscope.gateway import GatewayRoundResult, start_cancel_watcher
 from yuxi.agentscope.runner import ensure_thread_session
 from yuxi.agentscope.thread_guard import (
     LEGACY_THREAD_MESSAGE,
+    clear_pending_confirm,
     has_pending_confirm,
     load_pending_confirm,
     store_pending_confirm,
@@ -44,10 +43,7 @@ async def execute_agent_run_job(run_id: str) -> None:
             logger.warning(f"Run not found: {run_id}")
             return
         if run.status in TERMINAL_RUN_STATUSES:
-            if run.status == "completed" or (
-                run.status == "interrupted"
-                and not await has_pending_confirm(run.conversation_thread_id)
-            ):
+            if run.status != "interrupted" or not await has_pending_confirm(run.conversation_thread_id):
                 await dispatch_next_request(
                     uid=run.uid,
                     agent_slug=run.agent_slug,
@@ -55,29 +51,22 @@ async def execute_agent_run_job(run_id: str) -> None:
                 )
             return
 
-        input_message = (
-            await db.execute(select(Message).where(Message.id == run.input_message_id))
-        ).scalar_one_or_none() if run.input_message_id else None
+        conv_repo = ConversationRepository(db)
+        input_message = await conv_repo.get_message_by_id(run.input_message_id) if run.input_message_id else None
         if input_message is None:
-            await run_repo.set_terminal_status(
-                run_id, status="failed", error_message="运行任务缺少输入消息"
-            )
-            await db.commit()
+            await _fail_run(db, run_repo, run, "运行任务缺少输入消息")
             return
 
         await run_repo.mark_running(run_id)
         await db.commit()
 
-        client = AgentScopeServiceClient(
-            os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
-        )
-        conv_repo = ConversationRepository(db)
+        client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
         try:
             if run.run_type == "resume":
                 result = await _execute_resume(db, client, run, input_message)
             else:
                 model_spec = (run.input_payload or {}).get("model_spec")
-                await ensure_thread_session(
+                mapping = await ensure_thread_session(
                     db,
                     client,
                     uid=run.uid,
@@ -85,17 +74,20 @@ async def execute_agent_run_job(run_id: str) -> None:
                     agent_slug=run.agent_slug,
                     model_spec=model_spec,
                 )
-                result = await execute_run(
-                    db, client, run=run, text=input_message.content, model_spec=model_spec
+                text = await _materialize_run_attachments(
+                    conv_repo,
+                    client,
+                    run=run,
+                    input_message=input_message,
+                    mapping=mapping,
                 )
-            if result.parked == "permission" and result.pending_confirm:
-                await store_pending_confirm(
-                    run.conversation_thread_id, result.pending_confirm
-                )
+                result = await execute_run(db, client, run=run, text=text, model_spec=model_spec)
+            if result.parked in {"permission", "external"} and result.pending_confirm:
+                await store_pending_confirm(run.conversation_thread_id, result.pending_confirm)
 
             # yuxi 消息表落库：前端线程历史视图的数据源
             if result.text:
-                await conv_repo.add_message_by_thread_id(
+                output_message = await conv_repo.add_message_by_thread_id(
                     thread_id=run.conversation_thread_id,
                     role="assistant",
                     content=result.text,
@@ -108,22 +100,28 @@ async def execute_agent_run_job(run_id: str) -> None:
                     run_id=run_id,
                     request_id=run.request_id,
                 )
+                if output_message is None:
+                    raise RuntimeError("回复消息落库失败：线程不存在")
+                await run_repo.set_output_message(run_id, output_message.id)
             await db.commit()
         except ValueError as exc:
-            if LEGACY_THREAD_MESSAGE in str(exc):
-                await _fail_run(db, run_repo, run, str(exc))
-                return
-            raise
+            message = str(exc)
+            await _fail_run(
+                db,
+                run_repo,
+                run,
+                message if LEGACY_THREAD_MESSAGE in message else f"执行失败: {message}",
+            )
+            return
         except Exception as exc:  # noqa: BLE001 - 任务级失败统一终态
             logger.exception(f"agentscope 执行失败 run={run_id}: {exc}")
             await _fail_run(db, run_repo, run, f"执行失败: {exc}")
             return
 
         # 挂起/中断终态补发 end 帧（前端收尾依赖）；completed 与 steer 中断
-        #（非审批挂起）派发队头：引导消息需在被中断的 Run 结束后立即执行。
+        # （非审批挂起）派发队头：引导消息需在被中断的 Run 结束后立即执行。
         if result.run_status == "completed" or (
-            result.run_status == "interrupted"
-            and not await has_pending_confirm(run.conversation_thread_id)
+            result.run_status == "interrupted" and not await has_pending_confirm(run.conversation_thread_id)
         ):
             await dispatch_next_request(
                 uid=run.uid,
@@ -139,16 +137,69 @@ async def execute_agent_run_job(run_id: str) -> None:
 
 
 async def _fail_run(db, run_repo, run, message: str) -> None:
-    """失败终态 + end 帧 + 提交。"""
-    await run_repo.set_terminal_status(
-        run.id, status="failed", error_message=message
-    )
+    """失败终态提交后续派 FIFO 队头。"""
+    await run_repo.set_terminal_status(run.id, status="failed", error_message=message)
     await _emit_end_event(
         run.id,
         run.conversation_thread_id,
         {"status": "error", "error_message": message},
     )
     await db.commit()
+    await dispatch_next_request(
+        uid=run.uid,
+        agent_slug=run.agent_slug,
+        thread_id=run.conversation_thread_id,
+    )
+
+
+async def _materialize_run_attachments(
+    conv_repo: ConversationRepository,
+    client: AgentScopeServiceClient,
+    *,
+    run,
+    input_message: Message,
+    mapping,
+) -> str:
+    """绑定并上传本次请求附件，返回包含 workspace 路径的用户文本。"""
+    file_ids = (input_message.extra_metadata or {}).get("attachment_file_ids") or []
+    if not file_ids:
+        return input_message.content
+    if not isinstance(file_ids, list) or len(file_ids) > 10:
+        raise ValueError("attachment_file_ids 必须是最多 10 项的数组")
+    normalized_ids = [str(file_id).strip() for file_id in file_ids]
+    if any(not file_id for file_id in normalized_ids) or len(set(normalized_ids)) != len(normalized_ids):
+        raise ValueError("attachment_file_ids 不允许空值或重复值")
+
+    attachments = await conv_repo.get_attachments(run.conversation_id)
+    requested = set(normalized_ids)
+    selected = {str(item.get("file_id")): item for item in attachments if str(item.get("file_id")) in requested}
+    if requested != set(selected) or any(item.get("request_id") not in {None, ""} for item in selected.values()):
+        raise ValueError("附件不存在、已绑定其他请求或无权访问")
+
+    workspace_paths = []
+    for file_id in normalized_ids:
+        item = selected[file_id]
+        source_path = item.get("storage_path")
+        if not isinstance(source_path, str):
+            raise ValueError(f"附件 {item.get('file_id')} 缺少存储路径")
+        suffix = ".md" if item.get("status") == "parsed" else Path(item.get("file_name") or "file").suffix
+        destination = f"/workspace/uploads/{item['file_id']}{suffix}"
+        workspace_paths.append(
+            await client.upload_workspace_file(
+                run.uid,
+                mapping.agentscope_agent_id,
+                mapping.agentscope_session_id,
+                source_path=source_path,
+                destination=destination,
+            )
+        )
+
+    bound = await conv_repo.bind_attachments_to_request(run.conversation_id, run.request_id, normalized_ids)
+    if {str(item.get("file_id")) for item in bound} != requested:
+        raise RuntimeError("附件绑定状态在上传期间发生变化")
+
+    paths = "\n".join(f"- {path}" for path in workspace_paths)
+    return f"{input_message.content}\n\n本次请求附件（workspace 路径）：\n{paths}"
 
 
 async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
@@ -169,25 +220,36 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
 
     confirm_event = await load_pending_confirm(run.conversation_thread_id)
     decisions = resume_input.get("decisions") if isinstance(resume_input, dict) else None
-    if confirm_event and isinstance(decisions, list) and decisions:
-        approved = any(
-            str(d.get("type", "")).lower() in {"approve", "approved", "accept"}
-            for d in decisions
-            if isinstance(d, dict)
-        )
-        result = await _resume_and_collect(
-            client, run, mapping, confirm_event, approved
-        )
+    event_type = str((confirm_event or {}).get("type", "")).upper()
+    if confirm_event and event_type == "REQUIRE_USER_CONFIRM":
+        if (
+            not isinstance(decisions, list)
+            or not decisions
+            or any(not isinstance(decision, dict) for decision in decisions)
+        ):
+            raise ValueError("工具审批恢复缺少有效 decisions")
+        approved = [str(d.get("type", "")).lower() in {"approve", "approved", "accept"} for d in decisions]
+        result = await _resume_and_collect(client, run, mapping, confirm_event, approved)
         # resume 路径同样必须回写终态，否则 Run 永远停在 running
         await finalize_run(db, run, result)
+        await _replace_pending_confirm(run.conversation_thread_id, result)
         return result
 
-    # 文本回答（ask_user 语义）：作为新一轮用户输入执行
     answer = resume_input.get("answer") if isinstance(resume_input, dict) else None
+    if confirm_event and event_type == "REQUIRE_EXTERNAL_EXECUTION":
+        if answer is None:
+            raise ValueError("外部问答恢复缺少 answer")
+        result = await _resume_external_and_collect(client, run, mapping, confirm_event, answer)
+        await finalize_run(db, run, result)
+        await _replace_pending_confirm(run.conversation_thread_id, result)
+        return result
+
+    if confirm_event:
+        raise ValueError(f"不支持的挂起事件类型: {event_type or 'unknown'}")
+
+    # 没有挂起事件时，文本 resume 仍按普通新一轮输入处理。
     text = answer if isinstance(answer, str) and answer.strip() else input_message.content
-    return await execute_run(
-        db, client, run=run, text=text, model_spec=(run.input_payload or {}).get("model_spec")
-    )
+    return await execute_run(db, client, run=run, text=text, model_spec=(run.input_payload or {}).get("model_spec"))
 
 
 async def _collect_asking_tool_calls(
@@ -202,13 +264,9 @@ async def _collect_asking_tool_calls(
 
     并行多工具审批时，REQUIRE_USER_CONFIRM 事件可能只含先完成解析的
     调用（fork 流式时序）；以会话消息事实为准补全确认集合，避免其余
-    调用永久滞留 asking。读取失败时返回空列表，调用方回退事件载荷。
+    调用永久滞留 asking。读取失败必须显式中止，保留挂起状态供重试。
     """
-    try:
-        messages = await client.list_messages(uid, agent_id, session_id)
-    except Exception as exc:  # noqa: BLE001 - 补全失败回退事件载荷
-        logger.warning(f"读取会话消息补全审批集合失败: {exc}")
-        return []
+    messages = await client.list_messages(uid, agent_id, session_id)
     for msg in reversed(messages or []):
         if not isinstance(msg, dict) or msg.get("id") != reply_id:
             continue
@@ -219,29 +277,20 @@ async def _collect_asking_tool_calls(
                 "input": b.get("input"),
             }
             for b in msg.get("content") or []
-            if isinstance(b, dict)
-            and b.get("type") == "tool_call"
-            and str(b.get("state", "")).lower() == "asking"
+            if isinstance(b, dict) and b.get("type") == "tool_call" and str(b.get("state", "")).lower() == "asking"
         ]
     return []
 
 
-async def _resume_and_collect(
-    client, run, mapping, confirm_event, approved: bool
-) -> GatewayRoundResult:
+async def _resume_and_collect(client, run, mapping, confirm_event, approved: list[bool]) -> GatewayRoundResult:
     """订阅在先、恢复在后，收集到 REPLY_END。"""
-    queue: asyncio.Queue = asyncio.Queue()
-
-    async def _pump():
-        async for event in client.stream_events(
-            run.uid,
-            mapping.agentscope_agent_id,
-            mapping.agentscope_session_id,
-            read_timeout=180.0,
-        ):
-            await queue.put(event)
-
-    pump = asyncio.create_task(_pump())
+    queue, pump = start_event_pump(
+        client,
+        uid=run.uid,
+        agent_id=mapping.agentscope_agent_id,
+        session_id=mapping.agentscope_session_id,
+        read_timeout=180.0,
+    )
     cancel_task = start_cancel_watcher(
         client,
         uid=run.uid,
@@ -256,8 +305,10 @@ async def _resume_and_collect(
     total_deadline = asyncio.get_running_loop().time() + 180.0
     try:
         await asyncio.sleep(0.5)
-        # 发出确认前先以会话中仍处 asking 的完整集合为准
         tool_calls = confirm_event.get("tool_calls") or []
+        if len(tool_calls) != len(approved):
+            raise ValueError("待审批工具调用数量与审批决定数量不一致")
+        decisions_by_id = {call.get("id"): decision for call, decision in zip(tool_calls, approved, strict=True)}
         asking = await _collect_asking_tool_calls(
             client,
             uid=run.uid,
@@ -265,15 +316,17 @@ async def _resume_and_collect(
             session_id=mapping.agentscope_session_id,
             reply_id=confirm_event.get("reply_id", ""),
         )
-        if asking:
-            tool_calls = asking
+        pending_calls = asking or tool_calls
+        unknown_ids = {call.get("id") for call in pending_calls} - set(decisions_by_id)
+        if unknown_ids:
+            raise ValueError("会话出现未向用户展示的待审批工具调用")
         await client.resume_confirm(
             run.uid,
             mapping.agentscope_agent_id,
             mapping.agentscope_session_id,
             reply_id=confirm_event.get("reply_id", ""),
-            tool_calls=tool_calls,
-            confirmed=approved,
+            tool_calls=pending_calls,
+            confirmed=[decisions_by_id[call.get("id")] for call in pending_calls],
         )
         text_parts: list[str] = []
         event_count = 0
@@ -283,10 +336,8 @@ async def _resume_and_collect(
             if remaining <= 0:
                 raise TimeoutError("resume 收集超时：会话长时间无事件")
             try:
-                event = await asyncio.wait_for(
-                    queue.get(), timeout=min(stall_poll_seconds, remaining)
-                )
-            except asyncio.TimeoutError:
+                event = await asyncio.wait_for(queue.get(), timeout=min(stall_poll_seconds, remaining))
+            except TimeoutError:
                 asking = await _collect_asking_tool_calls(
                     client,
                     uid=run.uid,
@@ -295,13 +346,17 @@ async def _resume_and_collect(
                     reply_id=confirm_event.get("reply_id", ""),
                 )
                 if asking:
+                    unknown_ids = {call.get("id") for call in asking} - set(decisions_by_id)
+                    if unknown_ids:
+                        raise ValueError("会话出现未向用户展示的待审批工具调用")
+                    retry_decisions = [decisions_by_id[call.get("id")] for call in asking]
                     await client.resume_confirm(
                         run.uid,
                         mapping.agentscope_agent_id,
                         mapping.agentscope_session_id,
                         reply_id=confirm_event.get("reply_id", ""),
                         tool_calls=asking,
-                        confirmed=approved,
+                        confirmed=retry_decisions,
                     )
                 continue
             if isinstance(event, Exception):
@@ -309,24 +364,95 @@ async def _resume_and_collect(
             event_count += 1
             if str(event.get("type", "")).upper() == "TEXT_BLOCK_DELTA":
                 text_parts.append(event.get("delta", ""))
+            if str(event.get("type", "")).upper() in {
+                "REQUIRE_USER_CONFIRM",
+                "REQUIRE_EXTERNAL_EXECUTION",
+            }:
+                return _parked_resume_result(event, text_parts, event_count)
             if str(event.get("type", "")).upper() == "REPLY_END":
                 finished = str(event.get("finished_reason", "")).lower()
                 return GatewayRoundResult(
-                    run_status=(
-                        "completed" if finished == "completed" else "interrupted"
-                    ),
+                    run_status=("completed" if finished == "completed" else "interrupted"),
                     text="".join(text_parts),
                     reasoning="",
                     event_count=event_count,
                     usage=_EMPTY_USAGE,
                 )
     finally:
-        pump.cancel()
-        cancel_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await pump
-        with contextlib.suppress(asyncio.CancelledError):
-            await cancel_task
+        await cancel_tasks(pump, cancel_task)
+
+
+async def _resume_external_and_collect(client, run, mapping, pending_event: dict, answer: object) -> GatewayRoundResult:
+    """订阅在先并以 ExternalExecutionResultEvent 恢复用户问答。"""
+    queue, pump = start_event_pump(
+        client,
+        uid=run.uid,
+        agent_id=mapping.agentscope_agent_id,
+        session_id=mapping.agentscope_session_id,
+        read_timeout=180.0,
+    )
+    cancel_task = start_cancel_watcher(
+        client,
+        uid=run.uid,
+        agent_id=mapping.agentscope_agent_id,
+        session_id=mapping.agentscope_session_id,
+        run_id=run.id,
+    )
+    try:
+        await asyncio.sleep(0.5)
+        await client.resume_external_execution(
+            run.uid,
+            mapping.agentscope_agent_id,
+            mapping.agentscope_session_id,
+            reply_id=pending_event.get("reply_id", ""),
+            tool_calls=pending_event.get("tool_calls") or [],
+            answer=answer,
+        )
+        text_parts: list[str] = []
+        event_count = 0
+        while True:
+            event = await asyncio.wait_for(queue.get(), timeout=180.0)
+            if isinstance(event, Exception):
+                raise event
+            event_count += 1
+            event_type = str(event.get("type", "")).upper()
+            if event_type == "TEXT_BLOCK_DELTA":
+                text_parts.append(event.get("delta", ""))
+            if event_type in {"REQUIRE_USER_CONFIRM", "REQUIRE_EXTERNAL_EXECUTION"}:
+                return _parked_resume_result(event, text_parts, event_count)
+            if event_type == "REPLY_END":
+                finished = str(event.get("finished_reason", "")).lower()
+                return GatewayRoundResult(
+                    run_status="completed" if finished == "completed" else "interrupted",
+                    text="".join(text_parts),
+                    reasoning="",
+                    event_count=event_count,
+                    usage=_EMPTY_USAGE,
+                )
+    finally:
+        await cancel_tasks(pump, cancel_task)
+
+
+def _parked_resume_result(event: dict, text_parts: list[str], event_count: int) -> GatewayRoundResult:
+    """把恢复期间再次出现的审批或问答转换为新的挂起结果。"""
+    event_type = str(event.get("type", "")).upper()
+    return GatewayRoundResult(
+        run_status="interrupted",
+        text="".join(text_parts),
+        reasoning="",
+        event_count=event_count,
+        parked="permission" if event_type == "REQUIRE_USER_CONFIRM" else "external",
+        usage=_EMPTY_USAGE,
+        pending_confirm=event,
+    )
+
+
+async def _replace_pending_confirm(thread_id: str, result: GatewayRoundResult) -> None:
+    """成功恢复后清理旧挂起，或原子语义地以新挂起覆盖。"""
+    if result.parked in {"permission", "external"} and result.pending_confirm:
+        await store_pending_confirm(thread_id, result.pending_confirm)
+    else:
+        await clear_pending_confirm(thread_id)
 
 
 async def _emit_end_event(run_id: str, thread_id: str, payload: dict) -> None:

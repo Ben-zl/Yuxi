@@ -69,7 +69,11 @@ async def test_prepare_remote_skill_install_stages_success_and_failure(
         assert skills == ["pdf", "broken"]
         return preparation
 
+    async def fake_list_personal_skills(_uid):
+        return []
+
     monkeypatch.setattr(svc, "SkillRepository", FakeRepo)
+    monkeypatch.setattr(svc, "list_personal_skills", fake_list_personal_skills)
     monkeypatch.setattr(
         "yuxi.agents.skills.remote_install.prepare_remote_skills_batch",
         fake_prepare_remote_skills_batch,

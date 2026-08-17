@@ -270,13 +270,13 @@ def test_dump_config_hides_save_dir(tmp_path):
 
 
 def test_resolve_chat_model_spec_reads_runtime_refreshed_default(tmp_path, monkeypatch):
-    from yuxi.agents import models
+    from yuxi.models import chat
 
     payload = {"default_model": "test-provider:resolved-chat"}
     _patch_runtime_redis(monkeypatch, _FakeRedis(raw=json.dumps(payload)))
     cfg = Config(save_dir=str(tmp_path))
     cfg.default_model = "test-provider:old-chat"
     cfg.refresh()
-    monkeypatch.setattr(models, "sys_config", cfg)
+    monkeypatch.setattr(chat, "sys_config", cfg)
 
-    assert models.resolve_chat_model_spec(None) == "test-provider:resolved-chat"
+    assert chat.resolve_chat_model_spec(None) == "test-provider:resolved-chat"

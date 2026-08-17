@@ -59,7 +59,7 @@ async def test_read_viewer_workspace_office_file_returns_pdf_preview(
     target.write_bytes(b"presentation")
 
     async def fake_resolve_viewer_state(**kwargs):
-        return None, None, []
+        return None, []
 
     async def fake_convert(filename: str, content: bytes) -> bytes:
         assert filename == "slides.pptx"

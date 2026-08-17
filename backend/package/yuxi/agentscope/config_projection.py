@@ -9,9 +9,9 @@ LITE 模式下裁剪知识库相关投影，纯聊天能力不受影响。
 
 from dataclasses import dataclass, field
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from yuxi.agents.skills.service import list_accessible_skills
 from yuxi.agentscope.projection import (
     agent_context,
     is_lite_mode,
@@ -20,7 +20,10 @@ from yuxi.agentscope.projection import (
     project_subagent_template,
     split_model_spec,
 )
-from yuxi.storage.postgres.models_business import Agent, ModelProvider, Skill
+from yuxi.repositories.agent_repository import AgentRepository
+from yuxi.repositories.user_repository import UserRepository
+from yuxi.models.providers.repository import get_model_provider
+from yuxi.storage.postgres.models_business import Agent, ModelProvider
 
 
 @dataclass
@@ -33,15 +36,23 @@ class RuntimeProjection:
     credential_data: dict
     chat_model_config: dict
     skill_slugs: list[str] = field(default_factory=list)
-    mcp_server_names: list[str] = field(default_factory=list)
-    knowledge_slugs: list[str] = field(default_factory=list)
+    skills: list[dict] = field(default_factory=list)
+    mcp_servers: list[dict] = field(default_factory=list)
+    knowledge_slugs: list[str] | None = None
     subagent_templates: list[dict] = field(default_factory=list)
 
 
-async def _load_agent(db: AsyncSession, agent_slug: str) -> Agent:
-    """按 slug 读取智能体定义，缺失即显式失败。"""
-    result = await db.execute(select(Agent).where(Agent.slug == agent_slug))
-    agent = result.scalar_one_or_none()
+async def _load_user(db: AsyncSession, uid: str):
+    """读取运行用户，缺失即显式失败。"""
+    user = await UserRepository().get_by_uid_with_db(db, uid)
+    if user is None:
+        raise ValueError(f"用户 {uid} 不存在")
+    return user
+
+
+async def _load_agent(db: AsyncSession, agent_slug: str, user) -> Agent:
+    """按 slug 读取用户可见的主智能体，缺失即显式失败。"""
+    agent = await AgentRepository(db).get_visible_by_slug(slug=agent_slug, user=user, kind="any")
     if agent is None:
         raise ValueError(f"智能体 {agent_slug} 不存在")
     return agent
@@ -49,21 +60,12 @@ async def _load_agent(db: AsyncSession, agent_slug: str) -> Agent:
 
 async def _load_provider(db: AsyncSession, provider_id: str) -> ModelProvider:
     """按 provider_id 读取模型供应商，缺失或未启用即显式失败。"""
-    result = await db.execute(
-        select(ModelProvider).where(ModelProvider.provider_id == provider_id)
-    )
-    provider = result.scalar_one_or_none()
+    provider = await get_model_provider(db, provider_id)
     if provider is None:
         raise ValueError(f"模型供应商 {provider_id} 不存在")
     if not provider.is_enabled:
         raise ValueError(f"模型供应商 {provider_id} 未启用")
     return provider
-
-
-async def _visible_skill_slugs(db: AsyncSession) -> list[str]:
-    """全部可见 Skill（激活门控由 Skills 工单的渐进披露机制处理）。"""
-    result = await db.execute(select(Skill.slug))
-    return [row[0] for row in result.all()]
 
 
 async def project_runtime(
@@ -74,13 +76,14 @@ async def project_runtime(
     model_spec: str | None = None,
 ) -> RuntimeProjection:
     """统一投影入口：读取 yuxi 配置并产出该线程运行的全部运行时对象。"""
-    agent = await _load_agent(db, agent_slug)
+    user = await _load_user(db, uid)
+    agent = await _load_agent(db, agent_slug, user)
     context = agent_context(agent)
 
     spec = model_spec or context.get("model")
     if not spec:
         # 与旧栈一致：请求与智能体均未指定模型时，回落系统默认对话模型
-        #（前端新线程首条消息不携带 model_spec，无模型智能体依赖此兜底）
+        # （前端新线程首条消息不携带 model_spec，无模型智能体依赖此兜底）
         from yuxi.config import config as sys_config
 
         spec = sys_config.default_model or ""
@@ -99,16 +102,60 @@ async def project_runtime(
     )
 
     # 资源列表：None 表示全部可用（BaseContext 语义）
-    skills = context.get("skills")
-    projection.skill_slugs = (
-        await _visible_skill_slugs(db) if skills is None else list(skills)
-    )
-    mcps = context.get("mcps")
-    projection.mcp_server_names = [] if mcps is None else list(mcps)
-    projection.knowledge_slugs = [] if is_lite_mode() else list(context.get("knowledges") or [])
-
-    subagent_result = await db.execute(select(Agent).where(Agent.is_subagent.is_(True)))
-    projection.subagent_templates = [
-        project_subagent_template(row) for row in subagent_result.scalars().all()
+    accessible_skills = await list_accessible_skills(db, user)
+    accessible_by_slug = {item.slug: item for item in accessible_skills}
+    configured_skills = context.get("skills")
+    selected_slugs = list(accessible_by_slug) if configured_skills is None else list(configured_skills)
+    inaccessible_skills = [slug for slug in selected_slugs if slug not in accessible_by_slug]
+    if inaccessible_skills:
+        raise ValueError(f"智能体引用了当前用户不可访问的 Skill: {', '.join(inaccessible_skills)}")
+    projection.skill_slugs = selected_slugs
+    projection.skills = [
+        {
+            "slug": item.slug,
+            "name": item.name,
+            "source_dir": str(item.source_dir),
+        }
+        for item in (accessible_by_slug[slug] for slug in selected_slugs)
     ]
+    from yuxi.agents.mcp.service import load_enabled_mcp_server_configs
+
+    configured_mcps = context.get("mcps")
+    if configured_mcps is None:
+        selected_mcps = None
+    else:
+        if not isinstance(configured_mcps, list) or any(
+            not isinstance(slug, str) or not slug.strip() for slug in configured_mcps
+        ):
+            raise ValueError("智能体 MCP 配置只能包含非空 slug")
+        selected_mcps = list(dict.fromkeys(slug.strip() for slug in configured_mcps))
+    loaded_mcp_configs = await load_enabled_mcp_server_configs(names=selected_mcps, db=db)
+    mcp_configs = {
+        slug: config
+        for slug, config in loaded_mcp_configs.items()
+        if config.get("transport") in {"sse", "streamable_http"}
+    }
+    if selected_mcps is not None:
+        unavailable_mcps = [slug for slug in selected_mcps if slug not in mcp_configs]
+        if unavailable_mcps:
+            raise ValueError("智能体引用了不存在、未启用或不允许的 MCP: " + ", ".join(unavailable_mcps))
+        mcp_slugs = selected_mcps
+    else:
+        mcp_slugs = list(mcp_configs)
+    projection.mcp_servers = [{"slug": slug, **mcp_configs[slug]} for slug in mcp_slugs]
+
+    configured_knowledge = context.get("knowledges")
+    projection.knowledge_slugs = (
+        [] if is_lite_mode() else None if configured_knowledge is None else list(configured_knowledge)
+    )
+
+    visible_subagents = await AgentRepository(db).list_visible_subagents(user=user)
+    configured_subagents = context.get("subagents")
+    if configured_subagents is not None:
+        visible_by_slug = {item.slug: item for item in visible_subagents}
+        inaccessible_subagents = [slug for slug in configured_subagents if slug not in visible_by_slug]
+        if inaccessible_subagents:
+            raise ValueError("智能体引用了当前用户不可访问的子智能体: " + ", ".join(inaccessible_subagents))
+        visible_subagents = [visible_by_slug[slug] for slug in configured_subagents]
+    projection.subagent_templates = [project_subagent_template(row) for row in visible_subagents]
     return projection

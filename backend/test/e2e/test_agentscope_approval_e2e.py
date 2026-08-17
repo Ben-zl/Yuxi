@@ -13,15 +13,19 @@ import pytest
 from test.e2e.agentscope_e2e_fixtures import (
     PROVIDER_ID,
     cleanup_fixture_agents,
+    cleanup_test_users,
+    seed_test_users,
     upsert_mock_provider,
 )
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.runner import collect_chat_round, ensure_thread_session
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Agent
+from yuxi.storage.redis.manager import close_async_redis_client
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
 CHATBOT_SLUG = "e2e-approval-chatbot"
+TEST_UIDS = ("e2e-approval", "e2e-approval-reject", "e2e-approval-cancel")
 
 pytestmark = pytest.mark.e2e
 
@@ -32,6 +36,7 @@ async def db_session():
     await pg_manager.ensure_business_schema()
     async with pg_manager.get_async_session_context() as session:
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
+        await seed_test_users(session, *TEST_UIDS)
         session.add(
             Agent(
                 slug=CHATBOT_SLUG,
@@ -40,6 +45,7 @@ async def db_session():
                 config_json={
                     "context": {
                         "model": f"{PROVIDER_ID}:mock-chat-model",
+                        "mcps": [],
                         "system_prompt": "你是审批测试助手。",
                     }
                 },
@@ -49,6 +55,8 @@ async def db_session():
         await upsert_mock_provider(session)
         yield session
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
+        await cleanup_test_users(session, *TEST_UIDS)
+    await close_async_redis_client()
     await pg_manager.close()
     pg_manager._initialized = False
 
@@ -69,7 +77,9 @@ async def _resume_and_collect(client, mapping, uid, confirm_event, confirmed):
 
     async def _pump():
         async for event in client.stream_events(
-            uid, mapping.agentscope_agent_id, mapping.agentscope_session_id,
+            uid,
+            mapping.agentscope_agent_id,
+            mapping.agentscope_session_id,
             read_timeout=120.0,
         ):
             await queue.put(event)
@@ -111,9 +121,7 @@ async def _park_round(client, mapping, uid):
 
 async def _new_thread(db_session, client, uid):
     thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
-    mapping = await ensure_thread_session(
-        db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG
-    )
+    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
     return mapping
 
 
@@ -124,9 +132,7 @@ async def test_sensitive_tool_parks_and_resume_approves(db_session):
     _, confirm_event = await _park_round(client, mapping, "e2e-approval")
     assert confirm_event["tool_calls"][0]["name"] == "Write"
 
-    types, finished = await _resume_and_collect(
-        client, mapping, "e2e-approval", confirm_event, confirmed=True
-    )
+    types, finished = await _resume_and_collect(client, mapping, "e2e-approval", confirm_event, confirmed=[True])
     assert finished == "completed"
     assert "TOOL_RESULT_END" in types, types
 
@@ -139,9 +145,7 @@ async def test_reject_ends_round(db_session):
 
     # 拒绝后 agentscope 原生行为：模型收到拒绝说明并结束本轮（与旧栈
     # 「直接中断」的差异已记录为黄线项）
-    _, finished = await _resume_and_collect(
-        client, mapping, "e2e-approval-reject", confirm_event, confirmed=False
-    )
+    _, finished = await _resume_and_collect(client, mapping, "e2e-approval-reject", confirm_event, confirmed=[False])
     assert finished == "completed"
 
 
@@ -157,8 +161,10 @@ async def test_parked_session_can_be_cancelled(db_session):
 
     async def _pump():
         async for event in client.stream_events(
-            "e2e-approval-cancel", mapping.agentscope_agent_id,
-            mapping.agentscope_session_id, read_timeout=60.0,
+            "e2e-approval-cancel",
+            mapping.agentscope_agent_id,
+            mapping.agentscope_session_id,
+            read_timeout=60.0,
         ):
             await queue.put(event)
 
@@ -166,7 +172,8 @@ async def test_parked_session_can_be_cancelled(db_session):
     try:
         await asyncio.sleep(0.5)
         await client.interrupt_session(
-            "e2e-approval-cancel", mapping.agentscope_agent_id,
+            "e2e-approval-cancel",
+            mapping.agentscope_agent_id,
             mapping.agentscope_session_id,
         )
         while True:

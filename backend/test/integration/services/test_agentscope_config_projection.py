@@ -10,8 +10,9 @@ from sqlalchemy import delete
 
 from yuxi.agentscope.config_projection import project_runtime
 from yuxi.config import config
+from yuxi.repositories.agent_repository import DEFAULT_SHARE_CONFIG
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Agent, ModelProvider, Skill
+from yuxi.storage.postgres.models_business import Agent, MCPServer, ModelProvider, Skill, User
 
 CHATBOT_SLUG = "it-proj-chatbot"
 SUBAGENT_SLUG = "it-proj-subagent"
@@ -28,6 +29,12 @@ async def db_session():
     async with pg_manager.get_async_session_context() as session:
         session.add_all(
             [
+                User(
+                    uid="it-proj-user",
+                    username="it-proj-user",
+                    password_hash="test-only",
+                    role="superadmin",
+                ),
                 Agent(
                     slug=CHATBOT_SLUG,
                     name="投影测试智能体",
@@ -41,7 +48,7 @@ async def db_session():
                             "knowledges": ["kb-a"],
                         }
                     },
-                    share_config={},
+                    share_config=DEFAULT_SHARE_CONFIG,
                 ),
                 Agent(
                     slug=SUBAGENT_SLUG,
@@ -50,7 +57,7 @@ async def db_session():
                     backend_id="SubAgentBackend",
                     is_subagent=True,
                     config_json={"context": {}},
-                    share_config={},
+                    share_config=DEFAULT_SHARE_CONFIG,
                 ),
                 ModelProvider(
                     provider_id=PROVIDER_ID,
@@ -62,6 +69,15 @@ async def db_session():
                     enabled_models=[{"id": "mock-chat-model", "type": "chat"}],
                     is_enabled=True,
                 ),
+                MCPServer(
+                    slug="it-proj-mcp",
+                    name="投影测试 MCP",
+                    transport="streamable_http",
+                    url="http://mcp-mock:8000/mcp",
+                    enabled=1,
+                    created_by="integration",
+                    updated_by="integration",
+                ),
                 Skill(
                     slug="it-proj-skill",
                     name="投影测试技能",
@@ -70,7 +86,7 @@ async def db_session():
                     mcp_dependencies=[],
                     skill_dependencies=[],
                     dir_path="workspace/skills/it-proj-skill",
-                    share_config={},
+                    share_config=DEFAULT_SHARE_CONFIG,
                     enabled=True,
                 ),
             ]
@@ -78,24 +94,25 @@ async def db_session():
         await session.commit()
         yield session
         await session.execute(delete(Agent).where(Agent.slug.like("it-proj-%")))
-        await session.execute(
-            delete(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID)
-        )
+        await session.execute(delete(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID))
+        await session.execute(delete(MCPServer).where(MCPServer.slug == "it-proj-mcp"))
         await session.execute(delete(Skill).where(Skill.slug == "it-proj-skill"))
+        await session.execute(delete(User).where(User.uid == "it-proj-user"))
         await session.commit()
     await pg_manager.close()
     pg_manager._initialized = False
+    from yuxi.storage.redis.manager import close_async_redis_client
+
+    await close_async_redis_client()
 
 
 async def test_project_runtime_covers_all_components(db_session):
-    projection = await project_runtime(
-        db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG
-    )
+    projection = await project_runtime(db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
 
     assert projection.model_spec == MODEL_SPEC
     assert projection.agent_request["name"] == "投影测试智能体"
     assert projection.agent_request["system_prompt"] == "你是投影测试助手。"
-    # ReAct 迭代上限对齐旧栈 recursion_limit（默认 300）
+    # ReAct 迭代上限使用管理配置的默认值 300。
     assert projection.agent_request["react_config"] == {"max_iters": 300}
     assert projection.credential_data["type"] == "openai_credential"
     assert projection.credential_data["api_key"] == "it-proj-key"
@@ -105,7 +122,14 @@ async def test_project_runtime_covers_all_components(db_session):
 
     # skills=None 表示全部可用：投影为全部可见 Skill（dev 库存量技能 + 夹具技能）
     assert "it-proj-skill" in projection.skill_slugs
-    assert projection.mcp_server_names == ["it-proj-mcp"]
+    assert next(item for item in projection.skills if item["slug"] == "it-proj-skill")["name"] == "投影测试技能"
+    assert projection.mcp_servers == [
+        {
+            "slug": "it-proj-mcp",
+            "transport": "streamable_http",
+            "url": "http://mcp-mock:8000/mcp",
+        }
+    ]
     assert projection.knowledge_slugs == ["kb-a"]
 
     template_types = {t["type"] for t in projection.subagent_templates}
@@ -114,9 +138,7 @@ async def test_project_runtime_covers_all_components(db_session):
 
 async def test_project_runtime_lite_trims_knowledge(db_session, monkeypatch):
     monkeypatch.setenv("LITE_MODE", "true")
-    projection = await project_runtime(
-        db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG
-    )
+    projection = await project_runtime(db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
     assert projection.knowledge_slugs == []
     # 纯聊天核心不受 LITE 影响
     assert projection.chat_model_config["model"] == "mock-chat-model"

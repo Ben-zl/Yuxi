@@ -166,13 +166,9 @@ async def test_confirm_tmp_thread_attachments_materializes_original_and_parsed_f
     monkeypatch.setattr(service, "ensure_thread_dirs", lambda thread_id, user_id: fake_uploads_dir(thread_id))
     monkeypatch.setattr(service, "sandbox_uploads_dir", fake_uploads_dir)
 
-    async def noop_sync(**kwargs):
-        return None
-
     async def noop_invalidate(thread_id: str):
         return None
 
-    monkeypatch.setattr(service, "_sync_thread_upload_state", noop_sync)
     monkeypatch.setattr(service, "invalidate_mention_cache", noop_invalidate)
 
     response = await service.confirm_tmp_thread_attachments_view(
@@ -328,13 +324,9 @@ async def test_confirm_tmp_thread_attachments_keeps_duplicate_names_separate(mon
     monkeypatch.setattr(service, "ensure_thread_dirs", lambda thread_id, uid: fake_uploads_dir(thread_id))
     monkeypatch.setattr(service, "sandbox_uploads_dir", fake_uploads_dir)
 
-    async def noop_sync(**kwargs):
-        return None
-
     async def noop_invalidate(thread_id: str):
         return None
 
-    monkeypatch.setattr(service, "_sync_thread_upload_state", noop_sync)
     monkeypatch.setattr(service, "invalidate_mention_cache", noop_invalidate)
 
     response = await service.confirm_tmp_thread_attachments_view(

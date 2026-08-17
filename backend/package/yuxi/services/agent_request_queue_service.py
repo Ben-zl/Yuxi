@@ -823,16 +823,6 @@ async def _get_queue_state(
             "can_continue": False,
         }
 
-    if latest_run and latest_run.status in {"failed", "cancelled"} and latest_run.finished_at is None:
-        raise RuntimeError(f"Terminal run {latest_run.id} is missing finished_at")
-
-    if latest_run and latest_run.status in {"failed", "cancelled"} and head.created_at <= latest_run.finished_at:
-        return "paused", {
-            "paused_reason": latest_run.status,
-            "blocking_run_id": latest_run.id,
-            "can_continue": True,
-        }
-
     return "ready", {"paused_reason": None, "blocking_run_id": None, "can_continue": False}
 
 

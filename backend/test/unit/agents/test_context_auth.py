@@ -49,10 +49,6 @@ def test_get_configurable_items_filters_admin_fields_for_user():
     items = BaseContext.get_configurable_items(user_role="user")
 
     assert "system_prompt" in items
-    assert "summary_threshold" not in items
-    assert "summary_keep_messages" not in items
-    assert "summary_prompt" not in items
-    assert "summary_tool_result_token_limit" not in items
     assert "max_execution_steps" not in items
 
 
@@ -60,11 +56,8 @@ def test_get_configurable_items_allows_admin_and_superadmin_fields():
     admin_items = BaseContext.get_configurable_items(user_role="admin")
     superadmin_items = SuperAdminOnlyContext.get_configurable_items(user_role="superadmin")
 
-    assert "summary_threshold" in admin_items
-    assert "summary_keep_messages" in admin_items
-    assert "summary_prompt" in admin_items
-    assert "summary_tool_result_token_limit" in admin_items
     assert "max_execution_steps" in admin_items
+    assert admin_items["max_execution_steps"]["name"] == "最大 ReAct 迭代次数"
     assert "secret_setting" in superadmin_items
 
 
@@ -72,10 +65,6 @@ def test_filter_config_by_role_removes_unauthorized_context_values():
     config_json = {
         "context": {
             "system_prompt": "visible",
-            "summary_threshold": 10,
-            "summary_keep_messages": 8,
-            "summary_prompt": "custom summary",
-            "summary_tool_result_token_limit": 500,
             "max_execution_steps": 50,
             "secret_setting": "nope",
         },
@@ -85,17 +74,13 @@ def test_filter_config_by_role_removes_unauthorized_context_values():
     filtered = filter_config_by_role(config_json, "user", context_schema=SuperAdminOnlyContext)
 
     assert filtered == {"context": {"system_prompt": "visible"}, "other": {"keep": True}}
-    assert config_json["context"]["summary_threshold"] == 10
+    assert config_json["context"]["max_execution_steps"] == 50
 
 
 def test_filter_config_by_role_keeps_admin_context_values_for_admin():
     filtered = filter_config_by_role(
         {
             "context": {
-                "summary_threshold": 10,
-                "summary_keep_messages": 8,
-                "summary_prompt": "custom summary",
-                "summary_tool_result_token_limit": 500,
                 "max_execution_steps": 50,
                 "secret_setting": "nope",
             }
@@ -106,10 +91,6 @@ def test_filter_config_by_role_keeps_admin_context_values_for_admin():
 
     assert filtered == {
         "context": {
-            "summary_threshold": 10,
-            "summary_keep_messages": 8,
-            "summary_prompt": "custom summary",
-            "summary_tool_result_token_limit": 500,
             "max_execution_steps": 50,
         }
     }
@@ -235,7 +216,7 @@ async def test_normalize_agent_context_config_expands_null_and_filters_explicit_
 
 
 @pytest.mark.asyncio
-async def test_prepare_agent_runtime_context_filters_resources_and_derives_runtime_scope(monkeypatch):
+async def test_prepare_agent_runtime_context_filters_resources_for_file_view(monkeypatch):
     async def fake_get_databases_by_user(_user):
         return [_knowledge_summary("kb-a"), _knowledge_summary("kb-b")]
 
@@ -251,23 +232,6 @@ async def test_prepare_agent_runtime_context_filters_resources_and_derives_runti
             types.SimpleNamespace(slug="skill-a", name="Skill A", description=""),
             types.SimpleNamespace(slug="skill-b", name="Skill B", description=""),
         ]
-
-    async def fake_resolve_visible_knowledge_bases(context):
-        assert context.knowledges == ["kb-a"]
-        context._visible_knowledge_bases = [{"slug": "kb-a", "name": "Docs A"}]
-        return context._visible_knowledge_bases
-
-    async def fake_resolve_runtime_skills_for_context(context, *, db=None, user=None):
-        del db
-        assert user.uid == "u1"
-        assert context.skills == ["skill-a"]
-        return {
-            "context_skills": ["skill-a"],
-            "prompt_skills": ["skill-a", "skill-b"],
-            "readable_skills": ["skill-a", "skill-b"],
-            "runtime_skill_metadata": {"skill-a": {"name": "Skill A"}},
-            "runtime_skill_dependency_map": {"skill-a": {"skills": ["skill-b"]}},
-        }
 
     class FakeSessionContext:
         async def __aenter__(self):
@@ -289,16 +253,6 @@ async def test_prepare_agent_runtime_context_filters_resources_and_derives_runti
             assert user.uid == "u1"
             return [types.SimpleNamespace(slug="research-agent", name="Research", description="")]
 
-    monkeypatch.setitem(
-        sys.modules,
-        "yuxi.agents.backends.knowledge_base_backend",
-        types.SimpleNamespace(resolve_visible_knowledge_bases_for_context=fake_resolve_visible_knowledge_bases),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "yuxi.agents.middlewares.skills",
-        types.SimpleNamespace(resolve_runtime_skills_for_context=fake_resolve_runtime_skills_for_context),
-    )
     monkeypatch.setitem(
         sys.modules,
         "yuxi.repositories.user_repository",
@@ -357,11 +311,7 @@ async def test_prepare_agent_runtime_context_filters_resources_and_derives_runti
     assert prepared.mcps == ["mcp-a"]
     assert prepared.skills == ["skill-a"]
     assert prepared.subagents == ["research-agent"]
-    assert prepared._visible_knowledge_bases == [{"slug": "kb-a", "name": "Docs A"}]
-    assert prepared._prompt_skills == ["skill-a", "skill-b"]
-    assert prepared._readable_skills == ["skill-a", "skill-b"]
-    assert prepared._runtime_skill_metadata == {"skill-a": {"name": "Skill A"}}
-    assert prepared._runtime_skill_dependency_map == {"skill-a": {"skills": ["skill-b"]}}
+    assert prepared._readable_skills == ["skill-a"]
 
 
 @pytest.mark.asyncio
@@ -377,16 +327,6 @@ async def test_prepare_agent_runtime_context_clears_resources_for_missing_user(m
         async def get_by_uid_with_db(self, _db, _uid):
             return None
 
-    monkeypatch.setitem(
-        sys.modules,
-        "yuxi.agents.backends.knowledge_base_backend",
-        types.SimpleNamespace(resolve_visible_knowledge_bases_for_context=lambda _context: None),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "yuxi.agents.middlewares.skills",
-        types.SimpleNamespace(resolve_runtime_skills_for_context=lambda _context, db=None, user=None: None),
-    )
     monkeypatch.setitem(
         sys.modules,
         "yuxi.repositories.user_repository",
@@ -414,8 +354,4 @@ async def test_prepare_agent_runtime_context_clears_resources_for_missing_user(m
     assert prepared.mcps == []
     assert prepared.skills == []
     assert prepared.subagents == []
-    assert prepared._visible_knowledge_bases == []
-    assert prepared._prompt_skills == []
     assert prepared._readable_skills == []
-    assert prepared._runtime_skill_metadata == {}
-    assert prepared._runtime_skill_dependency_map == {}

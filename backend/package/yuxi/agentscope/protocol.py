@@ -67,6 +67,32 @@ def event_to_chunks(event: dict, *, request_id: str) -> list[dict]:
                 },
             )
         ]
+    if event_type == "REQUIRE_EXTERNAL_EXECUTION":
+        tool_calls = event.get("tool_calls") or []
+        questions = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            try:
+                payload = json.loads(call.get("input") or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if isinstance(payload.get("questions"), list):
+                questions.extend(payload["questions"])
+        if not questions:
+            raise ValueError("外部问答事件缺少有效 questions")
+        return [
+            make_chunk(
+                request_id,
+                status="ask_user_question_required",
+                questions=questions,
+                source=(
+                    tool_calls[0].get("name")
+                    if tool_calls and isinstance(tool_calls[0], dict)
+                    else "external_execution"
+                ),
+            )
+        ]
     if event_type in {"TEXT_BLOCK_DELTA", "THINKING_BLOCK_DELTA"}:
         # 文本与思考增量同构：思考块走 reasoning_content 字段区分
         msg = {"id": reply_id, "type": ASSISTANT_MSG_TYPE, "content": ""}

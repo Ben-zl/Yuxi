@@ -43,7 +43,6 @@ async def _create_agent(
                     "mcps": [],
                     "skills": [],
                     "subagents": [],
-                    "model_retry_times": 0,
                 }
             },
             "share_config": {

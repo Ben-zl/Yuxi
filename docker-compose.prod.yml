@@ -26,8 +26,10 @@ x-api-worker-env: &api-worker-env
   SANDBOX_VIRTUAL_PATH_PREFIX: ${SANDBOX_VIRTUAL_PATH_PREFIX:-/home/gem/user-data}
   SANDBOX_EXEC_TIMEOUT_SECONDS: ${SANDBOX_EXEC_TIMEOUT_SECONDS:-180}
   SANDBOX_MAX_OUTPUT_BYTES: ${SANDBOX_MAX_OUTPUT_BYTES:-262144}
-  NO_PROXY: localhost,127.0.0.1,milvus,graph,minio,milvus-etcd,etcd,mineru,paddlex,sandbox-provisioner,api.siliconflow.cn
-  no_proxy: localhost,127.0.0.1,milvus,graph,minio,milvus-etcd,etcd,mineru,paddlex,sandbox-provisioner,api.siliconflow.cn
+  AGENTSCOPE_BASE_URL: ${AGENTSCOPE_BASE_URL:-http://agentscope:8100}
+  AGENTSCOPE_LEGACY_CUTOFF: ${AGENTSCOPE_LEGACY_CUTOFF:?Set AGENTSCOPE_LEGACY_CUTOFF in .env.prod}
+  NO_PROXY: localhost,127.0.0.1,milvus,graph,minio,milvus-etcd,etcd,mineru,paddlex,sandbox-provisioner,agentscope,api.siliconflow.cn
+  no_proxy: localhost,127.0.0.1,milvus,graph,minio,milvus-etcd,etcd,mineru,paddlex,sandbox-provisioner,agentscope,api.siliconflow.cn
 
 services:
   api:
@@ -67,6 +69,8 @@ services:
         condition: service_healthy
       sandbox-provisioner:
         condition: service_healthy
+      agentscope:
+        condition: service_healthy
 
   worker:
     build:
@@ -96,6 +100,45 @@ services:
       minio:
         condition: service_healthy
       sandbox-provisioner:
+        condition: service_healthy
+      agentscope:
+        condition: service_healthy
+
+  agentscope:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: yuxi-api:${YUXI_VERSION:-0.7.1}
+    container_name: agentscope-prod
+    working_dir: /app
+    networks:
+      - app-network
+    volumes:
+      - ./docker/volumes/yuxi:/app/saves
+      - ./docker/volumes/models:/app/models
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}/docker/volumes/yuxi/agentscope-workspaces:${PWD}/docker/volumes/yuxi/agentscope-workspaces
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env.prod
+    environment:
+      <<: *api-worker-env
+      AGENTSCOPE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.prod}@postgres:5432/agentscope
+      AGENTSCOPE_WORKSPACE_BASEDIR: ${PWD}/docker/volumes/yuxi/agentscope-workspaces
+      AGENTSCOPE_WORKSPACE_BACKEND: docker
+    command: uv run --no-sync --no-dev uvicorn server.agentscope_main:app --host 0.0.0.0 --port 8100
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -H 'X-User-ID: compose-healthcheck' http://localhost:8100/health || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 8
+      start_period: 180s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   sandbox-provisioner:

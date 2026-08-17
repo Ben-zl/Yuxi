@@ -6,7 +6,7 @@
 
 ## 鸟瞰
 
-Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平台。用户通过 Vue 前端管理智能体、知识库、模型、工具、Skills、MCP 与 SubAgents；前端通过 `/api` 调用 FastAPI；后端服务层协调 PostgreSQL、Redis、MinIO、Milvus、Neo4j、LangGraph 和沙盒。
+Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平台。用户通过 Vue 前端管理智能体、知识库、模型、工具、Skills、MCP 与 SubAgents；前端通过 `/api` 调用 FastAPI；后端服务层协调 PostgreSQL、Redis、MinIO、Milvus、Neo4j、AgentScope 和隔离 workspace。
 
 普通智能体请求先在 PostgreSQL 中保存为请求和消息，再立即派发或进入线程级 FIFO 队列。派发后的 `AgentRun` 通过 Redis/ARQ 交给独立 worker 执行，运行事件写入 Redis Stream，最终状态和业务记录写回 PostgreSQL，前端通过 SSE 消费排队与运行事件。
 
@@ -15,8 +15,9 @@ Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平�
 - `web-dev`：Vue 3 / Vite 前端，挂载 `web/src` 并热重载。
 - `api-dev`：FastAPI API 服务，挂载 `backend/server`、`backend/package` 和测试目录并热重载。
 - `worker-dev`：ARQ worker，执行已经派发的 AgentRun，并负责异常恢复扫描。
-- `sandbox-provisioner`：为智能体工具执行提供隔离沙盒。
-- `postgres`：业务数据、知识库元数据、请求队列、AgentRun 与 LangGraph checkpoint。
+- `agentscope-dev`：持久化 AgentScope 会话、执行 ReAct/Team、装配服务端工具并管理每会话隔离 workspace。
+- `sandbox-provisioner`：仅为远程 Skill 安装等一次性管理任务提供隔离沙盒，不承载 AgentScope 对话工具。
+- `postgres`：业务数据、知识库元数据、请求队列、AgentRun，以及独立 `agentscope` database 中的 AgentScope 会话状态。
 - `redis`：ARQ 投递、运行事件、取消信号以及跨进程配置和模型缓存。
 - `minio`：附件、知识库原始文件和其他对象数据。
 - `milvus`、`etcd`：向量检索及其元数据协调。
@@ -31,17 +32,19 @@ Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平�
 
 - `server/main.py` 创建 FastAPI 应用、注册中间件，并将业务路由统一挂载到 `/api`。
 - `server/routers` 是 HTTP 路由边界，所有路由集中在 `server/routers/__init__.py` 注册。
-- `server/utils/lifespan.py` 管理数据库、内置模型/MCP/Skills、知识库、Redis、沙盒、LangGraph checkpoint 和通用 Tasker 的启动与关闭。
+- `server/utils/lifespan.py` 管理数据库、内置模型/MCP/Skills、知识库、Redis、沙盒和通用 Tasker 的启动与关闭。
+- `server/agentscope_main.py` 创建 AgentScope 服务，配置持久存储、Redis message bus、workspace、逐轮工具和观测中间件。
 - `server/worker_main.py` 是 ARQ worker 入口，实际执行设置位于 `yuxi.services.run_worker`。
 
 `LITE_MODE` 下保留认证、智能体、聊天、Skills、MCP、模型、工作区和系统管理接口，但不注册 `external_kb`、`knowledge`、`evaluation` 和 `graph` 路由，也不初始化知识库管理器。
 
 ### `backend/package/yuxi`
 
-- `agents` 定义 LangGraph 智能体体系。`BaseAgent` 是智能体基类，`BaseContext` 是运行上下文；`buildin/chatbot` 和 `buildin/subagent` 放内置智能体；`middlewares` 组合文件系统、Skills、SubAgent、摘要、审批、模型兼容和用量统计；`toolkits` 管理本地工具；`backends` 对接沙盒、知识库和 Skills 文件系统；`skills` 与 `mcp` 管理扩展能力及其运行时加载。
+- `agents` 保留智能体管理面的 backend 元数据、`BaseContext` 配置 Schema，以及 Skills/MCP/工具目录；不再包含独立执行图。实际执行适配集中在 `agentscope`。
+- `agentscope` 负责配置投影、Thread↔Session 映射、AgentScope HTTP 客户端、事件协议转换、取消/审批恢复和 worker 执行。
 - `services` 是用例层。智能体主链路重点分为请求接入与排队、Run 生命周期、运行时配置、worker 执行和 SubAgent 调用；聊天历史、附件、工作区、文件预览、评估、认证和观测等跨模块流程也从这里找入口。
 - `repositories` 是 PostgreSQL 访问边界，封装业务对象、知识库元数据、AgentRun、请求队列、Task 和扩展配置查询。路由不应绕过 repository 直接拼装持久化逻辑。
-- `storage/postgres` 管理 SQLAlchemy 模型、业务连接池和 LangGraph checkpoint 连接池。
+- `storage/postgres` 管理 SQLAlchemy 模型与业务连接池。
 - `storage/redis` 管理同步/异步 Redis 客户端和 ARQ 连接参数；业务 key、事件格式和缓存语义留在各自服务中。
 - `storage/minio` 管理对象上传、下载和临时文件访问。
 - `storage/neo4j` 管理共享 Neo4j Driver、生命周期和图查询辅助。
@@ -79,12 +82,13 @@ Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平�
 
 1. `AgentView` 和 `AgentChatComponent` 收集文本、图片、附件、模型与审批配置。
 2. `web/src/apis/agent_api.js` 调用 `POST /api/agent/runs`，由请求队列服务在同一数据库事务落库运行事实（排队、互斥、幂等），提交后才投递 ARQ。
-4. `worker-dev` 的 `process_agent_run`（`yuxi/services/run_worker.py`）执行 `yuxi.agentscope.worker_job`：统一配置投影（`config_projection`）→ 线程会话保障（Thread↔Session 映射，存量线程按 cutover 时间戳只读拒发）→ `gateway` 协议转换把 agentscope 事件流实时写入 `run:events:{run_id}`（复用既有 SSE 投递与断线续传）。
-5. 会话执行在独立的 agentscope 服务（`server/agentscope_main.py`）：Docker workspace 沙盒按线程隔离；KB/MCP/Skills/内置工具经 `extra_agent_tools` 装配；Team 子智能体由管理员配置投影为 worker 模板；审批挂起经 REQUIRE_USER_CONFIRM 映射为 `human_approval_required` chunk，resume 载荷转换为 UserConfirmResultEvent。
-6. 执行结束：助手消息落回 yuxi 消息表（前端历史视图数据源），AgentRun 终态与 token 用量回写，队头完成后派发下一条排队请求。
-7. 前端在排队阶段消费 Request SSE，派发后消费 Run SSE；断线经 `Last-Event-ID` 从 Redis Stream 续传。
+3. `worker-dev` 的 `process_agent_run`（`yuxi/services/run_worker.py`）执行 `yuxi.agentscope.worker_job`：统一配置投影（`config_projection`）→ 线程会话保障（Thread↔Session 映射，存量线程按 cutover 时间戳只读拒发）→ `gateway` 协议转换把 AgentScope 事件流实时写入 `run:events:{run_id}`（复用既有 SSE 投递与断线续传）。
+4. 会话执行在独立的 AgentScope 服务（`server/agentscope_main.py`）。`DockerWorkspaceManager` 以 session 为单位创建隔离 workspace；附件上传到 `/workspace/uploads`，文件与命令工具在 workspace 中执行。
+5. 知识库、HTTP MCP、网页搜索、补充工具与按当前用户/session 隔离的 `AgentCreate` 模板，通过 `extra_agent_tools` 消费同一 `RuntimeProjection` 在每轮开始时装配。HTTP MCP 由 AgentScope 服务进程中的无状态 `MCPClient` 调用，真实 URL、Header 和凭据不会进入 workspace；stdio MCP 不进入该运行路径。
+6. 审批挂起经 `REQUIRE_USER_CONFIRM` 映射为 `human_approval_required` chunk，resume 载荷转换为 AgentScope 确认或外部执行结果事件。
+7. 执行结束：助手消息落回 Yuxi 消息表（前端历史视图数据源），AgentRun 终态与 token 用量回写，队头完成后派发下一条排队请求。前端消费 Request/Run SSE；断线经 `Last-Event-ID` 从 Redis Stream 续传。
 
-审批或人机输入的 resume 请求仍经队列创建新 AgentRun，worker 将 decisions 载荷映射为审批恢复、文本回答映射为新输入。旧 LangGraph 执行路径已从 worker 移除；旧栈管理面（Skills/MCP/agent_state 视图）的清退计划见迁移工单 14。
+审批或人机输入的 resume 请求仍经队列创建新 AgentRun，worker 将 decisions 载荷映射为审批恢复、文本回答映射为新输入。线程状态接口由 `ThreadStateService` 从 Conversation/Message、AgentRun、Redis 挂起事件和 workspace 产物聚合，不读取旧 checkpoint。
 
 ## 架构不变量
 
@@ -94,7 +98,7 @@ Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平�
 - 同一用户、智能体和线程的普通请求通过 FIFO 队列串行派发；排队请求与运行中的 Run 使用不同状态模型和 SSE。
 - PostgreSQL 保存业务事实状态；Redis 承担投递、事件、取消和缓存，不作为 AgentRun 最终状态的唯一来源。
 - 前端 API 调用集中在 `web/src/apis`，组件不要散落拼接普通 HTTP 接口。
-- 智能体能力通过 context、middleware、toolkits、Skills、MCP 和 backends 组合；不要把知识库、沙盒或扩展逻辑硬编码进单个页面或路由。
+- 智能体配置由 context 管理，运行能力通过 AgentScope 配置投影、`extra_agent_tools`、Skills、MCP 和 workspace 组合；不要把知识库、沙盒或扩展逻辑硬编码进单个页面或路由。
 - Skill 依赖工具只有在对应 Skill 激活后才对模型开放；基础工具与受 Skill 门控的工具要保持边界。
 - LITE 模式必须允许跳过知识库、图谱和评估等重依赖能力，新增导入、路由和启动逻辑时要尊重该边界。
 - 沙盒虚拟路径以 `SANDBOX_VIRTUAL_PATH_PREFIX` 为边界，用户可见路径、对象存储 URL 与宿主机真实路径不能混用。
@@ -104,6 +108,6 @@ Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平�
 
 - **配置**：Compose 和 `.env` 提供部署配置；管理员系统配置写入 `base.toml` 并通过 Redis 快照同步；用户配置与模型供应商以 PostgreSQL 为事实来源。
 - **权限**：前端路由和页面标签提供体验级约束，FastAPI 认证依赖和 repository 可见性查询提供最终授权。
-- **状态与存储**：PostgreSQL 保存请求、Run、消息、业务和知识库元数据；LangGraph checkpoint 使用 PostgreSQL，必要时可回退 SQLite/内存；Redis 保存短期事件、取消信号、ARQ 和跨进程缓存；MinIO、沙盒与本地 `saves` 分别承载不同生命周期的文件。
+- **状态与存储**：Yuxi PostgreSQL 保存请求、Run、消息、业务和知识库元数据；AgentScope 使用独立 PostgreSQL database 保存 agent/session/message；Redis 保存短期事件、取消信号、审批挂起、ARQ 和跨进程缓存；MinIO、AgentScope workspace 与本地 `saves` 分别承载不同生命周期的文件。
 - **文档处理**：上传文件先进入对象存储和文件元数据边界，再经过解析、分块和知识库实现；解析器、分块策略和知识库连接器保持可替换。
 - **观测与调试**：优先查看 `api-dev`、`worker-dev` 和相关依赖日志；Langfuse 集中在服务层和 AgentRun 上下文；SSE 问题同时检查 Redis 事件与 PostgreSQL 终态。

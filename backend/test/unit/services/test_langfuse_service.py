@@ -30,13 +30,6 @@ class _FakeLangfuseClient:
         self.flush_count += 1
 
 
-class _FakeCallbackHandler:
-    def __init__(self, *, public_key=None, trace_context=None):
-        self.public_key = public_key
-        self.trace_context = trace_context
-        self.last_trace_id = None
-
-
 def test_build_run_context_includes_trace_metadata(monkeypatch):
     _FakeLangfuseClient.instances.clear()
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
@@ -44,7 +37,6 @@ def test_build_run_context_includes_trace_metadata(monkeypatch):
     monkeypatch.setenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.example")
     monkeypatch.delenv("LANGFUSE_ENABLED", raising=False)
     monkeypatch.setattr(svc, "Langfuse", _FakeLangfuseClient)
-    monkeypatch.setattr(svc, "CallbackHandler", _FakeCallbackHandler)
     svc.get_langfuse_client.cache_clear()
 
     run_context = svc.build_run_context(
@@ -61,8 +53,7 @@ def test_build_run_context_includes_trace_metadata(monkeypatch):
     )
 
     assert run_context.trace_id == "trace-req-1"
-    assert len(run_context.callbacks) == 1
-    assert run_context.callbacks[0].trace_context == {"trace_id": "trace-req-1"}
+    assert run_context.callbacks == []
     assert run_context.metadata["langfuse_user_id"] == "user-1"
     assert run_context.metadata["langfuse_session_id"] == "thread-1"
     assert run_context.metadata["backend_id"] == "ChatbotAgent"
@@ -108,12 +99,11 @@ def test_build_run_context_merges_evaluation_metadata_and_tags(monkeypatch):
     ]
 
 
-def test_get_trace_info_prefers_handler_last_trace_id(monkeypatch):
+def test_get_trace_info_uses_run_context_trace_id(monkeypatch):
     _FakeLangfuseClient.instances.clear()
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
     monkeypatch.setattr(svc, "Langfuse", _FakeLangfuseClient)
-    monkeypatch.setattr(svc, "CallbackHandler", _FakeCallbackHandler)
     svc.get_langfuse_client.cache_clear()
 
     run_context = svc.build_run_context(
@@ -123,12 +113,11 @@ def test_get_trace_info_prefers_handler_last_trace_id(monkeypatch):
         request_id="req-1",
         operation="agent_chat_stream",
     )
-    run_context.callbacks[0].last_trace_id = "trace-runtime"
 
     trace_info = svc.get_trace_info(run_context)
 
     assert trace_info == {
-        "langfuse_trace_id": "trace-runtime",
+        "langfuse_trace_id": "trace-req-1",
         "langfuse_user_id": "user-1",
         "langfuse_session_id": "thread-1",
     }
@@ -139,7 +128,6 @@ async def test_get_trace_url_async_returns_trace_url(monkeypatch):
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
     monkeypatch.setattr(svc, "Langfuse", _FakeLangfuseClient)
-    monkeypatch.setattr(svc, "CallbackHandler", _FakeCallbackHandler)
     svc.get_langfuse_client.cache_clear()
 
     run_context = svc.build_run_context(
@@ -149,11 +137,10 @@ async def test_get_trace_url_async_returns_trace_url(monkeypatch):
         request_id="req-1",
         operation="agent_chat_stream",
     )
-    run_context.callbacks[0].last_trace_id = "trace-runtime"
 
     trace_url = await svc.get_trace_url_async(run_context)
 
-    assert trace_url == "https://langfuse.local/trace/trace-runtime"
+    assert trace_url == "https://langfuse.local/trace/trace-req-1"
 
 
 def test_submit_user_feedback_score_creates_boolean_score(monkeypatch):
@@ -161,7 +148,6 @@ def test_submit_user_feedback_score_creates_boolean_score(monkeypatch):
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
     monkeypatch.setattr(svc, "Langfuse", _FakeLangfuseClient)
-    monkeypatch.setattr(svc, "CallbackHandler", _FakeCallbackHandler)
     svc.get_langfuse_client.cache_clear()
 
     created = svc.submit_user_feedback_score(
@@ -202,7 +188,6 @@ def test_submit_user_feedback_score_returns_false_when_langfuse_fails(monkeypatc
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
     monkeypatch.setattr(svc, "Langfuse", _FakeLangfuseClient)
-    monkeypatch.setattr(svc, "CallbackHandler", _FakeCallbackHandler)
     svc.get_langfuse_client.cache_clear()
     client = svc.get_langfuse_client()
     client.raise_on_score = True

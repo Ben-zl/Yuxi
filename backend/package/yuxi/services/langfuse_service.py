@@ -10,10 +10,8 @@ from yuxi.utils.logging_config import logger
 
 try:
     from langfuse import Langfuse
-    from langfuse.langchain import CallbackHandler
 except Exception:  # pragma: no cover - optional dependency during local test collection
     Langfuse = None  # type: ignore[assignment]
-    CallbackHandler = None  # type: ignore[assignment]
 
 
 _FALSE_VALUES = {"0", "false", "no", "off"}
@@ -32,7 +30,7 @@ def is_langfuse_enabled() -> bool:
     if enabled_raw in _FALSE_VALUES:
         return False
 
-    if Langfuse is None or CallbackHandler is None:
+    if Langfuse is None:
         return False
 
     return bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))
@@ -151,12 +149,11 @@ def build_run_context(
     )
 
     client = get_langfuse_client()
-    if client is None or CallbackHandler is None:
+    if client is None:
         return LangfuseRunContext(metadata=metadata, tags=tags)
 
     trace_id = client.create_trace_id(seed=request_id)
-    handler = CallbackHandler(trace_context={"trace_id": trace_id})
-    return LangfuseRunContext(callbacks=[handler], metadata=metadata, tags=tags, trace_id=trace_id)
+    return LangfuseRunContext(metadata=metadata, tags=tags, trace_id=trace_id)
 
 
 def get_trace_info(run_context: LangfuseRunContext | None) -> dict[str, Any]:

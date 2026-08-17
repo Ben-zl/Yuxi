@@ -13,6 +13,7 @@ from urllib.parse import quote, urlparse
 
 import asyncpg
 import uvicorn
+from fastapi import File, Header, HTTPException, Query, UploadFile, status
 
 from yuxi.storage.postgres.manager import pg_manager
 from agentscope.app import create_app
@@ -30,14 +31,10 @@ AGENTSCOPE_DATABASE_URL = os.getenv(
 )
 # message bus 复用全栈共享的 REDIS_URL，不为 agentscope 单独配置
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-AGENTSCOPE_WORKSPACE_BASEDIR = os.getenv(
-    "AGENTSCOPE_WORKSPACE_BASEDIR", "/app/saves/agentscope-workspaces"
-)
-# yuxi 挂载的 saves 目录（Skill 源目录相对其解析）
-AGENTSCOPE_SAVE_DIR = os.getenv("YUXI_SAVE_DIR", "/app/saves")
+AGENTSCOPE_WORKSPACE_BASEDIR = os.getenv("AGENTSCOPE_WORKSPACE_BASEDIR", "/app/saves/agentscope-workspaces")
 # docker 后端的 basedir 必须是 docker daemon 视角的路径（Docker Desktop 下
 # 为宿主路径，需将同一路径自镜像挂载进本容器）
-AGENTSCOPE_WORKSPACE_BACKEND = os.getenv("AGENTSCOPE_WORKSPACE_BACKEND", "local")
+AGENTSCOPE_WORKSPACE_BACKEND = os.getenv("AGENTSCOPE_WORKSPACE_BACKEND", "docker")
 
 
 async def _ensure_database_exists(database_url: str) -> None:
@@ -48,42 +45,14 @@ async def _ensure_database_exists(database_url: str) -> None:
     parsed = urlparse(database_url)
     database = parsed.path.lstrip("/")
     auth = f"{quote(parsed.username or '')}:{quote(parsed.password or '')}@"
-    maintenance_dsn = (
-        f"postgresql://{auth}{parsed.hostname}:{parsed.port or 5432}/postgres"
-    )
+    maintenance_dsn = f"postgresql://{auth}{parsed.hostname}:{parsed.port or 5432}/postgres"
     conn = await asyncpg.connect(maintenance_dsn)
     try:
-        exists = await conn.fetchval(
-            "SELECT 1 FROM pg_database WHERE datname = $1", database
-        )
+        exists = await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", database)
         if not exists:
             await conn.execute(f'CREATE DATABASE "{database}"')
     finally:
         await conn.close()
-
-
-async def _thread_knowledge_slugs(agentscope_agent_id: str) -> list[str] | None:
-    """按 agentscope agent_id 反查线程的会话启用知识库集（None=全部）。"""
-    from yuxi.agentscope.projection import agent_context
-    from yuxi.repositories.agentscope_thread_sessions import (
-        get_thread_session_by_agentscope_agent,
-    )
-    from yuxi.storage.postgres.models_business import Agent
-    from sqlalchemy import select
-
-    async with pg_manager.get_async_session_context() as db:
-        mapping = await get_thread_session_by_agentscope_agent(
-            db, agentscope_agent_id=agentscope_agent_id
-        )
-        if mapping is None:
-            return None
-        row = (
-            await db.execute(select(Agent).where(Agent.slug == mapping.agent_slug))
-        ).scalar_one_or_none()
-        if row is None:
-            return None
-        knowledges = agent_context(row).get("knowledges")
-        return None if knowledges is None else list(knowledges)
 
 
 async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str) -> list:
@@ -99,80 +68,49 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
 
 async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> list:
     """每轮 chat 按会话注入 yuxi 工具（KB 工具按可见性，LITE 自动裁剪）。"""
-    from yuxi.agentscope.tools import build_extra_tools, build_kb_tools, build_web_search_tool
+    from yuxi.agentscope.tools import (
+        build_extra_tools,
+        build_kb_tools,
+        build_mcp_tools,
+        build_subagent_tools,
+        build_web_search_tool,
+    )
+    from yuxi.agentscope.runtime_resources import resolve_runtime_projection
 
-    knowledge_slugs = await _thread_knowledge_slugs(agent_id)
-    tools = await build_kb_tools(uid=user_id, knowledge_slugs=knowledge_slugs)
+    async with pg_manager.get_async_session_context() as db:
+        projection = await resolve_runtime_projection(
+            db,
+            app.state.storage,
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+
+    tools = await build_kb_tools(uid=user_id, knowledge_slugs=projection.knowledge_slugs)
+    tools.extend(await build_mcp_tools(mcp_servers=projection.mcp_servers))
     tools.extend(
         await build_extra_tools(
             uid=user_id,
-            knowledge_slugs=knowledge_slugs,
+            knowledge_slugs=projection.knowledge_slugs,
             agent_id=agent_id,
             session_id=session_id,
+        )
+    )
+    tools.extend(
+        await build_subagent_tools(
+            storage=app.state.storage,
+            message_bus=app.state.message_bus,
+            workspace_manager=app.state.workspace_manager,
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            templates=projection.subagent_templates,
         )
     )
     web_search_tool = build_web_search_tool()
     if web_search_tool is not None:
         tools.append(web_search_tool)
     return tools
-
-
-def _subagent_templates(rows: list) -> list:
-    """把管理员配置的子智能体投影为 Team worker 模板（创建期快照）。"""
-    from agentscope.app import SubAgentTemplate
-
-    from yuxi.agentscope.projection import project_subagent_template
-
-    templates = []
-    for row in rows:
-        payload = project_subagent_template(row)
-        templates.append(
-            SubAgentTemplate(
-                type=payload["type"],
-                description=payload["description"],
-                system_prompt_template=payload["system_prompt_template"],
-            )
-        )
-    return templates
-
-
-async def _resolve_skill_paths() -> list[str]:
-    """读取启用的 Skill 源目录（相对 save_dir），作为 workspace 技能种子。
-
-    渐进披露由 agentscope 的 SkillViewer 机制承担（模型按需查看
-    SKILL.md），替代旧栈「读到激活」语义；目录在服务启动期快照。
-    """
-    import os
-
-    from sqlalchemy import select
-
-    from yuxi.storage.postgres.manager import pg_manager
-    from yuxi.storage.postgres.models_business import Skill
-
-    async with pg_manager.get_async_session_context() as db:
-        rows = (
-            await db.execute(select(Skill.slug, Skill.dir_path).where(Skill.enabled.is_(True)))
-        ).all()
-    paths = []
-    for _, dir_path in rows:
-        absolute = os.path.join(AGENTSCOPE_SAVE_DIR, dir_path)
-        if os.path.isdir(absolute):
-            paths.append(absolute)
-    return paths
-
-
-async def _resolve_subagent_rows() -> list:
-    """读取管理员配置的子智能体定义（Team worker 模板源，启动期快照）。"""
-    from sqlalchemy import select
-
-    from yuxi.storage.postgres.manager import pg_manager
-    from yuxi.storage.postgres.models_business import Agent
-
-    async with pg_manager.get_async_session_context() as db:
-        rows = (
-            await db.execute(select(Agent).where(Agent.is_subagent.is_(True)))
-        ).scalars().all()
-    return list(rows)
 
 
 def _setup_otel_if_configured() -> None:
@@ -191,9 +129,7 @@ def _setup_otel_if_configured() -> None:
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
     provider = TracerProvider(
-        resource=Resource.create(
-            {"service.name": os.getenv("OTEL_SERVICE_NAME", "yuxi-agentscope")}
-        )
+        resource=Resource.create({"service.name": os.getenv("OTEL_SERVICE_NAME", "yuxi-agentscope")})
     )
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
@@ -207,25 +143,20 @@ def _create_service_app_sync():
     持久存储指向独立 database，实时 bus 走 Redis，workspace 先用本地目录。
     """
     bootstrap_error = []
-    skill_paths: list[str] = []
-    subagent_rows: list = []
 
-    async def _bootstrap() -> list[str]:
+    async def _bootstrap() -> None:
         await _ensure_database_exists(AGENTSCOPE_DATABASE_URL)
         # initialize 需在事件循环内执行（内部创建 asyncpg/psycopg 连接池）；
         # 用毕立即释放并复位，避免连接池绑定 bootstrap 线程的循环——
         # 服务主循环内的首次使用（extra_agent_tools）会按需重新初始化
         pg_manager.initialize()
         await pg_manager.ensure_business_schema()
-        skills = await _resolve_skill_paths()
-        subagent_rows.extend(await _resolve_subagent_rows())
         await pg_manager.reset()
-        return skills
 
     def _run_bootstrap():
         loop = asyncio.new_event_loop()
         try:
-            skill_paths.extend(loop.run_until_complete(_bootstrap()))
+            loop.run_until_complete(_bootstrap())
         except Exception as exc:  # noqa: BLE001 - 线程内异常需带回主线程
             bootstrap_error.append(exc)
         finally:
@@ -245,12 +176,9 @@ def _create_service_app_sync():
         workspace_manager = DockerWorkspaceManager(
             basedir=AGENTSCOPE_WORKSPACE_BASEDIR,
             isolation=IsolationPolicy.PER_SESSION,
-            skill_paths=skill_paths,
         )
     else:
-        workspace_manager = LocalWorkspaceManager(
-            basedir=AGENTSCOPE_WORKSPACE_BASEDIR, skill_paths=skill_paths
-        )
+        workspace_manager = LocalWorkspaceManager(basedir=AGENTSCOPE_WORKSPACE_BASEDIR)
     return create_app(
         storage=AsyncSQLAlchemyStorage(AGENTSCOPE_DATABASE_URL, create_tables=True),
         message_bus=RedisMessageBus(
@@ -261,13 +189,40 @@ def _create_service_app_sync():
         ),
         extra_agent_middlewares=_extra_agent_middlewares,
         extra_agent_tools=_extra_agent_tools,
-        custom_subagent_templates=_subagent_templates(subagent_rows),
         workspace_manager=workspace_manager,
         title="Yuxi AgentScope Service",
     )
 
 
 app = _create_service_app_sync()
+
+
+@app.post("/yuxi/workspace/file", status_code=status.HTTP_201_CREATED)
+async def upload_yuxi_workspace_file(
+    file: UploadFile = File(...),
+    agent_id: str = Query(...),
+    session_id: str = Query(...),
+    destination: str = Query(...),
+    x_user_id: str = Header(...),
+) -> dict:
+    """把 Yuxi 已授权附件写入指定会话的隔离 workspace。"""
+    from urllib.parse import unquote
+    from yuxi.agentscope.workspace_files import MAX_WORKSPACE_UPLOAD_BYTES, store_workspace_upload
+
+    data = await file.read(MAX_WORKSPACE_UPLOAD_BYTES + 1)
+    try:
+        return await store_workspace_upload(
+            app.state.workspace_service,
+            user_id=unquote(x_user_id),
+            agent_id=agent_id,
+            session_id=session_id,
+            destination=destination,
+            data=data,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OverflowError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
 
 
 if __name__ == "__main__":

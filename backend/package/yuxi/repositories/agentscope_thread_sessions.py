@@ -6,9 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.storage.postgres.models_business import AgentScopeThreadSession
 
 
-async def get_thread_session(
-    db: AsyncSession, *, uid: str, thread_id: str
-) -> AgentScopeThreadSession | None:
+async def get_thread_session(db: AsyncSession, *, uid: str, thread_id: str) -> AgentScopeThreadSession | None:
     """按用户与线程取映射记录。"""
     result = await db.execute(
         select(AgentScopeThreadSession).where(
@@ -45,13 +43,43 @@ async def create_thread_session(
     return record
 
 
+async def update_thread_session_model(
+    db: AsyncSession,
+    record: AgentScopeThreadSession,
+    *,
+    model_spec: str,
+    agentscope_credential_id: str,
+) -> AgentScopeThreadSession:
+    """在 AgentScope 会话更新成功后同步模型映射事实。"""
+    record.model_spec = model_spec
+    record.agentscope_credential_id = agentscope_credential_id
+    await db.flush()
+    return record
+
+
 async def get_thread_session_by_agentscope_agent(
     db: AsyncSession, *, agentscope_agent_id: str
 ) -> AgentScopeThreadSession | None:
     """按 agentscope agent_id 反查映射（extra_agent_tools 工厂使用）。"""
     result = await db.execute(
+        select(AgentScopeThreadSession).where(AgentScopeThreadSession.agentscope_agent_id == agentscope_agent_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_thread_session_by_agentscope_context(
+    db: AsyncSession,
+    *,
+    uid: str,
+    agentscope_agent_id: str,
+    agentscope_session_id: str,
+) -> AgentScopeThreadSession | None:
+    """按用户、Agent 与 Session 精确反查线程映射。"""
+    result = await db.execute(
         select(AgentScopeThreadSession).where(
-            AgentScopeThreadSession.agentscope_agent_id == agentscope_agent_id
+            AgentScopeThreadSession.uid == uid,
+            AgentScopeThreadSession.agentscope_agent_id == agentscope_agent_id,
+            AgentScopeThreadSession.agentscope_session_id == agentscope_session_id,
         )
     )
     return result.scalar_one_or_none()

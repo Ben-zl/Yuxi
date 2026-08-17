@@ -10,7 +10,6 @@ from urllib.parse import quote
 from fastapi import HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from yuxi.agents.backends import create_agent_composite_backend
 from yuxi.agents.backends.sandbox import (
     SKILLS_PATH,
     USER_DATA_PATH,
@@ -263,10 +262,8 @@ async def _resolve_viewer_state(
     )
     selected_skills = getattr(runtime_context, "_readable_skills", [])
     selected_skills = normalize_string_list(selected_skills if isinstance(selected_skills, list) else [])
-    runtime_stub = type("RuntimeStub", (), {"context": runtime_context})()
-    sandbox_backend = create_agent_composite_backend(runtime_stub)
     skills_backend = SelectedSkillsReadonlyBackend(selected_slugs=selected_skills)
-    return sandbox_backend, skills_backend, selected_skills
+    return skills_backend, selected_skills
 
 
 async def list_viewer_filesystem_tree(
@@ -280,7 +277,7 @@ async def list_viewer_filesystem_tree(
         raise HTTPException(status_code=422, detail="thread_id 不能为空")
 
     normalized_path = _normalize_path(path)
-    sandbox_backend, skills_backend, selected_skills = await _resolve_viewer_state(
+    skills_backend, selected_skills = await _resolve_viewer_state(
         thread_id=thread_id,
         current_user=current_user,
         db=db,
@@ -345,7 +342,7 @@ async def read_viewer_file_content(
         raise HTTPException(status_code=422, detail="thread_id 不能为空")
     normalized_path = _normalize_path(path)
 
-    sandbox_backend, skills_backend, _selected_skills = await _resolve_viewer_state(
+    skills_backend, _selected_skills = await _resolve_viewer_state(
         thread_id=thread_id,
         current_user=current_user,
         db=db,
@@ -369,9 +366,6 @@ async def read_viewer_file_content(
             return _render_viewer_preview(normalized_path, raw_content)
         elif _is_skills_path(normalized_path):
             responses = await asyncio.to_thread(skills_backend.download_files, [_strip_skills_prefix(normalized_path)])
-        elif _is_in_home_gem(normalized_path):
-            # /home/gem/ 下的其他文件（如 workspace 目录）
-            responses = await asyncio.to_thread(sandbox_backend.download_files, [normalized_path])
         else:
             raise HTTPException(
                 status_code=400,
@@ -402,7 +396,7 @@ async def download_viewer_file(
     db: AsyncSession,
 ) -> StreamingResponse | FileResponse:
     normalized_path = _normalize_path(path)
-    sandbox_backend, skills_backend, _selected_skills = await _resolve_viewer_state(
+    skills_backend, _selected_skills = await _resolve_viewer_state(
         thread_id=thread_id,
         current_user=current_user,
         db=db,
@@ -430,9 +424,6 @@ async def download_viewer_file(
 
         if _is_skills_path(normalized_path):
             responses = await asyncio.to_thread(skills_backend.download_files, [_strip_skills_prefix(normalized_path)])
-        elif _is_in_home_gem(normalized_path):
-            # /home/gem/ 下的其他文件（如 workspace 目录）
-            responses = await asyncio.to_thread(sandbox_backend.download_files, [normalized_path])
         else:
             raise HTTPException(
                 status_code=400,

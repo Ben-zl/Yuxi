@@ -32,6 +32,11 @@ class ConversationRepository:
     def __init__(self, db_session: AsyncSession):
         self.db = db_session
 
+    async def get_message_by_id(self, message_id: int) -> Message | None:
+        """按主键读取消息。"""
+        result = await self.db.execute(select(Message).where(Message.id == message_id))
+        return result.scalar_one_or_none()
+
     def _normalize_title(self, title: str | None) -> str | None:
         if title is None:
             return None

@@ -19,3 +19,4 @@
 - 复用既有覆盖：reject 并发策略由既有 `test_agent_request_queue_concurrency.py` 覆盖（语义未变）；排队 SSE 由网关接入工单/切换工单在真实端点上复核。
 - steer 说明：steer 是旧栈专属提前结束语义，在 Team 工单（11）按新中断机制重新定义，不在本工单迁移。
 - 生产接线（切换工单 14）：arq job 的执行体从 LangGraph run_worker 换为 `execute_run`。
+- 失败接力修复（2026-08-17）：输入消息缺失、配置错误和执行异常统一落 failed 终态并在提交后调用 `dispatch_next_request`；已是 failed/cancelled 的重复任务也会续派，审批挂起的 interrupted 仍保持互斥。集成测试覆盖“队头失败后第二条立即获得派发机会”。

@@ -14,6 +14,8 @@ import pytest
 from test.e2e.agentscope_e2e_fixtures import (
     PROVIDER_ID,
     cleanup_fixture_agents,
+    cleanup_test_users,
+    seed_test_users,
     upsert_mock_provider,
 )
 from yuxi.agentscope.client import AgentScopeServiceClient
@@ -25,6 +27,7 @@ from yuxi.storage.redis.manager import close_async_redis_client, get_async_redis
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
 CHATBOT_SLUG = "e2e-kbtools-chatbot"
+USER_ID = "e2e-kbtools"
 
 pytestmark = pytest.mark.e2e
 
@@ -35,6 +38,7 @@ async def db_session():
     await pg_manager.ensure_business_schema()
     async with pg_manager.get_async_session_context() as session:
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
+        await seed_test_users(session, USER_ID)
         session.add(
             Agent(
                 slug=CHATBOT_SLUG,
@@ -43,6 +47,7 @@ async def db_session():
                 config_json={
                     "context": {
                         "model": f"{PROVIDER_ID}:mock-chat-model",
+                        "mcps": [],
                         "system_prompt": "你是工具测试助手。",
                     }
                 },
@@ -52,20 +57,20 @@ async def db_session():
         await upsert_mock_provider(session)
         yield session
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
+        await cleanup_test_users(session, USER_ID)
+    await close_async_redis_client()
     await pg_manager.close()
     pg_manager._initialized = False
 
 
 async def test_kb_tool_round_executes_and_streams(db_session):
-    uid = "e2e-kbtools"
+    uid = USER_ID
     run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
     request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
     thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
 
     client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = await ensure_thread_session(
-        db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG
-    )
+    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
     result = await stream_round_to_run_events(
         client,
         uid=uid,
@@ -89,17 +94,9 @@ async def test_kb_tool_round_executes_and_streams(db_session):
             if entry["event_type"] == "messages":
                 all_chunks.extend(json.loads(entry["payload"])["payload"]["items"])
 
-        tool_call_chunks = [
-            c
-            for c in all_chunks
-            if c["status"] == "loading" and c["msg"].get("tool_call_chunks")
-        ]
+        tool_call_chunks = [c for c in all_chunks if c["status"] == "loading" and c["msg"].get("tool_call_chunks")]
         assert tool_call_chunks, "应有工具调用增量 chunk"
-        assert any(
-            frag["name"] == "list_kbs"
-            for c in tool_call_chunks
-            for frag in c["msg"]["tool_call_chunks"]
-        )
+        assert any(frag["name"] == "list_kbs" for c in tool_call_chunks for frag in c["msg"]["tool_call_chunks"])
 
         tool_finished = [c for c in all_chunks if c["status"] == "stream_event"]
         assert tool_finished, "应有工具完成 stream_event chunk"

@@ -12,9 +12,9 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any
 
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from agentscope.mcp import HttpMCPConfig, MCPClient, StdioMCPConfig
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -184,15 +184,38 @@ async def ensure_builtin_mcp_servers_in_db() -> None:
 
 async def get_mcp_client(
     server_configs: dict[str, Any] | None = None,
-) -> MultiServerMCPClient | None:
-    """Initializes an MCP client with the given server configurations."""
-    try:
-        client = MultiServerMCPClient(server_configs)  # pyright: ignore[reportArgumentType]
-        logger.info(f"Initialized MCP client with servers: {list(server_configs.keys())}")
-        return client
-    except Exception as e:
-        logger.error("Failed to initialize MCP client: {}", e)
-        return None
+) -> MCPClient:
+    """按数据库配置创建 AgentScope MCP 客户端。"""
+    if not server_configs or len(server_configs) != 1:
+        raise ValueError("每个 MCPClient 必须且只能包含一个服务器配置")
+
+    server_slug, config = next(iter(server_configs.items()))
+    transport = config.get("transport")
+    if transport == "stdio":
+        if server_slug not in _BUILTIN_MCP_SERVER_SLUGS:
+            raise ValueError("用户 stdio MCP 不允许在服务进程启动")
+        mcp_config = StdioMCPConfig(
+            command=config["command"],
+            args=config.get("args"),
+            env=config.get("env"),
+        )
+    elif transport in _USER_CONFIGURABLE_TRANSPORTS:
+        if not config.get("url"):
+            raise ValueError(f"MCP 服务器 {server_slug} 缺少 URL")
+        mcp_config = HttpMCPConfig(
+            url=config["url"],
+            headers=config.get("headers"),
+            timeout=float(config.get("timeout") or config.get("sse_read_timeout") or 30.0),
+        )
+    else:
+        raise ValueError(f"MCP 服务器 {server_slug} 使用不支持的 transport: {transport}")
+
+    return MCPClient(
+        name=server_slug,
+        is_stateful=False,
+        mcp_config=mcp_config,
+        disable_tools=list(config.get("disabled_tools") or []),
+    )
 
 
 def to_camel_case(s: str) -> str:
@@ -206,7 +229,7 @@ def to_camel_case(s: str) -> str:
     return s
 
 
-async def _load_enabled_mcp_server_configs(
+async def load_enabled_mcp_server_configs(
     *,
     names: list[str] | None = None,
     db: AsyncSession | None = None,
@@ -226,12 +249,12 @@ async def _load_enabled_mcp_server_configs(
     from yuxi.storage.postgres.manager import pg_manager
 
     async with pg_manager.get_async_session_context() as session:
-        return await _load_enabled_mcp_server_configs(names=names, db=session)
+        return await load_enabled_mcp_server_configs(names=names, db=session)
 
 
 async def get_enabled_mcp_server_config(server_slug: str, *, db: AsyncSession | None = None) -> dict[str, Any] | None:
     """Get the latest enabled MCP server config from the database."""
-    configs = await _load_enabled_mcp_server_configs(names=[server_slug], db=db)
+    configs = await load_enabled_mcp_server_configs(names=[server_slug], db=db)
     return configs.get(server_slug)
 
 
@@ -300,10 +323,7 @@ async def get_mcp_tools(
             client_config = {k: v for k, v in server_config.items() if k not in ("disabled_tools",)}
 
             client = await get_mcp_client({server_slug: client_config})
-            if client is None:
-                return []
-
-            raw_tools = cast(list[Any], await client.get_tools())
+            raw_tools = list(await client.list_tools())
 
             server_cc = to_camel_case(server_slug)
             for tool in raw_tools:
@@ -311,11 +331,9 @@ async def get_mcp_tools(
                 tool_cc = to_camel_case(original_name)
                 unique_id = f"mcp__{server_cc}__{tool_cc}"
 
-                if tool.metadata is None:
-                    tool.metadata = {}
-                tool.metadata["id"] = unique_id
-                # 开启错误处理，防止工具调用抛出 ToolException 时击穿服务
-                tool.handle_tool_error = True
+                metadata = dict(getattr(tool, "metadata", {}) or {})
+                metadata["id"] = unique_id
+                tool.metadata = metadata
                 all_processed_tools.append(tool)
 
             if cache:
@@ -340,12 +358,9 @@ async def get_mcp_tools(
                     f"{len(all_processed_tools)} tools loaded."
                 )
 
-        except ExceptionGroup as e:
-            logger.warning(f"MCP server '{server_slug}' failed with group error: {e}")
-            return []
         except Exception as e:
             logger.exception(f"Failed to load tools from MCP server '{server_slug}': {e}")
-            return []
+            raise RuntimeError(f"MCP server '{server_slug}' is unavailable: {e}") from e
 
     # 3. Filtering (Apply to Return Value Only)
     if disabled_tools:
@@ -361,7 +376,7 @@ async def get_mcp_tools(
 
 async def get_tools_from_all_servers() -> list[Callable[..., Any]]:
     """Get all tools from all configured MCP servers."""
-    server_configs = await _load_enabled_mcp_server_configs()
+    server_configs = await load_enabled_mcp_server_configs()
     all_tools = []
     for server_slug in server_configs:
         tools = await get_mcp_tools(server_slug, additional_servers=server_configs)
@@ -645,7 +660,7 @@ async def get_servers_config(names: list[str]) -> dict[str, dict[str, Any]]:
     Returns:
         {name: config} dictionary, containing only found servers
     """
-    return await _load_enabled_mcp_server_configs(names=names)
+    return await load_enabled_mcp_server_configs(names=names)
 
 
 async def get_all_mcp_tools(server_slug: str) -> list:

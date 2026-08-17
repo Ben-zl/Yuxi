@@ -25,7 +25,7 @@
 - [ ] 子智能体与子智能体的通信机制
 
 **其他**
-- [ ] 集成 Memory，基于 deepagents 的文件后端实现，需要考虑定位
+- [ ] 设计 AgentScope 长期 Memory：明确用户/Agent/线程作用域、写入权限、压缩策略和可观测性
 - [ ] 优化 Agent 向用户追问交互：支持较长文本回答输入，并在流式输出时保持聊天区跟随最新内容（[#753](https://github.com/xerrors/Yuxi/issues/753)）
 
 

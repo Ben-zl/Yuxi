@@ -80,7 +80,7 @@ class AgentRunRepository:
         return result.scalar_one_or_none()
 
     async def get_latest_run_by_thread_for_user(self, conversation_thread_id: str, uid: str) -> AgentRun | None:
-        """读取线程最近一次 run，用于恢复查询 checkpoint 时的运行时模型。"""
+        """读取线程最近一次 run，用于恢复会话时解析运行模型。"""
         result = await self.db.execute(
             select(AgentRun)
             .where(

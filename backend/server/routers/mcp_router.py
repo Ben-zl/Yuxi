@@ -337,8 +337,8 @@ async def get_mcp_server_tools(
                     "enabled": original_name not in disabled_tools,
                 }
                 # 提取参数信息
-                if hasattr(tool, "args_schema") and tool.args_schema:
-                    schema = tool.args_schema.schema() if hasattr(tool.args_schema, "schema") else {}
+                schema = getattr(tool, "input_schema", None)
+                if isinstance(schema, dict):
                     tool_info["parameters"] = schema.get("properties", {})
                     tool_info["required"] = schema.get("required", [])
                 else:

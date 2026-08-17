@@ -1,7 +1,6 @@
 """网关 team 静默收束与多工具审批补全的单元测试（迁移工单 14 缺口修复）。"""
 
 import asyncio
-import contextlib
 
 import pytest
 
@@ -54,8 +53,15 @@ async def test_team_round_collects_wakeup_continuation(capture_events):
     ]
     client = _StubClient(events)
     result = await gateway.stream_round_to_run_events(
-        client, uid="u", agent_id="a", session_id="s", text="任务",
-        run_id="run-1", request_id="req-1", thread_id="th-1", read_timeout=5.0,
+        client,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        text="任务",
+        run_id="run-1",
+        request_id="req-1",
+        thread_id="th-1",
+        read_timeout=5.0,
     )
     assert result.run_status == "completed"
     assert "已派发。" in result.text and "综合结论：X。" in result.text
@@ -75,8 +81,15 @@ async def test_plain_round_unchanged_first_reply_end(capture_events):
     ]
     client = _StubClient(events)
     result = await gateway.stream_round_to_run_events(
-        client, uid="u", agent_id="a", session_id="s", text="问题",
-        run_id="run-2", request_id="req-2", thread_id="th-2", read_timeout=5.0,
+        client,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        text="问题",
+        run_id="run-2",
+        request_id="req-2",
+        thread_id="th-2",
+        read_timeout=5.0,
     )
     assert result.run_status == "completed"
     assert result.text == "普通回复"
@@ -91,11 +104,14 @@ async def test_collect_asking_tool_calls_from_session(monkeypatch):
     class _MsgClient:
         async def list_messages(self, uid, agent_id, session_id):
             return [
-                {"id": "r1", "content": [
-                    {"type": "text", "text": "hi"},
-                    {"type": "tool_call", "id": "t1", "name": "Write", "input": "{}", "state": "finished"},
-                    {"type": "tool_call", "id": "t2", "name": "Write", "input": "{}", "state": "asking"},
-                ]},
+                {
+                    "id": "r1",
+                    "content": [
+                        {"type": "text", "text": "hi"},
+                        {"type": "tool_call", "id": "t1", "name": "Write", "input": "{}", "state": "finished"},
+                        {"type": "tool_call", "id": "t2", "name": "Write", "input": "{}", "state": "asking"},
+                    ],
+                },
                 {"id": "older", "content": []},
             ]
 
@@ -108,7 +124,68 @@ async def test_collect_asking_tool_calls_from_session(monkeypatch):
         async def list_messages(self, uid, agent_id, session_id):
             raise RuntimeError("down")
 
-    empty = await worker_job._collect_asking_tool_calls(
-        _FailClient(), uid="u", agent_id="a", session_id="s", reply_id="r1"
+    with pytest.raises(RuntimeError, match="down"):
+        await worker_job._collect_asking_tool_calls(_FailClient(), uid="u", agent_id="a", session_id="s", reply_id="r1")
+
+
+async def test_external_execution_parks_as_question(capture_events):
+    """外部执行事件应立即挂起，并写出前端问答 chunk。"""
+    client = _StubClient(
+        [
+            {"type": "REPLY_START", "reply_id": "r1"},
+            {
+                "type": "REQUIRE_EXTERNAL_EXECUTION",
+                "reply_id": "r1",
+                "tool_calls": [
+                    {
+                        "id": "t1",
+                        "name": "ask_user_question",
+                        "input": '{"questions":[{"question":"继续吗？"}]}',
+                    }
+                ],
+            },
+        ]
     )
-    assert empty == []
+    result = await gateway.stream_round_to_run_events(
+        client,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        text="问题",
+        run_id="run-external",
+        request_id="req-external",
+        thread_id="th-external",
+        read_timeout=5.0,
+    )
+    assert result.parked == "external"
+    assert result.pending_confirm["reply_id"] == "r1"
+    message_payload = next(payload for name, payload in capture_events if name == "messages")
+    assert message_payload["items"][0]["status"] == "init"
+    question_payload = [
+        payload
+        for name, payload in capture_events
+        if name == "messages" and payload["items"][0]["status"] == "ask_user_question_required"
+    ]
+    assert len(question_payload) == 1
+
+
+async def test_client_preserves_mixed_confirmation_decisions(monkeypatch):
+    """客户端按位置发送混合审批决定，并拒绝数量不匹配。"""
+    from yuxi.agentscope.client import AgentScopeServiceClient
+
+    client = AgentScopeServiceClient("http://agentscope")
+    captured = {}
+
+    async def _request(method, path, uid, **kwargs):
+        captured.update(kwargs["json"])
+
+    monkeypatch.setattr(client, "_request", _request)
+    calls = [
+        {"id": "t1", "name": "Write", "input": "{}"},
+        {"id": "t2", "name": "Execute", "input": "{}"},
+    ]
+    await client.resume_confirm("u", "a", "s", reply_id="r", tool_calls=calls, confirmed=[True, False])
+    results = captured["input"]["confirm_results"]
+    assert [item["confirmed"] for item in results] == [True, False]
+    with pytest.raises(ValueError, match="数量不一致"):
+        await client.resume_confirm("u", "a", "s", reply_id="r", tool_calls=calls, confirmed=[True])

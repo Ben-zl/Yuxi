@@ -91,6 +91,21 @@ function Ensure-SandboxEnv {
     Set-EnvValue "SANDBOX_PROVISIONER_TOKEN" $SANDBOX_PROVISIONER_TOKEN
 }
 
+function Ensure-AgentScopeEnv {
+    if (Test-EnvValue "AGENTSCOPE_LEGACY_CUTOFF") {
+        return
+    }
+
+    Write-Host "AGENTSCOPE_LEGACY_CUTOFF is missing in .env. Messages before this time become read-only." -ForegroundColor Yellow
+    $AGENTSCOPE_LEGACY_CUTOFF = Read-Host "Please enter an ISO cutoff (press Enter to use current UTC)"
+    if ([string]::IsNullOrEmpty($AGENTSCOPE_LEGACY_CUTOFF)) {
+        $AGENTSCOPE_LEGACY_CUTOFF = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        Write-Host "Generated AGENTSCOPE_LEGACY_CUTOFF and saved it to .env." -ForegroundColor Green
+    }
+
+    Set-EnvValue "AGENTSCOPE_LEGACY_CUTOFF" $AGENTSCOPE_LEGACY_CUTOFF
+}
+
 function Test-SkipExistingImage($ImageTag) {
     & docker image inspect $ImageTag *> $null
     if ($LASTEXITCODE -ne 0) {
@@ -110,6 +125,7 @@ if (Test-Path ".env") {
     Ensure-RequiredApiEnv
     Ensure-JwtEnv
     Ensure-SandboxEnv
+    Ensure-AgentScopeEnv
 } else {
     Write-Host "📝 .env file not found. Let's set up your environment variables." -ForegroundColor Yellow
     Write-Host ""
@@ -168,6 +184,7 @@ if (Test-Path ".env") {
         $SANDBOX_PROVISIONER_TOKEN = New-RandomHex 32
         Write-Host "Generated SANDBOX_PROVISIONER_TOKEN and saved it to .env." -ForegroundColor Green
     }
+    $AGENTSCOPE_LEGACY_CUTOFF = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
 
     # Create .env file
     $envContent = @"
@@ -193,6 +210,7 @@ SILICONFLOW_API_KEY=$apiKey
 JWT_SECRET_KEY=$JWT_SECRET_KEY
 YUXI_INSTANCE_ID=$YUXI_INSTANCE_ID
 SANDBOX_PROVISIONER_TOKEN=$SANDBOX_PROVISIONER_TOKEN
+AGENTSCOPE_LEGACY_CUTOFF=$AGENTSCOPE_LEGACY_CUTOFF
 "@
 
     $envContent | Out-File -FilePath ".env" -Encoding UTF8
@@ -206,6 +224,7 @@ SANDBOX_PROVISIONER_TOKEN=$SANDBOX_PROVISIONER_TOKEN
     Remove-Variable -Name "JWT_SECRET_KEY" -ErrorAction SilentlyContinue
     Remove-Variable -Name "YUXI_INSTANCE_ID" -ErrorAction SilentlyContinue
     Remove-Variable -Name "SANDBOX_PROVISIONER_TOKEN" -ErrorAction SilentlyContinue
+    Remove-Variable -Name "AGENTSCOPE_LEGACY_CUTOFF" -ErrorAction SilentlyContinue
 }
 
 Write-Host ""

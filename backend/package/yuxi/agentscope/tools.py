@@ -11,10 +11,15 @@ import json
 import httpx
 
 from yuxi.agentscope.projection import is_lite_mode
-from yuxi.utils import logger
 
-# KB 管理器初始化只尝试一次（与 api 侧 lifespan 语义一致：失败不阻断服务）
-_kb_initialize_attempted = False
+# 成功后不重复初始化；失败不置位，下一轮可重试。
+_kb_initialized = False
+
+_TEAM_WORKER_PROTOCOL = """
+你是 Team worker。AgentCreate 的 prompt 会作为首个任务自动交给你。
+完成任务后必须调用 TeamSay，把完整结果报告给 leader；to 使用 null 即可广播给团队中的其他成员。
+TeamSay 成功前不得结束本轮，也不能只用普通文本声称已经完成。
+""".strip()
 
 
 def _json(value) -> str:
@@ -30,8 +35,7 @@ async def _visible_knowledge_bases(uid: str, knowledge_slugs: list[str] | None) 
 
     summaries = await knowledge_base.get_databases_by_uid(uid)
     visible = [
-        {"kb_id": s.kb_id, "name": s.name, "description": s.description, "kb_type": s.kb_type}
-        for s in summaries
+        {"kb_id": s.kb_id, "name": s.name, "description": s.description, "kb_type": s.kb_type} for s in summaries
     ]
     if knowledge_slugs is not None:
         enabled = set(knowledge_slugs)
@@ -40,25 +44,19 @@ async def _visible_knowledge_bases(uid: str, knowledge_slugs: list[str] | None) 
 
 
 async def _ensure_kb_manager_ready() -> bool:
-    """确保知识库管理器已初始化；失败或 LITE 下返回 False（不装配 KB 工具）。"""
-    global _kb_initialize_attempted
+    """确保知识库管理器已初始化；失败显式抛出并允许下一轮重试。"""
+    global _kb_initialized
     if is_lite_mode():
         return False
-    if not _kb_initialize_attempted:
-        _kb_initialize_attempted = True
-        try:
-            from yuxi.knowledge.runtime import knowledge_base
+    if not _kb_initialized:
+        from yuxi.knowledge.runtime import knowledge_base
 
-            await knowledge_base.initialize()
-        except Exception as exc:  # noqa: BLE001 - 与 lifespan 同语义：记录并降级
-            logger.error(f"agentscope 侧知识库管理器初始化失败，本轮不装配 KB 工具: {exc}")
-            return False
+        await knowledge_base.initialize()
+        _kb_initialized = True
     return True
 
 
-async def build_kb_tools(
-    *, uid: str, knowledge_slugs: list[str] | None
-) -> list:
+async def build_kb_tools(*, uid: str, knowledge_slugs: list[str] | None) -> list:
     """构建知识库工具集；不可用（LITE/初始化失败/无用户）时返回空集。"""
     if not await _ensure_kb_manager_ready():
         return []
@@ -68,9 +66,7 @@ async def build_kb_tools(
     async def list_kbs() -> str:
         """列出当前用户可见的知识库（返回 kb_id、名称与描述）。"""
         visible = await _visible_knowledge_bases(uid, knowledge_slugs)
-        return _json(
-            [{"kb_id": kb["kb_id"], "name": kb["name"], "description": kb["description"]} for kb in visible]
-        )
+        return _json([{"kb_id": kb["kb_id"], "name": kb["name"], "description": kb["description"]} for kb in visible])
 
     async def query_kb(kb_id: str, query_text: str, file_name: str | None = None) -> str:
         """在指定知识库中检索与 query_text 相关的内容片段。
@@ -86,9 +82,7 @@ async def build_kb_tools(
         result = await knowledge_base.retrieve(kb_id, query_text, file_name=file_name)
         return _json(result)
 
-    async def open_kb_document(
-        kb_id: str, file_id: str, offset: int = 0, window_size: int = 200
-    ) -> str:
+    async def open_kb_document(kb_id: str, file_id: str, offset: int = 0, window_size: int = 200) -> str:
         """分页打开知识库文档内容。
 
         Args:
@@ -100,9 +94,7 @@ async def build_kb_tools(
         target_error = await _check_target_visible(uid, knowledge_slugs, kb_id)
         if target_error:
             return target_error
-        result = await knowledge_base.open_document(
-            kb_id, file_id, offset=offset, limit=window_size
-        )
+        result = await knowledge_base.open_document(kb_id, file_id, offset=offset, limit=window_size)
         return _json(result)
 
     async def find_kb_document(
@@ -173,9 +165,7 @@ async def build_kb_tools(
     ]
 
 
-async def _check_target_visible(
-    uid: str, knowledge_slugs: list[str] | None, kb_id: str
-) -> str | None:
+async def _check_target_visible(uid: str, knowledge_slugs: list[str] | None, kb_id: str) -> str | None:
     """校验 kb_id 对当前用户可见；不可见时返回错误文本。"""
     visible = await _visible_knowledge_bases(uid, knowledge_slugs)
     if not any(kb["kb_id"] == kb_id for kb in visible):
@@ -236,61 +226,89 @@ def build_web_search_tool():
     return FunctionTool(web_search, name="web_search", description="搜索互联网获取最新信息")
 
 
-async def bind_thread_mcps(
-    db,
-    client,
+async def build_mcp_tools(
     *,
-    uid: str,
-    mcp_server_names: list[str] | None,
+    mcp_servers: list[dict],
+) -> list:
+    """按统一投影在 AgentScope 服务进程中装配当前轮次 HTTP MCP 工具。"""
+    from yuxi.agents.mcp.service import get_mcp_client
+
+    tools = []
+    for config in mcp_servers:
+        slug = config["slug"]
+        client = await get_mcp_client({slug: {key: value for key, value in config.items() if key != "slug"}})
+        tools.extend(await client.list_tools())
+    return tools
+
+
+async def build_subagent_tools(
+    *,
+    storage,
+    message_bus,
+    workspace_manager,
+    user_id: str,
     agent_id: str,
     session_id: str,
-) -> int:
-    """把 yuxi 的 MCP 服务器投影绑定到会话 workspace（会话创建期一次性）。
-
-    仅投影启用且 sse/streamable_http 的服务器（stdio 约束在 yuxi 源头
-    强制：用户不可创建 stdio）；重名冲突视为已绑定跳过。
-    """
-    from sqlalchemy import select
-
-    from yuxi.agentscope.client import AgentScopeServiceError
-    from yuxi.storage.postgres.models_business import MCPServer
-
-    stmt = select(MCPServer)
-    if mcp_server_names is not None:
-        if not mcp_server_names:
-            return 0
-        stmt = stmt.where(MCPServer.slug.in_(mcp_server_names))
-    rows = (await db.execute(stmt)).scalars().all()
-
-    bound = 0
-    for row in rows:
-        if not row.enabled or row.transport not in ("sse", "streamable_http") or not row.url:
-            continue
-        mcp_config = {"type": "http_mcp", "url": row.url}
-        if row.headers:
-            mcp_config["headers"] = row.headers
-        if row.timeout:
-            mcp_config["timeout"] = float(row.timeout)
-        payload = {
-            "name": row.slug,
-            "is_stateful": False,
-            "mcp_config": mcp_config,
-        }
-        if row.disabled_tools:
-            payload["disable_tools"] = list(row.disabled_tools)
-        try:
-            await client.add_workspace_mcp(uid, agent_id, session_id, payload)
-            bound += 1
-        except AgentScopeServiceError as exc:
-            if exc.status_code == 409:
-                continue  # 同名 MCP 已绑定
-            raise
-    return bound
-
-
-async def build_extra_tools(
-    *, uid: str, knowledge_slugs: list[str] | None, agent_id: str, session_id: str
+    templates: list[dict],
 ) -> list:
+    """按当前线程允许集合覆盖内建 AgentCreate；worker 会话不暴露 leader 工具。"""
+    session = await storage.get_session(user_id, agent_id, session_id)
+    if session is None:
+        raise ValueError("AgentScope 会话不存在，无法装配子智能体模板")
+    if session.team_id is not None:
+        team = await storage.get_team(user_id, session.team_id)
+        if team is None:
+            raise ValueError("AgentScope Team 已不存在，无法装配子智能体模板")
+        if team.session_id != session_id:
+            return []
+
+    from copy import deepcopy
+
+    from agentscope.app import SubAgentTemplate
+    from agentscope.app._tool import AgentCreate
+    from agentscope.tool import FunctionTool
+
+    if not templates:
+
+        async def unavailable_agent_create() -> str:
+            """当前智能体没有可用的受管子智能体模板。"""
+            raise ValueError("当前智能体没有可用的受管子智能体模板")
+
+        return [
+            FunctionTool(
+                unavailable_agent_create,
+                name="AgentCreate",
+                description="当前智能体没有可用的受管子智能体模板，不能创建 Team worker。",
+            )
+        ]
+
+    indexed = {}
+    for item in templates:
+        template = dict(item)
+        user_prompt = str(template["system_prompt_template"]).rstrip()
+        template["system_prompt_template"] = f"{user_prompt}\n\n{_TEAM_WORKER_PROTOCOL}"
+        indexed[template["type"]] = SubAgentTemplate(**template)
+    tool = AgentCreate(
+        storage=storage,
+        message_bus=message_bus,
+        workspace_manager=workspace_manager,
+        user_id=user_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        sub_agent_templates=indexed,
+    )
+    # AgentScope 会自动追加 default。Yuxi 的受管模板必须显式选择，禁止
+    # 回落到通用 worker 绕过主 Agent 的允许列表。
+    tool._sub_agent_templates.pop("default", None)
+    schema = deepcopy(tool.input_schema)
+    schema["properties"]["subagent_type"]["enum"] = list(indexed)
+    schema["properties"]["subagent_type"]["description"] = "受管子智能体类型，必须来自当前允许集合。"
+    schema.setdefault("required", []).append("subagent_type")
+    tool.input_schema = schema
+    return [tool]
+
+
+async def build_extra_tools(*, uid: str, knowledge_slugs: list[str] | None, agent_id: str, session_id: str) -> list:
     """装配补充工具：download_kb_file / present_artifacts / ocr_parse_file。
 
     KB 相关工具按可见性约束；LITE 下不装配 KB 部分。
@@ -328,9 +346,14 @@ def _download_kb_file_tool(uid: str, knowledge_slugs: list[str] | None):
         data = info.get("data")
         media_type = str(info.get("media_type") or "")
         # 文本类内容直接内联（模型可读）；二进制返回元数据
-        if data is not None and media_type.startswith("text/") or media_type in (
-            "application/json",
-            "text/markdown",
+        if (
+            data is not None
+            and media_type.startswith("text/")
+            or media_type
+            in (
+                "application/json",
+                "text/markdown",
+            )
         ):
             try:
                 return data.decode("utf-8") if isinstance(data, bytes) else str(data)

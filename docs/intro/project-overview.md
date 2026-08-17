@@ -1,6 +1,6 @@
 # 项目简介
 
-Yuxi (语析) 是一个智能知识库和知识图谱 Agent 开发平台，能够帮助你构建结合检索增强生成 (RAG) 与知识图谱推理的生产级 AI 应用。该平台基于 LangGraph、Vue.js 3、FastAPI、Milvus 和 Neo4j 构建，提供创建对话式 AI 系统所需的智能体编排、知识检索、图谱推理、工具调用和文件系统能力。
+Yuxi (语析) 是一个智能知识库和知识图谱 Agent 开发平台，能够帮助你构建结合检索增强生成 (RAG) 与知识图谱推理的生产级 AI 应用。该平台基于 AgentScope、Vue.js 3、FastAPI、Milvus 和 Neo4j 构建，提供创建对话式 AI 系统所需的智能体编排、知识检索、图谱推理、工具调用和隔离工作区能力。
 
 ## 设计理念
 
@@ -17,7 +17,7 @@ Yuxi (语析) 是一个智能知识库和知识图谱 Agent 开发平台，能�
 | 前端 | Vue.js 3, Vite, Ant Design Vue | 现代响应式 UI 框架与组件库 |
 | 状态管理 | Pinia | 前端集中式状态管理 |
 | 后端 API | FastAPI, Uvicorn | 高性能异步 Python Web 框架 |
-| Agent 框架 | LangGraph | Agent 编排、状态管理与 checkpoint |
+| Agent 框架 | AgentScope | ReAct/Team 编排、持久会话、工具审批与隔离 workspace |
 | 知识库 | Milvus（可建库入库）、Dify / Notion（只读连接器） | 向量知识库 RAG 与外部只读数据源检索 |
 | 图数据库 | Neo4j | Milvus 知识库内知识图谱存储与查询 |
 | 文档处理 | MinerU, PaddleX, RapidOCR | 多格式文档解析与 OCR |
@@ -33,7 +33,7 @@ Yuxi 的核心能力不在于“把大模型接进来”，而在于把 **智能
 
 ### 1. 面向真实业务的智能体开发
 
-Yuxi 基于 LangGraph 提供智能体开发能力，不只是一个固定问答入口，而是一套可配置、可扩展的 Agent 运行框架。开发者可以围绕同一个 Agent 配置模型、提示词、工具、MCP、Skills、子智能体与中间件，使“对话能力”变成“可编排的业务能力”。
+Yuxi 基于 AgentScope 提供智能体开发能力，不只是一个固定问答入口，而是一套可配置、可扩展的 Agent 运行框架。开发者可以围绕同一个 Agent 配置模型、提示词、工具、HTTP MCP、Skills 与 Team，使“对话能力”变成“可编排的业务能力”。
 
 这一层是项目的控制中心，决定了模型如何调用工具、如何访问知识、如何接入文件系统以及如何与其他子智能体协作。
 

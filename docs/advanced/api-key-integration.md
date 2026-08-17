@@ -141,7 +141,7 @@ GET /api/agent/runs/{run_id}/result
 | `POST /api/agent-invocation/agent-call/runs/result` | 读取 agent-call run 的 OpenAI 兼容结果结构 | `run_id`、可选 `agent_slug` |
 | `POST /api/agent-invocation/eval/runs` | 运行一次评估样例，阻塞到 run 终态后返回最终输出与可选轨迹摘要 | `query`、`agent_slug`、`evaluation`、`include_trajectory_summary` |
 
-agent-call 的 `messages[].content` 兼容 OpenAI 风格的 `text`/`image_url` 多模态数组：纯文本数组不会触发 422，图片输入会保留原始 LangChain 多模态消息供 worker 恢复。出于安全考虑，**不允许通过 `agent_call_meta.context` 覆盖 Agent 运行上下文**；运行时模型覆盖只允许走独立 `model_spec` 字段。Agent Eval 通常通过 `yuxi agent eval` CLI 触发，详见[智能体评估](../agents/agent-evaluation.md)。
+agent-call 的 `messages[].content` 兼容 OpenAI 风格的 `text`/`image_url` 多模态数组：纯文本数组不会触发 422，图片输入由 Yuxi 本地消息 DTO 保留并交给 worker 恢复。出于安全考虑，**不允许通过 `agent_call_meta.context` 覆盖 Agent 运行上下文**；运行时模型覆盖只允许走独立 `model_spec` 字段。Agent Eval 通常通过 `yuxi agent eval` CLI 触发，详见[智能体评估](../agents/agent-evaluation.md)。
 
 ## 响应格式
 
@@ -153,7 +153,7 @@ agent-call 的 `messages[].content` 兼容 OpenAI 风格的 `text`/`image_url` �
 
 服务端还会定期发送以 `:` 开头的 heartbeat 注释，客户端应忽略。断线重连时，可以在请求头中传 `Last-Event-ID`，或在 query 参数中传 `after_seq`，服务端会从该序号后继续回放事件。
 
-事件流默认返回完整载荷，便于排查 LangGraph/Langfuse 运行细节。如果只需要渲染消息、工具调用、工具结果、Agent state 和终止状态，可以在订阅地址追加 `?verbose=false`。精简模式会保留 SSE `event/data/id`、data 中的 `run_id/thread_id/request_id/payload` 以及客户端消费所需字段；同一 data 内的 `request_id` 会外提为单个字段。精简模式还会跳过 `metadata` 和空 `yuxi.agent_state`，并去掉每个 chunk 中重复的 `meta`、`metadata`、`thread_id`、`response`、空 `namespace` 和图片 base64 等调试字段。
+事件流默认返回完整载荷，便于排查 AgentScope/Langfuse 运行细节。如果只需要渲染消息、工具调用、工具结果、Agent state 和终止状态，可以在订阅地址追加 `?verbose=false`。精简模式会保留 SSE `event/data/id`、data 中的 `run_id/thread_id/request_id/payload` 以及客户端消费所需字段；同一 data 内的 `request_id` 会外提为单个字段。精简模式还会跳过 `metadata` 和空 `yuxi.agent_state`，并去掉每个 chunk 中重复的 `meta`、`metadata`、`thread_id`、`response`、空 `namespace` 和图片 base64 等调试字段。
 
 每次创建 run 都会返回 `request_id`，可用于日志追踪和问题排查。如果需要在多轮对话中使用同一个会话，请复用 `thread_id`，系统会将同一线程的消息串联起来形成连贯的对话上下文。
 

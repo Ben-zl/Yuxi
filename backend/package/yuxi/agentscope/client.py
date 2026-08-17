@@ -6,6 +6,7 @@ service；身份以 X-User-ID 头透传，接入统一认证后在网关注入�
 
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
@@ -32,9 +33,7 @@ class AgentScopeServiceClient:
         return {"X-User-ID": quote(uid)}
 
     async def _request(self, method: str, path: str, uid: str, **kwargs) -> httpx.Response:
-        async with httpx.AsyncClient(
-            base_url=self._base_url, timeout=self._timeout
-        ) as client:
+        async with httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout) as client:
             resp = await client.request(method, path, headers=self._headers(uid), **kwargs)
         if resp.status_code >= 400:
             raise AgentScopeServiceError(
@@ -53,9 +52,7 @@ class AgentScopeServiceClient:
         resp = await self._request("POST", "/credential/", uid, json={"data": data})
         return resp.json()["credential_id"]
 
-    async def create_session(
-        self, uid: str, agent_id: str, chat_model_config: dict
-    ) -> str:
+    async def create_session(self, uid: str, agent_id: str, chat_model_config: dict) -> str:
         """创建会话并绑定模型配置，返回 session_id。"""
         resp = await self._request(
             "POST",
@@ -65,21 +62,61 @@ class AgentScopeServiceClient:
         )
         return resp.json()["session_id"]
 
-    async def add_workspace_mcp(
-        self, uid: str, agent_id: str, session_id: str, mcp_client: dict
-    ) -> None:
-        """把 MCP 客户端配置绑定到会话 workspace（同名冲突返回 409）。"""
+    async def delete_session(self, uid: str, agent_id: str, session_id: str) -> None:
+        """删除测试或回滚场景中的会话。"""
         await self._request(
-            "POST",
-            "/workspace/mcp",
+            "DELETE",
+            f"/sessions/{session_id}",
             uid,
-            params={"agent_id": agent_id, "session_id": session_id},
-            json=mcp_client,
+            params={"agent_id": agent_id},
         )
 
-    async def set_permission_mode(
-        self, uid: str, agent_id: str, session_id: str, mode: str
-    ) -> None:
+    async def delete_agent(self, uid: str, agent_id: str) -> None:
+        """删除测试或回滚场景中的 AgentScope agent。"""
+        await self._request("DELETE", f"/agent/{agent_id}", uid)
+
+    async def delete_credential(self, uid: str, credential_id: str) -> None:
+        """删除测试或回滚场景中的 AgentScope credential。"""
+        await self._request("DELETE", f"/credential/{credential_id}", uid)
+
+    async def add_workspace_skill(self, uid: str, agent_id: str, session_id: str, skill_path: str) -> None:
+        """把已授权 Skill 安装到指定会话 workspace。"""
+        await self._request(
+            "POST",
+            "/workspace/skill",
+            uid,
+            params={"agent_id": agent_id, "session_id": session_id},
+            json={"skill_path": skill_path},
+        )
+
+    async def upload_workspace_file(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        *,
+        source_path: str,
+        destination: str,
+    ) -> str:
+        """上传一个已落盘附件到指定会话 workspace。"""
+        path = Path(source_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"附件文件不存在: {path.name}")
+        with path.open("rb") as stream:
+            resp = await self._request(
+                "POST",
+                "/yuxi/workspace/file",
+                uid,
+                params={
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "destination": destination,
+                },
+                files={"file": (path.name, stream, "application/octet-stream")},
+            )
+        return resp.json()["path"]
+
+    async def set_permission_mode(self, uid: str, agent_id: str, session_id: str, mode: str) -> None:
         """设置会话权限模式（如 accept_edits，跳过文件写工具的人工确认）。"""
         await self._request(
             "PATCH",
@@ -89,9 +126,23 @@ class AgentScopeServiceClient:
             json={"permission_mode": mode},
         )
 
-    async def trigger_chat(
-        self, uid: str, agent_id: str, session_id: str, text: str
+    async def update_session_model(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        chat_model_config: dict,
     ) -> None:
+        """替换已有会话的模型配置。"""
+        await self._request(
+            "PATCH",
+            f"/sessions/{session_id}",
+            uid,
+            params={"agent_id": agent_id},
+            json={"chat_model_config": chat_model_config},
+        )
+
+    async def trigger_chat(self, uid: str, agent_id: str, session_id: str, text: str) -> None:
         """触发一轮对话（fire-and-forget），事件经 stream 端点消费。"""
         msg = {
             "role": "user",
@@ -113,16 +164,53 @@ class AgentScopeServiceClient:
         *,
         reply_id: str,
         tool_calls: list[dict],
-        confirmed: bool,
+        confirmed: list[bool],
     ) -> None:
-        """恢复审批挂起的运行：对全部待确认工具调用给出同一决定。"""
+        """恢复审批挂起的运行：每个工具调用保留自己的审批决定。"""
+        if len(tool_calls) != len(confirmed):
+            raise ValueError("工具调用数量与审批决定数量不一致")
         confirm_results = [
-            {"confirmed": confirmed, "tool_call": call} for call in tool_calls
+            {"confirmed": decision, "tool_call": call} for call, decision in zip(tool_calls, confirmed, strict=True)
         ]
         input_event = {
             "type": "USER_CONFIRM_RESULT",
             "reply_id": reply_id,
             "confirm_results": confirm_results,
+        }
+        await self._request(
+            "POST",
+            "/chat/",
+            uid,
+            json={"agent_id": agent_id, "session_id": session_id, "input": input_event},
+        )
+
+    async def resume_external_execution(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        *,
+        reply_id: str,
+        tool_calls: list[dict],
+        answer: object,
+    ) -> None:
+        """把用户回答作为外部工具结果恢复挂起回复。"""
+        if not tool_calls:
+            raise ValueError("外部执行恢复缺少工具调用")
+        answer_text = answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
+        execution_results = [
+            {
+                "id": call.get("id"),
+                "name": call.get("name"),
+                "output": [{"type": "text", "text": answer_text}],
+                "state": "success",
+            }
+            for call in tool_calls
+        ]
+        input_event = {
+            "type": "EXTERNAL_EXECUTION_RESULT",
+            "reply_id": reply_id,
+            "execution_results": execution_results,
         }
         await self._request(
             "POST",
@@ -159,18 +247,14 @@ class AgentScopeServiceClient:
         """
         url = f"{self._base_url}/sessions/{session_id}/stream"
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=read_timeout)) as client:
-            async with client.stream(
-                "GET", url, params={"agent_id": agent_id}, headers=self._headers(uid)
-            ) as resp:
+            async with client.stream("GET", url, params={"agent_id": agent_id}, headers=self._headers(uid)) as resp:
                 if resp.status_code >= 400:
                     body = (await resp.aread()).decode(errors="replace")[:300]
-                    raise AgentScopeServiceError(
-                        f"GET stream 失败：{resp.status_code} {body}"
-                    )
+                    raise AgentScopeServiceError(f"GET stream 失败：{resp.status_code} {body}")
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue
                     try:
-                        yield json.loads(line[len("data: "):])
+                        yield json.loads(line[len("data: ") :])
                     except ValueError:
                         logger.warning(f"忽略无法解析的事件行：{line[:120]}")

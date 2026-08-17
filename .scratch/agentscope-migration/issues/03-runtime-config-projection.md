@@ -13,7 +13,7 @@
 
 ## Answer（2026-08-14 验证记录）
 
-- 实现：`yuxi/agentscope/config_projection.py` 统一入口 `project_runtime()`（RuntimeProjection 载荷：agent_request、credential_data、chat_model_config、skill_slugs、mcp_server_names、knowledge_slugs、subagent_templates、model_spec）；`projection.py` 扩展 agent 请求与子智能体模板投影 + `is_lite_mode()`；runner 的 ensure_thread_session 改为唯一消费方（所有 agentscope 侧 agent/credential 写入均经投影，无旁路）。
+- 实现：`yuxi/agentscope/config_projection.py` 统一入口 `project_runtime()`（RuntimeProjection 载荷：agent_request、credential_data、chat_model_config、skills、完整 HTTP MCP 配置、knowledge_slugs、subagent_templates、model_spec）；runner 消费核心对象和 Skill，`extra_agent_tools` 每轮消费同一投影的 KB/MCP/Team 资源，不再直查 Agent/MCP 表。
 - 调研事实（决定形态）：Agent/credential 记录唯一来源是 agentscope 的 StorageBase（ResourceAccessPolicy 只做跨 owner 引用，不注入记录），因此投影为**推写式**；Skills/MCP 进入 agent 的通道是 workspace（`workspace.list_skills/list_mcps`），装配分别落在工单 08/09。
 - 测试：`test/integration/services/test_agentscope_config_projection.py` 3 passed（全组件覆盖、LITE 裁剪、显式失败）；tracer e2e 改用 DB 夹具后 2 passed；骨架 e2e 3 passed——合计 8 passed。
-- 后续工单注意：夹具沿用 it-proj-* / e2e-* 命名空间并自行清理；Skill/MCP 装配走 workspace API，不直接写其存储表。
+- 后续工单注意：夹具沿用 it-proj-* / e2e-* 命名空间并自行清理；HTTP MCP 在服务进程执行，配置只从投影传入，不进入 workspace。

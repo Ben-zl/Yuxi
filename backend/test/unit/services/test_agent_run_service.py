@@ -43,7 +43,7 @@ def test_openai_content_parts_build_and_restore_multimodal_message():
         content=input_message.content, image_content=None, metadata={"raw_message": raw_message}
     )
     assert restored.message_type == "multimodal_image"
-    assert restored.require_langchain_message().content == raw_message["content"]
+    assert restored.raw_message()["content"] == raw_message["content"]
 
 
 def test_prepare_run_input_message_keeps_invocation_meta_namespaced():

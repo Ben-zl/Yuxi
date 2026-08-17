@@ -71,10 +71,7 @@ def project_chat_model(provider: ModelProvider, model_id: str) -> tuple[dict, di
     """
     credential_type = _CREDENTIAL_TYPE_BY_PROVIDER.get(provider.provider_type)
     if credential_type is None:
-        raise ValueError(
-            f"模型供应商 {provider.provider_id} 的类型 {provider.provider_type}"
-            " 暂不支持投影到 agentscope"
-        )
+        raise ValueError(f"模型供应商 {provider.provider_id} 的类型 {provider.provider_type} 暂不支持投影到 agentscope")
 
     credential_data = {
         "type": credential_type,

@@ -30,6 +30,7 @@ x-api-worker-env: &api-worker-env
   TASKER_DEFAULT_TIMEOUT_SECONDS: ${TASKER_DEFAULT_TIMEOUT_SECONDS:-21600}
   # agentscope 承接（网关翻转）：队列执行体与 steer 钩子访问的会话服务
   AGENTSCOPE_BASE_URL: ${AGENTSCOPE_BASE_URL:-http://agentscope:8100}
+  AGENTSCOPE_LEGACY_CUTOFF: ${AGENTSCOPE_LEGACY_CUTOFF:?AGENTSCOPE_LEGACY_CUTOFF must be set}
   # Agent run
   RUN_CANCEL_KEY_TTL_SECONDS: ${RUN_CANCEL_KEY_TTL_SECONDS:-1800}
   RUN_EVENTS_STREAM_TTL_SECONDS: ${RUN_EVENTS_STREAM_TTL_SECONDS:-7200}
@@ -107,6 +108,7 @@ services:
       - ./backend/pyproject.toml:/app/pyproject.toml
       - ./backend/uv.lock:/app/uv.lock
       - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}/docker/volumes/yuxi/agentscope-workspaces:${PWD}/docker/volumes/yuxi/agentscope-workspaces
     networks:
       - app-network
     extra_hosts:
@@ -150,8 +152,8 @@ services:
     environment:
       <<: *api-worker-env
       AGENTSCOPE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/agentscope
-      AGENTSCOPE_WORKSPACE_BASEDIR: ${AGENTSCOPE_WORKSPACE_BASEDIR:-/app/saves/agentscope-workspaces}
-      AGENTSCOPE_WORKSPACE_BACKEND: ${AGENTSCOPE_WORKSPACE_BACKEND:-local}
+      AGENTSCOPE_WORKSPACE_BASEDIR: ${PWD}/docker/volumes/yuxi/agentscope-workspaces
+      AGENTSCOPE_WORKSPACE_BACKEND: docker
     command: uv run --no-sync --no-dev uvicorn server.agentscope_main:app --host 0.0.0.0 --port 8100 --reload --reload-dir /app/server --reload-dir /app/package --timeout-graceful-shutdown 5
     restart: unless-stopped
     ports:

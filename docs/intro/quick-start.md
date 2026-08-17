@@ -1,7 +1,7 @@
 # 快速开始指南
 
 欢迎使用 Yuxi（语析），这是一个智能知识库和知识图谱 Agent 开发平台。
-本指南将帮助你在几分钟内启动并运行系统，使你能够利用 LangGraph、RAG 技术和知识图谱构建 AI 驱动的知识应用。
+本指南将帮助你在几分钟内启动并运行系统，使你能够利用 AgentScope、RAG 技术和知识图谱构建 AI 驱动的知识应用。
 
 ![系统架构图](https://xerrors.oss-cn-shanghai.aliyuncs.com/github/arch.png)
 
@@ -107,6 +107,9 @@ docker ps
 
 # 实时查看后端日志
 docker logs api-dev -f
+
+# 实时查看智能体会话服务日志
+docker logs agentscope-dev -f
 
 # 实时查看前端日志
 docker logs web-dev -f

@@ -10,15 +10,14 @@ collect_chat_round 订阅会话事件流后触发对话，收集本次 reply 的
 """
 
 import asyncio
-import contextlib
 from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.config_projection import project_runtime
+from yuxi.agentscope.event_stream import cancel_tasks, start_event_pump
 from yuxi.agentscope.thread_guard import ensure_thread_eligible
-from yuxi.agentscope.tools import bind_thread_mcps
 from yuxi.repositories import agentscope_thread_sessions as thread_session_repo
 from yuxi.repositories.agentscope_thread_sessions import AgentScopeThreadSession
 
@@ -50,25 +49,36 @@ async def ensure_thread_session(
     """
     existing = await thread_session_repo.get_thread_session(db, uid=uid, thread_id=thread_id)
     if existing is not None:
+        if model_spec and model_spec != existing.model_spec:
+            projection = await project_runtime(db, uid=uid, agent_slug=agent_slug, model_spec=model_spec)
+            credential_id = await client.create_credential(uid, projection.credential_data)
+            chat_model_config = {
+                **projection.chat_model_config,
+                "credential_id": credential_id,
+            }
+            await client.update_session_model(
+                uid,
+                existing.agentscope_agent_id,
+                existing.agentscope_session_id,
+                chat_model_config,
+            )
+            await thread_session_repo.update_thread_session_model(
+                db,
+                existing,
+                model_spec=projection.model_spec,
+                agentscope_credential_id=credential_id,
+            )
+            await db.commit()
         return existing
     await ensure_thread_eligible(db, uid=uid, thread_id=thread_id)
 
-    projection = await project_runtime(
-        db, uid=uid, agent_slug=agent_slug, model_spec=model_spec
-    )
+    projection = await project_runtime(db, uid=uid, agent_slug=agent_slug, model_spec=model_spec)
     credential_id = await client.create_credential(uid, projection.credential_data)
     agent_id = await client.create_agent(uid, projection.agent_request)
     chat_model_config = {**projection.chat_model_config, "credential_id": credential_id}
     session_id = await client.create_session(uid, agent_id, chat_model_config)
-    await bind_thread_mcps(
-        db,
-        client,
-        uid=uid,
-        mcp_server_names=projection.mcp_server_names,
-        agent_id=agent_id,
-        session_id=session_id,
-    )
-
+    for skill in projection.skills:
+        await client.add_workspace_skill(uid, agent_id, session_id, skill["source_dir"])
     record = await thread_session_repo.create_thread_session(
         db,
         uid=uid,
@@ -97,20 +107,13 @@ async def collect_chat_round(
     以「最近一次 REPLY_START 到其 REPLY_END」的完整区段识别本轮；
     会话锁保证同 session 串行，本轮必然是最后完成的区段。
     """
-    queue: asyncio.Queue = asyncio.Queue()
-
-    async def _pump() -> None:
-        try:
-            async for event in client.stream_events(
-                uid, agent_id, session_id, read_timeout=read_timeout
-            ):
-                await queue.put(event)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - 泵任务异常需带回消费方
-            await queue.put(exc)
-
-    pump_task = asyncio.create_task(_pump())
+    queue, pump_task = start_event_pump(
+        client,
+        uid=uid,
+        agent_id=agent_id,
+        session_id=session_id,
+        read_timeout=read_timeout,
+    )
     try:
         await asyncio.sleep(SUBSCRIBE_SETTLE_SECONDS)
         await client.trigger_chat(uid, agent_id, session_id, text)
@@ -145,8 +148,4 @@ async def collect_chat_round(
                 round_text = "".join(text_parts)
                 return ChatRoundResult(events=events[span_start:], text=round_text)
     finally:
-        pump_task.cancel()
-        # 等待取消传播完成，让 httpx 流上下文在协程栈展开中正常关闭，
-        # 避免连接清理协程被 GC 兜底（会以 unraisable 警告污染后续测试）
-        with contextlib.suppress(asyncio.CancelledError):
-            await pump_task
+        await cancel_tasks(pump_task)

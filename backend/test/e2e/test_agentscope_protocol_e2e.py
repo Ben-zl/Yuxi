@@ -9,7 +9,13 @@ import os
 import uuid
 
 import pytest
-from test.e2e.agentscope_e2e_fixtures import PROVIDER_ID, cleanup_fixture_agents, upsert_mock_provider
+from test.e2e.agentscope_e2e_fixtures import (
+    PROVIDER_ID,
+    cleanup_fixture_agents,
+    cleanup_test_users,
+    seed_test_users,
+    upsert_mock_provider,
+)
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.gateway import stream_round_to_run_events
@@ -20,6 +26,7 @@ from yuxi.storage.redis.manager import close_async_redis_client, get_async_redis
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
 CHATBOT_SLUG = "e2e-proto-chatbot"
+USER_ID = "e2e-proto"
 
 pytestmark = pytest.mark.e2e
 
@@ -30,6 +37,7 @@ async def db_session():
     await pg_manager.ensure_business_schema()
     async with pg_manager.get_async_session_context() as session:
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
+        await seed_test_users(session, USER_ID)
         session.add_all(
             [
                 Agent(
@@ -39,6 +47,7 @@ async def db_session():
                     config_json={
                         "context": {
                             "model": f"{PROVIDER_ID}:mock-chat-model",
+                            "mcps": [],
                             "system_prompt": "你是协议测试助手。",
                         }
                     },
@@ -50,20 +59,20 @@ async def db_session():
         await session.commit()
         yield session
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
+        await cleanup_test_users(session, USER_ID)
+    await close_async_redis_client()
     await pg_manager.close()
     pg_manager._initialized = False
 
 
 async def test_round_written_as_run_events_with_reconnect(db_session):
-    uid = "e2e-proto"
+    uid = USER_ID
     run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
     request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
     thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
 
     client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = await ensure_thread_session(
-        db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG
-    )
+    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
     result = await stream_round_to_run_events(
         client,
         uid=uid,
@@ -109,9 +118,7 @@ async def test_round_written_as_run_events_with_reconnect(db_session):
         assert all_chunks[0]["msg"]["content"] == "打个招呼"
         assert "loading" in statuses
         joined_text = "".join(
-            c["msg"].get("content", "")
-            for c in all_chunks
-            if c["status"] == "loading" and c["msg"].get("content")
+            c["msg"].get("content", "") for c in all_chunks if c["status"] == "loading" and c["msg"].get("content")
         )
         assert joined_text.startswith("你好，我是 e2e mock 模型")
 

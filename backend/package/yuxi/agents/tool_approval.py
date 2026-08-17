@@ -1,7 +1,5 @@
 from typing import Literal
 
-from langchain.agents.middleware import HumanInTheLoopMiddleware
-
 ToolApprovalMode = Literal["default", "always_trust"]
 
 DEFAULT_TOOL_APPROVAL_MODE: ToolApprovalMode = "default"
@@ -18,9 +16,3 @@ def normalize_tool_approval_mode(value: object) -> ToolApprovalMode:
     if mode not in TOOL_APPROVAL_MODES:
         raise ValueError(f"不支持的 tool_approval_mode: {value}")
     return mode
-
-
-def create_tool_approval_middleware(mode: ToolApprovalMode):
-    if mode == "always_trust":
-        return None
-    return HumanInTheLoopMiddleware(interrupt_on=TOOL_APPROVAL_INTERRUPT_ON)

@@ -11,43 +11,8 @@ from yuxi.utils.logging_config import logger
 from yuxi.utils.paths import WORKSPACE_AGENT_CONTEXT_FILES
 
 WORKSPACE_AGENTS_PROMPT_MAX_BYTES = 64 * 1024
-DEFAULT_SUMMARY_THRESHOLD_K = 100  # 100K tokens
-DEFAULT_SUMMARY_KEEP_MESSAGES = 10
-DEFAULT_SUMMARY_TOOL_RESULT_TOKEN_LIMIT = 300
-DEFAULT_SUMMARY_L2_TRIGGER_RATIO = 0.4
 DEFAULT_MAX_EXECUTION_STEPS = 300
 DEFAULT_TOOL_RESULT_EVICTION_K_TOKENS = 3
-DEFAULT_YUXI_SUMMARY_PROMPT = """你是对话上下文压缩助手。
-你的任务是把下面的对话历史压缩成后续智能体继续工作所需的高价值上下文。
-
-请特别保留并清晰记录：
-
-## SESSION INTENT
-用户当前的主要目标、任务范围和最终交付物。
-
-## USER REQUIREMENTS AND PREFERENCES
-用户明确提出的要求、偏好、禁忌、输出格式、语言风格、技术约束、验收标准，以及对实现方式的取舍意见。只记录仍然可能影响后续回答或执行的内容。
-
-## PROGRESS AND DECISIONS
-已经完成的步骤、关键结论、已确认的方案、被否定的方案及原因。
-
-## ARTIFACTS AND REFERENCES
-已经创建、修改、读取或需要继续关注的文件、路径、工具输出路径、线程或运行标识。保留具体路径和关键标识符。
-
-## NEXT STEPS
-为了完成用户目标，后续最应该继续做的具体步骤。没有待办时写 None。
-
-要求：
-- 不要逐字复述冗长工具输出；保留结论、路径和必要证据。
-- 不要编造没有出现在对话中的事实。
-- 如果存在未解决的问题或风险，明确记录。
-- 使用与用户主要对话一致的语言。
-
-<messages>
-{messages}
-</messages>
-
-只输出压缩后的上下文，不要添加额外说明。"""
 
 
 def _role_can_access(auth: str | None, role: str | None) -> bool:
@@ -131,13 +96,7 @@ def filter_config_by_role(
 
 @dataclass(kw_only=True)
 class BaseContext:
-    """
-    定义一个基础 Context 供 各类 graph 继承
-
-    配置优先级:
-    1. 运行时配置(RunnableConfig)：最高优先级，直接从函数参数传入
-    2. 类默认配置：最低优先级，类中定义的默认值
-    """
+    """定义 AgentScope 智能体的公共运行配置。"""
 
     def update(self, data: dict):
         """更新配置字段"""
@@ -220,8 +179,8 @@ class BaseContext:
             "name": "MCP服务器",
             "options": [],
             "description": (
-                "MCP服务器列表，默认选择当前用户可用的全部 MCP 服务器。建议使用支持 SSE 的 MCP 服务器，"
-                "如果需要使用 uvx 或 npx 运行的服务器，也请在项目外部启动 MCP 服务器，并在项目中配置 MCP 服务器。"
+                "MCP服务器列表，默认选择当前用户可用的全部 MCP 服务器。运行时支持 SSE 和 "
+                "Streamable HTTP；stdio 服务请在项目外部启动并配置为 HTTP MCP。"
             ),
             "type": "list",
             "kind": "mcps",
@@ -240,88 +199,14 @@ class BaseContext:
         },
     )
 
-    summary_threshold: int = field(
-        default=DEFAULT_SUMMARY_THRESHOLD_K,
-        metadata={
-            "name": "上下文摘要触发阈值 (K)",
-            "description": (
-                f"当上下文大小超过该值时，启用摘要功能以优化上下文使用。单位为 K，默认值为 "
-                f"{DEFAULT_SUMMARY_THRESHOLD_K}K。"
-            ),
-            "type": "number",
-            "auth": "admin",
-        },
-    )
-
-    summary_keep_messages: int = field(
-        default=DEFAULT_SUMMARY_KEEP_MESSAGES,
-        metadata={
-            "name": "摘要后保留消息数",
-            "description": (
-                f"上下文摘要触发后，除摘要消息外保留最近的消息数量，默认 {DEFAULT_SUMMARY_KEEP_MESSAGES} 条。"
-            ),
-            "type": "number",
-            "auth": "admin",
-        },
-    )
-
-    summary_prompt: str = field(
-        default=DEFAULT_YUXI_SUMMARY_PROMPT,
-        metadata={
-            "name": "上下文摘要提示词",
-            "description": "触发上下文摘要时使用的提示词，必须能接收 {messages} 作为待摘要消息占位符。",
-            "type": "string",
-            "kind": "prompt",
-            "auth": "admin",
-        },
-    )
-
-    summary_tool_result_token_limit: int = field(
-        default=DEFAULT_SUMMARY_TOOL_RESULT_TOKEN_LIMIT,
-        metadata={
-            "name": "摘要工具结果 token 上限",
-            "description": (
-                "上下文摘要 L1 清洗历史工具结果时，超过该 token 数的 ToolMessage 会写入 outputs，"
-                "并在上下文中保留不超过该 token 数的预览；未超过则保持原样。默认 "
-                f"{DEFAULT_SUMMARY_TOOL_RESULT_TOKEN_LIMIT}。"
-            ),
-            "type": "number",
-            "auth": "admin",
-        },
-    )
-
-    summary_l2_trigger_ratio: float = field(
-        default=DEFAULT_SUMMARY_L2_TRIGGER_RATIO,
-        metadata={
-            "name": "L2 摘要触发比例",
-            "description": (
-                "L1 结构精简后，剩余上下文超过 摘要触发阈值 * 该比例 时才进入 L2 summary。"
-                "建议范围 0.1 到 1.0，值越小越容易触发 L2，默认 "
-                f"{DEFAULT_SUMMARY_L2_TRIGGER_RATIO}。"
-            ),
-            "type": "number",
-            "auth": "admin",
-        },
-    )
-
     max_execution_steps: int = field(
         default=DEFAULT_MAX_EXECUTION_STEPS,
         metadata={
-            "name": "最大执行步数",
+            "name": "最大 ReAct 迭代次数",
             "description": (
-                "单次 Agent 运行允许的最大 LangGraph 执行步数，对应 recursion_limit，默认 "
+                "单次 AgentScope ReActAgent 运行允许的最大迭代次数，对应 react_config.max_iters，默认 "
                 f"{DEFAULT_MAX_EXECUTION_STEPS}。"
             ),
-            "type": "number",
-            "auth": "admin",
-        },
-    )
-
-    model_retry_times: int = field(
-        default=2,
-        metadata={
-            "name": "模型重试次数",
-            "description": "模型调用失败时的最大重试次数，默认值为 2。",
             "type": "number",
             "auth": "admin",
         },
@@ -491,10 +376,12 @@ async def normalize_agent_context_config(
     context_schema: type[BaseContext] | None = None,
 ) -> dict:
     schema = context_schema or BaseContext
-    raw_context = dict(context) if isinstance(context, dict) else {}
+    field_names = {item.name for item in fields(schema)}
+    raw_context = (
+        {key: value for key, value in context.items() if key in field_names} if isinstance(context, dict) else {}
+    )
     filtered = filter_config_by_role({"context": raw_context}, getattr(user, "role", None), schema)
     normalized = dict(filtered.get("context") or {})
-    field_names = {item.name for item in fields(schema)}
     resource_fields = _AGENT_RESOURCE_FIELDS & field_names
     if not resource_fields:
         return normalized
@@ -524,14 +411,12 @@ async def prepare_agent_runtime_context(
     *,
     context_schema: type[BaseContext] | None = None,
 ) -> BaseContext:
-    """准备 Agent 运行时上下文，主要是根据 context 中的 uid 加载用户可访问的资源列表，并进行规范化处理。"""
+    """为管理端文件视图解析线程可见资源，不构建旧 Agent runtime。"""
     schema = context_schema or type(context)
     uid = str(getattr(context, "uid", "") or "").strip()
     if not uid:
         return context
 
-    from yuxi.agents.backends.knowledge_base_backend import resolve_visible_knowledge_bases_for_context
-    from yuxi.agents.middlewares.skills import resolve_runtime_skills_for_context
     from yuxi.repositories.user_repository import UserRepository
     from yuxi.storage.postgres.manager import pg_manager
 
@@ -542,12 +427,7 @@ async def prepare_agent_runtime_context(
             for field_name in resource_fields:
                 if hasattr(context, field_name):
                     setattr(context, field_name, [])
-            setattr(context, "_visible_knowledge_bases", [])
-            setattr(context, "_prompt_skills", [])
             setattr(context, "_readable_skills", [])
-            setattr(context, "_runtime_skill_metadata", {})
-            setattr(context, "_runtime_skill_dependency_map", {})
-            setattr(context, "_runtime_skill_sources", {})
             return context
 
         raw_resources = {
@@ -565,13 +445,6 @@ async def prepare_agent_runtime_context(
             if hasattr(context, field_name):
                 setattr(context, field_name, normalized.get(field_name, []))
 
-        await resolve_visible_knowledge_bases_for_context(context)
-        skill_scope = await resolve_runtime_skills_for_context(context, db=db, user=user)
-        context.skills = skill_scope["context_skills"]
-        setattr(context, "_prompt_skills", skill_scope["prompt_skills"])
-        setattr(context, "_readable_skills", skill_scope["readable_skills"])
-        setattr(context, "_runtime_skill_metadata", skill_scope["runtime_skill_metadata"])
-        setattr(context, "_runtime_skill_dependency_map", skill_scope["runtime_skill_dependency_map"])
-        setattr(context, "_runtime_skill_sources", skill_scope.get("runtime_skill_sources", {}))
+        setattr(context, "_readable_skills", list(context.skills or []))
 
     return context

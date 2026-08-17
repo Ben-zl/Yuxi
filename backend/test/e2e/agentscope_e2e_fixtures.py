@@ -9,16 +9,19 @@ import os
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from yuxi.storage.postgres.models_business import Agent, ModelProvider
+from yuxi.storage.postgres.models_business import (
+    Agent,
+    AgentScopeThreadSession,
+    ModelProvider,
+    User,
+)
 
 PROVIDER_ID = "e2e-openai-mock"
 
 
 async def upsert_mock_provider(db: AsyncSession) -> None:
     """幂等写入 OpenAI 兼容 mock 供应商（指向 openai-mock 容器）。"""
-    provider = await db.scalar(
-        select(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID)
-    )
+    provider = await db.scalar(select(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID))
     if provider is None:
         provider = ModelProvider(provider_id=PROVIDER_ID)
         db.add(provider)
@@ -39,4 +42,27 @@ async def cleanup_fixture_agents(db: AsyncSession, *slugs: str) -> None:
     """
     if slugs:
         await db.execute(delete(Agent).where(Agent.slug.in_(slugs)))
+    await db.commit()
+
+
+async def seed_test_users(db: AsyncSession, *uids: str) -> None:
+    """创建具备完整可见性的隔离 E2E 用户。"""
+    await cleanup_test_users(db, *uids)
+    db.add_all(
+        User(
+            uid=uid,
+            username=uid,
+            password_hash="test-only",
+            role="superadmin",
+        )
+        for uid in uids
+    )
+    await db.commit()
+
+
+async def cleanup_test_users(db: AsyncSession, *uids: str) -> None:
+    """清理 E2E 用户及其 Yuxi 侧 AgentScope 映射。"""
+    if uids:
+        await db.execute(delete(AgentScopeThreadSession).where(AgentScopeThreadSession.uid.in_(uids)))
+        await db.execute(delete(User).where(User.uid.in_(uids)))
     await db.commit()

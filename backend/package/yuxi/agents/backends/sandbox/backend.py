@@ -4,25 +4,10 @@ import base64
 import os
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any
-
-from deepagents.backends.protocol import (
-    EditResult,
-    ExecuteResponse,
-    FileDownloadResponse,
-    FileInfo,
-    FileUploadResponse,
-    GlobResult,
-    GrepMatch,
-    GrepResult,
-    LsResult,
-    ReadResult,
-    WriteResult,
-)
-from deepagents.backends.sandbox import MAX_BINARY_BYTES, BaseSandbox
-from deepagents.backends.utils import _get_file_type
 
 from yuxi.utils.logging_config import logger
 from yuxi.utils.paths import (
@@ -34,6 +19,92 @@ from yuxi.utils.paths import (
 )
 
 from .provider import get_sandbox_provider, sandbox_id_for_thread, sandbox_provisioner_token
+
+MAX_BINARY_BYTES = 512_000
+FileInfo = dict[str, Any]
+GrepMatch = dict[str, Any]
+
+
+@dataclass
+class LsResult:
+    error: str | None = None
+    entries: list[FileInfo] | None = None
+
+
+@dataclass
+class ReadResult:
+    error: str | None = None
+    file_data: dict | None = None
+
+
+@dataclass
+class WriteResult:
+    error: str | None = None
+    path: str | None = None
+
+
+@dataclass
+class EditResult:
+    error: str | None = None
+    path: str | None = None
+    occurrences: int | None = None
+
+
+@dataclass
+class ExecuteResponse:
+    output: str
+    exit_code: int | None = None
+    truncated: bool = False
+
+
+@dataclass
+class GrepResult:
+    error: str | None = None
+    matches: list[GrepMatch] | None = None
+
+
+@dataclass
+class GlobResult:
+    error: str | None = None
+    matches: list[FileInfo] | None = None
+
+
+@dataclass
+class FileUploadResponse:
+    path: str
+    error: str | None = None
+
+
+@dataclass
+class FileDownloadResponse:
+    path: str
+    content: bytes | None = None
+    error: str | None = None
+
+
+def _get_file_type(path: str) -> str:
+    """按扩展名识别常见文本文件，其余交给二进制读取分支。"""
+    text_extensions = {
+        "",
+        ".cfg",
+        ".conf",
+        ".csv",
+        ".html",
+        ".ini",
+        ".js",
+        ".json",
+        ".md",
+        ".py",
+        ".sh",
+        ".toml",
+        ".ts",
+        ".txt",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+    return "text" if PurePosixPath(path).suffix.lower() in text_extensions else "binary"
+
 
 _USER_DATA_ROOT = "/" + VIRTUAL_PATH_PREFIX.strip("/")
 _WORKSPACE_ROOT = f"{_USER_DATA_ROOT}/{WORKSPACE_DIR_NAME}"
@@ -172,7 +243,7 @@ def _is_utf8_decode_failure(exc: Exception) -> bool:
     return "utf-8" in detail and "can't decode" in detail
 
 
-class ProvisionerSandboxBackend(BaseSandbox):
+class ProvisionerSandboxBackend:
     def __init__(
         self,
         thread_id: str,
@@ -438,7 +509,7 @@ class ProvisionerSandboxBackend(BaseSandbox):
                         info["modified_at"] = datetime.fromisoformat(modified_time).isoformat()
                     except ValueError:
                         info["modified_at"] = modified_time
-                elif isinstance(modified_time, (int, float)):
+                elif isinstance(modified_time, int | float):
                     info["modified_at"] = datetime.fromtimestamp(modified_time).isoformat()
             infos.append(info)
         return LsResult(entries=_filter_readable_infos(infos))
@@ -542,13 +613,7 @@ class ProvisionerSandboxBackend(BaseSandbox):
         if not search_paths:
             return GrepResult(error=_permission_error("read", normalized_path))
 
-        matches: list[GrepMatch] = []
-        for search_path in search_paths:
-            result = super().grep(pattern=pattern, path=search_path, glob=glob)
-            if result.error:
-                return result
-            matches.extend(result.matches or [])
-        return GrepResult(matches=_filter_readable_matches(matches))
+        return GrepResult(error="Sandbox grep is not supported by the provisioner file API")
 
     def glob(self, pattern: str, path: str = "/") -> GlobResult:
         """Return files matching a glob pattern under allowed sandbox paths."""

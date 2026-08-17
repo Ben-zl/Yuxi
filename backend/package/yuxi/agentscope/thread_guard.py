@@ -18,11 +18,8 @@ from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session
 from yuxi.storage.postgres.models_business import Conversation, Message
 from yuxi.storage.redis.manager import get_async_redis_client
-from yuxi.utils import logger
 
-LEGACY_THREAD_MESSAGE = (
-    "该线程创建于旧版本，已归档为只读。请新建线程继续对话（历史记录仍可查看）。"
-)
+LEGACY_THREAD_MESSAGE = "该线程创建于旧版本，已归档为只读。请新建线程继续对话（历史记录仍可查看）。"
 
 # 审批挂起事件缓存（thread 维度，resume 时取回 reply_id/tool_calls）
 PENDING_CONFIRM_KEY = "agentscope:pending_confirm:{thread_id}"
@@ -40,14 +37,19 @@ async def store_pending_confirm(thread_id: str, confirm_event: dict) -> None:
 
 
 async def load_pending_confirm(thread_id: str) -> dict | None:
-    """读取并清除线程的审批挂起事件。"""
+    """读取线程的挂起事件；恢复成功前保留，避免异常导致状态丢失。"""
     redis = await get_async_redis_client()
     key = PENDING_CONFIRM_KEY.format(thread_id=thread_id)
     raw = await redis.get(key)
     if not raw:
         return None
-    await redis.delete(key)
     return json.loads(raw)
+
+
+async def clear_pending_confirm(thread_id: str) -> None:
+    """恢复成功后清除线程挂起事件。"""
+    redis = await get_async_redis_client()
+    await redis.delete(PENDING_CONFIRM_KEY.format(thread_id=thread_id))
 
 
 async def has_pending_confirm(thread_id: str) -> bool:
@@ -60,15 +62,18 @@ async def has_pending_confirm(thread_id: str) -> bool:
     return await redis.exists(PENDING_CONFIRM_KEY.format(thread_id=thread_id)) > 0
 
 
-def _legacy_cutoff() -> datetime | None:
-    """读取切换时刻（AGENTSCOPE_LEGACY_CUTOFF，ISO 格式）；未设置视为无存量。
+def _legacy_cutoff() -> datetime:
+    """读取强制切换时刻（AGENTSCOPE_LEGACY_CUTOFF，ISO 格式）。
 
     Message.created_at 为 naive UTC（utc_now_naive），cutoff 统一转 naive 比较。
     """
     raw = os.getenv("AGENTSCOPE_LEGACY_CUTOFF")
     if not raw:
-        return None
-    cutoff = datetime.fromisoformat(raw)
+        raise RuntimeError("AGENTSCOPE_LEGACY_CUTOFF 未配置，拒绝判定线程新旧状态")
+    try:
+        cutoff = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise RuntimeError("AGENTSCOPE_LEGACY_CUTOFF 必须是 ISO 时间") from exc
     if cutoff.tzinfo is not None:
         cutoff = cutoff.astimezone(UTC).replace(tzinfo=None)
     return cutoff
@@ -77,8 +82,6 @@ def _legacy_cutoff() -> datetime | None:
 async def is_legacy_thread(db: AsyncSession, *, thread_id: str) -> bool:
     """无映射且存在切换时刻之前的消息 → 存量线程。"""
     cutoff = _legacy_cutoff()
-    if cutoff is None:
-        return False
     result = await db.execute(
         select(Message.id)
         .join(Conversation, Message.conversation_id == Conversation.id)
@@ -88,9 +91,7 @@ async def is_legacy_thread(db: AsyncSession, *, thread_id: str) -> bool:
     return result.first() is not None
 
 
-async def ensure_thread_eligible(
-    db: AsyncSession, *, uid: str, thread_id: str
-) -> None:
+async def ensure_thread_eligible(db: AsyncSession, *, uid: str, thread_id: str) -> None:
     """存量线程守卫：有旧栈历史且无映射时拒绝接入（显式失败）。"""
     mapping = await get_thread_session(db, uid=uid, thread_id=thread_id)
     if mapping is not None:
@@ -99,21 +100,11 @@ async def ensure_thread_eligible(
         raise ValueError(LEGACY_THREAD_MESSAGE)
 
 
-async def interrupt_thread_session(
-    db: AsyncSession, *, uid: str, agent_slug: str, thread_id: str
-) -> bool:
+async def interrupt_thread_session(db: AsyncSession, *, uid: str, agent_slug: str, thread_id: str) -> bool:
     """中断线程的活跃 agentscope 会话（steer 提前结束语义）。"""
     mapping = await get_thread_session(db, uid=uid, thread_id=thread_id)
     if mapping is None:
         return False
-    client = AgentScopeServiceClient(
-        os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
-    )
-    try:
-        await client.interrupt_session(
-            uid, mapping.agentscope_agent_id, mapping.agentscope_session_id
-        )
-        return True
-    except Exception as exc:  # noqa: BLE001 - steer 中断失败不阻断入队，仅记录
-        logger.warning(f"steer 中断会话失败 thread={thread_id}: {exc}")
-        return False
+    client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
+    await client.interrupt_session(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)
+    return True

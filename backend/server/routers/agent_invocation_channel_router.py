@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.services.agent_run_service import create_agent_run_view
 from yuxi.services.channel_command_service import parse_slash_command
-from yuxi.services.chat_service import get_agent_state_view
+from yuxi.services.thread_state_service import get_thread_state_view
 from yuxi.services.input_message_service import build_chat_input_message
 from yuxi.services.run_submission_service import RunOrigin, RunSubmissionCommand, submit_run_command
 from yuxi.storage.postgres.models_business import User
@@ -95,7 +95,7 @@ async def receive_channel_message(
     if command is not None:
         if command.name == "state":
             _require_no_args(command.name, command.args)
-            state = await get_agent_state_view(
+            state = await get_thread_state_view(
                 thread_id=thread_id,
                 current_user=current_user,
                 db=db,

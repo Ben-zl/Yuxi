@@ -93,6 +93,21 @@ ensure_sandbox_env() {
     set_env_value "SANDBOX_PROVISIONER_TOKEN" "$SANDBOX_PROVISIONER_TOKEN"
 }
 
+ensure_agentscope_env() {
+    if grep -Eq '^AGENTSCOPE_LEGACY_CUTOFF=.+' .env; then
+        return
+    fi
+
+    echo "AGENTSCOPE_LEGACY_CUTOFF is missing in .env. Messages before this time become read-only."
+    read -p "Please enter an ISO cutoff (press Enter to use current UTC): " AGENTSCOPE_LEGACY_CUTOFF
+    if [ -z "$AGENTSCOPE_LEGACY_CUTOFF" ]; then
+        AGENTSCOPE_LEGACY_CUTOFF=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        echo "Generated AGENTSCOPE_LEGACY_CUTOFF and saved it to .env."
+    fi
+
+    set_env_value "AGENTSCOPE_LEGACY_CUTOFF" "$AGENTSCOPE_LEGACY_CUTOFF"
+}
+
 skip_existing_image() {
     local image="$1"
 
@@ -113,6 +128,7 @@ if [ -f ".env" ]; then
     ensure_required_api_env
     ensure_jwt_env
     ensure_sandbox_env
+    ensure_agentscope_env
 else
     echo "📝 .env file not found. Let's set up your environment variables."
     echo ""
@@ -174,6 +190,7 @@ else
         SANDBOX_PROVISIONER_TOKEN=$(generate_hex 32)
         echo "Generated SANDBOX_PROVISIONER_TOKEN and saved it to .env."
     fi
+    AGENTSCOPE_LEGACY_CUTOFF=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
     # Create .env file
     cat > .env << EOF
@@ -199,6 +216,7 @@ EOF
 JWT_SECRET_KEY=${JWT_SECRET_KEY}
 YUXI_INSTANCE_ID=${YUXI_INSTANCE_ID}
 SANDBOX_PROVISIONER_TOKEN=${SANDBOX_PROVISIONER_TOKEN}
+AGENTSCOPE_LEGACY_CUTOFF=${AGENTSCOPE_LEGACY_CUTOFF}
 EOF
 
     echo "✅ .env file created successfully!"

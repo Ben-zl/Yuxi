@@ -11,7 +11,6 @@ from yuxi.agents.backends.sandbox import (
     ensure_thread_dirs,
     sandbox_uploads_dir,
 )
-from yuxi.agents.buildin import agent_manager
 from yuxi.config import config as app_config
 from yuxi.knowledge.parser.factory import DocumentProcessorFactory
 from yuxi.repositories.agent_repository import AgentRepository
@@ -253,56 +252,6 @@ def _normalize_parse_method(file_name: str, parse_method: str | None) -> str:
         allowed = ", ".join(allowed_methods)
         raise HTTPException(status_code=400, detail=f"不支持的解析方法: {method}，可选: {allowed}")
     return method
-
-
-def _build_state_uploads(attachments: list[dict]) -> list[dict]:
-    uploads: list[dict] = []
-    for attachment in attachments:
-        path = attachment.get("path")
-        if not isinstance(path, str) or not path.strip():
-            continue
-
-        uploads.append(
-            {
-                "file_id": attachment.get("file_id"),
-                "file_name": attachment.get("file_name"),
-                "file_type": attachment.get("file_type"),
-                "file_size": attachment.get("file_size", 0),
-                "status": attachment.get("status", "uploaded"),
-                "uploaded_at": attachment.get("uploaded_at"),
-                "path": path,
-                "artifact_url": attachment.get("artifact_url"),
-                "request_id": attachment.get("request_id"),
-            }
-        )
-    return uploads
-
-
-async def _sync_thread_upload_state(
-    *,
-    thread_id: str,
-    uid: str,
-    agent_id: str,
-    backend_id: str | None,
-    attachments: list[dict],
-) -> None:
-    try:
-        agent = agent_manager.get_agent(backend_id or agent_id)
-        if not agent:
-            logger.warning(f"Skip upload state sync: agent not found ({agent_id})")
-            return
-
-        graph = await agent.get_graph()
-        config = {"configurable": {"thread_id": thread_id, "uid": str(uid)}}
-
-        await graph.aupdate_state(
-            config=config,
-            values={
-                "uploads": _build_state_uploads(attachments),
-            },
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Failed to sync upload state for thread {thread_id}: {exc}")
 
 
 def serialize_attachment(record: dict) -> dict:
@@ -814,14 +763,6 @@ async def confirm_tmp_thread_attachments_view(
         added_records.append(attachment_record)
 
     await conv_repo.add_attachments(conversation.id, added_records)
-    all_attachments = await conv_repo.get_attachments(conversation.id)
-    await _sync_thread_upload_state(
-        thread_id=thread_id,
-        uid=str(current_uid),
-        agent_id=conversation.agent_id,
-        backend_id=(conversation.extra_metadata or {}).get("backend_id"),
-        attachments=all_attachments,
-    )
     await invalidate_mention_cache(thread_id)
 
     return {"attachments": [serialize_attachment(item) for item in added_records]}
@@ -874,15 +815,6 @@ async def upload_thread_attachment_view(
             attachment_record[optional_key] = materialized[optional_key]
 
     await conv_repo.add_attachment(conversation.id, attachment_record)
-    all_attachments = await conv_repo.get_attachments(conversation.id)
-    await _sync_thread_upload_state(
-        thread_id=thread_id,
-        uid=str(current_uid),
-        agent_id=conversation.agent_id,
-        backend_id=(conversation.extra_metadata or {}).get("backend_id"),
-        attachments=all_attachments,
-    )
-
     await invalidate_mention_cache(thread_id)
 
     return serialize_attachment(attachment_record)
@@ -940,15 +872,6 @@ async def delete_thread_attachment_view(
                     file_path.unlink()
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Failed to remove attachment file {candidate}: {exc}")
-
-    all_attachments = await conv_repo.get_attachments(conversation.id)
-    await _sync_thread_upload_state(
-        thread_id=thread_id,
-        uid=str(current_uid),
-        agent_id=conversation.agent_id,
-        backend_id=(conversation.extra_metadata or {}).get("backend_id"),
-        attachments=all_attachments,
-    )
 
     await invalidate_mention_cache(thread_id)
 

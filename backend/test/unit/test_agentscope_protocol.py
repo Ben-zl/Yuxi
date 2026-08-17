@@ -35,18 +35,14 @@ def test_reply_start_opens_assistant_message():
 
 
 def test_text_delta_maps_to_content():
-    chunks = event_to_chunks(
-        _event("TEXT_BLOCK_DELTA", delta="你好"), request_id=REQUEST_ID
-    )
+    chunks = event_to_chunks(_event("TEXT_BLOCK_DELTA", delta="你好"), request_id=REQUEST_ID)
     assert chunks[0]["status"] == "loading"
     assert chunks[0]["msg"]["content"] == "你好"
     assert "reasoning_content" not in chunks[0]["msg"]
 
 
 def test_thinking_delta_maps_to_reasoning_content():
-    chunks = event_to_chunks(
-        _event("THINKING_BLOCK_DELTA", delta="想一想"), request_id=REQUEST_ID
-    )
+    chunks = event_to_chunks(_event("THINKING_BLOCK_DELTA", delta="想一想"), request_id=REQUEST_ID)
     assert chunks[0]["msg"]["content"] == ""
     assert chunks[0]["msg"]["reasoning_content"] == "想一想"
 
@@ -65,9 +61,7 @@ def test_init_chunk_carries_user_message():
 
 
 def test_reply_end_completed():
-    terminal = reply_end_to_terminal(
-        _event("REPLY_END", finished_reason="completed"), request_id=REQUEST_ID
-    )
+    terminal = reply_end_to_terminal(_event("REPLY_END", finished_reason="completed"), request_id=REQUEST_ID)
     assert terminal.run_status == "completed"
     assert terminal.chunk["status"] == "finished"
 
@@ -88,15 +82,11 @@ def test_reply_end_error_carries_message():
 
 
 def test_reply_end_interrupted_and_max_iters():
-    interrupted = reply_end_to_terminal(
-        _event("REPLY_END", finished_reason="interrupted"), request_id=REQUEST_ID
-    )
+    interrupted = reply_end_to_terminal(_event("REPLY_END", finished_reason="interrupted"), request_id=REQUEST_ID)
     assert interrupted.run_status == "interrupted"
     assert interrupted.chunk["status"] == "interrupted"
 
-    max_iters = reply_end_to_terminal(
-        _event("REPLY_END", finished_reason="exceed_max_iters"), request_id=REQUEST_ID
-    )
+    max_iters = reply_end_to_terminal(_event("REPLY_END", finished_reason="exceed_max_iters"), request_id=REQUEST_ID)
     assert max_iters.run_status == "failed"
     assert max_iters.chunk["error_type"] == "exceed_max_iters"
 
@@ -105,9 +95,7 @@ def test_tool_event_converter_streams_call_and_result():
     from yuxi.agentscope.protocol import ToolEventConverter
 
     converter = ToolEventConverter(REQUEST_ID)
-    start = converter.feed(
-        {"type": "TOOL_CALL_START", "tool_call_id": "tc1", "tool_call_name": "query_kb"}
-    )
+    start = converter.feed({"type": "TOOL_CALL_START", "tool_call_id": "tc1", "tool_call_name": "query_kb"})
     assert start[0]["status"] == "loading"
     assert start[0]["msg"]["tool_call_chunks"][0]["name"] == "query_kb"
 
@@ -137,15 +125,36 @@ def test_require_user_confirm_maps_to_approval_chunk():
         {
             "type": "REQUIRE_USER_CONFIRM",
             "reply_id": "r1",
-            "tool_calls": [
-                {"id": "tc1", "name": "Write", "input": '{"file_path": "/workspace/a.txt"}'}
-            ],
+            "tool_calls": [{"id": "tc1", "name": "Write", "input": '{"file_path": "/workspace/a.txt"}'}],
         },
         request_id=REQUEST_ID,
     )
     approval = chunks[0]["approval"]
     assert chunks[0]["status"] == "human_approval_required"
-    assert approval["action_requests"] == [
-        {"action": "Write", "args": {"file_path": "/workspace/a.txt"}}
-    ]
+    assert approval["action_requests"] == [{"action": "Write", "args": {"file_path": "/workspace/a.txt"}}]
     assert len(approval["review_configs"]) == len(approval["action_requests"])
+
+
+def test_require_external_execution_maps_questions_and_rejects_invalid_input():
+    """外部执行挂起复用前端问答协议，畸形输入显式失败。"""
+    event = {
+        "type": "REQUIRE_EXTERNAL_EXECUTION",
+        "reply_id": "r1",
+        "tool_calls": [
+            {
+                "id": "tc1",
+                "name": "ask_user_question",
+                "input": '{"questions":[{"question_id":"q1","question":"选哪个？","options":[]}]}',
+            }
+        ],
+    }
+    chunk = event_to_chunks(event, request_id=REQUEST_ID)[0]
+    assert chunk["status"] == "ask_user_question_required"
+    assert chunk["source"] == "ask_user_question"
+    assert chunk["questions"][0]["question_id"] == "q1"
+
+    with pytest.raises(ValueError, match="缺少有效 questions"):
+        event_to_chunks(
+            {"type": "REQUIRE_EXTERNAL_EXECUTION", "tool_calls": [None]},
+            request_id=REQUEST_ID,
+        )

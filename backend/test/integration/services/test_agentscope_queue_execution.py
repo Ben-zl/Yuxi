@@ -28,6 +28,7 @@ from yuxi.storage.postgres.models_business import (
     Conversation,
     Message,
     ModelProvider,
+    User,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -46,9 +47,7 @@ async def env(monkeypatch):
     engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    monkeypatch.setattr(
-        agent_request_queue_service, "resolve_agent_run_config", lambda *a: ("model", "default")
-    )
+    monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *a: ("model", "default"))
     enqueued: list[str] = []
 
     async def _capture_enqueue(run_id: str) -> None:
@@ -58,8 +57,14 @@ async def env(monkeypatch):
 
     async with session_factory() as db:
         db.add(
-            Conversation(thread_id=thread_id, uid=uid, agent_id=agent_slug, status="active")
+            User(
+                uid=uid,
+                username=uid,
+                password_hash="test-only",
+                role="superadmin",
+            )
         )
+        db.add(Conversation(thread_id=thread_id, uid=uid, agent_id=agent_slug, status="active"))
         db.add(
             Agent(
                 slug=agent_slug,
@@ -68,15 +73,14 @@ async def env(monkeypatch):
                 config_json={
                     "context": {
                         "model": f"{PROVIDER_ID}:mock-chat-model",
+                        "mcps": [],
                         "system_prompt": "你是队列测试助手。",
                     }
                 },
                 share_config={},
             )
         )
-        provider = await db.scalar(
-            select(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID)
-        )
+        provider = await db.scalar(select(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID))
         if provider is None:
             provider = ModelProvider(provider_id=PROVIDER_ID)
             db.add(provider)
@@ -98,19 +102,14 @@ async def env(monkeypatch):
     }
 
     async with session_factory() as db:
-        conversation_id = await db.scalar(
-            select(Conversation.id).where(Conversation.thread_id == thread_id)
-        )
-        await db.execute(
-            delete(AgentRunRequest).where(
-                AgentRunRequest.conversation_thread_id == thread_id
-            )
-        )
+        conversation_id = await db.scalar(select(Conversation.id).where(Conversation.thread_id == thread_id))
+        await db.execute(delete(AgentRunRequest).where(AgentRunRequest.conversation_thread_id == thread_id))
         if conversation_id is not None:
             await db.execute(delete(Message).where(Message.conversation_id == conversation_id))
         await db.execute(delete(AgentRun).where(AgentRun.conversation_thread_id == thread_id))
         await db.execute(delete(Conversation).where(Conversation.thread_id == thread_id))
         await db.execute(delete(Agent).where(Agent.slug == agent_slug))
+        await db.execute(delete(User).where(User.uid == uid))
         await db.commit()
     await engine.dispose()
     # 复位跨测试事件循环的共享单例（PG 管理器与 Redis 客户端）
@@ -189,7 +188,7 @@ async def test_fifo_serial_dispatch_and_execution(env):
 async def test_interrupted_run_blocks_intake(env):
     """审批挂起（pending_confirm 存在）阻塞 intake；steer 中断（无挂起）放行。"""
     from yuxi.agentscope.thread_guard import (
-        load_pending_confirm,
+        clear_pending_confirm,
         store_pending_confirm,
     )
 
@@ -215,7 +214,7 @@ async def test_interrupted_run_blocks_intake(env):
     assert exc_info.value.status_code == 409
 
     # steer 中断（无挂起审批）：不阻塞，可继续入队
-    await load_pending_confirm(env["thread_id"])
+    await clear_pending_confirm(env["thread_id"])
     result = await _intake(env, f"itq-open-{uuid.uuid4().hex[:8]}", "中断后的新消息")
     assert result.status in {"queued", "dispatched"}
 
@@ -230,9 +229,7 @@ async def test_intake_is_idempotent_per_request_id(env):
     assert set(env["enqueued"]) == {first.run_id}
 
     async with env["session_factory"]() as db:
-        runs = await db.execute(
-            select(AgentRun.id).where(AgentRun.request_id == request_id)
-        )
+        runs = await db.execute(select(AgentRun.id).where(AgentRun.request_id == request_id))
         assert len(runs.all()) == 1
 
 
@@ -289,9 +286,5 @@ async def test_execute_run_records_token_usage_and_audit_facts(env):
     from sqlalchemy import select as _select
 
     async with env["session_factory"]() as db:
-        rows = (
-            await db.execute(
-                _select(AgentRunModel.status).where(AgentRunModel.request_id == request_id)
-            )
-        ).all()
+        rows = (await db.execute(_select(AgentRunModel.status).where(AgentRunModel.request_id == request_id))).all()
         assert rows == [("completed",)]

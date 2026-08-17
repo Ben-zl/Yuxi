@@ -792,7 +792,7 @@ async def _seed_terminal_run(session, *, run_id: str, status: str, created_at, f
 
 
 @pytest.mark.asyncio
-async def test_snapshot_marks_existing_backlog_paused_after_failed_run(session):
+async def test_snapshot_marks_existing_backlog_ready_after_failed_run(session):
     from yuxi.services.agent_request_queue_service import get_thread_queue_snapshot
 
     await _seed_thread(session)
@@ -810,16 +810,22 @@ async def test_snapshot_marks_existing_backlog_paused_after_failed_run(session):
     snapshot = await get_thread_queue_snapshot(db=session, uid="user-1", agent_slug="main", thread_id="t1")
 
     assert snapshot["queue"] == {
-        "status": "paused",
-        "paused_reason": "failed",
-        "blocking_run_id": "run-a",
-        "can_continue": True,
+        "status": "ready",
+        "paused_reason": None,
+        "blocking_run_id": None,
+        "can_continue": False,
     }
 
 
 @pytest.mark.asyncio
-async def test_snapshot_marks_interrupted_queue_as_non_continuable(session):
+async def test_snapshot_marks_interrupted_queue_as_non_continuable(session, monkeypatch: pytest.MonkeyPatch):
     from yuxi.services.agent_request_queue_service import get_thread_queue_snapshot
+    from yuxi.agentscope import thread_guard
+
+    async def pending_confirm(_thread_id: str) -> bool:
+        return True
+
+    monkeypatch.setattr(thread_guard, "has_pending_confirm", pending_confirm)
 
     await _seed_thread(session)
     now = utc_now_naive()
@@ -863,7 +869,7 @@ async def test_snapshot_marks_post_failure_request_ready(session):
 
 
 @pytest.mark.asyncio
-async def test_snapshot_rejects_terminal_run_without_finished_at(session):
+async def test_snapshot_allows_terminal_run_without_finished_at_to_release_queue(session):
     from yuxi.services.agent_request_queue_service import get_thread_queue_snapshot
 
     await _seed_thread(session)
@@ -878,13 +884,13 @@ async def test_snapshot_rejects_terminal_run_without_finished_at(session):
     await _seed_queued_request(session, request_id="request-b", message_id=101, created_at=now)
     await session.commit()
 
-    with pytest.raises(RuntimeError, match="run-a.*missing finished_at"):
-        await get_thread_queue_snapshot(db=session, uid="user-1", agent_slug="main", thread_id="t1")
+    snapshot = await get_thread_queue_snapshot(db=session, uid="user-1", agent_slug="main", thread_id="t1")
+    assert snapshot["queue"]["status"] == "ready"
 
 
 @pytest.mark.asyncio
-async def test_continue_dispatches_only_paused_fifo_head(session):
-    from yuxi.repositories.agent_run_request_repository import AgentRunRequestRepository
+async def test_continue_rejects_queue_that_is_automatically_ready(session):
+    from fastapi import HTTPException
     from yuxi.services.agent_request_queue_service import continue_thread_queue
 
     await _seed_thread(session)
@@ -900,17 +906,14 @@ async def test_continue_dispatches_only_paused_fifo_head(session):
     )
     await session.commit()
 
-    dispatched = await continue_thread_queue(
-        db=session,
-        uid="user-1",
-        agent_slug="main",
-        thread_id="t1",
-    )
-
-    repo = AgentRunRequestRepository(session)
-    assert dispatched.request_id == "request-b"
-    assert (await repo.get_by_request_id("request-b")).status == "dispatched"
-    assert await repo.get_queue_position("request-c") == 1
+    with pytest.raises(HTTPException) as exc_info:
+        await continue_thread_queue(
+            db=session,
+            uid="user-1",
+            agent_slug="main",
+            thread_id="t1",
+        )
+    assert exc_info.value.detail["code"] == "queue_not_paused"
 
 
 @pytest.mark.asyncio
@@ -991,10 +994,15 @@ async def test_intake_rejects_message_while_run_is_interrupted(
     session, monkeypatch: pytest.MonkeyPatch, queue_policy: str
 ):
     from fastapi import HTTPException
+    from yuxi.agentscope import thread_guard
     from yuxi.repositories.agent_run_request_repository import AgentRunRequestRepository
     from yuxi.services import agent_request_queue_service
     from yuxi.services.input_message_service import build_chat_input_message
 
+    async def pending_confirm(_thread_id: str) -> bool:
+        return True
+
+    monkeypatch.setattr(thread_guard, "has_pending_confirm", pending_confirm)
     monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
     await _seed_thread(session)
     now = utc_now_naive()

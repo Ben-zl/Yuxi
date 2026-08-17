@@ -1,100 +1,81 @@
 # MCP 集成
 
-MCP（Model Context Protocol）是扩展智能体能力的重要方式。系统支持通过管理界面动态配置 MCP 服务器，无需修改代码。
+MCP（Model Context Protocol）用于把外部工具接入智能体。Yuxi 当前的 AgentScope 运行路径支持 SSE 和 Streamable HTTP MCP；MCP 客户端在 AgentScope 服务进程执行，不在 Docker workspace 中执行。
 
-内置 MCP 服务器以代码为事实源：系统启动时会自动补齐缺失项，并用代码中的最新连接与展示字段覆盖数据库定义；是否“已添加”以及工具级禁用列表仍保留数据库状态。
+## 支持矩阵
 
-## 支持的传输协议
+| transport | 管理接口 | AgentScope 运行时 | 说明 |
+| --- | --- | --- | --- |
+| `streamable_http` | 支持 | 支持 | 推荐 |
+| `sse` | 支持 | 支持 | 兼容已有 HTTP MCP |
+| `stdio` | 拒绝用户新增 | 不装配 | 包括历史记录和代码内置记录 |
 
-| 协议 | 说明 | 适用场景 |
-|------|------|----------|
-| Streamable HTTP | 流式 HTTP 连接 | 远程 MCP 服务 |
-| SSE | Server-Sent Events | 标准 HTTP 长连接 |
-| Stdio | 标准输入输出 | 仅限代码中维护的系统内置 MCP |
+当前实现不会在 API、worker 或 workspace 中启动 stdio MCP 进程。已有 stdio 记录可以保留用于审计或迁移，但不会向模型暴露工具。需要继续使用的 stdio MCP 应先部署为受控 HTTP 服务，再以 SSE 或 Streamable HTTP 配置。
 
 ## 配置示例
 
-### 远程 MCP 服务
-
 ```json
 {
-    "name": "custom-remote-mcp",
-    "transport": "streamable_http",
-    "url": "https://example.com/mcp"
+  "name": "custom-remote-mcp",
+  "transport": "streamable_http",
+  "url": "https://example.com/mcp",
+  "headers": {
+    "Authorization": "Bearer <secret>"
+  },
+  "timeout": 30,
+  "disabled_tools": []
 }
 ```
 
-管理接口只允许配置 `streamable_http` 与 `sse` 远程服务。`stdio` 会在 API / worker 容器内启动本地进程，
-因此仅允许 `_DEFAULT_MCP_SERVERS` 中代码定义的系统内置 MCP；管理员不能通过接口新增 stdio 服务，
-也不能修改内置 MCP 的连接配置。升级前已保存的用户 stdio 配置会被禁用，需要迁移为远程 MCP。
+密钥只保存在服务端配置中。管理接口返回时应遵循现有脱敏规则，不要把真实 Header 写入日志、测试夹具或 Agent prompt。
 
-## 添加系统内置 stdio MCP
+## 运行链路
 
-只有经过代码审查、确实需要在 Yuxi 容器内启动本地进程的 MCP 才应使用 stdio。能够部署为远程服务时，
-优先使用 SSE 或 Streamable HTTP，通过管理界面添加即可。
+`server/agentscope_main.py` 的 `extra_agent_tools` 在每轮开始时：
 
-编辑 `backend/package/yuxi/agents/mcp/service.py` 中的 `_DEFAULT_MCP_SERVERS`，新增一个全局唯一的 slug。
-下面的包名和版本仅作结构参考，实际提交时应替换为经过审查并固定版本的 MCP 包：
+1. 使用 `(uid, agentscope_agent_id, agentscope_session_id)` 反查严格 Thread↔Session 映射。
+2. 读取当前 Agent 的 `config_json.context.mcps`。
+3. 从 PostgreSQL 加载对应 MCP 记录，只接受已启用、URL 非空的 SSE/Streamable HTTP 服务。
+4. 为每个服务创建 `is_stateful=False` 的 AgentScope `MCPClient`。
+5. 调用 `list_tools()`，应用 `disabled_tools`，把剩余工具交给当前 Agent。
 
-```python
-_DEFAULT_MCP_SERVERS = {
-    # 已有内置 MCP ...
-    "example-mcp": {
-        "command": "npx",
-        "args": ["-y", "@scope/example-mcp@1.2.3"],
-        "transport": "stdio",
-        "description": "示例内置 MCP，请替换为真实用途说明",
-        "icon": "🧩",
-        "tags": ["内置", "示例"],
-    },
-}
+客户端不会跨轮缓存，因此服务器配置、禁用工具和删除会在下一轮生效。端点不可达或握手失败会显式使本轮工具装配失败，不静默忽略。
+
+## Workspace 安全边界
+
+MCP 连接发生在 AgentScope 服务进程：
+
+```text
+workspace 中的模型工具调用
+  -> AgentScope service MCPClient
+  -> HTTP MCP endpoint
 ```
 
-常用字段如下：
+Docker workspace：
 
-| 字段 | 要求 |
-|------|------|
-| `command` | 容器内已安装或明确可用的可执行程序，不接受用户输入 |
-| `args` | 固定参数列表；使用包执行器时应固定包版本，不使用动态脚本参数 |
-| `transport` | 固定为 `stdio` |
-| `description` | 说明 MCP 的具体能力和使用场景 |
-| `icon` / `tags` | 管理界面的展示信息 |
-| `env` | 仅允许非敏感固定值；密钥不得提交到代码或同步进数据库 |
+- 不加入 Yuxi `app-network`；
+- 不获得 MCP URL、Header 或凭据；
+- 不生成 `/workspace/.mcp`；
+- 不直接访问 PostgreSQL、Redis、API 或其他 workspace。
 
-新增 slug 前应确认数据库和 `_DEFAULT_MCP_SERVERS` 中没有同名项。运行时只信任
-`_DEFAULT_MCP_SERVERS` 的固定 slug 白名单；`created_by` 仅用于审计，不能通过复用用户记录或手工修改
-`created_by` 来创建内置 MCP。
+如果 MCP 需要访问 Yuxi 内部服务，应让 MCP endpoint 部署在 AgentScope 服务可达的位置，并在 MCP 自身完成最小权限控制。不要把 workspace 接入业务网络。
 
-开发环境会在 API / worker 热重载后的启动阶段调用 `ensure_builtin_mcp_servers_in_db()`；生产部署需要重新
-构建并启动 API 与 worker。新内置项首次同步时默认 `enabled=false`，管理员需要在 MCP 管理页中“添加”后
-才会进入运行时。后续启动会用代码定义覆盖连接与展示字段，同时保留启用状态和工具禁用列表。
+## Agent 配置与启用状态
 
-添加后执行一次验证：
+MCP 管理页的“添加/移除”控制记录的 `enabled` 状态。Agent 的 `context.mcps` 决定该 Agent 允许装配哪些 MCP：
 
-```bash
-docker compose up -d --build api worker
-docker logs api-dev --tail 100
-docker logs worker-dev --tail 100
-```
+- 空列表表示不装配 MCP；
+- 显式列表只装配其中仍存在且已启用的 HTTP MCP；
+- 被删除或禁用的记录不会产生工具；
+- `disabled_tools` 可进一步屏蔽单个工具。
 
-确认日志中没有同步异常，并在管理页添加该 MCP，检查能够发现预期工具。验证过程不得执行文件写入、
-Shell 命令或其他无关副作用。
+## 验证
 
-::: danger 安全边界
-stdio MCP 与在 API / worker 容器内执行程序等价。提交前必须审查可执行程序、依赖来源、固定版本、参数、
-网络访问和工具副作用；不得从 HTTP 请求、数据库用户配置或环境中的非受信任内容拼接 `command`、`args`
-或 `env`，也不得通过把用户记录改成 `created_by=system` 绕过运行时限制。
-:::
+配置保存成功不是运行验收。至少验证：
 
-## 服务器管理
-
-管理界面使用“添加 / 移除”语义管理 MCP 服务器：
-
-- 已添加：`enabled=true`；远程 MCP 读取数据库中的最新连接配置，内置 stdio MCP 使用代码中的固定连接配置
-- 可添加：`enabled=false`，记录保留但不会进入运行时
-
-Agent 配置中的 `mcps` 决定本次运行可使用哪些已添加服务器；未显式配置时使用当前用户可见的全部服务器。工具对象会按配置哈希做本地缓存，更新服务器配置后会自动使用新的缓存键，不需要重启服务。
-
-## 工具管理
-
-MCP 工具支持粒度控制：管理员可以单独启用或禁用某个 MCP 服务器下的特定工具，实现精细化的权限管理。
+1. AgentScope 服务可以真实 `list_tools`。
+2. 模型发起工具调用后，MCP endpoint 收到 `call_tool`，结果进入 Run SSE。
+3. `disabled_tools` 修改后下一轮消失。
+4. URL 改为不可达地址时本轮显式失败。
+5. 删除或禁用 MCP 后下一轮不再暴露。
+6. workspace 容器元数据不包含 MCP URL/Header，且没有 `.mcp` 目录。

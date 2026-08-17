@@ -2,7 +2,6 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from yuxi.services.task_service import tasker
 from yuxi.agents.mcp.service import ensure_builtin_mcp_servers_in_db
@@ -104,13 +103,6 @@ async def lifespan(app: FastAPI):
         init_sandbox_provider()
     except Exception as e:
         logger.error(f"Failed to initialize sandbox provider during startup: {e}")
-
-    # =========================================================
-    # 2. 核心修复：在这里执行一次 setup()，建完表就拉倒
-    # =========================================================
-    checkpointer = AsyncPostgresSaver(pg_manager.langgraph_pool)
-    await checkpointer.setup()
-    print("LangGraph Checkpoint tables verified/created!")
 
     await tasker.start()
     logger.info(f"""
