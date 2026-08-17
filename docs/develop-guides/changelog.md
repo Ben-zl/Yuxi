@@ -15,6 +15,7 @@
 
 - AgentScope 网关承接队列执行、持久 Session、审批/取消/steer、Team、Skills、KB 和隔离 workspace；生产 Compose 同步新增内部 AgentScope 服务与固定切换时间配置。
 - 修复并行工具审批、resume 再挂起、Team 异步回报收束、模型切换、附件绑定和终态竞态；真实浏览器、MiniMax-M3、OTLP 与 Docker E2E 已验证。
+- 两轴复审修复：工具审批策略接线（run 的审批模式每次执行前写入会话权限，完全信任 → bypass，此前"完全信任"退化为逐次审批）；多模态图片输入贯通（image_content 以 data 块送达模型，含媒体类型嗅探，此前被静默丢弃）；run 终态回写输入消息投递状态；修复 download_kb_file 运算符优先级缺陷；install_skill 元数据残留清理；read_timeout/sleep 常量收敛；ADR 接入站点导航；e2e mock URL 参数化并修复触发词被技能 hint 误命中。
 
 - AgentScope gateway 聚合模型事件中的 token usage 并写入 AgentRun；线程状态接口读取最近 Run 的持久化用量，不再依赖旧 middleware state。
 - 修复公开图片上传的存储型 XSS 风险：头像与用户图片不再信任客户端 MIME 或文件名后缀，服务端校验真实图片内容且仅接受 PNG、JPEG、WebP、GIF，对象名使用识别出的固定安全后缀，拒绝伪装成图片的 SVG。
