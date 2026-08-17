@@ -11,6 +11,7 @@ let agentApi
 let useAgentRequestQueue
 let useAgentRunStream
 let useAgentStreamHandler
+let ErrorHandler
 
 before(async () => {
   const storage = new Map()
@@ -28,6 +29,7 @@ before(async () => {
   ;({ useAgentStreamHandler } = await server.ssrLoadModule(
     '/src/composables/useAgentStreamHandler.js'
   ))
+  ;({ ErrorHandler } = await server.ssrLoadModule('/src/utils/errorHandler.js'))
 })
 
 after(async () => {
@@ -66,6 +68,40 @@ test('agent_state SSE 使在途状态请求失效', () => {
 
   assert.deepEqual(threadState.agentState, agentState)
   assert.equal(threadState.agentStateRequestVersion, 5)
+})
+
+test('error SSE 向用户展示后端 error_message', () => {
+  const threadState = {
+    isStreaming: true,
+    replyLoadingVisible: true,
+    pendingRequestId: 'request-1',
+    pendingInterrupt: {},
+    contextCompressing: true
+  }
+  const errors = []
+  const originalHandleError = ErrorHandler.handleError
+  ErrorHandler.handleError = (error, context) => errors.push({ error, context })
+
+  try {
+    const { handleStreamChunk } = useAgentStreamHandler({
+      getThreadState: () => threadState,
+      processApprovalInStream: () => false,
+      currentAgentId: { value: 'agent-1' },
+      supportsFiles: { value: false }
+    })
+
+    const shouldStop = handleStreamChunk(
+      { status: 'error', error_message: '模型服务超时' },
+      'thread-1'
+    )
+
+    assert.equal(shouldStop, true)
+    assert.equal(errors[0].error.message, '模型服务超时')
+    assert.equal(errors[0].context, '流式处理')
+    assert.equal(threadState.replyLoadingVisible, false)
+  } finally {
+    ErrorHandler.handleError = originalHandleError
+  }
 })
 
 test('run_created 立即完成状态交接并订阅新 Run SSE', async () => {

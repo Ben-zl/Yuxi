@@ -48,6 +48,7 @@ class GatewayRoundResult:
     text: str
     reasoning: str
     event_count: int
+    error_message: str | None = None  # AgentScope 终态中的可展示错误
     parked: str | None = None  # 挂起原因（permission=等待工具审批）
     usage: dict | None = None  # 聚合的 token 用量（input/output/total）
     pending_confirm: dict | None = None  # 审批挂起原始事件（resume 用）
@@ -114,6 +115,10 @@ async def stream_round_to_run_events(
         thread_id=thread_id,
     )
 
+    existing_messages = await client.list_messages(uid, agent_id, session_id)
+    historical_reply_ids = {
+        str(message["id"]) for message in existing_messages or [] if isinstance(message, dict) and message.get("id")
+    }
     queue, pump_task = start_event_pump(
         client,
         uid=uid,
@@ -135,6 +140,7 @@ async def stream_round_to_run_events(
         team_tool_seen = False
         pending_terminal = None  # team 静默期内暂存的终态，收束时落 end 帧
         team_deadline = 0.0
+        active_reply_id: str | None = None
         while True:
             if pending_terminal is not None:
                 remaining = team_deadline - time.monotonic()
@@ -152,6 +158,18 @@ async def stream_round_to_run_events(
             if isinstance(event, Exception):
                 raise event
             event_type = str(event.get("type", "")).upper()
+            event_reply_id = str(event.get("reply_id") or "")
+            if not event_reply_id:
+                continue
+            if event_type == "REPLY_START":
+                if event_reply_id in historical_reply_ids:
+                    continue
+                if active_reply_id is None or pending_terminal is not None:
+                    active_reply_id = event_reply_id
+            if active_reply_id is None:
+                continue
+            if event_reply_id != active_reply_id:
+                continue
             if event_type in {"REQUIRE_USER_CONFIRM", "REQUIRE_EXTERNAL_EXECUTION"}:
                 # 工具审批挂起：run 进入 interrupted 终态（挂起互斥依据），
                 # 审批结果经新一轮 resume 请求续跑（与旧栈 resume 语义一致）
@@ -191,6 +209,7 @@ async def stream_round_to_run_events(
                         text="".join(text_parts),
                         reasoning="".join(reasoning_parts),
                         event_count=event_count,
+                        error_message=terminal.chunk.get("error_message"),
                         usage=_usage(input_tokens, output_tokens),
                     )
                 # team 轮次：暂存终态，等待成员回报驱动的续写（静默窗口）
@@ -225,6 +244,7 @@ async def stream_round_to_run_events(
             text="".join(text_parts),
             reasoning="".join(reasoning_parts),
             event_count=event_count,
+            error_message=pending_terminal.chunk.get("error_message"),
             usage=_usage(input_tokens, output_tokens),
         )
     finally:

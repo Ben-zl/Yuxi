@@ -56,6 +56,7 @@ async def test_ensure_deep_research_agents_creates_orchestrator_and_subagents(mo
     context = orchestrator.config_json["context"]
     assert context["subagents"] == [RESEARCH_EXPLORER_AGENT_SLUG, FACT_VERIFIER_AGENT_SLUG]
     assert context["skills"] == [DEEP_RESEARCH_AGENT_SLUG]
+    assert context["mcps"] == []
     assert context["system_prompt"].strip()
 
 

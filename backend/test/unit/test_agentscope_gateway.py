@@ -10,8 +10,9 @@ from yuxi.agentscope import gateway
 class _StubClient:
     """按脚本吐事件的会话客户端桩：事件耗尽后挂起模拟静默。"""
 
-    def __init__(self, events):
+    def __init__(self, events, messages=None):
         self._events = events
+        self._messages = messages or []
         self.triggered = None
 
     async def trigger_chat(self, uid, agent_id, session_id, text, image_content=None):
@@ -19,6 +20,9 @@ class _StubClient:
 
     async def interrupt_session(self, uid, agent_id, session_id):
         return None
+
+    async def list_messages(self, uid, agent_id, session_id):
+        return self._messages
 
     async def stream_events(self, uid, agent_id, session_id, read_timeout=180.0):
         for event in self._events:
@@ -46,10 +50,10 @@ async def test_team_round_collects_wakeup_continuation(capture_events):
         {"type": "TOOL_CALL_START", "reply_id": "r1", "tool_call_id": "t1", "tool_call_name": "TeamCreate"},
         {"type": "TEXT_BLOCK_DELTA", "reply_id": "r1", "delta": "已派发。"},
         {"type": "REPLY_END", "reply_id": "r1", "finished_reason": "completed"},
-        # 静默窗口内的续写（成员回报驱动）
-        {"type": "REPLY_START", "reply_id": "r1"},
-        {"type": "TEXT_BLOCK_DELTA", "reply_id": "r1", "delta": "综合结论：X。"},
-        {"type": "REPLY_END", "reply_id": "r1", "finished_reason": "completed"},
+        # 成员回报会触发一个新的 leader reply，而不是续用上一条 reply_id。
+        {"type": "REPLY_START", "reply_id": "r2"},
+        {"type": "TEXT_BLOCK_DELTA", "reply_id": "r2", "delta": "综合结论：X。"},
+        {"type": "REPLY_END", "reply_id": "r2", "finished_reason": "completed"},
     ]
     client = _StubClient(events)
     result = await gateway.stream_round_to_run_events(
@@ -68,6 +72,40 @@ async def test_team_round_collects_wakeup_continuation(capture_events):
     # end 帧只在静默收束时写一次
     end_frames = [p for name, p in capture_events if name == "end"]
     assert len(end_frames) == 1 and end_frames[0]["status"] == "completed"
+
+
+async def test_team_round_ignores_unscoped_heartbeat_during_quiesce(capture_events):
+    """team 终态后的无归属心跳不得清除静默收束状态。"""
+    client = _StubClient(
+        [
+            {"type": "REPLY_START", "reply_id": "r1"},
+            {
+                "type": "TOOL_CALL_START",
+                "reply_id": "r1",
+                "tool_call_id": "t1",
+                "tool_call_name": "TeamCreate",
+            },
+            {"type": "TEXT_BLOCK_DELTA", "reply_id": "r1", "delta": "已派发。"},
+            {"type": "REPLY_END", "reply_id": "r1", "finished_reason": "completed"},
+            {"type": "HEARTBEAT"},
+        ]
+    )
+
+    result = await gateway.stream_round_to_run_events(
+        client,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        text="任务",
+        run_id="run-heartbeat",
+        request_id="req-heartbeat",
+        thread_id="th-heartbeat",
+        read_timeout=0.05,
+    )
+
+    assert result.run_status == "completed"
+    assert result.text == "已派发。"
+    assert len([payload for name, payload in capture_events if name == "end"]) == 1
 
 
 async def test_plain_round_unchanged_first_reply_end(capture_events):
@@ -95,6 +133,70 @@ async def test_plain_round_unchanged_first_reply_end(capture_events):
     assert result.text == "普通回复"
     assert "不应出现" not in result.text
     assert len([p for name, p in capture_events if name == "end"]) == 1
+
+
+async def test_failed_round_preserves_provider_error(capture_events):
+    """AgentScope 的可展示错误应进入运行结果，供 AgentRun 持久化。"""
+    client = _StubClient(
+        [
+            {"type": "REPLY_START", "reply_id": "r-error"},
+            {
+                "type": "REPLY_END",
+                "reply_id": "r-error",
+                "finished_reason": "error",
+                "error": {"type": "connection", "message": "模型服务连接超时"},
+            },
+        ]
+    )
+
+    result = await gateway.stream_round_to_run_events(
+        client,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        text="问题",
+        run_id="run-error",
+        request_id="req-error",
+        thread_id="th-error",
+        read_timeout=5.0,
+    )
+
+    assert result.run_status == "failed"
+    assert result.error_message == "模型服务连接超时"
+
+
+async def test_new_round_ignores_previous_reply_replay(capture_events):
+    """新一轮订阅不得把 replay 中上一轮终态当成本轮结果。"""
+    client = _StubClient(
+        [
+            {"type": "REPLY_START", "reply_id": "old-reply"},
+            {
+                "type": "REPLY_END",
+                "reply_id": "old-reply",
+                "finished_reason": "error",
+                "error": {"type": "connection", "message": "old error"},
+            },
+            {"type": "REPLY_START", "reply_id": "new-reply"},
+            {"type": "TEXT_BLOCK_DELTA", "reply_id": "new-reply", "delta": "新回复"},
+            {"type": "REPLY_END", "reply_id": "new-reply", "finished_reason": "completed"},
+        ],
+        messages=[{"id": "old-reply", "role": "assistant"}],
+    )
+
+    result = await gateway.stream_round_to_run_events(
+        client,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        text="重试问题",
+        run_id="run-replay",
+        request_id="req-replay",
+        thread_id="th-replay",
+        read_timeout=5.0,
+    )
+
+    assert result.run_status == "completed"
+    assert result.text == "新回复"
 
 
 async def test_collect_asking_tool_calls_from_session(monkeypatch):

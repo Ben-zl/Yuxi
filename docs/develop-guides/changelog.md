@@ -14,7 +14,7 @@
 - 完成 AgentScope 收口：统一投影逐轮装配 HTTP MCP、知识库与按用户/session 隔离的 Team worker 模板，凭据不进入 workspace；动态模板自动保留 `TeamSay` 回报协议，避免自定义系统提示覆盖团队协作约束；失败运行会继续派发 FIFO；线程状态改由 Yuxi 事实源聚合；移除 LangChain/LangGraph/DeepAgents 运行代码、依赖及无效摘要配置。
 
 - AgentScope 网关承接队列执行、持久 Session、审批/取消/steer、Team、Skills、KB 和隔离 workspace；生产 Compose 同步新增内部 AgentScope 服务与固定切换时间配置。
-- 修复并行工具审批、resume 再挂起、Team 异步回报收束、模型切换、附件绑定和终态竞态；真实浏览器、MiniMax-M3、OTLP 与 Docker E2E 已验证。
+- 修复并行工具审批、resume 再挂起、Team 成员唤醒产生新回复时被过滤及无归属事件破坏终态、模型切换、附件绑定和终态竞态；真实浏览器、MiniMax-M3、OTLP 与 Docker E2E 已验证。
 - 两轴复审修复：工具审批策略接线（run 的审批模式每次执行前写入会话权限，完全信任 → bypass，此前"完全信任"退化为逐次审批）；多模态图片输入贯通（image_content 以 data 块送达模型，含媒体类型嗅探，此前被静默丢弃）；run 终态回写输入消息投递状态；修复 download_kb_file 运算符优先级缺陷；install_skill 元数据残留清理；read_timeout/sleep 常量收敛；ADR 接入站点导航；e2e mock URL 参数化并修复触发词被技能 hint 误命中。
 
 - AgentScope gateway 聚合模型事件中的 token usage 并写入 AgentRun；线程状态接口读取最近 Run 的持久化用量，不再依赖旧 middleware state。

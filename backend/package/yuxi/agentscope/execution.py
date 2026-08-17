@@ -58,7 +58,7 @@ def _terminal_error_message(result: GatewayRoundResult) -> str | None:
         return None
     if result.run_status == "interrupted":
         return "会话已中断"
-    return "运行失败"
+    return result.error_message or "运行失败"
 
 
 async def finalize_run(db: AsyncSession, run: AgentRun, result: GatewayRoundResult) -> None:

@@ -302,6 +302,7 @@ class AgentRepository:
                 "system_prompt": DEEP_RESEARCH_SYSTEM_PROMPT,
                 "subagents": [RESEARCH_EXPLORER_AGENT_SLUG, FACT_VERIFIER_AGENT_SLUG],
                 "skills": [DEEP_RESEARCH_AGENT_SLUG],
+                "mcps": [],
             },
             is_subagent=False,
             created_by=created_by,

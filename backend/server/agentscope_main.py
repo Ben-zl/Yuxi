@@ -180,7 +180,11 @@ def _create_service_app_sync():
     else:
         workspace_manager = LocalWorkspaceManager(basedir=AGENTSCOPE_WORKSPACE_BASEDIR)
     return create_app(
-        storage=AsyncSQLAlchemyStorage(AGENTSCOPE_DATABASE_URL, create_tables=True),
+        storage=AsyncSQLAlchemyStorage(
+            AGENTSCOPE_DATABASE_URL,
+            create_tables=True,
+            engine_kwargs={"pool_pre_ping": True},
+        ),
         message_bus=RedisMessageBus(
             host=redis_parsed.hostname or "redis",
             port=redis_parsed.port or 6379,

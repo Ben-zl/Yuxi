@@ -28,9 +28,7 @@ def _message_text(message: dict) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(
-            block.get("text", "") for block in content if isinstance(block, dict)
-        )
+        return "".join(block.get("text", "") for block in content if isinstance(block, dict))
     return ""
 
 
@@ -68,7 +66,7 @@ def _assistant_tool_names(body: dict) -> set[str]:
 
 
 def _team_next_call(body: dict):
-    """「组建团队」编排：TeamCreate → AgentCreate(自定义模板) → 总结。"""
+    """团队编排：TeamCreate → AgentCreate(自定义模板) → 总结。"""
     called = _assistant_tool_names(body)
     if "AgentCreate" in called:
         return None  # worker 已创建，进入总结轮
@@ -93,12 +91,13 @@ def _matched_tool_trigger(body: dict):
     """
     messages = body.get("messages") or []
     user_texts = [
-        t for t in (_message_text(m) for m in messages if m.get("role") == "user")
+        t
+        for t in (_message_text(m) for m in messages if m.get("role") == "user")
         if not t.startswith("<system-reminder>")
     ]
     joined = user_texts[-1] if user_texts else ""
     # 团队编排是状态机（多轮工具调用），先于一次性触发的工具结果短路
-    if "组建团队" in joined:
+    if "组建团队" in joined or "简短调研" in joined:
         return _team_next_call(body)
     if any(m.get("role") == "tool" for m in messages):
         return None
