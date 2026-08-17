@@ -50,7 +50,9 @@ export default defineConfig({
           { text: '沙盒架构与设计', link: '/agents/sandbox-architecture' },
           { text: 'MCP 集成', link: '/agents/mcp-integration' },
           { text: 'Skills 管理', link: '/agents/skills-management' },
-          { text: '子智能体', link: '/agents/subagents-management' }
+          { text: '子智能体', link: '/agents/subagents-management' },
+          { text: 'ADR-0001 agent 域迁移 agentscope 承接', link: '/adr/0001-agentscope-平台层一刀切承接agent域' },
+          { text: 'ADR-0002 存储边界划分', link: '/adr/0002-存储边界配置留yuxi会话归agentscope' }
         ]
       },
       {

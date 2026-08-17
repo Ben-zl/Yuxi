@@ -18,6 +18,7 @@ from yuxi.agentscope.protocol import (
     init_chunk,
     reply_end_to_terminal,
 )
+from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
 from yuxi.agentscope.runner import SUBSCRIBE_SETTLE_SECONDS
 from yuxi.services.run_queue_service import append_run_stream_event
 
@@ -93,7 +94,8 @@ async def stream_round_to_run_events(
     run_id: str,
     request_id: str,
     thread_id: str,
-    read_timeout: float = 180.0,
+    read_timeout: float = READ_TIMEOUT_SECONDS,
+    image_content: str | None = None,
 ) -> GatewayRoundResult:
     """触发一轮对话，事件实时转换为 chunk 并写入 run 事件流，直至终态。
 
@@ -122,7 +124,7 @@ async def stream_round_to_run_events(
     cancel_task = start_cancel_watcher(client, uid=uid, agent_id=agent_id, session_id=session_id, run_id=run_id)
     try:
         await asyncio.sleep(SUBSCRIBE_SETTLE_SECONDS)
-        await client.trigger_chat(uid, agent_id, session_id, text)
+        await client.trigger_chat(uid, agent_id, session_id, text, image_content=image_content)
 
         text_parts: list[str] = []
         reasoning_parts: list[str] = []

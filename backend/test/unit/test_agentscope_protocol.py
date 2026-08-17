@@ -158,3 +158,23 @@ def test_require_external_execution_maps_questions_and_rejects_invalid_input():
             {"type": "REQUIRE_EXTERNAL_EXECUTION", "tool_calls": [None]},
             request_id=REQUEST_ID,
         )
+
+
+def test_permission_mode_mapping():
+    """审批模式映射：完全信任 → bypass（跳过人工确认），其余 → default。"""
+    from yuxi.agentscope.projection import permission_mode_for
+
+    assert permission_mode_for("always_trust") == "bypass"
+    assert permission_mode_for("default") == "default"
+    assert permission_mode_for(None) == "default"
+
+
+def test_trigger_chat_with_image_builds_data_block():
+    """带图输入构造 data 块，media_type 按 base64 前缀嗅探。"""
+    from yuxi.agentscope.client import _sniff_image_media_type
+
+    assert _sniff_image_media_type("/9j/4AAQ") == "image/jpeg"
+    assert _sniff_image_media_type("iVBORw0KGgo") == "image/png"
+    assert _sniff_image_media_type("UklGRhheAAB") == "image/webp"
+    assert _sniff_image_media_type("R0lGODlhAQAB") == "image/gif"
+    assert _sniff_image_media_type("unknown") == "image/png"

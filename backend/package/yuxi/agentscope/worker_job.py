@@ -10,10 +10,11 @@ import os
 from pathlib import Path
 
 from yuxi.agentscope.client import AgentScopeServiceClient
+from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
 from yuxi.agentscope.execution import execute_run, finalize_run
 from yuxi.agentscope.event_stream import cancel_tasks, start_event_pump
 from yuxi.agentscope.gateway import GatewayRoundResult, start_cancel_watcher
-from yuxi.agentscope.runner import ensure_thread_session
+from yuxi.agentscope.runner import SUBSCRIBE_SETTLE_SECONDS, ensure_thread_session
 from yuxi.agentscope.thread_guard import (
     LEGACY_THREAD_MESSAGE,
     clear_pending_confirm,
@@ -81,7 +82,15 @@ async def execute_agent_run_job(run_id: str) -> None:
                     input_message=input_message,
                     mapping=mapping,
                 )
-                result = await execute_run(db, client, run=run, text=text, model_spec=model_spec)
+                await _apply_permission_mode(client, run, mapping)
+                result = await execute_run(
+                    db,
+                    client,
+                    run=run,
+                    text=text,
+                    model_spec=model_spec,
+                    image_content=input_message.image_content,
+                )
             if result.parked in {"permission", "external"} and result.pending_confirm:
                 await store_pending_confirm(run.conversation_thread_id, result.pending_confirm)
 
@@ -103,6 +112,7 @@ async def execute_agent_run_job(run_id: str) -> None:
                 if output_message is None:
                     raise RuntimeError("回复消息落库失败：线程不存在")
                 await run_repo.set_output_message(run_id, output_message.id)
+            await _sync_input_delivery_status(db, run, result.run_status)
             await db.commit()
         except ValueError as exc:
             message = str(exc)
@@ -136,6 +146,30 @@ async def execute_agent_run_job(run_id: str) -> None:
             )
 
 
+async def _apply_permission_mode(client, run, mapping) -> None:
+    """按 run 的审批模式设置会话权限（完全信任 → bypass 跳过人工确认）。"""
+    from yuxi.agentscope.projection import permission_mode_for
+
+    mode = (run.input_payload or {}).get("tool_approval_mode")
+    await client.set_permission_mode(
+        run.uid,
+        mapping.agentscope_agent_id,
+        mapping.agentscope_session_id,
+        permission_mode_for(mode),
+    )
+
+
+async def _sync_input_delivery_status(db, run, run_status: str) -> None:
+    """run 终态回写输入消息投递状态（interrupted 保持原状态以便 UI 区分）。"""
+    from yuxi.services.agent_request_queue_service import RUN_STATUS_TO_DELIVERY_STATUS
+
+    delivery = RUN_STATUS_TO_DELIVERY_STATUS.get(run_status)
+    if delivery and run.input_message_id:
+        await ConversationRepository(db).set_message_delivery_status(
+            run.input_message_id, delivery
+        )
+
+
 async def _fail_run(db, run_repo, run, message: str) -> None:
     """失败终态提交后续派 FIFO 队头。"""
     await run_repo.set_terminal_status(run.id, status="failed", error_message=message)
@@ -144,6 +178,7 @@ async def _fail_run(db, run_repo, run, message: str) -> None:
         run.conversation_thread_id,
         {"status": "error", "error_message": message},
     )
+    await _sync_input_delivery_status(db, run, "failed")
     await db.commit()
     await dispatch_next_request(
         uid=run.uid,
@@ -216,6 +251,7 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
         agent_slug=run.agent_slug,
         model_spec=(run.input_payload or {}).get("model_spec"),
     )
+    await _apply_permission_mode(client, run, mapping)
     resume_input = (input_message.extra_metadata or {}).get("resume") or {}
 
     confirm_event = await load_pending_confirm(run.conversation_thread_id)
@@ -289,7 +325,7 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
         uid=run.uid,
         agent_id=mapping.agentscope_agent_id,
         session_id=mapping.agentscope_session_id,
-        read_timeout=180.0,
+        read_timeout=READ_TIMEOUT_SECONDS,
     )
     cancel_task = start_cancel_watcher(
         client,
@@ -302,9 +338,9 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
     # 个别 tool_call 可能在确认后才进入 asking。事件流停滞期间周期性
     # 检查会话，发现滞留 asking 即按本次决定补发确认。
     stall_poll_seconds = 15.0
-    total_deadline = asyncio.get_running_loop().time() + 180.0
+    total_deadline = asyncio.get_running_loop().time() + READ_TIMEOUT_SECONDS
     try:
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(SUBSCRIBE_SETTLE_SECONDS)
         tool_calls = confirm_event.get("tool_calls") or []
         if len(tool_calls) != len(approved):
             raise ValueError("待审批工具调用数量与审批决定数量不一致")
@@ -389,7 +425,7 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
         uid=run.uid,
         agent_id=mapping.agentscope_agent_id,
         session_id=mapping.agentscope_session_id,
-        read_timeout=180.0,
+        read_timeout=READ_TIMEOUT_SECONDS,
     )
     cancel_task = start_cancel_watcher(
         client,
@@ -399,7 +435,7 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
         run_id=run.id,
     )
     try:
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(SUBSCRIBE_SETTLE_SECONDS)
         await client.resume_external_execution(
             run.uid,
             mapping.agentscope_agent_id,

@@ -86,10 +86,17 @@ def _team_next_call(body: dict):
 
 
 def _matched_tool_trigger(body: dict):
-    """按用户消息关键词匹配工具触发；无工具结果时才触发（有则进入总结轮）。"""
+    """按最后一条真实用户消息匹配工具触发；无工具结果时才触发。
+
+    只看末条 user 消息：全量技能种子会以 hint 块注入会话（含“写文件”
+    等触发词字样），扫全部历史会误触发错误工具。
+    """
     messages = body.get("messages") or []
-    user_texts = [_message_text(m) for m in messages if m.get("role") == "user"]
-    joined = "".join(user_texts)
+    user_texts = [
+        t for t in (_message_text(m) for m in messages if m.get("role") == "user")
+        if not t.startswith("<system-reminder>")
+    ]
+    joined = user_texts[-1] if user_texts else ""
     # 团队编排是状态机（多轮工具调用），先于一次性触发的工具结果短路
     if "组建团队" in joined:
         return _team_next_call(body)

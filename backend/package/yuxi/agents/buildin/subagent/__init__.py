@@ -3,7 +3,7 @@
 from yuxi.agents.base import BaseAgent
 from yuxi.agents.buildin.subagent.context import SubAgentContext
 
-_SUBAGENT_DISABLED_TOOLS = frozenset({"present_artifacts", "ask_user_question", "install_skill"})
+_SUBAGENT_DISABLED_TOOLS = frozenset({"present_artifacts", "ask_user_question"})
 
 
 class SubAgentBackend(BaseAgent):

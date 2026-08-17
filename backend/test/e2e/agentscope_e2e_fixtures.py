@@ -27,7 +27,7 @@ async def upsert_mock_provider(db: AsyncSession) -> None:
         db.add(provider)
     provider.display_name = "e2e mock provider"
     provider.provider_type = "openai"
-    provider.base_url = os.getenv("OPENAI_MOCK_BASE_URL", "http://openai-mock:8080/v1")
+    provider.base_url = os.getenv("OPENAI_MOCK_BASE_URL", os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1"))
     provider.api_key = "e2e-mock-key"
     provider.capabilities = ["chat"]
     provider.enabled_models = [{"id": "mock-chat-model", "type": "chat"}]

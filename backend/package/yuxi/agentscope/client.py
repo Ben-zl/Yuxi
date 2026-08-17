@@ -22,6 +22,18 @@ class AgentScopeServiceError(RuntimeError):
         self.status_code = status_code
 
 
+def _sniff_image_media_type(b64: str) -> str:
+    """按 base64 前缀嗅探图片 MIME 类型（存储侧只存裸 base64 无类型）。"""
+    head = b64[:10]
+    if head.startswith("/9j/"):
+        return "image/jpeg"
+    if head.startswith("R0lGOD"):
+        return "image/gif"
+    if head.startswith("UklGR"):
+        return "image/webp"
+    return "image/png"
+
+
 class AgentScopeServiceClient:
     """薄客户端：不缓存业务状态，映射与幂等由调用方（runner/投影层）负责。"""
 
@@ -142,13 +154,31 @@ class AgentScopeServiceClient:
             json={"chat_model_config": chat_model_config},
         )
 
-    async def trigger_chat(self, uid: str, agent_id: str, session_id: str, text: str) -> None:
-        """触发一轮对话（fire-and-forget），事件经 stream 端点消费。"""
-        msg = {
-            "role": "user",
-            "name": "user",
-            "content": [{"type": "text", "text": text}],
-        }
+    async def trigger_chat(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        text: str,
+        image_content: str | None = None,
+    ) -> None:
+        """触发一轮对话（fire-and-forget），事件经 stream 端点消费。
+
+        image_content 为可选的裸 base64 图片，与文本一起作为多模态输入。
+        """
+        content: list[dict] = [{"type": "text", "text": text}]
+        if image_content:
+            content.append(
+                {
+                    "type": "data",
+                    "source": {
+                        "type": "base64",
+                        "data": image_content,
+                        "media_type": _sniff_image_media_type(image_content),
+                    },
+                }
+            )
+        msg = {"role": "user", "name": "user", "content": content}
         await self._request(
             "POST",
             "/chat/",

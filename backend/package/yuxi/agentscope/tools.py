@@ -173,6 +173,23 @@ async def _check_target_visible(uid: str, knowledge_slugs: list[str] | None, kb_
     return None
 
 
+def _textual_inline(data, media_type: str) -> str | None:
+    """文本类内容内联为模型可读字符串；二进制或无数据返回 None。
+
+    application/json 的 media_type 不带 text/ 前缀，需并列判断；
+    data 为空时不得落入文本分支（回归：曾因运算符优先级返回 "None"）。
+    """
+    if data is None:
+        return None
+    is_textual = media_type.startswith("text/") or media_type == "application/json"
+    if not is_textual:
+        return None
+    try:
+        return data.decode("utf-8") if isinstance(data, bytes) else str(data)
+    except UnicodeDecodeError:
+        return None
+
+
 async def _doubao_search(query: str, count: int, api_key: str) -> str:
     """豆包搜索 provider（Bearer 认证）。"""
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -345,20 +362,9 @@ def _download_kb_file_tool(uid: str, knowledge_slugs: list[str] | None):
             return _json(info)
         data = info.get("data")
         media_type = str(info.get("media_type") or "")
-        # 文本类内容直接内联（模型可读）；二进制返回元数据
-        if (
-            data is not None
-            and media_type.startswith("text/")
-            or media_type
-            in (
-                "application/json",
-                "text/markdown",
-            )
-        ):
-            try:
-                return data.decode("utf-8") if isinstance(data, bytes) else str(data)
-            except UnicodeDecodeError:
-                pass
+        inline = _textual_inline(data, media_type)
+        if inline is not None:
+            return inline
         return _json(
             {
                 "file_id": file_id,

@@ -90,6 +90,17 @@ def project_chat_model(provider: ModelProvider, model_id: str) -> tuple[dict, di
     return credential_data, chat_model_config
 
 
+def permission_mode_for(tool_approval_mode: str | None) -> str:
+    """yuxi 审批模式 → agentscope 会话权限模式。
+
+    always_trust（完全信任）映射 bypass（跳过全部人工确认），
+    其余（含 None）按 default（逐次审批）。
+    """
+    if tool_approval_mode == "always_trust":
+        return "bypass"
+    return "default"
+
+
 def split_model_spec(model_spec: str) -> tuple[str, str]:
     """拆分 provider_id:model_id（model_id 允许包含斜杠）。"""
     provider_id, _, model_id = model_spec.partition(":")

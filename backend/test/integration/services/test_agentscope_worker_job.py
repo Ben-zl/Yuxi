@@ -95,7 +95,7 @@ async def env(monkeypatch):
             db.add(provider)
         provider.display_name = "e2e mock provider"
         provider.provider_type = "openai"
-        provider.base_url = os.getenv("OPENAI_MOCK_BASE_URL", "http://openai-mock:8080/v1")
+        provider.base_url = os.getenv("OPENAI_MOCK_BASE_URL", os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1"))
         provider.api_key = "e2e-mock-key"
         provider.capabilities = ["chat"]
         provider.enabled_models = [{"id": "mock-chat-model", "type": "chat"}]
@@ -216,6 +216,10 @@ async def test_worker_job_full_pipeline(env):
         assert "user" in roles and "assistant" in roles
         assistant = next(m for m in messages if m.role == "assistant")
         assert assistant.content.startswith("你好，我是 e2e mock 模型")
+
+        # run 终态回写输入消息投递状态
+        user = next(m for m in messages if m.role == "user")
+        assert user.delivery_status == "complete"
         assert run.output_message_id == assistant.id
 
 
@@ -234,7 +238,7 @@ async def test_steer_interrupted_run_dispatches_queue_head(env, monkeypatch):
     async def _capture_dispatch(**kwargs):
         dispatched.append(kwargs.get("thread_id"))
 
-    async def _interrupted_run(db, client, *, run, text, read_timeout=180.0, model_spec=None):
+    async def _interrupted_run(db, client, *, run, text, read_timeout=180.0, model_spec=None, image_content=None):
         return GatewayRoundResult(run_status="interrupted", text="", reasoning="", event_count=1)
 
     monkeypatch.setattr(worker_job, "dispatch_next_request", _capture_dispatch)
@@ -291,7 +295,7 @@ async def test_approval_parked_interrupted_run_holds_queue(env, monkeypatch):
     async def _capture_dispatch(**kwargs):
         dispatched.append(kwargs.get("thread_id"))
 
-    async def _parked_run(db, client, *, run, text, read_timeout=180.0, model_spec=None):
+    async def _parked_run(db, client, *, run, text, read_timeout=180.0, model_spec=None, image_content=None):
         return GatewayRoundResult(
             run_status="interrupted",
             text="",

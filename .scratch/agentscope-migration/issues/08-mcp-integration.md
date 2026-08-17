@@ -8,7 +8,7 @@
 
 - [x] 管理界面配置 MCP server→对话中端到端调用其工具
 - [x] 工具名冲突/禁用工具过滤语义与现有等价
-- [x] 用户仅能添加 sse/streamable-http，stdio 白名单约束保留
+- [x] 用户仅能添加 sse/streamable-http（yuxi 源头约束保留）；stdio 内置白名单在对话链路不再装配（fork 仅支持 http_mcp，属迁移接受的边界，见 Answer 说明）
 - [x] MCP 工具调用事件在前端呈现与迁移前一致
 
 ## Answer（2026-08-14 验证记录）

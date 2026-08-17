@@ -215,3 +215,15 @@ async def test_build_subagent_tools_does_not_expose_agent_create_to_worker():
     )
 
     assert built == []
+
+
+def test_textual_inline_guards_empty_data():
+    """回归：application/json 且 data=None 时不得返回字符串 "None"。"""
+    from yuxi.agentscope.tools import _textual_inline
+
+    assert _textual_inline(None, "application/json") is None
+    assert _textual_inline(None, "text/plain") is None
+    assert _textual_inline(b"hello", "text/plain") == "hello"
+    assert _textual_inline("hello", "application/json") == "hello"
+    assert _textual_inline(b"\xff\xfe", "text/plain") is None  # 非 UTF-8
+    assert _textual_inline(b"bin", "application/pdf") is None

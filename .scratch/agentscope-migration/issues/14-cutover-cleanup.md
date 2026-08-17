@@ -114,3 +114,23 @@
 - MiniMax-M3 在 team 编排指令下偶发停滞（无工具调用无终态直至 180s read_timeout）或 AgentCreate 病态重试循环。
 
 回归：47 passed + 4 skipped 全绿。
+
+## 复审补充边界（2026-08-16）
+
+- **内置 stdio MCP 不再装配**：agentscope fork 仅支持 http_mcp，`mcp-server-chart`（stdio）在新对话链路不可用；用户禁用 stdio 的管理面约束保留。如需恢复需 fork 增补 stdio 传输支持（当前"不改 fork"约束下接受）。
+- **install_skill 工具随旧栈清退**：元数据与禁用列表残留已同步清理，前端工具清单不再展示该条目。
+
+## 两轴复审修复记录（2026-08-17）
+
+**已修复（含单测/集成验证）**：
+1. tool_approval_mode 全链接线：每次 run 执行前 `_apply_permission_mode` 写会话权限（always_trust→bypass）——修复"完全信任"退化为逐次审批。
+2. image_content 贯通：client.trigger_chat 构造 data 块（base64 媒体类型嗅探）→ gateway → execution → worker 传 input_message.image_content——修复图片静默丢弃。
+3. run 终态回写输入消息 delivery_status（RUN_STATUS_TO_DELIVERY_STATUS 启用；interrupted 保持原状）。
+4. tools.py 运算符优先级真缺陷（application/json+无 data → "None"）：抽 `_textual_inline` 纯函数修复并回归测试。
+5. install_skill 元数据/禁用列表残留清理（实现已随旧栈清退）。
+6. read_timeout(5处)/sleep(2处) 常量收敛至 event_stream.READ_TIMEOUT_SECONDS/SUBSCRIBE_SETTLE_SECONDS；runner 大小写归一统一 .upper()。
+7. docs/adr 两篇接入 vitepress 导航；docs/agents/issue-tracker.md（技能工作流文件）移出分支。
+8. e2e 环境适配：OPENAI_MOCK_URL 参数化；mock 触发词改为只匹配末条真实用户消息（技能 hint 含"写文件"字样曾误触发）。
+9. 环境数据修复：minimax provider 被改坏（is_enabled=false、enabled_models 清空、base_url/type 错写为 api.minimax.io/v1+openai）已恢复；SILICONFLOW/DOUBAO 坏 key 此前已清。
+
+**真实链路验证阻塞（fork 服务层，非 yuxi 代码）**：agentscope 服务自上次容器重建后，ChatService.run 上下文内的模型调用一律报 "Could not reach the model service"（CONNECTION 分类）。已排除：容器网络（服务名/bridge IP/公网均通）、Anthropic SDK 直调（同容器同参数成功）、fork AnthropicChatModel 直调（同 credential 成功）、服务重启。e2e（mcp/kb/team/skills 等）同根因失败；bisect 证明与本轮修复无关。需 fork 侧排查 BackgroundTaskManager 执行上下文中的模型客户端行为。上述阻塞下，浏览器级 P1/P2/P3 端到端复验待恢复后补做（代码路径由 29+ 项单测/集成测试覆盖）。

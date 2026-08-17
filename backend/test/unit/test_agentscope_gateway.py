@@ -14,7 +14,7 @@ class _StubClient:
         self._events = events
         self.triggered = None
 
-    async def trigger_chat(self, uid, agent_id, session_id, text):
+    async def trigger_chat(self, uid, agent_id, session_id, text, image_content=None):
         self.triggered = text
 
     async def interrupt_session(self, uid, agent_id, session_id):

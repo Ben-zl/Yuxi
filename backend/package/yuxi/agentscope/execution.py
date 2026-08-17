@@ -8,6 +8,7 @@ AgentRun 终态回写。请求提交与排队互斥由既有 intake/队列服务
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agentscope.client import AgentScopeServiceClient
+from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
 from yuxi.agentscope.gateway import GatewayRoundResult, stream_round_to_run_events
 from yuxi.agentscope.runner import ensure_thread_session
 from yuxi.repositories.agent_run_repository import AgentRunRepository
@@ -20,8 +21,9 @@ async def execute_run(
     *,
     run: AgentRun,
     text: str,
-    read_timeout: float = 180.0,
+    read_timeout: float = READ_TIMEOUT_SECONDS,
     model_spec: str | None = None,
+    image_content: str | None = None,
 ) -> GatewayRoundResult:
     """执行一个已派发的 Run：事件写入 Redis Stream，终态回写 AgentRun。"""
     mapping = await ensure_thread_session(
@@ -42,6 +44,7 @@ async def execute_run(
         request_id=run.request_id,
         thread_id=run.conversation_thread_id,
         read_timeout=read_timeout,
+        image_content=image_content,
     )
     await finalize_run(db, run, result)
     return result

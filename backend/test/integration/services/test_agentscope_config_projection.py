@@ -5,6 +5,8 @@
 后续工具/Skills/MCP/Team 工单的夹具一律复用本入口，不另起炉灶。
 """
 
+import os
+
 import pytest
 from sqlalchemy import delete
 
@@ -63,7 +65,7 @@ async def db_session():
                     provider_id=PROVIDER_ID,
                     display_name="投影测试供应商",
                     provider_type="openai",
-                    base_url="http://openai-mock:8080/v1",
+                    base_url=os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1"),
                     api_key="it-proj-key",
                     capabilities=["chat"],
                     enabled_models=[{"id": "mock-chat-model", "type": "chat"}],
@@ -116,7 +118,7 @@ async def test_project_runtime_covers_all_components(db_session):
     assert projection.agent_request["react_config"] == {"max_iters": 300}
     assert projection.credential_data["type"] == "openai_credential"
     assert projection.credential_data["api_key"] == "it-proj-key"
-    assert projection.credential_data["base_url"] == "http://openai-mock:8080/v1"
+    assert projection.credential_data["base_url"] == os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1")
     assert projection.chat_model_config["model"] == "mock-chat-model"
     assert projection.chat_model_config["credential_id"] is None  # 由创建方回填
 

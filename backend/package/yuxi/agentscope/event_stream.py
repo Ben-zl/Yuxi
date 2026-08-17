@@ -5,6 +5,10 @@ import asyncio
 from yuxi.agentscope.client import AgentScopeServiceClient
 
 
+# 事件流读取超时（秒）：无新事件超过该时长视为会话停滞，显式失败。
+READ_TIMEOUT_SECONDS = 180.0
+
+
 def start_event_pump(
     client: AgentScopeServiceClient,
     *,

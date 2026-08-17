@@ -8,6 +8,13 @@ import pytest
 from yuxi.agentscope import worker_job
 from yuxi.agentscope.gateway import GatewayRoundResult
 
+
+class _MinimalClient:
+    """仅实现 resume 路径所需接口的最小桩。"""
+
+    async def set_permission_mode(self, uid, agent_id, session_id, mode):
+        self.permission_mode = mode
+
 pytestmark = pytest.mark.unit
 
 
@@ -40,7 +47,7 @@ async def test_worker_preserves_mixed_approval_decisions(monkeypatch):
     clear = AsyncMock()
     monkeypatch.setattr(worker_job, "clear_pending_confirm", clear)
 
-    await worker_job._execute_resume(SimpleNamespace(), object(), run, message)
+    await worker_job._execute_resume(SimpleNamespace(), _MinimalClient(), run, message)
 
     assert captured == [True, False]
     clear.assert_awaited_once_with("thread")
@@ -73,7 +80,7 @@ async def test_resume_failure_keeps_pending_confirmation(monkeypatch):
     monkeypatch.setattr(worker_job, "clear_pending_confirm", clear)
 
     with pytest.raises(RuntimeError, match="session read failed"):
-        await worker_job._execute_resume(SimpleNamespace(), object(), run, message)
+        await worker_job._execute_resume(SimpleNamespace(), _MinimalClient(), run, message)
     clear.assert_not_awaited()
 
 
@@ -99,7 +106,7 @@ async def test_permission_resume_requires_decisions(monkeypatch):
     with pytest.raises(ValueError, match="缺少有效 decisions"):
         await worker_job._execute_resume(
             SimpleNamespace(),
-            object(),
+            _MinimalClient(),
             run,
             SimpleNamespace(extra_metadata={"resume": {}}),
         )
@@ -235,7 +242,8 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
         worker_job,
         "ConversationRepository",
         lambda current_db: SimpleNamespace(
-            get_message_by_id=AsyncMock(return_value=SimpleNamespace(content="hello", extra_metadata={}))
+            get_message_by_id=AsyncMock(return_value=SimpleNamespace(content="hello", extra_metadata={})),
+            set_message_delivery_status=AsyncMock(),
         ),
     )
     monkeypatch.setattr(
@@ -255,3 +263,16 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
     )
     emit.assert_awaited_once()
     dispatch.assert_awaited_once_with(uid="u", agent_slug="agent", thread_id="thread")
+
+
+async def test_apply_permission_mode_maps_always_trust_to_bypass():
+    """完全信任映射 bypass 并写入会话；default 保持逐次审批。"""
+    run = SimpleNamespace(uid="u", input_payload={"tool_approval_mode": "always_trust"})
+    mapping = SimpleNamespace(agentscope_agent_id="a", agentscope_session_id="s")
+    client = _MinimalClient()
+    await worker_job._apply_permission_mode(client, run, mapping)
+    assert client.permission_mode == "bypass"
+
+    run_default = SimpleNamespace(uid="u", input_payload={"tool_approval_mode": "default"})
+    await worker_job._apply_permission_mode(client, run_default, mapping)
+    assert client.permission_mode == "default"

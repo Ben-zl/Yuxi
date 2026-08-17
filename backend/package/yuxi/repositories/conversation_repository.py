@@ -32,6 +32,14 @@ class ConversationRepository:
     def __init__(self, db_session: AsyncSession):
         self.db = db_session
 
+    async def set_message_delivery_status(self, message_id: int, status: str) -> None:
+        """更新消息投递状态（run 终态回写）。"""
+        from sqlalchemy import update
+
+        await self.db.execute(
+            update(Message).where(Message.id == message_id).values(delivery_status=status)
+        )
+
     async def get_message_by_id(self, message_id: int) -> Message | None:
         """按主键读取消息。"""
         result = await self.db.execute(select(Message).where(Message.id == message_id))

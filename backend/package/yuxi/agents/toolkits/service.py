@@ -43,16 +43,6 @@ _BUILTIN_TOOLS = [
         "tags": ["交互"],
         "config_guide": "",
     },
-    {
-        "slug": "install_skill",
-        "name": "安装技能",
-        "description": "从允许的远程来源安装 Skill",
-        "metadata": {},
-        "args": [],
-        "category": "buildin",
-        "tags": ["Skill"],
-        "config_guide": "",
-    },
 ]
 
 _metadata_cache: list[dict] = []

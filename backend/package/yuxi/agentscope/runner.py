@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agentscope.client import AgentScopeServiceClient
+from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
 from yuxi.agentscope.config_projection import project_runtime
 from yuxi.agentscope.event_stream import cancel_tasks, start_event_pump
 from yuxi.agentscope.thread_guard import ensure_thread_eligible
@@ -100,7 +101,7 @@ async def collect_chat_round(
     agent_id: str,
     session_id: str,
     text: str,
-    read_timeout: float = 180.0,
+    read_timeout: float = READ_TIMEOUT_SECONDS,
 ) -> ChatRoundResult:
     """订阅在先、触发在后，收集本次 reply 的完整事件流并拼装文本。
 
@@ -126,25 +127,25 @@ async def collect_chat_round(
             event = await asyncio.wait_for(queue.get(), timeout=read_timeout)
             if isinstance(event, Exception):
                 raise event
-            event_type = str(event.get("type", "")).lower()
-            if event_type == "text_block_delta":
+            event_type = str(event.get("type", "")).upper()
+            if event_type == "TEXT_BLOCK_DELTA":
                 text_parts.append(event.get("delta", ""))
-            elif event_type == "thinking_block_delta":
+            elif event_type == "THINKING_BLOCK_DELTA":
                 reasoning_parts.append(event.get("delta", ""))
-            if event_type == "reply_start":
+            if event_type == "REPLY_START":
                 span_start = len(events)
                 events.append(event)
                 continue
             if span_start < 0:
                 continue  # 订阅前残留的无关事件
             events.append(event)
-            if event_type == "require_user_confirm":
+            if event_type == "REQUIRE_USER_CONFIRM":
                 return ChatRoundResult(
                     events=events[span_start:],
                     text="".join(text_parts),
                     parked="permission",
                 )
-            if event_type == "reply_end":
+            if event_type == "REPLY_END":
                 round_text = "".join(text_parts)
                 return ChatRoundResult(events=events[span_start:], text=round_text)
     finally:
