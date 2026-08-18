@@ -34,6 +34,16 @@ _BUILTIN_TOOLS = [
         "config_guide": "",
     },
     {
+        "slug": "read_media",
+        "name": "读取图片/PDF",
+        "description": "读取工作区图片或文本型 PDF，扫描件可转交 OCR",
+        "metadata": {},
+        "args": [],
+        "category": "buildin",
+        "tags": ["文件", "多模态"],
+        "config_guide": "",
+    },
+    {
         "slug": "ask_user_question",
         "name": "向用户提问",
         "description": "在需要补充信息时请求用户输入",

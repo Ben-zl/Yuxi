@@ -3174,12 +3174,12 @@ const handleApprovalWithStream = async (answer) => {
   }
 }
 
-const handleQuestionSubmit = (answer) => {
-  handleApprovalWithStream(answer)
+const handleQuestionSubmit = (payload) => {
+  handleApprovalWithStream(approvalState.kind === 'question' ? { answer: payload } : payload)
 }
 
 const handleQuestionCancel = () => {
-  handleApprovalWithStream('reject')
+  handleApprovalWithStream({ answer: 'reject' })
 }
 
 const buildExportPayload = () => {

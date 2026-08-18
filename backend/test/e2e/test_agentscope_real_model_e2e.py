@@ -63,7 +63,16 @@ async def db_session():
                     base_url="https://api.minimaxi.com/anthropic",
                     api_key_env="MINIMAX_API_KEY",
                     capabilities=["chat"],
-                    enabled_models=[{"id": "MiniMax-M3", "type": "chat"}],
+                    enabled_models=[
+                        {
+                            "id": "MiniMax-M3",
+                            "type": "chat",
+                            "request_body_overrides": {
+                                "enable_thinking": True,
+                                "thinking_budget": 1024,
+                            },
+                        }
+                    ],
                     is_enabled=True,
                 ),
                 Agent(
@@ -73,6 +82,7 @@ async def db_session():
                     config_json={
                         "context": {
                             "model": MODEL_SPEC,
+                            "skills": [],
                             "mcps": [],
                             "system_prompt": "你是真实模型验证助手，请用一句话回答。",
                         }
@@ -120,6 +130,7 @@ async def test_real_model_roundtrip_with_usage(db_session):
 
         assert result.run_status == "completed"
         assert len(result.text.strip()) > 0, "真实模型应返回非空回复"
+        assert len(result.reasoning.strip()) > 0, "开启 thinking 后应返回非空推理摘要"
         assert result.usage and result.usage["total_tokens"] > 0, result.usage
 
         messages = await client.list_messages(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)

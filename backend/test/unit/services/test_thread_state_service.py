@@ -88,6 +88,13 @@ async def test_thread_state_uses_persisted_run_message_and_pending_confirm(monke
     monkeypatch.setattr(service, "AgentRunRepository", _RunRepository)
     monkeypatch.setattr(service, "SubagentThreadRepository", _ThreadRepository)
     monkeypatch.setattr(service, "_list_artifacts", lambda *_args: [])
+    async def load_runtime_state(*_args, **_kwargs):
+        return (
+            [{"id": "task-1", "content": "整理资料", "status": "completed"}],
+            {"/workspace/report.md": {"path": "/workspace/report.md", "name": "report.md"}},
+        )
+
+    monkeypatch.setattr(service, "_load_agentscope_state", load_runtime_state)
 
     async def load_pending(_thread_id: str):
         return {
@@ -105,8 +112,8 @@ async def test_thread_state_uses_persisted_run_message_and_pending_confirm(monke
     )
 
     assert result["agent_state"] == {
-        "todos": [],
-        "files": {},
+        "todos": [{"id": "task-1", "content": "整理资料", "status": "completed"}],
+        "files": {"/workspace/report.md": {"path": "/workspace/report.md", "name": "report.md"}},
         "artifacts": [],
         "subagent_runs": [],
         "token_usage": {"total_tokens": 7},

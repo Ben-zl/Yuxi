@@ -59,6 +59,10 @@ class AgentScopeServiceClient:
         resp = await self._request("POST", "/agent/", uid, json=agent_request)
         return resp.json()["agent_id"]
 
+    async def update_agent(self, uid: str, agent_id: str, agent_request: dict) -> None:
+        """替换已有 Agent 的名称、系统提示词和 ReAct 配置。"""
+        await self._request("PATCH", f"/agent/{agent_id}", uid, json=agent_request)
+
     async def create_credential(self, uid: str, data: dict) -> str:
         """创建凭据（data 为 credential 判别联合的 dict 形式），返回 credential_id。"""
         resp = await self._request("POST", "/credential/", uid, json={"data": data})
@@ -99,6 +103,31 @@ class AgentScopeServiceClient:
             uid,
             params={"agent_id": agent_id, "session_id": session_id},
             json={"skill_path": skill_path},
+        )
+
+    async def list_workspace_skills(self, uid: str, agent_id: str, session_id: str) -> list[str]:
+        """列出会话工作区当前安装的 Skill 名称。"""
+        resp = await self._request(
+            "GET",
+            "/workspace/skill",
+            uid,
+            params={"agent_id": agent_id, "session_id": session_id},
+        )
+        return [str(item["name"]) for item in resp.json()]
+
+    async def remove_workspace_skill(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        skill_name: str,
+    ) -> None:
+        """从会话工作区移除一个已取消配置的 Skill。"""
+        await self._request(
+            "DELETE",
+            f"/workspace/skill/{quote(skill_name, safe='')}",
+            uid,
+            params={"agent_id": agent_id, "session_id": session_id},
         )
 
     async def upload_workspace_file(
@@ -267,6 +296,103 @@ class AgentScopeServiceClient:
             params={"agent_id": agent_id, "limit": 50},
         )
         return resp.json()["messages"]
+
+    async def get_session(self, uid: str, agent_id: str, session_id: str) -> dict:
+        """读取指定 Session 的持久化配置与轻量状态。"""
+        resp = await self._request(
+            "GET",
+            "/sessions/",
+            uid,
+            params={"agent_id": agent_id},
+        )
+        for view in resp.json().get("sessions", []):
+            session = view.get("session", {})
+            if session.get("id") == session_id:
+                return session
+        raise AgentScopeServiceError(f"Session {session_id} 不存在", status_code=404)
+
+    async def list_workspace_files(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        *,
+        max_entries: int = 500,
+    ) -> list[dict]:
+        """递归列出会话 workspace 文件，限制条目数避免状态接口失控。"""
+        pending = [""]
+        files: list[dict] = []
+        while pending and len(files) < max_entries:
+            path = pending.pop(0)
+            resp = await self._request(
+                "GET",
+                "/workspace/directories",
+                uid,
+                params={"agent_id": agent_id, "session_id": session_id, "path": path},
+            )
+            listing = resp.json()
+            base = str(listing.get("path") or "").rstrip("/")
+            for entry in listing.get("entries", []):
+                item = dict(entry)
+                item["path"] = f"{base}/{entry['name']}"
+                if item.get("is_dir"):
+                    pending.append(item["path"])
+                else:
+                    files.append(item)
+                    if len(files) >= max_entries:
+                        break
+        return files
+
+    async def list_workspace_directory(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        path: str,
+    ) -> dict:
+        """列出会话 workspace 的一个目录层级。"""
+        resp = await self._request(
+            "GET",
+            "/workspace/directories",
+            uid,
+            params={"agent_id": agent_id, "session_id": session_id, "path": path},
+        )
+        return resp.json()
+
+    async def read_workspace_file(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        path: str,
+        *,
+        max_bytes: int = 25 * 1024 * 1024,
+    ) -> bytes:
+        """读取一个会话文件，并在服务进程限制最大响应体。"""
+        resp = await self._request(
+            "GET",
+            "/workspace/files",
+            uid,
+            params={"agent_id": agent_id, "session_id": session_id, "path": path},
+        )
+        if len(resp.content) > max_bytes:
+            raise ValueError("workspace 文件超过 25 MB")
+        return resp.content
+
+    async def delete_workspace_output(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        path: str,
+    ) -> None:
+        """删除会话 workspace 的一个产出文件或目录。"""
+        await self._request(
+            "DELETE",
+            "/yuxi/workspace/output",
+            uid,
+            params={"agent_id": agent_id, "session_id": session_id, "path": path},
+        )
 
     async def stream_events(
         self, uid: str, agent_id: str, session_id: str, read_timeout: float = 180.0

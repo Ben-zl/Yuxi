@@ -109,3 +109,70 @@ async def test_skill_progressive_disclosure(db_session):
     finally:
         await redis_client.delete(stream_key)
         await close_async_redis_client()
+
+
+async def test_skill_dependency_runs_through_gateway(db_session):
+    """原版 AgentScope 通过 Yuxi Gateway 执行激活后的 Skill 依赖。"""
+    run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
+    request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
+    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
+    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
+    mapping = await ensure_thread_session(
+        db_session,
+        client,
+        uid=USER_ID,
+        thread_id=thread_id,
+        agent_slug=CHATBOT_SLUG,
+    )
+    await client.set_permission_mode(
+        USER_ID,
+        mapping.agentscope_agent_id,
+        mapping.agentscope_session_id,
+        "bypass",
+    )
+
+    result = await stream_round_to_run_events(
+        client,
+        uid=USER_ID,
+        agent_id=mapping.agentscope_agent_id,
+        session_id=mapping.agentscope_session_id,
+        text="请调用技能依赖完成查询",
+        run_id=run_id,
+        request_id=request_id,
+        thread_id=thread_id,
+        read_timeout=300.0,
+    )
+    assert result.run_status == "completed"
+
+    redis_client = await get_async_redis_client()
+    try:
+        frames = await redis_client.xrange(f"run:events:{run_id}")
+        chunks = [
+            chunk
+            for _, entry in frames
+            if entry["event_type"] == "messages"
+            for chunk in json.loads(entry["payload"])["payload"]["items"]
+        ]
+        called_names = [
+            fragment["name"]
+            for chunk in chunks
+            if chunk["status"] == "loading" and chunk["msg"].get("tool_call_chunks")
+            for fragment in chunk["msg"]["tool_call_chunks"]
+        ]
+        assert "Skill" in called_names
+        assert "skill_dependency_gateway" in called_names
+        call_names_by_id = {
+            fragment["id"]: fragment["name"]
+            for chunk in chunks
+            if chunk["status"] == "loading" and chunk["msg"].get("tool_call_chunks")
+            for fragment in chunk["msg"]["tool_call_chunks"]
+        }
+        finished = [chunk for chunk in chunks if chunk["status"] == "stream_event"]
+        assert any(
+            call_names_by_id.get(chunk["event"]["data"]["tool_call_id"])
+            == "skill_dependency_gateway"
+            for chunk in finished
+        )
+    finally:
+        await redis_client.delete(f"run:events:{run_id}")
+        await close_async_redis_client()

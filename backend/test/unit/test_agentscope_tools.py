@@ -227,3 +227,227 @@ def test_textual_inline_guards_empty_data():
     assert _textual_inline("hello", "application/json") == "hello"
     assert _textual_inline(b"\xff\xfe", "text/plain") is None  # 非 UTF-8
     assert _textual_inline(b"bin", "application/pdf") is None
+
+
+def test_build_ask_user_question_tool_is_external_with_structured_schema():
+    """主动提问必须由 AgentScope external-execution 原生链路挂起。"""
+    tool = tools.build_ask_user_question_tool()
+
+    assert tool.name == "ask_user_question"
+    assert tool.is_external_tool is True
+    assert tool.is_concurrency_safe is False
+    assert tool.input_schema["required"] == ["questions"]
+    question_schema = tool.input_schema["properties"]["questions"]["items"]
+    assert {"question", "header", "options"} <= set(question_schema["required"])
+
+
+def test_build_web_search_tool_remains_available_without_provider_keys(monkeypatch):
+    """搜索未配置时仍注册工具，由调用结果显式说明缺少配置。"""
+    monkeypatch.delenv("DOUBAO_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    tool = tools.build_web_search_tool()
+
+    assert tool is not None
+    assert tool.name == "web_search"
+
+
+async def test_build_optional_tools_respects_empty_and_explicit_allowlist(monkeypatch):
+    """tools=[] 禁用全部可选工具，白名单只装配指定项。"""
+    monkeypatch.setattr(tools, "build_web_search_tool", lambda: SimpleNamespace(name="web_search"))
+    monkeypatch.setattr(tools, "_present_artifacts_tool", lambda *_args: SimpleNamespace(name="present_artifacts"))
+    monkeypatch.setattr(tools, "_ocr_parse_file_tool", lambda *_args: SimpleNamespace(name="ocr_parse_file"))
+
+    assert await tools.build_optional_tools(
+        tool_slugs=[], uid="u", knowledge_slugs=[], agent_id="a", session_id="s"
+    ) == []
+    selected = await tools.build_optional_tools(
+        tool_slugs=["ask_user_question", "present_artifacts"],
+        uid="u",
+        knowledge_slugs=[],
+        agent_id="a",
+        session_id="s",
+    )
+    assert [item.name for item in selected] == ["ask_user_question", "present_artifacts"]
+
+
+async def test_skill_dependency_gateway_requires_activation_and_dispatches(monkeypatch):
+    """Gateway 只允许调用当前 Session 已经通过 Skill 激活的依赖。"""
+    from agentscope.permission import PermissionBehavior, PermissionDecision
+    from agentscope.tool import FunctionTool
+
+    async def search(query: str) -> str:
+        return f"result:{query}"
+
+    dependency_tool = FunctionTool(search, name="web_search", is_read_only=True)
+    dependency_tool.check_permissions = AsyncMock(
+        return_value=PermissionDecision(
+            behavior=PermissionBehavior.ALLOW,
+            message="allowed",
+        )
+    )
+    workspace = SimpleNamespace(
+        list_skills=AsyncMock(
+            return_value=[SimpleNamespace(name="research", markdown="# Research")]
+        )
+    )
+    monkeypatch.setattr(
+        tools,
+        "build_dependency_tools",
+        AsyncMock(return_value=[dependency_tool]),
+    )
+    monkeypatch.setattr(
+        tools,
+        "build_mcp_tools",
+        AsyncMock(return_value=[]),
+    )
+    projection = SimpleNamespace(
+        skill_tool_dependencies={"research": ["web_search"]},
+        skill_mcp_servers={"research": []},
+        knowledge_slugs=[],
+    )
+
+    extensions = await tools.build_skill_dependency_gateway(
+        projection=projection,
+        workspace=workspace,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+    )
+
+    assert extensions[0].name == "Skill"
+    assert extensions[0].is_concurrency_safe is True
+    gateway = extensions[1]
+    assert gateway.name == "skill_dependency_gateway"
+    state = SimpleNamespace(tool_context=SimpleNamespace(activated_groups=[]))
+
+    blocked = await gateway.call(
+        skill="research",
+        tool_name="web_search",
+        arguments={"query": "AgentScope"},
+        _agent_state=state,
+    )
+    assert blocked.state == "error"
+
+    viewed = await extensions[0].call(skill="research", _agent_state=state)
+    assert "skill_dependency_gateway" in viewed.content[0].text
+    assert state.tool_context.activated_groups == ["skill__research"]
+
+    result = await gateway.call(
+        skill="research",
+        tool_name="web_search",
+        arguments={"query": "AgentScope"},
+        _agent_state=state,
+    )
+    assert result.content[0].text == "result:AgentScope"
+
+
+async def test_external_skill_gateway_requires_token_and_preserves_nested_schema(monkeypatch):
+    """外部依赖只能使用 Skill 返回的令牌，questions 保持嵌套协议。"""
+    import re
+
+    from agentscope.permission import PermissionBehavior
+
+    external = tools.build_ask_user_question_tool()
+    workspace = SimpleNamespace(
+        list_skills=AsyncMock(
+            return_value=[SimpleNamespace(name="research", markdown="# Research")]
+        )
+    )
+    monkeypatch.setattr(
+        tools,
+        "build_dependency_tools",
+        AsyncMock(return_value=[external]),
+    )
+    monkeypatch.setattr(tools, "build_mcp_tools", AsyncMock(return_value=[]))
+    projection = SimpleNamespace(
+        skill_tool_dependencies={"research": ["ask_user_question"]},
+        skill_mcp_servers={"research": []},
+        knowledge_slugs=[],
+    )
+    extensions = await tools.build_skill_dependency_gateway(
+        projection=projection,
+        workspace=workspace,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+    )
+    viewer, gateway = extensions
+    state = SimpleNamespace(tool_context=SimpleNamespace(activated_groups=[]))
+    viewed = await viewer.call(skill="research", _agent_state=state)
+    token = re.search(r"activation_token 固定为 `([^`]+)`", viewed.content[0].text).group(1)
+    arguments = {
+        "questions": [
+            {
+                "question": "范围？",
+                "header": "范围",
+                "options": [
+                    {"label": "A", "description": "选项 A"},
+                    {"label": "B", "description": "选项 B"},
+                ],
+            }
+        ]
+    }
+
+    denied = await gateway.check_permissions(
+        {
+            "skill": "research",
+            "tool_name": "ask_user_question",
+            "arguments": arguments,
+            "activation_token": "invalid",
+        },
+        SimpleNamespace(),
+    )
+    allowed = await gateway.check_permissions(
+        {
+            "skill": "research",
+            "tool_name": "ask_user_question",
+            "arguments": arguments,
+            "activation_token": token,
+        },
+        SimpleNamespace(),
+    )
+
+    assert denied.behavior == PermissionBehavior.DENY
+    assert allowed.behavior == PermissionBehavior.ALLOW
+
+
+async def test_media_reader_returns_image_block_and_rejects_unknown_binary():
+    """独立媒体工具按真实文件头返回图片块，拒绝伪装二进制。"""
+    from agentscope.message import DataBlock
+
+    backend = SimpleNamespace(
+        read_file=AsyncMock(return_value=b"\x89PNG\r\n\x1a\nfixture"),
+        basename=lambda path: path.rsplit("/", 1)[-1],
+    )
+    workspace = SimpleNamespace(get_backend=lambda: backend)
+    reader = tools.build_media_reader_tool(workspace)
+
+    image = await reader.call(file_path="/workspace/uploads/demo.png")
+    assert isinstance(image.content[1], DataBlock)
+    assert image.content[1].source.media_type == "image/png"
+
+    backend.read_file.return_value = b"not-an-image"
+    invalid = await reader.call(file_path="/workspace/uploads/demo.png")
+    assert invalid.state == "error"
+
+
+async def test_media_reader_extracts_selected_pdf_pages(monkeypatch):
+    """PDF 读取只返回指定的 1-based 页面。"""
+    import pypdf
+
+    pages = [
+        SimpleNamespace(extract_text=lambda: "FIRST PAGE"),
+        SimpleNamespace(extract_text=lambda: "SECOND PAGE"),
+    ]
+    monkeypatch.setattr(pypdf, "PdfReader", lambda _stream: SimpleNamespace(pages=pages))
+    backend = SimpleNamespace(
+        read_file=AsyncMock(return_value=b"%PDF fixture"),
+        basename=lambda path: path.rsplit("/", 1)[-1],
+    )
+    reader = tools.build_media_reader_tool(SimpleNamespace(get_backend=lambda: backend))
+
+    result = await reader.call(file_path="/workspace/uploads/demo.pdf", pages=[2])
+
+    assert "SECOND PAGE" in result.content[0].text
+    assert "FIRST PAGE" not in result.content[0].text

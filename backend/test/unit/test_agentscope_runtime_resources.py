@@ -12,7 +12,7 @@ pytestmark = pytest.mark.unit
 
 async def test_direct_session_uses_exact_mapping(monkeypatch):
     """主线程必须通过 uid、agent、session 的精确映射消费统一投影。"""
-    mapping = SimpleNamespace(agent_slug="leader", model_spec="p:m")
+    mapping = SimpleNamespace(agent_slug="leader", model_spec="p:m", thread_id="thread-1")
     lookup = AsyncMock(return_value=mapping)
     projection = SimpleNamespace(agent_slug="leader")
     project = AsyncMock(return_value=projection)
@@ -34,12 +34,18 @@ async def test_direct_session_uses_exact_mapping(monkeypatch):
         agentscope_agent_id="a",
         agentscope_session_id="s",
     )
-    project.assert_awaited_once_with(ANY, uid="u", agent_slug="leader", model_spec="p:m")
+    project.assert_awaited_once_with(
+        ANY,
+        uid="u",
+        agent_slug="leader",
+        model_spec="p:m",
+        thread_id="thread-1",
+    )
 
 
 async def test_team_worker_resolves_leader_mapping(monkeypatch):
     """AgentScope 动态 worker 没有直接映射时继承 Team leader 的线程投影。"""
-    mapping = SimpleNamespace(agent_slug="leader", model_spec="p:m")
+    mapping = SimpleNamespace(agent_slug="leader", model_spec="p:m", thread_id="thread-1")
     lookup = AsyncMock(side_effect=[None, mapping])
     project = AsyncMock(return_value=SimpleNamespace(agent_slug="leader"))
     storage = SimpleNamespace(
@@ -63,7 +69,13 @@ async def test_team_worker_resolves_leader_mapping(monkeypatch):
     )
 
     assert lookup.await_count == 2
-    project.assert_awaited_once_with(ANY, uid="u", agent_slug="leader", model_spec="p:m")
+    project.assert_awaited_once_with(
+        ANY,
+        uid="u",
+        agent_slug="leader",
+        model_spec="p:m",
+        thread_id="thread-1",
+    )
 
 
 async def test_unmapped_non_team_session_fails_explicitly(monkeypatch):

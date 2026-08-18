@@ -24,6 +24,9 @@ class _StubClient:
     async def list_messages(self, uid, agent_id, session_id):
         return self._messages
 
+    async def list_workspace_files(self, uid, agent_id, session_id):
+        return [{"path": "/workspace/outputs/report.md", "name": "report.md", "is_dir": False}]
+
     async def stream_events(self, uid, agent_id, session_id, read_timeout=180.0):
         for event in self._events:
             yield event
@@ -133,6 +136,117 @@ async def test_plain_round_unchanged_first_reply_end(capture_events):
     assert result.text == "普通回复"
     assert "不应出现" not in result.text
     assert len([p for name, p in capture_events if name == "end"]) == 1
+
+
+async def test_replyless_state_update_emits_agent_state(capture_events):
+    """AgentScope 独立 state_updated 事件必须驱动实时 Todo/文件面板。"""
+    client = _StubClient(
+        [
+            {"type": "REPLY_START", "reply_id": "r1"},
+            {
+                "type": "CUSTOM",
+                "name": "state_updated",
+                "value": {
+                    "tasks_context": {
+                        "tasks": [
+                            {"id": "task-1", "subject": "整理资料", "state": "in_progress"}
+                        ]
+                    }
+                },
+            },
+            {"type": "REPLY_END", "reply_id": "r1", "finished_reason": "completed"},
+        ]
+    )
+
+    await gateway.stream_round_to_run_events(
+        client,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        text="任务",
+        run_id="run-state",
+        request_id="req-state",
+        thread_id="th-state",
+        read_timeout=5.0,
+    )
+
+    state_chunks = [
+        item
+        for event, payload in capture_events
+        if event == "messages"
+        for item in payload.get("items", [])
+        if item.get("status") == "agent_state"
+    ]
+    assert state_chunks[0]["agent_state"]["todos"] == [
+        {"id": "task-1", "content": "整理资料", "status": "in_progress"}
+    ]
+    assert "/workspace/outputs/report.md" in state_chunks[0]["agent_state"]["files"]
+
+
+async def test_round_result_collects_tool_call_for_history(capture_events):
+    """运行结果应保留工具参数、输出和失败状态，供线程历史持久化。"""
+    client = _StubClient(
+        [
+            {"type": "REPLY_START", "reply_id": "r1"},
+            {
+                "type": "TOOL_CALL_START",
+                "reply_id": "r1",
+                "tool_call_id": "tc1",
+                "tool_call_name": "query_kb",
+            },
+            {
+                "type": "TOOL_CALL_DELTA",
+                "reply_id": "r1",
+                "tool_call_id": "tc1",
+                "delta": '{"query":"退款',
+            },
+            {
+                "type": "TOOL_CALL_DELTA",
+                "reply_id": "r1",
+                "tool_call_id": "tc1",
+                "delta": '政策"}',
+            },
+            {"type": "TOOL_CALL_END", "reply_id": "r1", "tool_call_id": "tc1"},
+            {
+                "type": "TOOL_RESULT_TEXT_DELTA",
+                "reply_id": "r1",
+                "tool_call_id": "tc1",
+                "delta": "知识库不可用",
+            },
+            {
+                "type": "TOOL_RESULT_END",
+                "reply_id": "r1",
+                "tool_call_id": "tc1",
+                "state": "error",
+                "metadata": {"message": "连接失败"},
+            },
+            {"type": "TEXT_BLOCK_DELTA", "reply_id": "r1", "delta": "查询失败"},
+            {"type": "REPLY_END", "reply_id": "r1", "finished_reason": "completed"},
+        ]
+    )
+
+    result = await gateway.stream_round_to_run_events(
+        client,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        text="查询退款政策",
+        run_id="run-tools",
+        request_id="req-tools",
+        thread_id="th-tools",
+        read_timeout=5.0,
+    )
+
+    assert result.tool_calls == [
+        {
+            "id": "tc1",
+            "name": "query_kb",
+            "args": {"query": "退款政策"},
+            "output": "知识库不可用",
+            "status": "error",
+            "error_message": "连接失败",
+        }
+    ]
 
 
 async def test_failed_round_preserves_provider_error(capture_events):

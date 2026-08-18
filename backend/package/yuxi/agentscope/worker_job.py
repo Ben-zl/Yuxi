@@ -14,6 +14,7 @@ from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
 from yuxi.agentscope.execution import execute_run, finalize_run
 from yuxi.agentscope.event_stream import cancel_tasks, start_event_pump
 from yuxi.agentscope.gateway import GatewayRoundResult, start_cancel_watcher
+from yuxi.agentscope.protocol import ToolEventConverter, event_to_chunks, reply_end_to_terminal
 from yuxi.agentscope.runner import SUBSCRIBE_SETTLE_SECONDS, ensure_thread_session
 from yuxi.agentscope.thread_guard import (
     LEGACY_THREAD_MESSAGE,
@@ -28,6 +29,7 @@ from yuxi.repositories.agent_run_repository import (
 )
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.services.agent_request_queue_service import dispatch_next_request
+from yuxi.services.run_queue_service import append_run_stream_event
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Message
 from yuxi.utils import logger
@@ -94,8 +96,9 @@ async def execute_agent_run_job(run_id: str) -> None:
             if result.parked in {"permission", "external"} and result.pending_confirm:
                 await store_pending_confirm(run.conversation_thread_id, result.pending_confirm)
 
-            # yuxi 消息表落库：前端线程历史视图的数据源
-            if result.text:
+            # yuxi 消息表落库：正文、推理与工具生命周期需和实时流一致。
+            if result.text or result.reasoning or result.tool_calls:
+                additional_kwargs = {"reasoning_content": result.reasoning} if result.reasoning else {}
                 output_message = await conv_repo.add_message_by_thread_id(
                     thread_id=run.conversation_thread_id,
                     role="assistant",
@@ -105,12 +108,23 @@ async def execute_agent_run_job(run_id: str) -> None:
                         "request_id": run.request_id,
                         "run_id": run_id,
                         "token_usage": result.usage or {},
+                        "additional_kwargs": additional_kwargs,
                     },
                     run_id=run_id,
                     request_id=run.request_id,
                 )
                 if output_message is None:
                     raise RuntimeError("回复消息落库失败：线程不存在")
+                for tool_call in result.tool_calls or []:
+                    await conv_repo.add_tool_call(
+                        message_id=output_message.id,
+                        tool_name=tool_call.get("name") or "unknown",
+                        tool_input=tool_call.get("args") or {},
+                        tool_output=tool_call.get("output") or "",
+                        status=tool_call.get("status") or "pending",
+                        error_message=tool_call.get("error_message"),
+                        langgraph_tool_call_id=tool_call.get("id"),
+                    )
                 await run_repo.set_output_message(run_id, output_message.id)
             await _sync_input_delivery_status(db, run, result.run_status)
             await db.commit()
@@ -165,9 +179,7 @@ async def _sync_input_delivery_status(db, run, run_status: str) -> None:
 
     delivery = RUN_STATUS_TO_DELIVERY_STATUS.get(run_status)
     if delivery and run.input_message_id:
-        await ConversationRepository(db).set_message_delivery_status(
-            run.input_message_id, delivery
-        )
+        await ConversationRepository(db).set_message_delivery_status(run.input_message_id, delivery)
 
 
 async def _fail_run(db, run_repo, run, message: str) -> None:
@@ -365,7 +377,13 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
             confirmed=[decisions_by_id[call.get("id")] for call in pending_calls],
         )
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         event_count = 0
+        tool_converter = ToolEventConverter(run.request_id)
+        tool_converter.seed_tool_calls(
+            tool_calls,
+            reply_id=str(confirm_event.get("reply_id") or ""),
+        )
         loop = asyncio.get_running_loop()
         while True:
             remaining = total_deadline - loop.time()
@@ -398,21 +416,53 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
             if isinstance(event, Exception):
                 raise event
             event_count += 1
-            if str(event.get("type", "")).upper() == "TEXT_BLOCK_DELTA":
+            event_type = str(event.get("type", "")).upper()
+            if event_type == "TEXT_BLOCK_DELTA":
                 text_parts.append(event.get("delta", ""))
-            if str(event.get("type", "")).upper() in {
+            elif event_type == "THINKING_BLOCK_DELTA":
+                reasoning_parts.append(event.get("delta", ""))
+
+            chunks = event_to_chunks(event, request_id=run.request_id)
+            chunks.extend(tool_converter.feed(event))
+            if chunks:
+                await append_run_stream_event(
+                    run.id,
+                    "messages",
+                    {"items": chunks},
+                    thread_id=run.conversation_thread_id,
+                )
+
+            if event_type in {
                 "REQUIRE_USER_CONFIRM",
                 "REQUIRE_EXTERNAL_EXECUTION",
             }:
-                return _parked_resume_result(event, text_parts, event_count)
-            if str(event.get("type", "")).upper() == "REPLY_END":
-                finished = str(event.get("finished_reason", "")).lower()
+                tool_converter.seed_tool_calls(
+                    event.get("tool_calls") or [],
+                    reply_id=str(event.get("reply_id") or ""),
+                )
+                return _parked_resume_result(
+                    event,
+                    text_parts,
+                    reasoning_parts,
+                    event_count,
+                    tool_converter.history_tool_calls(),
+                )
+            if event_type == "REPLY_END":
+                terminal = reply_end_to_terminal(event, request_id=run.request_id)
+                await append_run_stream_event(
+                    run.id,
+                    "end",
+                    {"status": terminal.run_status, "chunk": terminal.chunk},
+                    thread_id=run.conversation_thread_id,
+                )
                 return GatewayRoundResult(
-                    run_status=("completed" if finished == "completed" else "interrupted"),
+                    run_status=terminal.run_status,
                     text="".join(text_parts),
-                    reasoning="",
+                    reasoning="".join(reasoning_parts),
                     event_count=event_count,
                     usage=_EMPTY_USAGE,
+                    error_message=terminal.chunk.get("error_message"),
+                    tool_calls=tool_converter.history_tool_calls(),
                 )
     finally:
         await cancel_tasks(pump, cancel_task)
@@ -445,7 +495,13 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
             answer=answer,
         )
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         event_count = 0
+        tool_converter = ToolEventConverter(run.request_id)
+        tool_converter.seed_tool_calls(
+            pending_event.get("tool_calls") or [],
+            reply_id=str(pending_event.get("reply_id") or ""),
+        )
         while True:
             event = await asyncio.wait_for(queue.get(), timeout=180.0)
             if isinstance(event, Exception):
@@ -454,32 +510,70 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
             event_type = str(event.get("type", "")).upper()
             if event_type == "TEXT_BLOCK_DELTA":
                 text_parts.append(event.get("delta", ""))
+            elif event_type == "THINKING_BLOCK_DELTA":
+                reasoning_parts.append(event.get("delta", ""))
+
+            chunks = event_to_chunks(event, request_id=run.request_id)
+            chunks.extend(tool_converter.feed(event))
+            if chunks:
+                await append_run_stream_event(
+                    run.id,
+                    "messages",
+                    {"items": chunks},
+                    thread_id=run.conversation_thread_id,
+                )
+
             if event_type in {"REQUIRE_USER_CONFIRM", "REQUIRE_EXTERNAL_EXECUTION"}:
-                return _parked_resume_result(event, text_parts, event_count)
+                tool_converter.seed_tool_calls(
+                    event.get("tool_calls") or [],
+                    reply_id=str(event.get("reply_id") or ""),
+                )
+                return _parked_resume_result(
+                    event,
+                    text_parts,
+                    reasoning_parts,
+                    event_count,
+                    tool_converter.history_tool_calls(),
+                )
             if event_type == "REPLY_END":
-                finished = str(event.get("finished_reason", "")).lower()
+                terminal = reply_end_to_terminal(event, request_id=run.request_id)
+                await append_run_stream_event(
+                    run.id,
+                    "end",
+                    {"status": terminal.run_status, "chunk": terminal.chunk},
+                    thread_id=run.conversation_thread_id,
+                )
                 return GatewayRoundResult(
-                    run_status="completed" if finished == "completed" else "interrupted",
+                    run_status=terminal.run_status,
                     text="".join(text_parts),
-                    reasoning="",
+                    reasoning="".join(reasoning_parts),
                     event_count=event_count,
                     usage=_EMPTY_USAGE,
+                    error_message=terminal.chunk.get("error_message"),
+                    tool_calls=tool_converter.history_tool_calls(),
                 )
     finally:
         await cancel_tasks(pump, cancel_task)
 
 
-def _parked_resume_result(event: dict, text_parts: list[str], event_count: int) -> GatewayRoundResult:
+def _parked_resume_result(
+    event: dict,
+    text_parts: list[str],
+    reasoning_parts: list[str],
+    event_count: int,
+    tool_calls: list[dict],
+) -> GatewayRoundResult:
     """把恢复期间再次出现的审批或问答转换为新的挂起结果。"""
     event_type = str(event.get("type", "")).upper()
     return GatewayRoundResult(
         run_status="interrupted",
         text="".join(text_parts),
-        reasoning="",
+        reasoning="".join(reasoning_parts),
         event_count=event_count,
         parked="permission" if event_type == "REQUIRE_USER_CONFIRM" else "external",
         usage=_EMPTY_USAGE,
         pending_confirm=event,
+        tool_calls=tool_calls,
     )
 
 

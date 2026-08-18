@@ -12,6 +12,8 @@ dependencies = [
     "fastapi>=0.121",
     "uvicorn[standard]>=0.34.2",
     "arq>=0.26.3",
+    "jsonschema>=4.26.0",
+    "pypdf>=6.13.3",
     "yuxi",
     # agentscope 承接迁移（工单 01/06）：固定 commit 的 fork，经 lock 锁定，升级必须显式 bump
     "agentscope[service,storage-sql,workspace-docker] @ git+https://github.com/Ben-zl/agentscope.git@ae6a563c",

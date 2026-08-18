@@ -3,6 +3,7 @@
 from pathlib import PurePosixPath
 
 MAX_WORKSPACE_UPLOAD_BYTES = 25 * 1024 * 1024
+WORKSPACE_OUTPUT_ROOT = PurePosixPath("/workspace/outputs")
 
 
 async def store_workspace_upload(
@@ -24,3 +25,29 @@ async def store_workspace_upload(
     workspace = await workspace_service.resolve(user_id, agent_id, session_id)
     await workspace.get_backend().write_file(str(path), data)
     return {"path": str(path), "size": len(data)}
+
+
+async def delete_workspace_output(
+    workspace_service,
+    *,
+    user_id: str,
+    agent_id: str,
+    session_id: str,
+    path: str,
+) -> dict:
+    """删除指定会话的产出文件，禁止删除产出根目录及越界路径。"""
+    target = PurePosixPath(path)
+    if (
+        not target.is_absolute()
+        or ".." in target.parts
+        or target == WORKSPACE_OUTPUT_ROOT
+        or not target.is_relative_to(WORKSPACE_OUTPUT_ROOT)
+    ):
+        raise ValueError("只能删除 outputs 目录中的文件或子目录")
+
+    workspace = await workspace_service.resolve(user_id, agent_id, session_id)
+    backend = workspace.get_backend()
+    if await backend.stat(str(target)) is None:
+        raise FileNotFoundError(str(target))
+    await backend.delete_path(str(target))
+    return {"success": True, "path": str(target)}

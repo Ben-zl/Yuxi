@@ -52,6 +52,25 @@ class GatewayRoundResult:
     parked: str | None = None  # 挂起原因（permission=等待工具审批）
     usage: dict | None = None  # 聚合的 token 用量（input/output/total）
     pending_confirm: dict | None = None  # 审批挂起原始事件（resume 用）
+    tool_calls: list[dict] | None = None  # 历史消息需恢复的工具调用与结果
+
+
+def tasks_to_todos(tasks_context: dict) -> list[dict]:
+    """把 AgentScope TaskContext 转为现有前端 Todo 数据结构。"""
+    return [
+        {
+            "id": str(task.get("id") or ""),
+            "content": str(task.get("subject") or task.get("description") or ""),
+            "status": str(task.get("state") or "pending"),
+        }
+        for task in tasks_context.get("tasks", [])
+        if isinstance(task, dict)
+    ]
+
+
+def files_to_state(files: list[dict]) -> dict[str, dict]:
+    """按路径索引 workspace 文件，保持前端历史状态契约。"""
+    return {str(item["path"]): item for item in files if item.get("path")}
 
 
 def start_cancel_watcher(
@@ -159,6 +178,25 @@ async def stream_round_to_run_events(
                 raise event
             event_type = str(event.get("type", "")).upper()
             event_reply_id = str(event.get("reply_id") or "")
+            if event_type == "CUSTOM" and event.get("name") == "state_updated":
+                files = await client.list_workspace_files(uid, agent_id, session_id)
+                state_chunk = make_chunk(
+                    request_id,
+                    status="agent_state",
+                    agent_state={
+                        "todos": tasks_to_todos(
+                            (event.get("value") or {}).get("tasks_context") or {}
+                        ),
+                        "files": files_to_state(files),
+                    },
+                )
+                await append_run_stream_event(
+                    run_id,
+                    "messages",
+                    {"items": [state_chunk]},
+                    thread_id=thread_id,
+                )
+                continue
             if not event_reply_id:
                 continue
             if event_type == "REPLY_START":
@@ -173,6 +211,10 @@ async def stream_round_to_run_events(
             if event_type in {"REQUIRE_USER_CONFIRM", "REQUIRE_EXTERNAL_EXECUTION"}:
                 # 工具审批挂起：run 进入 interrupted 终态（挂起互斥依据），
                 # 审批结果经新一轮 resume 请求续跑（与旧栈 resume 语义一致）
+                tool_converter.seed_tool_calls(
+                    event.get("tool_calls") or [],
+                    reply_id=event_reply_id,
+                )
                 chunks = event_to_chunks(event, request_id=request_id)
                 await append_run_stream_event(run_id, "messages", {"items": chunks}, thread_id=thread_id)
                 parked = "permission" if event_type == "REQUIRE_USER_CONFIRM" else "external"
@@ -192,6 +234,7 @@ async def stream_round_to_run_events(
                     parked=parked,
                     usage=_usage(input_tokens, output_tokens),
                     pending_confirm=event,
+                    tool_calls=tool_converter.history_tool_calls(),
                 )
             if event_type == "TOOL_CALL_START" and str(event.get("tool_call_name", "")) in TEAM_TOOL_NAMES:
                 team_tool_seen = True
@@ -211,6 +254,7 @@ async def stream_round_to_run_events(
                         event_count=event_count,
                         error_message=terminal.chunk.get("error_message"),
                         usage=_usage(input_tokens, output_tokens),
+                        tool_calls=tool_converter.history_tool_calls(),
                     )
                 # team 轮次：暂存终态，等待成员回报驱动的续写（静默窗口）
                 if pending_terminal is None:
@@ -246,6 +290,7 @@ async def stream_round_to_run_events(
             event_count=event_count,
             error_message=pending_terminal.chunk.get("error_message"),
             usage=_usage(input_tokens, output_tokens),
+            tool_calls=tool_converter.history_tool_calls(),
         )
     finally:
         await cancel_tasks(pump_task, cancel_task)

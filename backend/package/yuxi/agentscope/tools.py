@@ -6,7 +6,11 @@ FunctionTool：核心调用 KnowledgeBaseManager 的公开方法；可见性沿�
 LITE 模式或知识库管理器不可用时不装配知识库工具。
 """
 
+import base64
+import io
 import json
+import mimetypes
+import secrets
 
 import httpx
 
@@ -233,11 +237,7 @@ async def web_search(query: str, count: int = 10) -> str:
 
 
 def build_web_search_tool():
-    """构建网页搜索工具（provider 未配置时返回 None，不装配）。"""
-    import os
-
-    if not (os.getenv("DOUBAO_SEARCH_API_KEY") or os.getenv("TAVILY_API_KEY")):
-        return None
+    """构建网页搜索工具，未配置 provider 时由工具调用显式报错。"""
     from agentscope.tool import FunctionTool
 
     return FunctionTool(web_search, name="web_search", description="搜索互联网获取最新信息")
@@ -256,6 +256,490 @@ async def build_mcp_tools(
         client = await get_mcp_client({slug: {key: value for key, value in config.items() if key != "slug"}})
         tools.extend(await client.list_tools())
     return tools
+
+
+def build_ask_user_question_tool():
+    """构建由前端执行并通过 external-execution 结果恢复的提问工具。"""
+    from typing import Any
+
+    from agentscope.permission import PermissionBehavior, PermissionDecision
+    from agentscope.tool import ToolBase
+
+    class AskUserQuestion(ToolBase):
+        """向用户展示结构化问题并挂起当前回复。"""
+
+        name = "ask_user_question"
+        description = "需要用户补充关键信息时，展示一组结构化问题并等待回答。"
+        is_external_tool = True
+        is_concurrency_safe = False
+        is_read_only = True
+        input_schema: dict[str, Any] = {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string", "minLength": 1},
+                            "header": {"type": "string", "minLength": 1, "maxLength": 12},
+                            "options": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 4,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string", "minLength": 1},
+                                        "description": {"type": "string", "minLength": 1},
+                                    },
+                                    "required": ["label", "description"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["question", "header", "options"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["questions"],
+            "additionalProperties": False,
+        }
+
+        async def check_permissions(self, tool_input, context) -> PermissionDecision:
+            """提问只读取用户输入，无需额外工具审批。"""
+            return PermissionDecision(
+                behavior=PermissionBehavior.ALLOW,
+                decision_reason="ask_user_question is an external read-only tool",
+                message="允许向当前用户提问",
+            )
+
+    return AskUserQuestion()
+
+
+def build_media_reader_tool(workspace):
+    """构建独立图片/PDF读取工具，避免修改 AgentScope 内置 Read。"""
+    if workspace is None:
+        raise ValueError("read_media 需要已初始化的 AgentScope workspace")
+
+    from agentscope.message import Base64Source, DataBlock, TextBlock, ToolResultState
+    from agentscope.permission import PermissionBehavior, PermissionDecision
+    from agentscope.tool import ToolBase, ToolChunk
+
+    class MediaReader(ToolBase):
+        """读取 workspace 中的图片或文本型 PDF。"""
+
+        name = "read_media"
+        description = "读取 workspace 图片或 PDF；扫描 PDF 无文本时请改用 ocr_parse_file。"
+        is_concurrency_safe = True
+        is_read_only = True
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "minLength": 1},
+                "pages": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "uniqueItems": True,
+                },
+            },
+            "required": ["file_path"],
+            "additionalProperties": False,
+        }
+
+        async def check_permissions(self, tool_input, context) -> PermissionDecision:
+            """媒体读取为只读操作，交由权限引擎继续匹配规则。"""
+            return PermissionDecision(
+                behavior=PermissionBehavior.PASSTHROUGH,
+                message="Media reading is read-only.",
+            )
+
+        async def call(self, file_path: str, pages: list[int] | None = None) -> ToolChunk:
+            """返回图片 DataBlock 或指定 PDF 页面的文本。"""
+            raw = await workspace.get_backend().read_file(file_path)
+            if len(raw) > 20 * 1024 * 1024:
+                return _gateway_error("媒体文件超过 20 MB 读取限制。")
+
+            media_type = _detect_image_media_type(raw)
+            if media_type:
+                return ToolChunk(
+                    content=[
+                        TextBlock(text=f"Image: {file_path}"),
+                        DataBlock(
+                            source=Base64Source(
+                                data=base64.b64encode(raw).decode("ascii"),
+                                media_type=media_type,
+                            ),
+                            name=workspace.get_backend().basename(file_path),
+                        ),
+                    ],
+                    state=ToolResultState.RUNNING,
+                )
+
+            guessed_type = mimetypes.guess_type(file_path)[0]
+            if guessed_type != "application/pdf" and not file_path.lower().endswith(".pdf"):
+                return _gateway_error("read_media 仅支持 PNG/JPEG/GIF/WebP 图片和 PDF。")
+
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(raw))
+            if len(reader.pages) > 10 and not pages:
+                return _gateway_error("PDF 超过 10 页，请通过 pages 指定需要读取的页码。")
+            selected = pages or list(range(1, len(reader.pages) + 1))
+            invalid = [page for page in selected if page > len(reader.pages)]
+            if invalid:
+                return _gateway_error(f"PDF 页码越界: {invalid}")
+            texts = [reader.pages[page - 1].extract_text() or "" for page in selected]
+            if not any(text.strip() for text in texts):
+                return _gateway_error("PDF 没有可提取文本，请使用 ocr_parse_file 处理扫描页。")
+            content = "\n\n".join(
+                f"--- Page {page} ---\n{text}" for page, text in zip(selected, texts)
+            )
+            return ToolChunk(content=[TextBlock(text=content)], state=ToolResultState.RUNNING)
+
+    return MediaReader()
+
+
+def _detect_image_media_type(raw: bytes) -> str | None:
+    """根据真实文件头识别允许的图片类型。"""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+async def build_optional_tools(
+    *,
+    tool_slugs: list[str] | None,
+    uid: str,
+    knowledge_slugs: list[str] | None,
+    agent_id: str,
+    session_id: str,
+    workspace=None,
+) -> list:
+    """按 Agent 白名单装配 Yuxi 可选工具；None 表示全部目录项。"""
+    from yuxi.agents.toolkits.service import get_tool_metadata
+
+    selected = (
+        [item["slug"] for item in get_tool_metadata()]
+        if tool_slugs is None
+        else tool_slugs
+    )
+    tools_by_slug = {
+        "ask_user_question": build_ask_user_question_tool,
+        "present_artifacts": lambda: _present_artifacts_tool(uid, agent_id, session_id),
+        "ocr_parse_file": lambda: _ocr_parse_file_tool(uid, agent_id, session_id),
+        "read_media": lambda: build_media_reader_tool(workspace),
+        "web_search": build_web_search_tool,
+    }
+    result = []
+    for slug in selected:
+        factory = tools_by_slug.get(slug)
+        if factory is None:
+            raise ValueError(f"不支持的 Yuxi 可选工具: {slug}")
+        tool = factory()
+        if tool is not None:
+            result.append(tool)
+    return result
+
+
+async def build_dependency_tools(
+    *,
+    tool_slugs: list[str],
+    uid: str,
+    knowledge_slugs: list[str] | None,
+    agent_id: str,
+    session_id: str,
+    workspace=None,
+) -> list:
+    """构建 Skill 声明的 Yuxi 工具依赖，并严格按 slug 返回。"""
+    from yuxi.agents.toolkits.service import get_tool_metadata
+
+    optional_names = {item["slug"] for item in get_tool_metadata()}
+    selected_optional = [slug for slug in tool_slugs if slug in optional_names]
+    result = await build_optional_tools(
+        tool_slugs=selected_optional,
+        uid=uid,
+        knowledge_slugs=knowledge_slugs,
+        agent_id=agent_id,
+        session_id=session_id,
+        workspace=workspace,
+    )
+
+    kb_tools = await build_kb_tools(uid=uid, knowledge_slugs=knowledge_slugs)
+    if await _ensure_kb_manager_ready():
+        kb_tools.append(_download_kb_file_tool(uid, knowledge_slugs))
+    kb_by_name = {tool.name: tool for tool in kb_tools}
+    result.extend(kb_by_name[slug] for slug in tool_slugs if slug in kb_by_name)
+
+    resolved = {tool.name for tool in result}
+    missing = [slug for slug in tool_slugs if slug not in resolved]
+    if missing:
+        raise ValueError("Skill 工具依赖当前不可用: " + ", ".join(missing))
+    return result
+
+
+async def build_skill_dependency_gateway(
+    *,
+    projection,
+    workspace,
+    uid: str,
+    agent_id: str,
+    session_id: str,
+) -> list:
+    """构建 Skill 激活器和按 Session 隔离的依赖调用 Gateway。"""
+    from jsonschema import ValidationError, validate
+
+    from agentscope.message import TextBlock, ToolResultState
+    from agentscope.permission import PermissionBehavior, PermissionDecision
+    from agentscope.tool import ToolBase, ToolChunk
+
+    dependency_tools: dict[str, dict[str, ToolBase]] = {}
+    external_tokens: dict[str, str] = {}
+    for skill_slug in projection.skill_tool_dependencies:
+        configured = await build_dependency_tools(
+            tool_slugs=projection.skill_tool_dependencies.get(skill_slug, []),
+            uid=uid,
+            knowledge_slugs=projection.knowledge_slugs,
+            agent_id=agent_id,
+            session_id=session_id,
+            workspace=workspace,
+        )
+        configured.extend(
+            await build_mcp_tools(
+                mcp_servers=projection.skill_mcp_servers.get(skill_slug, []),
+            )
+        )
+        if configured:
+            dependency_tools[skill_slug] = {tool.name: tool for tool in configured}
+            if any(tool.is_external_tool for tool in configured):
+                external_tokens[skill_slug] = secrets.token_urlsafe(24)
+
+    async def list_skills() -> dict:
+        items = await workspace.list_skills(agent_id=agent_id)
+        return {item.name: item for item in items}
+
+    class ActivatingSkillViewer(ToolBase):
+        """读取 Skill 内容，并在当前 Session state 中激活其依赖组。"""
+
+        name = "Skill"
+        description = "读取与当前任务匹配的 Skill 指令。"
+        is_state_injected = True
+        is_read_only = True
+        is_concurrency_safe = True
+        input_schema = {
+            "type": "object",
+            "properties": {"skill": {"type": "string", "minLength": 1}},
+            "required": ["skill"],
+            "additionalProperties": False,
+        }
+
+        async def check_permissions(self, tool_input, context) -> PermissionDecision:
+            """Skill 读取及依赖激活均为只读操作。"""
+            return PermissionDecision(
+                behavior=PermissionBehavior.ALLOW,
+                decision_reason="Skill viewer is read-only",
+                message="允许读取 Skill",
+            )
+
+        async def call(self, skill: str, _agent_state) -> ToolChunk:
+            """返回 Skill 正文并激活当前 Session 的依赖 Gateway。"""
+            skills = await list_skills()
+            target = skills.get(skill)
+            if target is None:
+                return ToolChunk(
+                    content=[TextBlock(text=f"SkillNotFoundError: Skill '{skill}' not found.")],
+                    state=ToolResultState.ERROR,
+                )
+            group = f"skill__{skill}"
+            if skill in dependency_tools and group not in _agent_state.tool_context.activated_groups:
+                _agent_state.tool_context.activated_groups.append(group)
+
+            guidance = _dependency_guidance(
+                skill,
+                dependency_tools.get(skill, {}),
+                external_tokens.get(skill),
+            )
+            return ToolChunk(content=[TextBlock(text=f"{target.markdown}{guidance}")])
+
+    class SkillDependencyGateway(ToolBase):
+        """调用已激活 Skill 的服务端工具或 HTTP MCP。"""
+
+        name = "skill_dependency_gateway"
+        description = "调用已通过 Skill 工具激活的依赖工具；参数格式由 Skill 返回内容提供。"
+        is_state_injected = True
+        is_read_only = False
+        is_concurrency_safe = False
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "skill": {"type": "string", "enum": list(dependency_tools)},
+                "tool_name": {
+                    "type": "string",
+                    "enum": sorted(
+                        {
+                            name
+                            for tools_by_name in dependency_tools.values()
+                            for name, tool in tools_by_name.items()
+                            if not tool.is_external_tool
+                        }
+                    ),
+                },
+                "arguments": {"type": "object"},
+            },
+            "required": ["skill", "tool_name", "arguments"],
+            "additionalProperties": False,
+        }
+
+        async def check_permissions(self, tool_input, context) -> PermissionDecision:
+            """沿用被代理工具的审批策略。"""
+            target = _resolve_dependency(
+                dependency_tools,
+                tool_input.get("skill"),
+                tool_input.get("tool_name"),
+                external=False,
+            )
+            if target is None:
+                return PermissionDecision(
+                    behavior=PermissionBehavior.DENY,
+                    message="Skill 依赖工具不存在或类型不匹配。",
+                )
+            arguments = tool_input.get("arguments")
+            if not isinstance(arguments, dict):
+                return PermissionDecision(
+                    behavior=PermissionBehavior.DENY,
+                    message="Skill 依赖工具 arguments 必须是对象。",
+                )
+            return await target.check_permissions(arguments, context)
+
+        async def call(self, skill: str, tool_name: str, arguments: dict, _agent_state):
+            """校验激活状态与原始 schema 后调用依赖。"""
+            if f"skill__{skill}" not in _agent_state.tool_context.activated_groups:
+                return _gateway_error(f"Skill '{skill}' 尚未激活，请先调用 Skill。")
+            target = _resolve_dependency(
+                dependency_tools,
+                skill,
+                tool_name,
+                external=False,
+            )
+            if target is None:
+                return _gateway_error(f"Skill '{skill}' 没有可调用依赖 '{tool_name}'。")
+            try:
+                validate(instance=arguments, schema=target.input_schema)
+            except ValidationError as exc:
+                return _gateway_error(f"依赖工具参数不合法: {exc.message}")
+            call_args = dict(arguments)
+            if target.is_state_injected:
+                call_args["_agent_state"] = _agent_state
+            return await target(**call_args)
+
+    class SkillExternalDependencyGateway(ToolBase):
+        """把已激活 Skill 的外部工具调用交给 Yuxi 页面执行。"""
+
+        name = "skill_external_dependency_gateway"
+        description = "调用 Skill 返回内容中声明的外部依赖；必须携带该内容提供的 activation_token。"
+        is_external_tool = True
+        is_read_only = True
+        is_concurrency_safe = False
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "skill": {"type": "string", "enum": sorted(external_tokens)},
+                "tool_name": {
+                    "type": "string",
+                    "enum": sorted(
+                        {
+                            name
+                            for tools_by_name in dependency_tools.values()
+                            for name, tool in tools_by_name.items()
+                            if tool.is_external_tool
+                        }
+                    ),
+                },
+                "arguments": {"type": "object"},
+                "activation_token": {"type": "string"},
+            },
+            "required": ["skill", "tool_name", "arguments", "activation_token"],
+            "additionalProperties": False,
+        }
+
+        async def check_permissions(self, tool_input, context) -> PermissionDecision:
+            """用当前进程签发的激活令牌阻止未查看 Skill 的外部调用。"""
+            skill = tool_input.get("skill")
+            target = _resolve_dependency(
+                dependency_tools,
+                skill,
+                tool_input.get("tool_name"),
+                external=True,
+            )
+            if target is None or not secrets.compare_digest(
+                str(tool_input.get("activation_token") or ""),
+                external_tokens.get(skill, ""),
+            ):
+                return PermissionDecision(
+                    behavior=PermissionBehavior.DENY,
+                    message="Skill 外部依赖未激活或令牌已失效，请重新调用 Skill。",
+                )
+            arguments = tool_input.get("arguments")
+            if not isinstance(arguments, dict):
+                return PermissionDecision(
+                    behavior=PermissionBehavior.DENY,
+                    message="Skill 外部依赖 arguments 必须是对象。",
+                )
+            try:
+                validate(instance=arguments, schema=target.input_schema)
+            except ValidationError as exc:
+                return PermissionDecision(
+                    behavior=PermissionBehavior.DENY,
+                    message=f"Skill 外部依赖参数不合法: {exc.message}",
+                )
+            return await target.check_permissions(arguments, context)
+
+    extensions = [ActivatingSkillViewer()]
+    if any(not tool.is_external_tool for item in dependency_tools.values() for tool in item.values()):
+        extensions.append(SkillDependencyGateway())
+    if external_tokens:
+        extensions.append(SkillExternalDependencyGateway())
+    return extensions
+
+
+def _resolve_dependency(dependencies: dict, skill: str | None, tool_name: str | None, *, external: bool):
+    """按 Skill 和工具名解析依赖，并校验外部执行类型。"""
+    target = dependencies.get(skill, {}).get(tool_name)
+    if target is None or target.is_external_tool is not external:
+        return None
+    return target
+
+
+def _dependency_guidance(skill: str, dependencies: dict, activation_token: str | None) -> str:
+    """生成只在 Skill 读取后返回的依赖调用说明。"""
+    if not dependencies:
+        return ""
+    lines = ["\n\n## 已激活的依赖工具", "依赖必须通过下列 Gateway 调用，不要直接调用原工具名："]
+    for name, tool in dependencies.items():
+        gateway = "skill_external_dependency_gateway" if tool.is_external_tool else "skill_dependency_gateway"
+        schema = json.dumps(tool.input_schema, ensure_ascii=False)
+        lines.append(f"- `{name}` → `{gateway}`，arguments schema: `{schema}`")
+    lines.append(f"Gateway 的 skill 固定为 `{skill}`。")
+    if activation_token:
+        lines.append(f"外部 Gateway 的 activation_token 固定为 `{activation_token}`。")
+    return "\n".join(lines)
+
+
+def _gateway_error(message: str):
+    """构造统一的 Gateway 错误结果。"""
+    from agentscope.message import TextBlock, ToolResultState
+    from agentscope.tool import ToolChunk
+
+    return ToolChunk(content=[TextBlock(text=message)], state=ToolResultState.ERROR)
 
 
 async def build_subagent_tools(
@@ -325,8 +809,16 @@ async def build_subagent_tools(
     return [tool]
 
 
-async def build_extra_tools(*, uid: str, knowledge_slugs: list[str] | None, agent_id: str, session_id: str) -> list:
-    """装配补充工具：download_kb_file / present_artifacts / ocr_parse_file。
+async def build_extra_tools(
+    *,
+    uid: str,
+    knowledge_slugs: list[str] | None,
+    agent_id: str,
+    session_id: str,
+    tool_slugs: list[str] | None = None,
+    workspace=None,
+) -> list:
+    """装配知识库下载工具与受 Agent 白名单控制的可选工具。
 
     KB 相关工具按可见性约束；LITE 下不装配 KB 部分。
     """
@@ -334,10 +826,16 @@ async def build_extra_tools(*, uid: str, knowledge_slugs: list[str] | None, agen
         extra = [_download_kb_file_tool(uid, knowledge_slugs)]
     else:
         extra = []
-    extra.append(_present_artifacts_tool(uid, agent_id, session_id))
-    ocr_tool = _ocr_parse_file_tool()
-    if ocr_tool is not None:
-        extra.append(ocr_tool)
+    extra.extend(
+        await build_optional_tools(
+            tool_slugs=tool_slugs,
+            uid=uid,
+            knowledge_slugs=knowledge_slugs,
+            agent_id=agent_id,
+            session_id=session_id,
+            workspace=workspace,
+        )
+    )
     return extra
 
 
@@ -418,7 +916,11 @@ def _present_artifacts_tool(uid: str, agent_id: str, session_id: str):
     )
 
 
-def _ocr_parse_file_tool():
+def _ocr_parse_file_tool(
+    uid: str | None = None,
+    agent_id: str | None = None,
+    session_id: str | None = None,
+):
     """OCR 工具（经 PaddleOCR 服务解析图片文本；服务未配置时不装配）。"""
     import os
 
@@ -428,12 +930,34 @@ def _ocr_parse_file_tool():
     if not paddlex_uri:
         return None
 
-    async def ocr_parse_file(image_base64: str) -> str:
-        """对图片执行 OCR 并返回识别文本。
+    async def ocr_parse_file(
+        file_path: str | None = None,
+        image_base64: str | None = None,
+    ) -> str:
+        """对 workspace 图片或 base64 图片执行 OCR 并返回识别文本。
 
         Args:
+            file_path: AgentScope workspace 内的绝对图片路径
             image_base64: 图片的 base64 编码内容（不含 data: 前缀）
         """
+        if bool(file_path) == bool(image_base64):
+            raise ValueError("file_path 和 image_base64 必须且只能提供一个")
+        if file_path:
+            from base64 import b64encode
+            from pathlib import PurePosixPath
+
+            from yuxi.agentscope.client import AgentScopeServiceClient
+
+            path = PurePosixPath(file_path)
+            if not path.is_absolute() or path.parts[:2] != ("/", "workspace") or ".." in path.parts:
+                raise ValueError("OCR 文件路径必须位于 /workspace")
+            if not uid or not agent_id or not session_id:
+                raise ValueError("OCR workspace 路径缺少会话上下文")
+            client = AgentScopeServiceClient(
+                os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
+            )
+            data = await client.read_workspace_file(uid, agent_id, session_id, str(path))
+            image_base64 = b64encode(data).decode("ascii")
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{paddlex_uri}/ocr",
@@ -445,6 +969,6 @@ def _ocr_parse_file_tool():
     return FunctionTool(
         ocr_parse_file,
         name="ocr_parse_file",
-        description="对图片执行 OCR 识别，返回图片中的文本",
+        description="对 /workspace 图片路径或 base64 图片执行 OCR，返回识别文本",
         is_read_only=True,
     )

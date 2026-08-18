@@ -77,8 +77,10 @@ def event_to_chunks(event: dict, *, request_id: str) -> list[dict]:
                 payload = json.loads(call.get("input") or "{}")
             except (TypeError, ValueError):
                 payload = {}
-            if isinstance(payload.get("questions"), list):
-                questions.extend(payload["questions"])
+            arguments = payload.get("arguments") if isinstance(payload, dict) else None
+            question_payload = arguments if isinstance(arguments, dict) else payload
+            if isinstance(question_payload.get("questions"), list):
+                questions.extend(question_payload["questions"])
         if not questions:
             raise ValueError("外部问答事件缺少有效 questions")
         return [
@@ -87,7 +89,7 @@ def event_to_chunks(event: dict, *, request_id: str) -> list[dict]:
                 status="ask_user_question_required",
                 questions=questions,
                 source=(
-                    tool_calls[0].get("name")
+                    _external_source(tool_calls[0])
                     if tool_calls and isinstance(tool_calls[0], dict)
                     else "external_execution"
                 ),
@@ -102,6 +104,15 @@ def event_to_chunks(event: dict, *, request_id: str) -> list[dict]:
             msg["reasoning_content"] = event.get("delta", "")
         return [make_chunk(request_id, status="loading", msg=msg)]
     return []
+
+
+def _external_source(tool_call: dict) -> str:
+    """Gateway 外部调用展示真实依赖名，普通外部工具保持原名。"""
+    try:
+        payload = json.loads(tool_call.get("input") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    return str(payload.get("tool_name") or tool_call.get("name") or "external_execution")
 
 
 @dataclass
@@ -152,6 +163,10 @@ class ToolEventConverter:
         self._args_fragments: dict[str, list[str]] = {}
         self._result_fragments: dict[str, list[str]] = {}
         self._tool_names: dict[str, str] = {}
+        self._reply_ids: dict[str, str] = {}
+        self._tool_indexes: dict[str, int] = {}
+        self._result_states: dict[str, str] = {}
+        self._result_metadata: dict[str, dict] = {}
 
     def feed(self, event: dict) -> list[dict]:
         event_type = str(event.get("type", "")).upper()
@@ -160,8 +175,15 @@ class ToolEventConverter:
         if event_type == "TOOL_CALL_START":
             name = event.get("tool_call_name", "")
             self._tool_names[tool_call_id] = name
+            self._reply_ids[tool_call_id] = str(event.get("reply_id") or "")
+            self._tool_indexes.setdefault(tool_call_id, len(self._tool_indexes))
             self._args_fragments[tool_call_id] = []
             return [self._tool_call_make_chunk(tool_call_id, args="")]
+        if event_type == "TOOL_RESULT_START":
+            self._tool_names.setdefault(tool_call_id, event.get("tool_call_name", ""))
+            self._reply_ids.setdefault(tool_call_id, str(event.get("reply_id") or ""))
+            self._tool_indexes.setdefault(tool_call_id, len(self._tool_indexes))
+            return []
         if event_type == "TOOL_CALL_DELTA":
             fragment = event.get("delta", "")
             self._args_fragments.setdefault(tool_call_id, []).append(fragment)
@@ -174,20 +196,65 @@ class ToolEventConverter:
             self._result_fragments.setdefault(tool_call_id, []).append(event.get("delta", ""))
             return []
         if event_type == "TOOL_RESULT_END":
+            self._result_states[tool_call_id] = str(event.get("state") or "success").lower()
+            self._result_metadata[tool_call_id] = dict(event.get("metadata") or {})
             output_text = "".join(self._result_fragments.get(tool_call_id, []))
             return [self._tool_finished_make_chunk(tool_call_id, output_text)]
         return []
 
+    def seed_tool_calls(self, tool_calls: list[dict], *, reply_id: str) -> None:
+        """用审批事件中的完整工具参数初始化恢复轮次。"""
+        for call in tool_calls:
+            if not isinstance(call, dict) or not call.get("id"):
+                continue
+            tool_call_id = str(call["id"])
+            self._tool_names.setdefault(tool_call_id, str(call.get("name") or ""))
+            self._reply_ids.setdefault(tool_call_id, reply_id)
+            self._tool_indexes.setdefault(tool_call_id, len(self._tool_indexes))
+            raw_args = call.get("input")
+            if not isinstance(raw_args, str):
+                raw_args = json.dumps(raw_args or {}, ensure_ascii=False)
+            self._args_fragments.setdefault(tool_call_id, [raw_args])
+
+    def history_tool_calls(self) -> list[dict]:
+        """返回当前轮次可直接写入 Yuxi 历史表的工具调用。"""
+        calls = []
+        for tool_call_id in self._tool_indexes:
+            raw_args = "".join(self._args_fragments.get(tool_call_id, []))
+            try:
+                parsed_args = json.loads(raw_args) if raw_args else {}
+            except (TypeError, ValueError):
+                parsed_args = {"raw": raw_args}
+            if not isinstance(parsed_args, dict):
+                parsed_args = {"value": parsed_args}
+
+            state = self._result_states.get(tool_call_id, "pending")
+            metadata = self._result_metadata.get(tool_call_id, {})
+            error_message = None
+            if state != "success":
+                error_message = metadata.get("error_message") or metadata.get("message")
+            calls.append(
+                {
+                    "id": tool_call_id,
+                    "name": self._tool_names.get(tool_call_id, "") or "unknown",
+                    "args": parsed_args,
+                    "output": "".join(self._result_fragments.get(tool_call_id, [])),
+                    "status": state,
+                    "error_message": error_message,
+                }
+            )
+        return calls
+
     def _tool_call_make_chunk(self, tool_call_id: str, *, args: str, complete: bool = False) -> dict:
         name = self._tool_names.get(tool_call_id, "")
         fragment = {
-            "index": 0,
+            "index": self._tool_indexes.get(tool_call_id, 0),
             "id": tool_call_id,
             "name": name,
             "args": args,
         }
         msg = {
-            "id": None,
+            "id": self._reply_ids.get(tool_call_id) or None,
             "type": ASSISTANT_MSG_TYPE,
             "content": "",
             "tool_call_chunks": [fragment],

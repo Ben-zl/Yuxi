@@ -1,0 +1,17 @@
+# Unity Profiler Analyzer Requirements
+
+# ubox-api dependencies
+requests>=2.28.0
+pycryptodome>=3.15.0
+boto3>=1.26.0
+
+# Core dependencies
+dataclasses-json>=0.5.9
+rich>=13.0.0
+click>=8.1.0
+tabulate>=0.9.0
+python-dateutil>=2.8.2
+numpy>=1.24.0
+
+# Optional dependencies
+diskcache>=5.6.0

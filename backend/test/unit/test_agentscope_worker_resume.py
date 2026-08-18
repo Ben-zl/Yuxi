@@ -1,5 +1,6 @@
 """AgentScope worker 的恢复流程与附件边界测试。"""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,6 +15,7 @@ class _MinimalClient:
 
     async def set_permission_mode(self, uid, agent_id, session_id, mode):
         self.permission_mode = mode
+
 
 pytestmark = pytest.mark.unit
 
@@ -82,6 +84,95 @@ async def test_resume_failure_keeps_pending_confirmation(monkeypatch):
     with pytest.raises(RuntimeError, match="session read failed"):
         await worker_job._execute_resume(SimpleNamespace(), _MinimalClient(), run, message)
     clear.assert_not_awaited()
+
+
+async def test_resume_streams_reasoning_tools_and_terminal_event(monkeypatch):
+    """审批恢复后应继续输出完整事件，并返回可持久化的工具结果。"""
+    run = SimpleNamespace(
+        uid="u",
+        id="run",
+        request_id="request",
+        conversation_thread_id="thread",
+    )
+    mapping = SimpleNamespace(agentscope_agent_id="agent-id", agentscope_session_id="session-id")
+    confirm_event = {
+        "reply_id": "reply",
+        "tool_calls": [
+            {"id": "tc1", "name": "query_kb", "input": '{"query":"退款"}'},
+        ],
+    }
+    events = [
+        {
+            "type": "TOOL_RESULT_START",
+            "reply_id": "reply",
+            "tool_call_id": "tc1",
+            "tool_call_name": "query_kb",
+        },
+        {
+            "type": "TOOL_RESULT_TEXT_DELTA",
+            "reply_id": "reply",
+            "tool_call_id": "tc1",
+            "delta": "知识库结果",
+        },
+        {
+            "type": "TOOL_RESULT_END",
+            "reply_id": "reply",
+            "tool_call_id": "tc1",
+            "state": "success",
+        },
+        {"type": "THINKING_BLOCK_DELTA", "reply_id": "reply", "delta": "整理结果"},
+        {"type": "TEXT_BLOCK_DELTA", "reply_id": "reply", "delta": "最终答案"},
+        {"type": "REPLY_END", "reply_id": "reply", "finished_reason": "completed"},
+    ]
+    queue = asyncio.Queue()
+    for event in events:
+        queue.put_nowait(event)
+    emitted: list[tuple[str, dict]] = []
+
+    async def _append(run_id, event, payload, thread_id=None):
+        emitted.append((event, payload))
+
+    client = SimpleNamespace(resume_confirm=AsyncMock())
+    monkeypatch.setattr(worker_job, "start_event_pump", lambda *args, **kwargs: (queue, None))
+    monkeypatch.setattr(worker_job, "start_cancel_watcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_job, "cancel_tasks", AsyncMock())
+    monkeypatch.setattr(worker_job, "SUBSCRIBE_SETTLE_SECONDS", 0)
+    monkeypatch.setattr(worker_job, "_collect_asking_tool_calls", AsyncMock(return_value=confirm_event["tool_calls"]))
+    monkeypatch.setattr(worker_job, "append_run_stream_event", _append, raising=False)
+
+    result = await worker_job._resume_and_collect(
+        client,
+        run,
+        mapping,
+        confirm_event,
+        [True],
+    )
+
+    assert result.text == "最终答案"
+    assert result.reasoning == "整理结果"
+    assert result.tool_calls == [
+        {
+            "id": "tc1",
+            "name": "query_kb",
+            "args": {"query": "退款"},
+            "output": "知识库结果",
+            "status": "success",
+            "error_message": None,
+        }
+    ]
+    assert any(name == "messages" for name, _ in emitted)
+    assert emitted[-1] == (
+        "end",
+        {
+            "status": "completed",
+            "chunk": {
+                "request_id": "request",
+                "response": None,
+                "thread_id": None,
+                "status": "finished",
+            },
+        },
+    )
 
 
 async def test_permission_resume_requires_decisions(monkeypatch):
@@ -263,6 +354,86 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
     )
     emit.assert_awaited_once()
     dispatch.assert_awaited_once_with(uid="u", agent_slug="agent", thread_id="thread")
+
+
+async def test_worker_persists_reasoning_and_tool_calls(monkeypatch):
+    """公共 worker 路径应保存推理内容与工具生命周期，刷新后仍可恢复。"""
+    run = SimpleNamespace(
+        id="run",
+        uid="u",
+        status="dispatched",
+        input_message_id=1,
+        run_type="chat",
+        input_payload={},
+        conversation_id=1,
+        request_id="request",
+        conversation_thread_id="thread",
+        agent_slug="agent",
+    )
+    input_message = SimpleNamespace(content="查询", extra_metadata={}, image_content=None)
+    output_message = SimpleNamespace(id=2)
+    run_repo = SimpleNamespace(
+        get_run=AsyncMock(return_value=run),
+        mark_running=AsyncMock(),
+        set_output_message=AsyncMock(),
+    )
+    conv_repo = SimpleNamespace(
+        get_message_by_id=AsyncMock(return_value=input_message),
+        add_message_by_thread_id=AsyncMock(return_value=output_message),
+        add_tool_call=AsyncMock(),
+        set_message_delivery_status=AsyncMock(),
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+
+    class _SessionContext:
+        async def __aenter__(self):
+            return db
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    result = GatewayRoundResult(
+        "completed",
+        "最终答案",
+        "检索知识库",
+        7,
+        usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+        tool_calls=[
+            {
+                "id": "tc1",
+                "name": "query_kb",
+                "args": {"query": "退款"},
+                "output": "结果",
+                "status": "success",
+                "error_message": None,
+            }
+        ],
+    )
+    mapping = SimpleNamespace(agentscope_agent_id="agent-id", agentscope_session_id="session-id")
+
+    monkeypatch.setattr(worker_job.pg_manager, "get_async_session_context", lambda: _SessionContext())
+    monkeypatch.setattr(worker_job, "AgentRunRepository", lambda current_db: run_repo)
+    monkeypatch.setattr(worker_job, "ConversationRepository", lambda current_db: conv_repo)
+    monkeypatch.setattr(worker_job, "ensure_thread_session", AsyncMock(return_value=mapping))
+    monkeypatch.setattr(worker_job, "_apply_permission_mode", AsyncMock())
+    monkeypatch.setattr(worker_job, "execute_run", AsyncMock(return_value=result))
+    monkeypatch.setattr(worker_job, "dispatch_next_request", AsyncMock())
+
+    await worker_job.execute_agent_run_job("run")
+
+    message_kwargs = conv_repo.add_message_by_thread_id.await_args.kwargs
+    assert message_kwargs["content"] == "最终答案"
+    assert message_kwargs["extra_metadata"]["additional_kwargs"] == {"reasoning_content": "检索知识库"}
+    conv_repo.add_tool_call.assert_awaited_once_with(
+        message_id=2,
+        tool_name="query_kb",
+        tool_input={"query": "退款"},
+        tool_output="结果",
+        status="success",
+        error_message=None,
+        langgraph_tool_call_id="tc1",
+    )
+    run_repo.set_output_message.assert_awaited_once_with("run", 2)
 
 
 async def test_apply_permission_mode_maps_always_trust_to_bypass():

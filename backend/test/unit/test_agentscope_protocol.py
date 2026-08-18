@@ -95,8 +95,16 @@ def test_tool_event_converter_streams_call_and_result():
     from yuxi.agentscope.protocol import ToolEventConverter
 
     converter = ToolEventConverter(REQUEST_ID)
-    start = converter.feed({"type": "TOOL_CALL_START", "tool_call_id": "tc1", "tool_call_name": "query_kb"})
+    start = converter.feed(
+        {
+            "type": "TOOL_CALL_START",
+            "reply_id": "reply-1",
+            "tool_call_id": "tc1",
+            "tool_call_name": "query_kb",
+        }
+    )
     assert start[0]["status"] == "loading"
+    assert start[0]["msg"]["id"] == "reply-1"
     assert start[0]["msg"]["tool_call_chunks"][0]["name"] == "query_kb"
 
     delta = converter.feed({"type": "TOOL_CALL_DELTA", "tool_call_id": "tc1", "delta": '{"kb_'})
@@ -158,6 +166,36 @@ def test_require_external_execution_maps_questions_and_rejects_invalid_input():
             {"type": "REQUIRE_EXTERNAL_EXECUTION", "tool_calls": [None]},
             request_id=REQUEST_ID,
         )
+
+
+def test_external_gateway_unwraps_question_payload_and_source():
+    """Skill 外部 Gateway 仍投影为原 ask_user_question 页面协议。"""
+    import json
+
+    event = {
+        "type": "REQUIRE_EXTERNAL_EXECUTION",
+        "tool_calls": [
+            {
+                "name": "skill_external_dependency_gateway",
+                "input": json.dumps(
+                    {
+                        "skill": "research",
+                        "tool_name": "ask_user_question",
+                        "activation_token": "token",
+                        "arguments": {
+                            "questions": [
+                                {"question_id": "q1", "question": "范围？", "options": []}
+                            ]
+                        },
+                    }
+                ),
+            }
+        ],
+    }
+
+    chunk = event_to_chunks(event, request_id=REQUEST_ID)[0]
+    assert chunk["source"] == "ask_user_question"
+    assert chunk["questions"][0]["question"] == "范围？"
 
 
 def test_permission_mode_mapping():

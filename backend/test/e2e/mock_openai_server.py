@@ -83,6 +83,23 @@ def _team_next_call(body: dict):
     return ("TeamCreate", {"name": "e2e-team", "description": "e2e 验证团队"})
 
 
+def _skill_gateway_next_call(body: dict):
+    """Skill 依赖编排：读取 deep-research 后通过 Gateway 调用搜索。"""
+    called = _assistant_tool_names(body)
+    if "skill_dependency_gateway" in called:
+        return None
+    if "Skill" in called:
+        return (
+            "skill_dependency_gateway",
+            {
+                "skill": "deep-research",
+                "tool_name": "web_search",
+                "arguments": {"query": "AgentScope"},
+            },
+        )
+    return ("Skill", {"skill": "deep-research"})
+
+
 def _matched_tool_trigger(body: dict):
     """按最后一条真实用户消息匹配工具触发；无工具结果时才触发。
 
@@ -99,6 +116,8 @@ def _matched_tool_trigger(body: dict):
     # 团队编排是状态机（多轮工具调用），先于一次性触发的工具结果短路
     if "组建团队" in joined or "简短调研" in joined:
         return _team_next_call(body)
+    if "调用技能依赖" in joined:
+        return _skill_gateway_next_call(body)
     if any(m.get("role") == "tool" for m in messages):
         return None
     for keyword, (name, args) in TOOL_TRIGGERS.items():

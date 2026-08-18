@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi import HTTPException
@@ -11,8 +12,11 @@ from yuxi.agents.backends.sandbox.paths import (
     virtual_path_for_thread_file,
 )
 from yuxi.agentscope.protocol import event_to_chunks
+from yuxi.agentscope.client import AgentScopeServiceClient
+from yuxi.agentscope.gateway import files_to_state, tasks_to_todos
 from yuxi.agentscope.thread_guard import load_pending_confirm
 from yuxi.repositories.agent_run_repository import AgentRunRepository
+from yuxi.repositories.agentscope_thread_sessions import get_thread_session
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.repositories.subagent_thread_repository import SubagentThreadRepository
 from yuxi.services.subagent_run_service import serialize_subagent_run_state
@@ -28,6 +32,28 @@ def _list_artifacts(thread_id: str, uid: str) -> list[str]:
     return [
         virtual_path_for_thread_file(thread_id, path, uid=uid) for path in sorted(root.rglob("*")) if path.is_file()
     ]
+
+
+async def _load_agentscope_state(db, *, uid: str, thread_id: str) -> tuple[list[dict], dict]:
+    """从 AgentScope Session 与 workspace 恢复 Todo 和文件事实。"""
+    mapping = await get_thread_session(db, uid=uid, thread_id=thread_id)
+    if mapping is None:
+        return [], {}
+    client = AgentScopeServiceClient(
+        os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
+    )
+    session = await client.get_session(
+        uid,
+        mapping.agentscope_agent_id,
+        mapping.agentscope_session_id,
+    )
+    state = session.get("state") or {}
+    files = await client.list_workspace_files(
+        uid,
+        mapping.agentscope_agent_id,
+        mapping.agentscope_session_id,
+    )
+    return tasks_to_todos(state.get("tasks_context") or {}), files_to_state(files)
 
 
 def _serialize_message(message: Any) -> dict[str, Any]:
@@ -97,10 +123,11 @@ async def get_thread_state_view(
                     detail="子智能体运行记录格式异常",
                 ) from exc
 
+    todos, files = await _load_agentscope_state(db, uid=uid, thread_id=thread_id)
     response: dict[str, Any] = {
         "agent_state": {
-            "todos": [],
-            "files": {},
+            "todos": todos,
+            "files": files,
             "artifacts": _list_artifacts(thread_id, uid),
             "subagent_runs": subagent_runs,
             "token_usage": dict(latest_run.token_usage or {}) if latest_run else None,

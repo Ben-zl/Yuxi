@@ -24,6 +24,7 @@ from agentscope.app.workspace_manager import (
     IsolationPolicy,
     LocalWorkspaceManager,
 )
+from yuxi.agentscope.runtime_models import register_yuxi_credentials
 
 AGENTSCOPE_DATABASE_URL = os.getenv(
     "AGENTSCOPE_DATABASE_URL",
@@ -72,8 +73,8 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
         build_extra_tools,
         build_kb_tools,
         build_mcp_tools,
+        build_skill_dependency_gateway,
         build_subagent_tools,
-        build_web_search_tool,
     )
     from yuxi.agentscope.runtime_resources import resolve_runtime_projection
 
@@ -86,6 +87,16 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
             session_id=session_id,
         )
 
+    session = await app.state.storage.get_session(user_id, agent_id, session_id)
+    if session is None:
+        raise ValueError("AgentScope 会话不存在，无法装配运行时工具")
+    workspace = await app.state.workspace_manager.get_workspace(
+        user_id,
+        agent_id,
+        session_id,
+        session.config.workspace_id,
+    )
+
     tools = await build_kb_tools(uid=user_id, knowledge_slugs=projection.knowledge_slugs)
     tools.extend(await build_mcp_tools(mcp_servers=projection.mcp_servers))
     tools.extend(
@@ -94,6 +105,8 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
             knowledge_slugs=projection.knowledge_slugs,
             agent_id=agent_id,
             session_id=session_id,
+            tool_slugs=projection.tool_slugs,
+            workspace=workspace,
         )
     )
     tools.extend(
@@ -107,9 +120,15 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
             templates=projection.subagent_templates,
         )
     )
-    web_search_tool = build_web_search_tool()
-    if web_search_tool is not None:
-        tools.append(web_search_tool)
+    tools.extend(
+        await build_skill_dependency_gateway(
+            projection=projection,
+            workspace=workspace,
+            uid=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+    )
     return tools
 
 
@@ -162,6 +181,7 @@ def _create_service_app_sync():
         finally:
             loop.close()
 
+    register_yuxi_credentials()
     _setup_otel_if_configured()
 
     bootstrap_thread = threading.Thread(target=_run_bootstrap)
@@ -227,6 +247,32 @@ async def upload_yuxi_workspace_file(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except OverflowError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+
+@app.delete("/yuxi/workspace/output")
+async def delete_yuxi_workspace_output(
+    agent_id: str = Query(...),
+    session_id: str = Query(...),
+    path: str = Query(...),
+    x_user_id: str = Header(...),
+) -> dict:
+    """删除 Yuxi 当前线程的产出文件或目录。"""
+    from urllib.parse import unquote
+
+    from yuxi.agentscope.workspace_files import delete_workspace_output
+
+    try:
+        return await delete_workspace_output(
+            app.state.workspace_service,
+            user_id=unquote(x_user_id),
+            agent_id=agent_id,
+            session_id=session_id,
+            path=path,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="文件不存在") from exc
 
 
 if __name__ == "__main__":

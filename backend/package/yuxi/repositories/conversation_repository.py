@@ -36,9 +36,7 @@ class ConversationRepository:
         """更新消息投递状态（run 终态回写）。"""
         from sqlalchemy import update
 
-        await self.db.execute(
-            update(Message).where(Message.id == message_id).values(delivery_status=status)
-        )
+        await self.db.execute(update(Message).where(Message.id == message_id).values(delivery_status=status))
 
     async def get_message_by_id(self, message_id: int) -> Message | None:
         """按主键读取消息。"""
@@ -275,8 +273,18 @@ class ConversationRepository:
         if langgraph_tool_call_id:
             existing = await self.get_tool_call_by_langgraph_id(langgraph_tool_call_id)
             if existing:
+                existing.tool_name = tool_name
+                if tool_input is not None:
+                    existing.tool_input = tool_input
+                if status != "pending" or existing.status == "pending":
+                    existing.status = status
+                    if tool_output is not None:
+                        existing.tool_output = tool_output
+                    existing.error_message = error_message
+                await self.db.commit()
+                await self.db.refresh(existing)
                 logger.debug(
-                    "Tool call already exists for langgraph_tool_call_id=%s, skip insert",
+                    "Updated existing tool call for langgraph_tool_call_id=%s",
                     langgraph_tool_call_id,
                 )
                 return existing

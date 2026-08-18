@@ -45,7 +45,7 @@ async def db_session():
                         "context": {
                             "model": MODEL_SPEC,
                             "system_prompt": "你是投影测试助手。",
-                            "skills": None,
+                            "skills": ["it-proj-skill"],
                             "mcps": ["it-proj-mcp"],
                             "knowledges": ["kb-a"],
                         }
@@ -58,7 +58,7 @@ async def db_session():
                     description="子智能体描述",
                     backend_id="SubAgentBackend",
                     is_subagent=True,
-                    config_json={"context": {}},
+                    config_json={"context": {"skills": [], "mcps": []}},
                     share_config=DEFAULT_SHARE_CONFIG,
                 ),
                 ModelProvider(
@@ -68,7 +68,16 @@ async def db_session():
                     base_url=os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1"),
                     api_key="it-proj-key",
                     capabilities=["chat"],
-                    enabled_models=[{"id": "mock-chat-model", "type": "chat"}],
+                    enabled_models=[
+                        {
+                            "id": "mock-chat-model",
+                            "type": "chat",
+                            "base_url_override": "http://openai-mock:8080/custom",
+                            "request_body_overrides": {"enable_thinking": True},
+                        }
+                    ],
+                    headers_json={"X-Test": "projection"},
+                    extra_json={"parameters": {"temperature": 0.2}},
                     is_enabled=True,
                 ),
                 MCPServer(
@@ -84,8 +93,8 @@ async def db_session():
                     slug="it-proj-skill",
                     name="投影测试技能",
                     description="投影测试技能",
-                    tool_dependencies=[],
-                    mcp_dependencies=[],
+                    tool_dependencies=["ask_user_question"],
+                    mcp_dependencies=["it-proj-mcp"],
                     skill_dependencies=[],
                     dir_path="workspace/skills/it-proj-skill",
                     share_config=DEFAULT_SHARE_CONFIG,
@@ -116,14 +125,18 @@ async def test_project_runtime_covers_all_components(db_session):
     assert projection.agent_request["system_prompt"] == "你是投影测试助手。"
     # ReAct 迭代上限使用管理配置的默认值 300。
     assert projection.agent_request["react_config"] == {"max_iters": 300}
-    assert projection.credential_data["type"] == "openai_credential"
+    assert projection.credential_data["type"] == "yuxi_openai_credential"
     assert projection.credential_data["api_key"] == "it-proj-key"
-    assert projection.credential_data["base_url"] == os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1")
+    assert projection.credential_data["base_url"] == "http://openai-mock:8080/custom"
+    assert projection.credential_data["default_headers"] == {"X-Test": "projection"}
+    assert projection.credential_data["request_body_overrides"] == {"enable_thinking": True}
     assert projection.chat_model_config["model"] == "mock-chat-model"
     assert projection.chat_model_config["credential_id"] is None  # 由创建方回填
+    assert projection.chat_model_config["parameters"] == {"temperature": 0.2}
+    assert "client_kwargs" not in projection.chat_model_config
+    assert "extra_body" not in projection.chat_model_config
 
-    # skills=None 表示全部可用：投影为全部可见 Skill（dev 库存量技能 + 夹具技能）
-    assert "it-proj-skill" in projection.skill_slugs
+    assert projection.skill_slugs == ["it-proj-skill"]
     assert next(item for item in projection.skills if item["slug"] == "it-proj-skill")["name"] == "投影测试技能"
     assert projection.mcp_servers == [
         {
@@ -133,6 +146,9 @@ async def test_project_runtime_covers_all_components(db_session):
         }
     ]
     assert projection.knowledge_slugs == ["kb-a"]
+    assert projection.tool_slugs is None
+    assert projection.skill_tool_dependencies["it-proj-skill"] == ["ask_user_question"]
+    assert projection.skill_mcp_dependencies["it-proj-skill"] == ["it-proj-mcp"]
 
     template_types = {t["type"] for t in projection.subagent_templates}
     assert SUBAGENT_SLUG in template_types

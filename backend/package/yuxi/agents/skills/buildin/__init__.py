@@ -60,8 +60,20 @@ BUILTIN_SKILLS: list[BuiltinSkillSpec] = [
     BuiltinSkillSpec(
         slug="mysql-reporter",
         source_dir=_SKILLS_ROOT / "mysql-reporter",
-        description="基于 MySQL 数据库生成查询报表和可视化图表，适合分析业务指标、统计趋势，并用 Charts MCP 展示结果。",
-        version="2026.06.05",
-        mcp_dependencies=("mcp-server-chart",),
+        description="基于 MySQL 数据库生成查询报表和静态可视化，适合分析业务指标与统计趋势。",
+        version="2026.08.18",
+        skill_dependencies=("html-preview",),
+    ),
+    BuiltinSkillSpec(
+        slug="auto-platform-query",
+        source_dir=_SKILLS_ROOT / "auto-platform-query",
+    ),
+    BuiltinSkillSpec(
+        slug="perfeye-analysis",
+        source_dir=_SKILLS_ROOT / "perfeye-analysis",
+    ),
+    BuiltinSkillSpec(
+        slug="unity-profiler-analyzer",
+        source_dir=_SKILLS_ROOT / "unity-profiler-analyzer",
     ),
 ]

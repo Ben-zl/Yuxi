@@ -82,6 +82,7 @@ async def env(monkeypatch):
                 config_json={
                     "context": {
                         "model": f"{PROVIDER_ID}:mock-chat-model",
+                        "skills": [],
                         "mcps": [],
                         "system_prompt": "你是任务测试助手。",
                     }

@@ -1,0 +1,25 @@
+{
+  "_comment": "Unity Profiler Analyzer 配置文件示例",
+  "_comment_usage": "复制此文件为 .upa-config.json 并根据需要修改配置",
+
+  "base_url": "http://10.11.10.173:8080",
+  "project_id": "pcavpt6w",
+  "timeout": 30,
+
+  "directories": {
+    "_comment": "目录配置 - 支持绝对路径和相对路径",
+    "_comment_temp": "临时文件目录，存放 CLI 输出的原始 JSON 数据",
+    "_comment_reports": "报告目录，存放最终生成的 Markdown 分析报告",
+    "_comment_cache": "缓存目录，存放 API 响应数据",
+
+    "temp": "H:\\work\\ubox\temp",
+    "reports": "H:\\work\\ubox\reports",
+    "cache": "H:\\work\\ubox\\cache"
+  },
+
+  "cache_ttl": 86400,
+  "_comment_cache_ttl": "缓存过期时间（秒），默认 86400（24 小时）",
+
+  "verbose": false,
+  "debug": false
+}

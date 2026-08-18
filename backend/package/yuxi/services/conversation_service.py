@@ -963,6 +963,9 @@ async def get_thread_history_view(
             "image_content": msg.image_content,
             "feedback": user_feedback,
         }
+        additional_kwargs = extra_metadata.get("additional_kwargs")
+        if isinstance(additional_kwargs, dict) and additional_kwargs:
+            msg_dict["additional_kwargs"] = additional_kwargs
 
         if msg.tool_calls:
             msg_dict["tool_calls"] = [

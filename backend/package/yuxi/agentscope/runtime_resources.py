@@ -48,4 +48,5 @@ async def resolve_runtime_projection(
         uid=user_id,
         agent_slug=mapping.agent_slug,
         model_spec=mapping.model_spec,
+        thread_id=mapping.thread_id,
     )

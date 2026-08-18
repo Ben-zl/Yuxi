@@ -10,9 +10,9 @@ from yuxi.storage.postgres.models_business import Agent, ModelProvider
 
 # yuxi provider_type → agentscope credential 判别值
 _CREDENTIAL_TYPE_BY_PROVIDER = {
-    "openai": "openai_credential",
-    "anthropic": "anthropic_credential",
-    "gemini": "gemini_credential",
+    "openai": "yuxi_openai_credential",
+    "anthropic": "yuxi_anthropic_credential",
+    "gemini": "yuxi_gemini_credential",
 }
 
 
@@ -73,20 +73,52 @@ def project_chat_model(provider: ModelProvider, model_id: str) -> tuple[dict, di
     if credential_type is None:
         raise ValueError(f"模型供应商 {provider.provider_id} 的类型 {provider.provider_type} 暂不支持投影到 agentscope")
 
+    model = next(
+        (item for item in provider.enabled_models or [] if item.get("id") == model_id),
+        None,
+    )
+    if model is None or model.get("type", "chat") != "chat":
+        raise ValueError(f"模型供应商 {provider.provider_id} 未启用聊天模型 {model_id}")
+
     credential_data = {
         "type": credential_type,
         "api_key": _resolve_api_key(provider),
         "name": f"yuxi:{provider.provider_id}",
     }
-    if provider.base_url:
-        credential_data["base_url"] = provider.base_url
+    base_url = model.get("base_url_override") or provider.base_url
+    if base_url:
+        credential_data["base_url"] = base_url
+    if provider.headers_json:
+        credential_data["default_headers"] = dict(provider.headers_json)
+
+    provider_extra = dict(provider.extra_json or {})
+    parameters = dict(provider_extra.pop("parameters", {}) or {})
+    request_overrides = dict(model.get("request_body_overrides") or {})
+    if credential_type == "yuxi_anthropic_credential":
+        aliases = {
+            "enable_thinking": "thinking_enable",
+            "thinking_budget": "thinking_budget",
+            "reasoning_effort": "reasoning_effort",
+        }
+        unsupported = [key for key in request_overrides if key not in aliases]
+        if unsupported:
+            raise ValueError(
+                f"Anthropic 模型请求体覆盖包含不支持字段: {', '.join(unsupported)}"
+            )
+        for key, value in request_overrides.items():
+            parameters[aliases[key]] = value
+        request_overrides = {}
+    elif request_overrides and credential_type != "yuxi_openai_credential":
+        raise ValueError("只有 OpenAI-compatible 模型支持通用请求体覆盖")
 
     chat_model_config = {
         "type": credential_type,
         "credential_id": None,
         "model": model_id,
-        "parameters": {},
+        "parameters": parameters,
     }
+    if request_overrides:
+        credential_data["request_body_overrides"] = request_overrides
     return credential_data, chat_model_config
 
 

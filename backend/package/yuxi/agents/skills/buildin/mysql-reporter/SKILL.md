@@ -6,7 +6,7 @@ description: "生成 MySQL 查询报表并生成可视化图表。当用户需�
 
 # MySQL 报表技能
 
-根据用户的指令，通过终端脚本访问 MySQL 数据库，并结合图表绘制工具构建 SQL 查询报告。
+根据用户的指令，通过终端脚本访问 MySQL 数据库，并构建包含静态可视化的 SQL 查询报告。
 
 ## 操作流程
 
@@ -15,8 +15,8 @@ description: "生成 MySQL 查询报表并生成可视化图表。当用户需�
 3. 使用 `uv run scripts/list_tables.py` 查看可用表；如果脚本提示缺少 MySQL 配置，按“环境变量缺失处理”回复用户
 4. 必要时用 `uv run scripts/describe_table.py --table 表名` 查看表结构
 5. 生成正确且高效的只读 SQL，通过 `uv run scripts/query.py --sql "SQL语句" --timeout 60` 执行查询并获取结果
-6. 使用 Charts MCP 生成图表
-7. 将图表以 markdown 图片格式嵌入报表
+6. 按 `html-preview` Skill 的边界，用静态 HTML/CSS 展示最重要的指标、对比或趋势
+7. 在普通 Markdown 中补充结论、口径和完整明细
 
 ## 环境变量缺失处理
 
@@ -39,11 +39,11 @@ description: "生成 MySQL 查询报表并生成可视化图表。当用户需�
 - 生成的 SQL 查询必须正确且高效，避免全表扫描
 - MySQL 操作必须通过本技能 `scripts/` 下的 CLI 脚本执行，不要调用平台内置 MySQL tools
 - 不要在报表或错误说明中输出 `MYSQL_PASSWORD` 等敏感环境变量的值，只能说明缺少哪些变量名
-- 图表生成工具的返回结果不会默认渲染，必须在最终报表中以 `![描述](图片URL)` 格式嵌入
+- 可视化只能使用 `html-preview` 允许的静态 HTML/CSS，不使用 JavaScript、iframe 或外部鉴权资源
 - 只返回报表相关的结论，不要返回原始 SQL 查询语句
 
 ## 允许的工具
 
 - terminal：执行 `scripts/list_tables.py`、`scripts/describe_table.py`、`scripts/query.py`
-- Charts MCP：生成可视化图表
+- html-preview Skill：生成静态、安全的指标或趋势预览
 - 网络检索工具：必要时补充背景信息

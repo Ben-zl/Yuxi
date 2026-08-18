@@ -50,30 +50,63 @@ async def ensure_thread_session(
     """
     existing = await thread_session_repo.get_thread_session(db, uid=uid, thread_id=thread_id)
     if existing is not None:
-        if model_spec and model_spec != existing.model_spec:
-            projection = await project_runtime(db, uid=uid, agent_slug=agent_slug, model_spec=model_spec)
-            credential_id = await client.create_credential(uid, projection.credential_data)
-            chat_model_config = {
-                **projection.chat_model_config,
-                "credential_id": credential_id,
-            }
-            await client.update_session_model(
+        projection = await project_runtime(
+            db,
+            uid=uid,
+            agent_slug=agent_slug,
+            model_spec=model_spec,
+            thread_id=thread_id,
+        )
+        credential_id = await client.create_credential(uid, projection.credential_data)
+        await client.update_agent(uid, existing.agentscope_agent_id, projection.agent_request)
+        await client.update_session_model(
+            uid,
+            existing.agentscope_agent_id,
+            existing.agentscope_session_id,
+            {**projection.chat_model_config, "credential_id": credential_id},
+        )
+        current_skills = set(
+            await client.list_workspace_skills(
                 uid,
                 existing.agentscope_agent_id,
                 existing.agentscope_session_id,
-                chat_model_config,
             )
-            await thread_session_repo.update_thread_session_model(
-                db,
-                existing,
-                model_spec=projection.model_spec,
-                agentscope_credential_id=credential_id,
+        )
+        desired_skills = {item["slug"]: item["source_dir"] for item in projection.skills}
+        for slug in sorted(current_skills - desired_skills.keys()):
+            await client.remove_workspace_skill(
+                uid,
+                existing.agentscope_agent_id,
+                existing.agentscope_session_id,
+                slug,
             )
-            await db.commit()
+        for slug in desired_skills.keys() - current_skills:
+            await client.add_workspace_skill(
+                uid,
+                existing.agentscope_agent_id,
+                existing.agentscope_session_id,
+                desired_skills[slug],
+            )
+        old_credential_id = existing.agentscope_credential_id
+        await thread_session_repo.update_thread_session_model(
+            db,
+            existing,
+            model_spec=projection.model_spec,
+            agentscope_credential_id=credential_id,
+        )
+        await db.commit()
+        if old_credential_id != credential_id:
+            await client.delete_credential(uid, old_credential_id)
         return existing
     await ensure_thread_eligible(db, uid=uid, thread_id=thread_id)
 
-    projection = await project_runtime(db, uid=uid, agent_slug=agent_slug, model_spec=model_spec)
+    projection = await project_runtime(
+        db,
+        uid=uid,
+        agent_slug=agent_slug,
+        model_spec=model_spec,
+        thread_id=thread_id,
+    )
     credential_id = await client.create_credential(uid, projection.credential_data)
     agent_id = await client.create_agent(uid, projection.agent_request)
     chat_model_config = {**projection.chat_model_config, "credential_id": credential_id}

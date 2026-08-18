@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.repositories.conversation_repository import (
@@ -11,7 +12,7 @@ from yuxi.repositories.conversation_repository import (
     INVOCATION_CONVERSATION_SOURCES,
     MAX_CONVERSATION_TITLE_LENGTH,
 )
-from yuxi.storage.postgres.models_business import Base, Conversation, Message
+from yuxi.storage.postgres.models_business import Base, Conversation, Message, ToolCall
 from yuxi.utils.datetime_utils import utc_now_naive
 
 pytestmark = pytest.mark.unit
@@ -93,6 +94,46 @@ async def test_list_conversations_excludes_invocation_sources(conversation_sessi
     )
 
     assert [item.thread_id for item in items] == ["thread-normal"]
+
+
+@pytest.mark.asyncio
+async def test_add_tool_call_updates_existing_lifecycle(conversation_session):
+    """同一工具在审批恢复后应更新原记录，而不是保留 pending 或重复插入。"""
+    conversation = Conversation(
+        thread_id="thread-tools",
+        uid="user-a",
+        agent_id="agent-a",
+        title="Tools",
+        status="active",
+    )
+    message = Message(conversation=conversation, role="assistant", content="", message_type="text")
+    conversation_session.add_all([conversation, message])
+    await conversation_session.commit()
+
+    repo = ConversationRepository(conversation_session)
+    pending = await repo.add_tool_call(
+        message_id=message.id,
+        tool_name="query_kb",
+        tool_input={"query": "退款"},
+        status="pending",
+        langgraph_tool_call_id="tc1",
+    )
+    completed = await repo.add_tool_call(
+        message_id=message.id,
+        tool_name="query_kb",
+        tool_input={"query": "退款"},
+        tool_output="知识库结果",
+        status="success",
+        langgraph_tool_call_id="tc1",
+    )
+
+    assert completed.id == pending.id
+    assert completed.status == "success"
+    assert completed.tool_output == "知识库结果"
+    count = await conversation_session.scalar(
+        select(func.count()).select_from(ToolCall).where(ToolCall.langgraph_tool_call_id == "tc1")
+    )
+    assert count == 1
 
 
 @pytest.mark.asyncio

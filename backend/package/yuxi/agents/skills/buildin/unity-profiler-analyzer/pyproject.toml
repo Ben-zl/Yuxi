@@ -1,0 +1,25 @@
+[project]
+name = "unity_profiler_analyzer"
+version = "0.1.0"
+description = "Unity Profiler Performance Analyzer"
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.28.0",
+    "pycryptodome>=3.15.0",
+    "boto3>=1.26.0",
+    "dataclasses-json>=0.5.9",
+    "rich>=13.0.0",
+    "click>=8.1.0",
+    "tabulate>=0.9.0",
+    "python-dateutil>=2.8.2",
+    "numpy>=1.24.0",
+    "diskcache>=5.6.0",
+    "ubox-profiler>=0.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "scripts"}

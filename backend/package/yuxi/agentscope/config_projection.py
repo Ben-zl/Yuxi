@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agents.skills.service import list_accessible_skills
+from yuxi.agents.toolkits.service import get_tool_metadata
+from yuxi.utils.paths import VIRTUAL_PATH_PREFIX
 from yuxi.agentscope.projection import (
     agent_context,
     is_lite_mode,
@@ -37,9 +39,18 @@ class RuntimeProjection:
     chat_model_config: dict
     skill_slugs: list[str] = field(default_factory=list)
     skills: list[dict] = field(default_factory=list)
+    tool_slugs: list[str] | None = None
+    skill_tool_dependencies: dict[str, list[str]] = field(default_factory=dict)
+    skill_mcp_dependencies: dict[str, list[str]] = field(default_factory=dict)
+    skill_mcp_servers: dict[str, list[dict]] = field(default_factory=dict)
     mcp_servers: list[dict] = field(default_factory=list)
     knowledge_slugs: list[str] | None = None
     subagent_templates: list[dict] = field(default_factory=list)
+
+
+def adapt_prompt_paths_for_agentscope(prompt: str) -> str:
+    """把 Yuxi 虚拟文件路径映射到 AgentScope 的持久 workspace。"""
+    return prompt.replace(VIRTUAL_PATH_PREFIX, "/workspace")
 
 
 async def _load_user(db: AsyncSession, uid: str):
@@ -74,6 +85,7 @@ async def project_runtime(
     uid: str,
     agent_slug: str,
     model_spec: str | None = None,
+    thread_id: str | None = None,
 ) -> RuntimeProjection:
     """统一投影入口：读取 yuxi 配置并产出该线程运行的全部运行时对象。"""
     user = await _load_user(db, uid)
@@ -93,10 +105,29 @@ async def project_runtime(
     provider = await _load_provider(db, provider_id)
 
     credential_data, chat_model_config = project_chat_model(provider, model_id)
+    agent_request = project_agent_request(agent)
+    if thread_id:
+        from types import SimpleNamespace
+
+        from yuxi.agents.buildin.chatbot.prompt import build_prompt_with_context
+        from yuxi.agents.context import build_agent_input_context
+
+        platform_prompt = adapt_prompt_paths_for_agentscope(
+            build_prompt_with_context(
+                SimpleNamespace(system_prompt=context.get("system_prompt") or "")
+            )
+        )
+        input_context = await build_agent_input_context(
+            {"system_prompt": platform_prompt},
+            thread_id=thread_id,
+            uid=uid,
+        )
+        agent_request["system_prompt"] = input_context["system_prompt"]
+
     projection = RuntimeProjection(
         agent_slug=agent_slug,
         model_spec=spec,
-        agent_request=project_agent_request(agent),
+        agent_request=agent_request,
         credential_data=credential_data,
         chat_model_config=chat_model_config,
     )
@@ -109,15 +140,73 @@ async def project_runtime(
     inaccessible_skills = [slug for slug in selected_slugs if slug not in accessible_by_slug]
     if inaccessible_skills:
         raise ValueError(f"智能体引用了当前用户不可访问的 Skill: {', '.join(inaccessible_skills)}")
-    projection.skill_slugs = selected_slugs
+    resolved_slugs: list[str] = []
+    visiting: set[str] = set()
+
+    def visit_skill(slug: str) -> None:
+        """按依赖优先顺序解析 Skill 闭包，并拒绝循环与越权依赖。"""
+        if slug in resolved_slugs:
+            return
+        if slug in visiting:
+            raise ValueError(f"Skill 依赖存在循环: {slug}")
+        item = accessible_by_slug.get(slug)
+        if item is None:
+            raise ValueError(f"Skill 依赖不存在、未启用或不可访问: {slug}")
+        visiting.add(slug)
+        for dependency in item.skill_dependencies:
+            visit_skill(dependency)
+        visiting.remove(slug)
+        resolved_slugs.append(slug)
+
+    for slug in selected_slugs:
+        visit_skill(slug)
+
+    projection.skill_slugs = resolved_slugs
     projection.skills = [
         {
             "slug": item.slug,
             "name": item.name,
             "source_dir": str(item.source_dir),
         }
-        for item in (accessible_by_slug[slug] for slug in selected_slugs)
+        for item in (accessible_by_slug[slug] for slug in resolved_slugs)
     ]
+    projection.skill_tool_dependencies = {
+        slug: list(accessible_by_slug[slug].tool_dependencies) for slug in resolved_slugs
+    }
+    projection.skill_mcp_dependencies = {
+        slug: list(accessible_by_slug[slug].mcp_dependencies) for slug in resolved_slugs
+    }
+
+    configured_tools = context.get("tools")
+    available_tools = {item["slug"] for item in get_tool_metadata()}
+    available_dependency_tools = available_tools | {
+        "list_kbs",
+        "query_kb",
+        "find_kb_document",
+        "open_kb_document",
+        "get_mindmap",
+        "search_file",
+        "download_kb_file",
+    }
+    if configured_tools is None:
+        projection.tool_slugs = None
+    else:
+        if not isinstance(configured_tools, list):
+            raise ValueError("智能体工具配置必须是 slug 列表")
+        projection.tool_slugs = list(dict.fromkeys(configured_tools))
+        unavailable_tools = [slug for slug in projection.tool_slugs if slug not in available_tools]
+        if unavailable_tools:
+            raise ValueError("智能体引用了不存在或不可用的工具: " + ", ".join(unavailable_tools))
+    unavailable_skill_tools = sorted(
+        {
+            slug
+            for dependencies in projection.skill_tool_dependencies.values()
+            for slug in dependencies
+            if slug not in available_dependency_tools
+        }
+    )
+    if unavailable_skill_tools:
+        raise ValueError("Skill 引用了不存在或不可用的工具: " + ", ".join(unavailable_skill_tools))
     from yuxi.agents.mcp.service import load_enabled_mcp_server_configs
 
     configured_mcps = context.get("mcps")
@@ -129,7 +218,15 @@ async def project_runtime(
         ):
             raise ValueError("智能体 MCP 配置只能包含非空 slug")
         selected_mcps = list(dict.fromkeys(slug.strip() for slug in configured_mcps))
-    loaded_mcp_configs = await load_enabled_mcp_server_configs(names=selected_mcps, db=db)
+    dependency_mcps = list(
+        dict.fromkeys(
+            slug
+            for dependencies in projection.skill_mcp_dependencies.values()
+            for slug in dependencies
+        )
+    )
+    requested_mcps = None if selected_mcps is None else list(dict.fromkeys([*selected_mcps, *dependency_mcps]))
+    loaded_mcp_configs = await load_enabled_mcp_server_configs(names=requested_mcps, db=db)
     mcp_configs = {
         slug: config
         for slug, config in loaded_mcp_configs.items()
@@ -143,6 +240,18 @@ async def project_runtime(
     else:
         mcp_slugs = list(mcp_configs)
     projection.mcp_servers = [{"slug": slug, **mcp_configs[slug]} for slug in mcp_slugs]
+    unavailable_skill_mcps = [slug for slug in dependency_mcps if slug not in mcp_configs]
+    if unavailable_skill_mcps:
+        raise ValueError(
+            "Skill 引用了不存在、未启用或不允许的 MCP: " + ", ".join(unavailable_skill_mcps)
+        )
+    projection.skill_mcp_servers = {
+        skill_slug: [
+            {"slug": mcp_slug, **mcp_configs[mcp_slug]}
+            for mcp_slug in dependencies
+        ]
+        for skill_slug, dependencies in projection.skill_mcp_dependencies.items()
+    }
 
     configured_knowledge = context.get("knowledges")
     projection.knowledge_slugs = (

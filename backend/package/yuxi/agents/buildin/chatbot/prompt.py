@@ -44,12 +44,6 @@ SOURCE_CITE_PROMPT = """
 比如 <cite source="食品工艺学.pdf" type="file">1</cite>
 """
 
-TODO_MID_PROMPT = """
-你需要根据任务的复杂程度来使用 write_todos 来记录规划和待办事项，确保任务的每个步骤都被记录和跟踪。
-每个待办任务名称必须简短，控制在 20 个中文汉字以内。
-"""
-
-
 def build_prompt_with_context(context):
     current_date = f"当前日期：{shanghai_now().strftime('%Y-%m-%d')}"
     system_prompt = f"{current_date}\n\n{PROMPT.strip()}\n\n{context.system_prompt or ''}"

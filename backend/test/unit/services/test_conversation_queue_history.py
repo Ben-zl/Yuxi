@@ -6,7 +6,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from yuxi.services.conversation_service import get_thread_history_view
-from yuxi.storage.postgres.models_business import AgentRun, Base, Conversation, Message
+from yuxi.storage.postgres.models_business import AgentRun, Base, Conversation, Message, ToolCall
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -118,4 +118,51 @@ async def test_queue_history_keeps_each_request_with_its_reply(session):
         "A reply",
         "B",
         "B reply",
+    ]
+
+
+async def test_history_restores_reasoning_and_tool_calls(session):
+    """历史接口应恢复实时阶段可见的推理内容与工具执行详情。"""
+    session.add(Conversation(id=1, thread_id="thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(
+        Message(
+            id=1,
+            conversation_id=1,
+            role="assistant",
+            content="最终答案",
+            extra_metadata={
+                "additional_kwargs": {"reasoning_content": "先查询知识库"},
+            },
+        )
+    )
+    session.add(
+        ToolCall(
+            message_id=1,
+            langgraph_tool_call_id="tc1",
+            tool_name="query_kb",
+            tool_input={"query": "退款"},
+            tool_output="知识库结果",
+            status="success",
+        )
+    )
+    await session.commit()
+
+    response = await get_thread_history_view(
+        thread_id="thread-1",
+        current_uid="user-1",
+        db=session,
+    )
+
+    assistant = response["history"][0]
+    assert assistant["additional_kwargs"] == {"reasoning_content": "先查询知识库"}
+    assert assistant["tool_calls"] == [
+        {
+            "id": "tc1",
+            "name": "query_kb",
+            "function": {"name": "query_kb"},
+            "args": {"query": "退款"},
+            "tool_call_result": {"content": "知识库结果"},
+            "status": "success",
+            "error_message": None,
+        }
     ]

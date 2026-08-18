@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import mimetypes
+import os
 import shutil
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
@@ -21,6 +22,8 @@ from yuxi.agents.backends.sandbox import (
 )
 from yuxi.agents.backends.skills_backend import SelectedSkillsReadonlyBackend
 from yuxi.agents.skills.service import normalize_string_list
+from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError
+from yuxi.repositories import agentscope_thread_sessions
 from yuxi.services.agent_runtime_service import resolve_thread_agent_runtime_context
 from yuxi.services.file_preview import (
     MAX_BINARY_PREVIEW_SIZE_BYTES,
@@ -48,6 +51,8 @@ from yuxi.services.workspace_service import (
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.datetime_utils import utc_isoformat_from_timestamp
 from yuxi.utils.paths import VIRTUAL_PATH_OUTPUTS, VIRTUAL_PATH_UPLOADS, VIRTUAL_PATH_WORKSPACE
+
+AGENTSCOPE_OUTPUT_ROOT = PurePosixPath("/workspace/outputs")
 
 _PROTECTED_USER_DATA_ROOTS = frozenset(
     {
@@ -88,6 +93,19 @@ def _is_user_data_path(path: str) -> bool:
 
 def _is_workspace_path(path: str) -> bool:
     return path == VIRTUAL_PATH_WORKSPACE or path.startswith(f"{VIRTUAL_PATH_WORKSPACE}/")
+
+
+def _is_outputs_path(path: str) -> bool:
+    """检查路径是否属于线程产出目录。"""
+    return path == VIRTUAL_PATH_OUTPUTS or path.startswith(f"{VIRTUAL_PATH_OUTPUTS}/")
+
+
+def _agentscope_output_path(path: str) -> str:
+    """把 Viewer 产出虚拟路径转换为 AgentScope 持久 workspace 路径。"""
+    relative = PurePosixPath(path).relative_to(PurePosixPath(VIRTUAL_PATH_OUTPUTS))
+    if ".." in relative.parts:
+        raise ValueError("产出路径不允许包含上级目录")
+    return str(AGENTSCOPE_OUTPUT_ROOT / relative)
 
 
 def _is_skills_path(path: str) -> bool:
@@ -228,6 +246,51 @@ def _viewer_response_from_workspace_response(response: dict) -> dict:
     return result
 
 
+def _viewer_entry_from_agentscope(directory_path: str, entry: dict) -> dict:
+    """把 AgentScope 目录项转换为 Viewer 文件树协议。"""
+    is_dir = bool(entry.get("is_dir", False))
+    path = f"{directory_path.rstrip('/')}/{entry['name']}"
+    if is_dir:
+        path = f"{path}/"
+    return {
+        "path": path,
+        "name": str(entry["name"]),
+        "is_dir": is_dir,
+        "size": int(entry.get("size_bytes", 0) or 0),
+        "modified_at": utc_isoformat_from_timestamp(entry.get("updated_at")) or "",
+    }
+
+
+async def _resolve_agentscope_output_context(
+    *,
+    thread_id: str,
+    path: str,
+    current_user: User,
+    db: AsyncSession,
+):
+    """解析 AgentScope 线程产出目录；旧线程或其他目录返回 None。"""
+    if not _is_outputs_path(path):
+        return None
+    mapping = await agentscope_thread_sessions.get_thread_session(
+        db,
+        uid=str(current_user.uid),
+        thread_id=thread_id,
+    )
+    if mapping is None:
+        return None
+    client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
+    return client, mapping
+
+
+def _agentscope_http_error(exc: AgentScopeServiceError) -> HTTPException:
+    """把 AgentScope 文件接口错误转换为 Viewer HTTP 错误。"""
+    if exc.status_code == 404:
+        return HTTPException(status_code=404, detail="文件不存在")
+    if exc.status_code == 400:
+        return HTTPException(status_code=400, detail="当前路径类型不正确")
+    return HTTPException(status_code=502, detail="AgentScope 工作区暂不可用")
+
+
 def _list_user_data_root_entries(thread_id: str, uid: str) -> list[dict]:
     """Expose thread-root files while keeping the user workspace entry visible."""
     entries = _list_local_entries(thread_id, uid, sandbox_user_data_dir(thread_id))
@@ -282,6 +345,12 @@ async def list_viewer_filesystem_tree(
         current_user=current_user,
         db=db,
     )
+    agentscope_context = await _resolve_agentscope_output_context(
+        thread_id=thread_id,
+        path=normalized_path,
+        current_user=current_user,
+        db=db,
+    )
 
     if normalized_path == "/":
         # 根目录只显示 viewer 暴露的虚拟命名空间，避免为只读树视图触发 sandbox 冷启动。
@@ -297,6 +366,24 @@ async def list_viewer_filesystem_tree(
 
     try:
         if _is_user_data_path(normalized_path):
+            if agentscope_context is not None:
+                client, mapping = agentscope_context
+                try:
+                    response = await client.list_workspace_directory(
+                        str(current_user.uid),
+                        mapping.agentscope_agent_id,
+                        mapping.agentscope_session_id,
+                        _agentscope_output_path(normalized_path),
+                    )
+                except AgentScopeServiceError as exc:
+                    if exc.status_code == 404:
+                        return {"entries": []}
+                    raise _agentscope_http_error(exc) from exc
+                entries = [
+                    _viewer_entry_from_agentscope(normalized_path, entry)
+                    for entry in response.get("entries", [])
+                ]
+                return {"entries": _sort_entries(entries)}
             uid = str(current_user.uid)
             ensure_thread_dirs(thread_id, uid)
             if _is_workspace_path(normalized_path):
@@ -347,9 +434,27 @@ async def read_viewer_file_content(
         current_user=current_user,
         db=db,
     )
+    agentscope_context = await _resolve_agentscope_output_context(
+        thread_id=thread_id,
+        path=normalized_path,
+        current_user=current_user,
+        db=db,
+    )
 
     try:
         if _is_user_data_path(normalized_path):
+            if agentscope_context is not None:
+                client, mapping = agentscope_context
+                try:
+                    raw_content = await client.read_workspace_file(
+                        str(current_user.uid),
+                        mapping.agentscope_agent_id,
+                        mapping.agentscope_session_id,
+                        _agentscope_output_path(normalized_path),
+                    )
+                except AgentScopeServiceError as exc:
+                    raise _agentscope_http_error(exc) from exc
+                return _render_viewer_preview(normalized_path, raw_content)
             if _is_workspace_path(normalized_path):
                 return await read_workspace_file_content_response(
                     path=_workspace_relative_path(normalized_path),
@@ -401,9 +506,33 @@ async def download_viewer_file(
         current_user=current_user,
         db=db,
     )
+    agentscope_context = await _resolve_agentscope_output_context(
+        thread_id=thread_id,
+        path=normalized_path,
+        current_user=current_user,
+        db=db,
+    )
 
     try:
         if _is_user_data_path(normalized_path):
+            if agentscope_context is not None:
+                client, mapping = agentscope_context
+                try:
+                    raw_content = await client.read_workspace_file(
+                        str(current_user.uid),
+                        mapping.agentscope_agent_id,
+                        mapping.agentscope_session_id,
+                        _agentscope_output_path(normalized_path),
+                        max_bytes=100 * 1024 * 1024,
+                    )
+                except AgentScopeServiceError as exc:
+                    raise _agentscope_http_error(exc) from exc
+                file_name = PurePosixPath(normalized_path).name or "download"
+                media_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+                headers = {
+                    "Content-Disposition": f"attachment; filename*=UTF-8''{quote(file_name)}",
+                }
+                return StreamingResponse(io.BytesIO(raw_content), media_type=media_type, headers=headers)
             if _is_workspace_path(normalized_path):
                 return await download_workspace_file_response(
                     path=_workspace_relative_path(normalized_path),
@@ -467,6 +596,12 @@ async def delete_viewer_file(
         current_user=current_user,
         db=db,
     )
+    agentscope_context = await _resolve_agentscope_output_context(
+        thread_id=thread_id,
+        path=normalized_path,
+        current_user=current_user,
+        db=db,
+    )
 
     if not _is_user_data_path(normalized_path):
         raise HTTPException(status_code=400, detail="当前路径不支持删除")
@@ -474,6 +609,18 @@ async def delete_viewer_file(
         raise HTTPException(status_code=400, detail="当前目录不允许删除")
 
     try:
+        if agentscope_context is not None:
+            client, mapping = agentscope_context
+            try:
+                await client.delete_workspace_output(
+                    str(current_user.uid),
+                    mapping.agentscope_agent_id,
+                    mapping.agentscope_session_id,
+                    _agentscope_output_path(normalized_path),
+                )
+            except AgentScopeServiceError as exc:
+                raise _agentscope_http_error(exc) from exc
+            return {"success": True, "path": normalized_path}
         if _is_workspace_path(normalized_path):
             await delete_workspace_path(path=_workspace_relative_path(normalized_path), current_user=current_user)
             return {"success": True, "path": normalized_path}
