@@ -11,6 +11,7 @@ import io
 import json
 import mimetypes
 import secrets
+from pathlib import Path, PurePosixPath
 
 import httpx
 
@@ -395,12 +396,81 @@ def build_media_reader_tool(workspace):
             texts = [reader.pages[page - 1].extract_text() or "" for page in selected]
             if not any(text.strip() for text in texts):
                 return _gateway_error("PDF 没有可提取文本，请使用 ocr_parse_file 处理扫描页。")
-            content = "\n\n".join(
-                f"--- Page {page} ---\n{text}" for page, text in zip(selected, texts)
-            )
+            content = "\n\n".join(f"--- Page {page} ---\n{text}" for page, text in zip(selected, texts))
             return ToolChunk(content=[TextBlock(text=content)], state=ToolResultState.RUNNING)
 
     return MediaReader()
+
+
+def build_shared_workspace_tools(uid: str) -> list:
+    """构建服务进程侧个人工作区工具，不向 Docker workspace 暴露宿主路径。"""
+    from agentscope.tool import FunctionTool
+    from yuxi.agents.backends.sandbox.paths import global_user_data_dir
+
+    user_data_root = global_user_data_dir(uid)
+    user_data_root.mkdir(parents=True, exist_ok=True)
+    workspace_root = user_data_root / "workspace"
+    if workspace_root.is_symlink():
+        raise ValueError("个人工作区根目录不能是符号链接")
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    root = workspace_root.resolve()
+    if not root.is_relative_to(user_data_root.resolve()):
+        raise ValueError("个人工作区根目录越界")
+
+    def resolve(path: str, *, allow_missing: bool = False) -> Path:
+        virtual = PurePosixPath("/" + path.lstrip("/"))
+        prefix = PurePosixPath("/workspace/workspace")
+        if ".." in virtual.parts or not virtual.is_relative_to(prefix):
+            raise ValueError("个人工作区路径必须位于 /workspace/workspace")
+        target = root.joinpath(*virtual.relative_to(prefix).parts)
+        parent = target.parent.resolve()
+        parent_outside = target != root and not parent.is_relative_to(root)
+        target_outside = target.exists() and not target.resolve().is_relative_to(root)
+        if parent_outside or target_outside:
+            raise ValueError("个人工作区路径越界")
+        if not allow_missing and not target.exists():
+            raise FileNotFoundError(path)
+        return target
+
+    async def shared_workspace_list(path: str = "/workspace/workspace") -> str:
+        """列出个人工作区目录。"""
+        target = resolve(path)
+        if not target.is_dir():
+            raise ValueError("路径不是目录")
+        return _json(
+            [
+                {"name": child.name, "is_dir": child.is_dir(), "size": child.stat().st_size if child.is_file() else 0}
+                for child in sorted(target.iterdir(), key=lambda item: item.name.lower())
+                if child.resolve().is_relative_to(root)
+            ]
+        )
+
+    async def shared_workspace_read(path: str) -> str:
+        """读取个人工作区 UTF-8 文本文件。"""
+        target = resolve(path)
+        if not target.is_file() or target.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError("只能读取 2 MB 以内的文本文件")
+        return target.read_text(encoding="utf-8")
+
+    async def shared_workspace_write(path: str, content: str) -> str:
+        """写入个人工作区 UTF-8 文本文件。"""
+        if len(content.encode("utf-8")) > 2 * 1024 * 1024:
+            raise ValueError("写入内容不能超过 2 MB")
+        target = resolve(path, allow_missing=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return _json({"path": path, "size": target.stat().st_size})
+
+    return [
+        FunctionTool(shared_workspace_list, name="shared_workspace_list", description="列出个人共享工作区目录"),
+        FunctionTool(
+            shared_workspace_read,
+            name="shared_workspace_read",
+            description="读取个人共享工作区文本文件",
+            is_read_only=True,
+        ),
+        FunctionTool(shared_workspace_write, name="shared_workspace_write", description="写入个人共享工作区文本文件"),
+    ]
 
 
 def _detect_image_media_type(raw: bytes) -> str | None:
@@ -428,14 +498,10 @@ async def build_optional_tools(
     """按 Agent 白名单装配 Yuxi 可选工具；None 表示全部目录项。"""
     from yuxi.agents.toolkits.service import get_tool_metadata
 
-    selected = (
-        [item["slug"] for item in get_tool_metadata()]
-        if tool_slugs is None
-        else tool_slugs
-    )
+    selected = [item["slug"] for item in get_tool_metadata()] if tool_slugs is None else tool_slugs
     tools_by_slug = {
         "ask_user_question": build_ask_user_question_tool,
-        "present_artifacts": lambda: _present_artifacts_tool(uid, agent_id, session_id),
+        "present_artifacts": lambda: _present_artifacts_tool(workspace),
         "ocr_parse_file": lambda: _ocr_parse_file_tool(uid, agent_id, session_id),
         "read_media": lambda: build_media_reader_tool(workspace),
         "web_search": build_web_search_tool,
@@ -882,37 +948,37 @@ def _download_kb_file_tool(uid: str, knowledge_slugs: list[str] | None):
     )
 
 
-def _present_artifacts_tool(uid: str, agent_id: str, session_id: str):
-    """产出物展示工具：列出线程工作区 outputs 目录的文件。"""
-    import os
-
+def _present_artifacts_tool(workspace):
+    """产出物展示工具：校验并持久化明确的 outputs 文件清单。"""
     from agentscope.tool import FunctionTool
 
-    base_url = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
+    async def present_artifacts(filepaths: list[str]) -> str:
+        """展示已生成的文件；filepaths 必须是 /workspace/outputs 下的文件。"""
+        from pathlib import PurePosixPath
 
-    async def present_artifacts() -> str:
-        """列出工作区产出目录（/workspace/outputs）中的文件，供用户查看与下载。"""
-        try:
-            async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as http:
-                resp = await http.get(
-                    "/workspace/directories",
-                    params={
-                        "agent_id": agent_id,
-                        "session_id": session_id,
-                        "path": "/workspace/outputs",
-                    },
-                    headers={"X-User-ID": uid},
-                )
-                resp.raise_for_status()
-                return _json(resp.json())
-        except httpx.HTTPError as exc:
-            return f"读取产出目录失败：{exc}"
+        if not filepaths:
+            raise ValueError("至少需要一个产出文件")
+        backend = workspace.get_backend()
+        validated = []
+        root = PurePosixPath("/workspace/outputs")
+        for value in filepaths:
+            path = PurePosixPath(value)
+            if not path.is_absolute() or ".." in path.parts or path == root or not path.is_relative_to(root):
+                raise ValueError(f"产出文件必须位于 /workspace/outputs: {value}")
+            stat = await backend.stat(str(path))
+            if stat is None or getattr(stat, "is_dir", False):
+                raise ValueError(f"产出文件不存在或不是普通文件: {value}")
+            validated.append(str(path))
+        await backend.write_file(
+            "/workspace/data/yuxi-artifacts.json",
+            json.dumps({"filepaths": validated}, ensure_ascii=False).encode("utf-8"),
+        )
+        return _json({"filepaths": validated})
 
     return FunctionTool(
         present_artifacts,
         name="present_artifacts",
-        description="列出智能体生成的产出文件（用户可在工作区下载）",
-        is_read_only=True,
+        description="向用户展示已生成的 /workspace/outputs 文件",
     )
 
 
@@ -953,9 +1019,7 @@ def _ocr_parse_file_tool(
                 raise ValueError("OCR 文件路径必须位于 /workspace")
             if not uid or not agent_id or not session_id:
                 raise ValueError("OCR workspace 路径缺少会话上下文")
-            client = AgentScopeServiceClient(
-                os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
-            )
+            client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
             data = await client.read_workspace_file(uid, agent_id, session_id, str(path))
             image_base64 = b64encode(data).decode("ascii")
         async with httpx.AsyncClient(timeout=60.0) as client:

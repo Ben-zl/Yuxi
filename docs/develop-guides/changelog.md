@@ -14,6 +14,7 @@
 - 完成 AgentScope 收口：统一投影逐轮装配 HTTP MCP、知识库与按用户/session 隔离的 Team worker 模板，凭据不进入 workspace；动态模板自动保留 `TeamSay` 回报协议，避免自定义系统提示覆盖团队协作约束；失败运行会继续派发 FIFO；线程状态改由 Yuxi 事实源聚合；移除 LangChain/LangGraph/DeepAgents 运行代码、依赖及无效摘要配置。
 
 - AgentScope 网关承接队列执行、持久 Session、审批/取消/steer、Team、Skills、KB 和隔离 workspace；生产 Compose 同步新增内部 AgentScope 服务与固定切换时间配置。
+- AgentScope 线程文件统一仅暴露 uploads/outputs：交付物清单可跨刷新恢复，文件可从对话保存到个人工作区并出现在历史对话目录；个人工作区由服务进程受限工具访问，不向 Docker 容器暴露宿主路径；删除线程同步清理 Session、Agent、Credential、映射和持久 workspace。
 - 补齐 AgentScope 功能对齐：工具白名单、主动提问挂起及多轮恢复、逐轮配置同步、平台上下文、Todo/文件状态及图片/PDF/OCR；模型级 URL/Header/参数由 Yuxi 自定义 Credential 与 ChatModel Adapter 承接，图片/PDF 读取由独立 `read_media` 工具承接，Skill 依赖通过按查看状态门控的 `SkillDependencyGateway` 执行，固定 AgentScope 版本无需源码修改；Deep Research 改用 Team/Task 协议，刷新后保留推理与工具调用；生成文件写入持久 workspace，文件树支持列表、预览、下载和删除，服务重启后保留。
 - 修复并行工具审批、resume 再挂起、Team 成员唤醒产生新回复时被过滤及无归属事件破坏终态、模型切换、附件绑定和终态竞态；推理内容与工具调用在实时流、审批恢复和刷新历史中保持一致；真实浏览器、MiniMax-M3、OTLP 与 Docker E2E 已验证。
 - 两轴复审修复：工具审批策略接线（run 的审批模式每次执行前写入会话权限，完全信任 → bypass，此前"完全信任"退化为逐次审批）；多模态图片输入贯通（image_content 以 data 块送达模型，含媒体类型嗅探，此前被静默丢弃）；run 终态回写输入消息投递状态；修复 download_kb_file 运算符优先级缺陷；install_skill 元数据残留清理；read_timeout/sleep 常量收敛；ADR 接入站点导航；e2e mock URL 参数化并修复触发词被技能 hint 误命中。

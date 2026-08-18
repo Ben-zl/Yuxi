@@ -514,10 +514,37 @@ async def delete_thread_view(
 ) -> dict:
     conv_repo = ConversationRepository(db)
     await require_user_conversation(conv_repo, thread_id, str(current_uid))
+    await _delete_agentscope_thread_resources(db, uid=str(current_uid), thread_id=thread_id)
     deleted = await conv_repo.delete_conversation(thread_id, soft_delete=True)
     if not deleted:
         raise HTTPException(status_code=404, detail="对话线程不存在")
     return {"message": "删除成功"}
+
+
+async def _delete_agentscope_thread_resources(db: AsyncSession, *, uid: str, thread_id: str) -> None:
+    """删除线程独占的 AgentScope 资源与持久 workspace。"""
+    import asyncio
+    import os
+    import shutil
+    from pathlib import Path
+
+    from yuxi.agentscope.client import AgentScopeServiceClient
+    from yuxi.repositories.agentscope_thread_sessions import delete_thread_session, get_thread_session
+
+    mapping = await get_thread_session(db, uid=uid, thread_id=thread_id)
+    if mapping is None:
+        return
+
+    client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
+    await client.delete_session(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)
+    await client.delete_agent(uid, mapping.agentscope_agent_id)
+    await client.delete_credential(uid, mapping.agentscope_credential_id)
+    await delete_thread_session(db, mapping)
+
+    base = Path(os.getenv("AGENTSCOPE_WORKSPACE_BASEDIR", "/app/saves/agentscope-workspaces")).resolve()
+    target = (base / uid / mapping.agentscope_agent_id).resolve()
+    if target != base and target.is_relative_to(base) and target.exists() and not target.is_symlink():
+        await asyncio.to_thread(shutil.rmtree, target)
 
 
 async def update_thread_view(

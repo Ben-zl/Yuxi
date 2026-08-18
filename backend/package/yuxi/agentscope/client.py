@@ -317,10 +317,11 @@ class AgentScopeServiceClient:
         agent_id: str,
         session_id: str,
         *,
+        root: str = "",
         max_entries: int = 500,
     ) -> list[dict]:
         """递归列出会话 workspace 文件，限制条目数避免状态接口失控。"""
-        pending = [""]
+        pending = [root]
         files: list[dict] = []
         while pending and len(files) < max_entries:
             path = pending.pop(0)

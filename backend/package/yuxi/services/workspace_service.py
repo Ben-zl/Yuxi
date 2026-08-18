@@ -69,6 +69,7 @@ async def list_workspace_tree(
     files_only: bool = False,
     current_user: User,
     thread_titles: dict[str, str] | None = None,
+    db: AsyncSession | None = None,
 ) -> dict:
     root = _workspace_root(current_user)
     if workspace_path_uses_chat_mapping(path):
@@ -76,6 +77,17 @@ async def list_workspace_tree(
         if chats_path.is_symlink() or chats_path.exists():
             raise HTTPException(status_code=409, detail="工作区 agents/chats 已被现有文件或目录占用")
     if _chat_path_parts(path) is not None:
+        if db is not None:
+            remote_entries = await _list_chat_directory_agentscope(
+                db,
+                uid=str(current_user.uid),
+                path=path,
+                thread_titles=thread_titles or {},
+                recursive=recursive,
+                files_only=files_only,
+            )
+            if remote_entries is not None:
+                return {"entries": remote_entries, "readonly": True}
         entries = await asyncio.to_thread(
             _list_chat_directory,
             path,
@@ -139,8 +151,22 @@ def resolve_workspace_file_path(*, path: str, current_user: User, thread_titles:
 
 
 async def read_workspace_file_content(
-    *, path: str, current_user: User, thread_titles: dict[str, str] | None = None
+    *, path: str, current_user: User, thread_titles: dict[str, str] | None = None, db: AsyncSession | None = None
 ) -> dict | StreamingResponse:
+    remote = await _read_chat_agentscope_file(db, uid=str(current_user.uid), path=path, thread_titles=thread_titles)
+    if remote is not None:
+        if len(remote) > MAX_BINARY_PREVIEW_SIZE_BYTES:
+            return render_preview_too_large_payload()
+        if is_office_pdf_preview_file(path):
+            filename = PurePosixPath(path).name or "preview"
+            pdf_content = await convert_office_to_pdf(filename, remote)
+            return _preview_binary_response(
+                filename=f"{Path(filename).stem or 'preview'}.pdf",
+                content=pdf_content,
+                media_type="application/pdf",
+                preview_type="pdf",
+            )
+        return render_preview_payload(path, remote)
     target = resolve_workspace_file_path(path=path, current_user=current_user, thread_titles=thread_titles)
     if not target.exists():
         raise HTTPException(status_code=404, detail="文件不存在")
@@ -289,8 +315,18 @@ async def upload_workspace_files(*, parent_path: str, files: list[UploadFile], c
 
 
 async def download_workspace_file(
-    *, path: str, current_user: User, thread_titles: dict[str, str] | None = None
+    *, path: str, current_user: User, thread_titles: dict[str, str] | None = None, db: AsyncSession | None = None
 ) -> StreamingResponse | FileResponse:
+    remote = await _read_chat_agentscope_file(
+        db, uid=str(current_user.uid), path=path, thread_titles=thread_titles, max_bytes=100 * 1024 * 1024
+    )
+    if remote is not None:
+        file_name = PurePosixPath(path).name or "download"
+        return StreamingResponse(
+            io.BytesIO(remote),
+            media_type=detect_media_type(file_name, remote[:512]),
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(file_name)}"},
+        )
     target = resolve_workspace_file_path(path=path, current_user=current_user, thread_titles=thread_titles)
     if not target.exists():
         raise HTTPException(status_code=404, detail="文件不存在")
@@ -510,6 +546,106 @@ def _is_chat_intermediate_path(path: Path, namespace_root: Path) -> bool:
     except ValueError:
         return True
     return bool(relative.parts and relative.parts[0] in _CHAT_INTERMEDIATE_DIR_NAMES)
+
+
+async def _list_chat_directory_agentscope(
+    db: AsyncSession,
+    *,
+    uid: str,
+    path: str,
+    thread_titles: dict[str, str],
+    recursive: bool,
+    files_only: bool,
+) -> list[dict] | None:
+    """将 AgentScope uploads/outputs 合并到历史对话虚拟目录。"""
+    from yuxi.services.thread_workspace_service import list_visible_files, resolve_thread_workspace
+
+    parts = _chat_path_parts(path)
+    if parts is None:
+        return None
+    if not parts:
+        entries = _list_chat_directory(path, thread_titles=thread_titles, recursive=recursive, files_only=files_only)
+        visible_threads = {entry["name"] for entry in entries if entry.get("is_dir")}
+        for thread_id, title in thread_titles.items():
+            if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is None:
+                continue
+            files = await list_visible_files(db, uid=uid, thread_id=thread_id)
+            if not files:
+                continue
+            if not files_only and thread_id not in visible_threads:
+                entries.append(_virtual_entry(f"/agents/chats/{thread_id}", name=thread_id, title=title, is_dir=True))
+            if recursive:
+                entries.extend(
+                    _agentscope_chat_entries(
+                        thread_id, files, path=f"/agents/chats/{thread_id}", recursive=True, files_only=files_only
+                    )
+                )
+        return _sort_chat_entries(list({entry["path"]: entry for entry in entries}.values()))
+
+    thread_id = parts[0]
+    if thread_id not in thread_titles:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is None:
+        return None
+    files = await list_visible_files(db, uid=uid, thread_id=thread_id)
+    return _agentscope_chat_entries(thread_id, files, path=path, recursive=recursive, files_only=files_only)
+
+
+def _agentscope_chat_entries(
+    thread_id: str, files: list[dict], *, path: str, recursive: bool, files_only: bool
+) -> list[dict]:
+    """将平铺的 AgentScope 文件列表转换为历史对话目录项。"""
+    base = PurePosixPath(f"/agents/chats/{thread_id}")
+    requested = PurePosixPath(path)
+    entries: dict[str, dict] = {}
+    for item in files:
+        user_path = PurePosixPath(str(item["path"]))
+        relative = user_path.relative_to(PurePosixPath("/home/gem/user-data"))
+        display = base / relative
+        if not display.is_relative_to(requested) or display == requested:
+            continue
+        remainder = display.relative_to(requested)
+        if len(remainder.parts) > 1 and not recursive:
+            child = requested / remainder.parts[0]
+            if not files_only:
+                entries[str(child)] = _virtual_entry(str(child), name=child.name, is_dir=True)
+            continue
+        if recursive and not files_only:
+            for depth in range(1, len(remainder.parts)):
+                directory = requested.joinpath(*remainder.parts[:depth])
+                entries.setdefault(str(directory), _virtual_entry(str(directory), name=directory.name, is_dir=True))
+        entry = _virtual_entry(str(display), name=display.name, is_dir=False)
+        entry["size"] = int(item.get("size_bytes", 0) or 0)
+        entries[str(display)] = entry
+    return _sort_entries(list(entries.values()))
+
+
+async def _read_chat_agentscope_file(
+    db: AsyncSession | None,
+    *,
+    uid: str,
+    path: str,
+    thread_titles: dict[str, str] | None,
+    max_bytes: int = 25 * 1024 * 1024,
+) -> bytes | None:
+    """历史对话路径命中 AgentScope 映射时读取容器 workspace 文件。"""
+    if db is None:
+        return None
+    parts = _chat_path_parts(path)
+    if parts is None or len(parts) < 3:
+        return None
+    thread_id, namespace, *relative = parts
+    if thread_id not in (thread_titles or {}) or namespace not in {UPLOADS_DIR_NAME, OUTPUTS_DIR_NAME}:
+        raise HTTPException(status_code=403, detail="Access denied")
+    from yuxi.services.thread_workspace_service import read_file, resolve_thread_workspace
+
+    if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is None:
+        return None
+    virtual = str(PurePosixPath("/home/gem/user-data") / namespace / PurePosixPath(*relative))
+    try:
+        return await read_file(db, uid=uid, thread_id=thread_id, virtual_path=virtual, max_bytes=max_bytes)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"工作区文件不存在: {path}") from exc
 
 
 def _directory_has_visible_entries(directory: Path) -> bool:

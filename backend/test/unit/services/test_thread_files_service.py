@@ -16,6 +16,10 @@ async def _fake_require_user_conversation(_repo, _thread_id: str, _current_uid: 
     return _Conversation()
 
 
+async def _no_agentscope_mapping(*_args, **_kwargs):
+    return None
+
+
 @pytest.mark.asyncio
 async def test_read_thread_file_content_runs_file_read_in_worker_thread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -30,6 +34,7 @@ async def test_read_thread_file_content_runs_file_read_in_worker_thread(
 
     monkeypatch.setattr(svc, "require_user_conversation", _fake_require_user_conversation)
     monkeypatch.setattr(svc, "ConversationRepository", lambda _db: object())
+    monkeypatch.setattr(svc, "resolve_thread_workspace", _no_agentscope_mapping)
     monkeypatch.setattr(svc, "resolve_virtual_path", lambda _thread_id, _path, *, uid: file_path)
     monkeypatch.setattr(svc.asyncio, "to_thread", _fake_to_thread)
 
@@ -59,6 +64,7 @@ async def test_list_thread_files_runs_directory_scan_in_worker_thread(tmp_path: 
 
     monkeypatch.setattr(svc, "require_user_conversation", _fake_require_user_conversation)
     monkeypatch.setattr(svc, "ConversationRepository", lambda _db: object())
+    monkeypatch.setattr(svc, "resolve_thread_workspace", _no_agentscope_mapping)
     monkeypatch.setattr(svc, "ensure_thread_dirs", lambda _thread_id, _uid: None)
     monkeypatch.setattr(svc, "resolve_virtual_path", lambda _thread_id, _path, *, uid: directory)
     monkeypatch.setattr(
@@ -99,6 +105,7 @@ async def test_resolve_thread_artifact_view_blocks_symlink_escape(tmp_path: Path
     monkeypatch.setattr(svc, "sandbox_outputs_dir", lambda _thread_id: thread_root / "outputs")
     monkeypatch.setattr(svc, "resolve_virtual_path", lambda _thread_id, _path, *, uid: uploads_dir / "escape.txt")
     monkeypatch.setattr(svc, "ConversationRepository", lambda _db: object())
+    monkeypatch.setattr(svc, "resolve_thread_workspace", _no_agentscope_mapping)
 
     with pytest.raises(HTTPException, match="access denied"):
         await svc.resolve_thread_artifact_view(
@@ -107,3 +114,39 @@ async def test_resolve_thread_artifact_view_blocks_symlink_escape(tmp_path: Path
             db=None,
             path="/home/gem/user-data/uploads/escape.txt",
         )
+
+
+@pytest.mark.asyncio
+async def test_save_agentscope_artifact_to_personal_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    async def mapped(*_args, **_kwargs):
+        return object(), object()
+
+    async def read_file(*_args, **_kwargs):
+        return b"generated"
+
+    monkeypatch.setattr(svc, "require_user_conversation", _fake_require_user_conversation)
+    monkeypatch.setattr(svc, "ConversationRepository", lambda _db: object())
+    monkeypatch.setattr(svc, "resolve_thread_workspace", mapped)
+    monkeypatch.setattr(svc, "read_agentscope_file", read_file)
+    monkeypatch.setattr(svc, "sandbox_workspace_dir", lambda *_args: tmp_path / "workspace")
+    monkeypatch.setattr(
+        svc,
+        "virtual_path_for_thread_file",
+        lambda *_args, **_kwargs: "/home/gem/user-data/workspace/saved_artifacts/report.md",
+    )
+
+    async def noop(*_args):
+        return None
+
+    monkeypatch.setattr(svc, "invalidate_mention_cache", noop)
+    monkeypatch.setattr(svc, "invalidate_workspace_mention_cache", noop)
+
+    result = await svc.save_thread_artifact_to_workspace_view(
+        thread_id="thread-1",
+        current_uid="user-1",
+        db=None,
+        path="/home/gem/user-data/outputs/report.md",
+    )
+
+    assert (tmp_path / "workspace" / "saved_artifacts" / "report.md").read_bytes() == b"generated"
+    assert result["saved_path"] == "/home/gem/user-data/workspace/saved_artifacts/report.md"

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import HTTPException
@@ -18,6 +19,11 @@ from yuxi.agents.backends.sandbox import (
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.services.conversation_service import require_user_conversation
 from yuxi.services.mention_search_service import invalidate_mention_cache, invalidate_workspace_mention_cache
+from yuxi.services.thread_workspace_service import (
+    list_visible_files,
+    read_file as read_agentscope_file,
+    resolve_thread_workspace,
+)
 from yuxi.utils.datetime_utils import utc_isoformat_from_timestamp
 from yuxi.utils.paths import VIRTUAL_PATH_PREFIX
 
@@ -62,6 +68,35 @@ async def list_thread_files_view(
     conversation = await require_user_conversation(conv_repo, thread_id, str(current_uid))
     uid = str(conversation.uid)
 
+    if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is not None:
+        virtual_path = (path or _get_virtual_root()).rstrip("/") or "/"
+        files = await list_visible_files(db, uid=uid, thread_id=thread_id)
+        if virtual_path == _get_virtual_root():
+            namespaces = sorted({item["path"].split("/")[4] for item in files})
+            entries = [
+                {
+                    "path": f"{_get_virtual_root()}/{name}/",
+                    "name": name,
+                    "is_dir": True,
+                    "size": 0,
+                    "modified_at": "",
+                    "artifact_url": None,
+                }
+                for name in namespaces
+            ]
+            if recursive:
+                entries.extend(_agentscope_file_entries(thread_id, files))
+            return {"path": path or _get_virtual_root(), "files": entries}
+        entries = _agentscope_file_entries(thread_id, files)
+        prefix = f"{virtual_path}/"
+        if not recursive:
+            entries = [
+                item for item in entries if item["path"].startswith(prefix) and "/" not in item["path"][len(prefix) :]
+            ]
+        else:
+            entries = [item for item in entries if item["path"].startswith(prefix)]
+        return {"path": path or _get_virtual_root(), "files": entries}
+
     ensure_thread_dirs(thread_id, uid)
     virtual_path = path or _get_virtual_root()
     try:
@@ -97,6 +132,21 @@ def _list_directory_entries(thread_id: str, uid: str, actual_path: Path) -> list
     return [
         _thread_file_entry(thread_id, uid, child)
         for child in sorted(actual_path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
+    ]
+
+
+def _agentscope_file_entries(thread_id: str, files: list[dict]) -> list[dict[str, Any]]:
+    """把 AgentScope 文件项转换为线程文件 API 协议。"""
+    return [
+        {
+            "path": item["path"],
+            "name": PurePosixPath(item["path"]).name,
+            "is_dir": False,
+            "size": int(item.get("size_bytes", 0) or 0),
+            "modified_at": utc_isoformat_from_timestamp(item.get("updated_at")) or "",
+            "artifact_url": f"/api/chat/thread/{thread_id}/artifacts/{item['path'].lstrip('/')}",
+        }
+        for item in files
     ]
 
 
@@ -154,6 +204,21 @@ async def read_thread_file_content_view(
     conversation = await require_user_conversation(conv_repo, thread_id, str(current_uid))
     uid = str(conversation.uid)
 
+    if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is not None:
+        raw = await read_agentscope_file(db, uid=uid, thread_id=thread_id, virtual_path=path)
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        start = max(0, int(offset))
+        count = min(max(1, int(limit)), 5000)
+        return {
+            "path": path,
+            "content": lines[start : start + count],
+            "offset": start,
+            "limit": count,
+            "total_lines": len(lines),
+            "artifact_url": f"/api/chat/thread/{thread_id}/artifacts/{path.lstrip('/')}",
+        }
+
     try:
         actual_path = resolve_virtual_path(thread_id, path, uid=uid)
     except ValueError as exc:
@@ -180,20 +245,33 @@ async def read_thread_file_content_view(
     }
 
 
+@dataclass(frozen=True)
+class InMemoryArtifact:
+    """AgentScope 文件响应，避免把容器文件复制到 API 临时目录。"""
+
+    name: str
+    content: bytes
+
+
 async def resolve_thread_artifact_view(
     *,
     thread_id: str,
     current_uid: str,
     db,
     path: str,
-) -> Path:
+) -> Path | InMemoryArtifact:
     conv_repo = ConversationRepository(db)
     conversation = await require_user_conversation(conv_repo, thread_id, str(current_uid))
     uid = str(conversation.uid)
 
-    ensure_thread_dirs(thread_id, uid)
-
     normalized = "/" + path.lstrip("/")
+    if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is not None:
+        raw = await read_agentscope_file(
+            db, uid=uid, thread_id=thread_id, virtual_path=normalized, max_bytes=100 * 1024 * 1024
+        )
+        return InMemoryArtifact(name=PurePosixPath(normalized).name, content=raw)
+
+    ensure_thread_dirs(thread_id, uid)
     try:
         actual_path = resolve_virtual_path(thread_id, normalized, uid=uid)
     except ValueError as exc:
@@ -225,7 +303,7 @@ async def save_thread_artifact_to_workspace_view(
     db,
     path: str,
 ) -> dict[str, str]:
-    source_path = await resolve_thread_artifact_view(
+    source = await resolve_thread_artifact_view(
         thread_id=thread_id,
         current_uid=current_uid,
         db=db,
@@ -238,9 +316,13 @@ async def save_thread_artifact_to_workspace_view(
     target_dir = sandbox_workspace_dir(thread_id, uid) / "saved_artifacts"
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    target_path = _next_available_artifact_path(target_dir, source_path.name)
-    with source_path.open("rb") as src, target_path.open("wb") as dst:
-        shutil.copyfileobj(src, dst)
+    source_name = source.name
+    target_path = _next_available_artifact_path(target_dir, source_name)
+    if isinstance(source, InMemoryArtifact):
+        await asyncio.to_thread(target_path.write_bytes, source.content)
+    else:
+        with source.open("rb") as src, target_path.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
 
     await invalidate_mention_cache(thread_id)
     await invalidate_workspace_mention_cache(uid)

@@ -19,6 +19,7 @@ from yuxi.agentscope.runner import collect_chat_round, ensure_thread_session
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Agent, AgentScopeThreadSession, User
 from yuxi.storage.redis import close_async_redis_client
+from yuxi.services.thread_workspace_service import list_visible_files, read_file
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
 CHATBOT_SLUG = "e2e-ws-chatbot"
@@ -31,6 +32,7 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture
 async def db_session():
+    await close_async_redis_client()
     pg_manager.initialize()
     await pg_manager.ensure_business_schema()
     async with pg_manager.get_async_session_context() as session:
@@ -112,6 +114,18 @@ async def test_write_tool_executes_in_docker_workspace(db_session):
             )
             assert resp.status_code == 200, resp.text
             assert resp.text == WRITE_CONTENT
+
+        visible = await list_visible_files(db_session, uid=uid, thread_id=thread_id)
+        assert [item["path"] for item in visible] == ["/home/gem/user-data/outputs/hello.txt"]
+        assert (
+            await read_file(
+                db_session,
+                uid=uid,
+                thread_id=thread_id,
+                virtual_path="/home/gem/user-data/outputs/hello.txt",
+            )
+            == WRITE_CONTENT.encode()
+        )
     finally:
         await client.delete_session(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)
         await client.delete_agent(uid, mapping.agentscope_agent_id)

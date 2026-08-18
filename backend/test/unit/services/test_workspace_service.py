@@ -737,3 +737,40 @@ async def test_physical_symlink_under_virtual_chats_cannot_redirect_access(tmp_p
         )
 
     assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_agentscope_history_lists_and_reads_output(monkeypatch) -> None:
+    """历史对话目录通过线程映射读取 AgentScope output。"""
+    from yuxi.services import thread_workspace_service
+
+    async def mapped(*_args, **_kwargs):
+        return object(), object()
+
+    async def visible(*_args, **_kwargs):
+        return [{"path": "/home/gem/user-data/outputs/report.md", "size_bytes": 6}]
+
+    async def read(*_args, **_kwargs):
+        return b"report"
+
+    monkeypatch.setattr(thread_workspace_service, "resolve_thread_workspace", mapped)
+    monkeypatch.setattr(thread_workspace_service, "list_visible_files", visible)
+    monkeypatch.setattr(thread_workspace_service, "read_file", read)
+    user = _user()
+    titles = {"thread-1": "2026-08-18-report"}
+
+    tree = await svc.list_workspace_tree(
+        path="/agents/chats/thread-1/outputs",
+        current_user=user,
+        thread_titles=titles,
+        db=object(),
+    )
+    preview = await svc.read_workspace_file_content(
+        path="/agents/chats/thread-1/outputs/report.md",
+        current_user=user,
+        thread_titles=titles,
+        db=object(),
+    )
+
+    assert [entry["name"] for entry in tree["entries"]] == ["report.md"]
+    assert preview["content"] == "report"

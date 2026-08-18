@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 import pytest_asyncio
+from types import SimpleNamespace
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.repositories.conversation_repository import ConversationRepository, UNVIEWED_RUN_MARKER
@@ -13,6 +14,53 @@ from yuxi.services import conversation_service as svc
 from yuxi.storage.postgres.models_business import AgentRun, Base, Conversation
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
+
+
+async def test_delete_agentscope_thread_resources_removes_remote_mapping_and_workspace(tmp_path, monkeypatch):
+    """线程删除必须清理独占的 AgentScope 资源和持久目录。"""
+    from yuxi.agentscope import client as client_module
+    from yuxi.repositories import agentscope_thread_sessions as mapping_repo
+
+    mapping = SimpleNamespace(
+        agentscope_agent_id="agent-1",
+        agentscope_session_id="session-1",
+        agentscope_credential_id="credential-1",
+    )
+    calls = []
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def delete_session(self, *args):
+            calls.append(("session", *args))
+
+        async def delete_agent(self, *args):
+            calls.append(("agent", *args))
+
+        async def delete_credential(self, *args):
+            calls.append(("credential", *args))
+
+    async def get_mapping(*_args, **_kwargs):
+        return mapping
+
+    async def delete_mapping(_db, record):
+        assert record is mapping
+        calls.append(("mapping",))
+
+    base = tmp_path / "agentscope-workspaces"
+    workdir = base / "user-1" / "agent-1"
+    workdir.mkdir(parents=True)
+    (workdir / "report.md").write_text("result", encoding="utf-8")
+    monkeypatch.setenv("AGENTSCOPE_WORKSPACE_BASEDIR", str(base))
+    monkeypatch.setattr(client_module, "AgentScopeServiceClient", Client)
+    monkeypatch.setattr(mapping_repo, "get_thread_session", get_mapping)
+    monkeypatch.setattr(mapping_repo, "delete_thread_session", delete_mapping)
+
+    await svc._delete_agentscope_thread_resources(object(), uid="user-1", thread_id="thread-1")
+
+    assert [call[0] for call in calls] == ["session", "agent", "credential", "mapping"]
+    assert not workdir.exists()
 
 
 @pytest_asyncio.fixture()

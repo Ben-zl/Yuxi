@@ -258,9 +258,9 @@ async def test_build_optional_tools_respects_empty_and_explicit_allowlist(monkey
     monkeypatch.setattr(tools, "_present_artifacts_tool", lambda *_args: SimpleNamespace(name="present_artifacts"))
     monkeypatch.setattr(tools, "_ocr_parse_file_tool", lambda *_args: SimpleNamespace(name="ocr_parse_file"))
 
-    assert await tools.build_optional_tools(
-        tool_slugs=[], uid="u", knowledge_slugs=[], agent_id="a", session_id="s"
-    ) == []
+    assert (
+        await tools.build_optional_tools(tool_slugs=[], uid="u", knowledge_slugs=[], agent_id="a", session_id="s") == []
+    )
     selected = await tools.build_optional_tools(
         tool_slugs=["ask_user_question", "present_artifacts"],
         uid="u",
@@ -287,9 +287,7 @@ async def test_skill_dependency_gateway_requires_activation_and_dispatches(monke
         )
     )
     workspace = SimpleNamespace(
-        list_skills=AsyncMock(
-            return_value=[SimpleNamespace(name="research", markdown="# Research")]
-        )
+        list_skills=AsyncMock(return_value=[SimpleNamespace(name="research", markdown="# Research")])
     )
     monkeypatch.setattr(
         tools,
@@ -350,9 +348,7 @@ async def test_external_skill_gateway_requires_token_and_preserves_nested_schema
 
     external = tools.build_ask_user_question_tool()
     workspace = SimpleNamespace(
-        list_skills=AsyncMock(
-            return_value=[SimpleNamespace(name="research", markdown="# Research")]
-        )
+        list_skills=AsyncMock(return_value=[SimpleNamespace(name="research", markdown="# Research")])
     )
     monkeypatch.setattr(
         tools,
@@ -451,3 +447,49 @@ async def test_media_reader_extracts_selected_pdf_pages(monkeypatch):
 
     assert "SECOND PAGE" in result.content[0].text
     assert "FIRST PAGE" not in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_present_artifacts_persists_validated_manifest():
+    writes = []
+
+    class Backend:
+        async def stat(self, path):
+            return SimpleNamespace(is_dir=False) if path == "/workspace/outputs/report.md" else None
+
+        async def write_file(self, path, content):
+            writes.append((path, content))
+
+    workspace = SimpleNamespace(get_backend=lambda: Backend())
+    tool = tools._present_artifacts_tool(workspace)
+
+    result = await tool.call(filepaths=["/workspace/outputs/report.md"])
+
+    assert "report.md" in str(result.content)
+    assert writes[0][0] == "/workspace/data/yuxi-artifacts.json"
+    assert b"/workspace/outputs/report.md" in writes[0][1]
+
+
+@pytest.mark.asyncio
+async def test_present_artifacts_rejects_internal_workspace_file():
+    workspace = SimpleNamespace(get_backend=lambda: object())
+    tool = tools._present_artifacts_tool(workspace)
+
+    with pytest.raises(ValueError, match="outputs"):
+        await tool.call(filepaths=["/workspace/skills/private.md"])
+
+
+async def test_shared_workspace_tools_allow_root_and_reject_traversal(tmp_path, monkeypatch):
+    from yuxi.agents.backends.sandbox import paths
+
+    monkeypatch.setattr(paths.conf, "save_dir", str(tmp_path))
+    toolset = {tool.name: tool for tool in tools.build_shared_workspace_tools("user-1")}
+    await toolset["shared_workspace_write"].call(
+        path="/workspace/workspace/report.txt",
+        content="result",
+    )
+
+    listed = await toolset["shared_workspace_list"].call(path="/workspace/workspace")
+    assert "report.txt" in str(listed.content)
+    with pytest.raises(ValueError, match="个人工作区"):
+        await toolset["shared_workspace_read"].call(path="/workspace/workspace/../agents/AGENTS.md")

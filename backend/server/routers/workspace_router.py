@@ -114,6 +114,7 @@ async def get_workspace_tree(
         files_only=files_only,
         current_user=current_user,
         thread_titles=thread_titles,
+        db=db,
     )
 
 
@@ -144,7 +145,7 @@ async def get_workspace_file(
     db: AsyncSession = Depends(get_db),
 ):
     thread_titles = await build_owned_thread_titles(db, str(current_user.uid)) if is_workspace_chat_path(path) else None
-    return await read_workspace_file_content(path=path, current_user=current_user, thread_titles=thread_titles)
+    return await read_workspace_file_content(path=path, current_user=current_user, thread_titles=thread_titles, db=db)
 
 
 @workspace.get("/knowledge/tree", response_model=dict)
@@ -267,4 +268,4 @@ async def download_workspace(
     db: AsyncSession = Depends(get_db),
 ):
     thread_titles = await build_owned_thread_titles(db, str(current_user.uid)) if is_workspace_chat_path(path) else None
-    return await download_workspace_file(path=path, current_user=current_user, thread_titles=thread_titles)
+    return await download_workspace_file(path=path, current_user=current_user, thread_titles=thread_titles, db=db)

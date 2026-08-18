@@ -73,6 +73,7 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
         build_extra_tools,
         build_kb_tools,
         build_mcp_tools,
+        build_shared_workspace_tools,
         build_skill_dependency_gateway,
         build_subagent_tools,
     )
@@ -109,6 +110,7 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
             workspace=workspace,
         )
     )
+    tools.extend(build_shared_workspace_tools(user_id))
     tools.extend(
         await build_subagent_tools(
             storage=app.state.storage,

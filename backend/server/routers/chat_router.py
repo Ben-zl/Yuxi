@@ -4,7 +4,7 @@ from typing import Any
 
 import aiofiles
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +34,7 @@ from yuxi.services.thread_files_service import (
     list_thread_files_view,
     read_thread_file_content_view,
     resolve_thread_artifact_view,
+    InMemoryArtifact,
     save_thread_artifact_to_workspace_view,
 )
 from yuxi.services.feedback_service import get_message_feedback_view, submit_message_feedback_view
@@ -507,6 +508,11 @@ async def get_thread_artifact(
         db=db,
         path=path,
     )
+
+    if isinstance(file_path, InMemoryArtifact):
+        media_type = detect_media_type(file_path.name, file_path.content[:512])
+        headers = {"Content-Disposition": f'attachment; filename="{file_path.name}"'} if download else None
+        return Response(content=file_path.content, media_type=media_type, headers=headers)
 
     async with aiofiles.open(file_path, "rb") as artifact_file:
         file_head = await artifact_file.read(512)

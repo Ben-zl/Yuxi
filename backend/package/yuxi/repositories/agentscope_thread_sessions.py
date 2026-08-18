@@ -57,6 +57,12 @@ async def update_thread_session_model(
     return record
 
 
+async def delete_thread_session(db: AsyncSession, record: AgentScopeThreadSession) -> None:
+    """删除已完成远端清理的线程映射。"""
+    await db.delete(record)
+    await db.flush()
+
+
 async def get_thread_session_by_agentscope_agent(
     db: AsyncSession, *, agentscope_agent_id: str
 ) -> AgentScopeThreadSession | None:
