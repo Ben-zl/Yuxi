@@ -248,14 +248,20 @@ async def build_mcp_tools(
     *,
     mcp_servers: list[dict],
 ) -> list:
-    """按统一投影在 AgentScope 服务进程中装配当前轮次 HTTP MCP 工具。"""
-    from yuxi.agents.mcp.service import get_mcp_client
+    """按统一投影在服务进程装配 HTTP MCP 与内置 stdio MCP 工具。"""
+    from yuxi.agents.mcp.service import get_mcp_tools
 
     tools = []
     for config in mcp_servers:
         slug = config["slug"]
-        client = await get_mcp_client({slug: {key: value for key, value in config.items() if key != "slug"}})
-        tools.extend(await client.list_tools())
+        server_config = {key: value for key, value in config.items() if key != "slug"}
+        tools.extend(
+            await get_mcp_tools(
+                slug,
+                additional_servers={slug: server_config},
+                disabled_tools=list(server_config.get("disabled_tools") or []),
+            )
+        )
     return tools
 
 

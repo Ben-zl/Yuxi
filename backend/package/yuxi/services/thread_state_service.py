@@ -19,13 +19,19 @@ from yuxi.services.subagent_run_service import serialize_subagent_run_state
 from yuxi.services.thread_workspace_service import list_artifacts, list_visible_files
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.logging_config import logger
+from yuxi.agentscope.usage import token_usage_view
 
 
-async def _load_agentscope_state(db, *, uid: str, thread_id: str) -> tuple[list[dict], dict, list[str]]:
+async def _load_agentscope_state(
+    db,
+    *,
+    uid: str,
+    thread_id: str,
+) -> tuple[list[dict], dict, bool, list[str], bool]:
     """从 AgentScope Session 与 workspace 恢复 Todo 和文件事实。"""
     mapping = await get_thread_session(db, uid=uid, thread_id=thread_id)
     if mapping is None:
-        return [], {}, []
+        return [], {}, False, [], False
     client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
     session = await client.get_session(
         uid,
@@ -35,7 +41,13 @@ async def _load_agentscope_state(db, *, uid: str, thread_id: str) -> tuple[list[
     state = session.get("state") or {}
     files = await list_visible_files(db, uid=uid, thread_id=thread_id)
     artifacts = await list_artifacts(db, uid=uid, thread_id=thread_id)
-    return tasks_to_todos(state.get("tasks_context") or {}), files_to_state(files), artifacts
+    return (
+        tasks_to_todos(state.get("tasks_context") or {}),
+        files_to_state(files.items),
+        files.truncated,
+        artifacts,
+        bool(state.get("summary")),
+    )
 
 
 def _serialize_message(message: Any) -> dict[str, Any]:
@@ -88,6 +100,7 @@ async def get_thread_state_view(
 
     run_repo = AgentRunRepository(db)
     latest_run = await run_repo.get_latest_run_by_thread_for_user(thread_id, uid)
+    run_usages = await run_repo.list_run_usages_by_thread_for_user(thread_id, uid)
     subagent_runs = []
     if latest_run is not None:
         for child_run in await run_repo.list_child_runs_for_user(latest_run.id, uid):
@@ -105,14 +118,27 @@ async def get_thread_state_view(
                     detail="子智能体运行记录格式异常",
                 ) from exc
 
-    todos, files, artifacts = await _load_agentscope_state(db, uid=uid, thread_id=thread_id)
+    todos, files, files_truncated, artifacts, summary_active = await _load_agentscope_state(
+        db,
+        uid=uid,
+        thread_id=thread_id,
+    )
+    token_usage = token_usage_view(
+        dict(latest_run.token_usage or {}) if latest_run else None,
+        run_usages,
+    )
+    if token_usage is not None:
+        # AgentScope 先发布 REPLY_END、随后持久化 Session；Run 事件已确认的
+        # 摘要状态不能被这一短暂的远端空状态覆盖。
+        token_usage["summary_active"] = summary_active or bool(token_usage.get("summary_active"))
     response: dict[str, Any] = {
         "agent_state": {
             "todos": todos,
             "files": files,
+            "files_truncated": files_truncated,
             "artifacts": artifacts,
             "subagent_runs": subagent_runs,
-            "token_usage": dict(latest_run.token_usage or {}) if latest_run else None,
+            "token_usage": token_usage,
         }
     }
 

@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import PurePosixPath
 
-from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError
+from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError, WorkspaceFileListing
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session
 
 VIRTUAL_USER_DATA_ROOT = PurePosixPath("/home/gem/user-data")
@@ -46,32 +46,39 @@ async def resolve_thread_workspace(db, *, uid: str, thread_id: str):
     return client, mapping
 
 
-async def list_visible_files(db, *, uid: str, thread_id: str) -> list[dict]:
-    """仅列出 uploads/outputs，隐藏 skills、data 和 sessions。"""
+async def list_visible_files(db, *, uid: str, thread_id: str, max_entries: int = 500) -> WorkspaceFileListing:
+    """仅列出 uploads/outputs，并保留目录和完整性标记。"""
     context = await resolve_thread_workspace(db, uid=uid, thread_id=thread_id)
     if context is None:
-        return []
+        return WorkspaceFileListing(items=[])
     client, mapping = context
     files: list[dict] = []
+    truncated = False
     for namespace in VISIBLE_NAMESPACES:
+        remaining = max_entries - len(files)
+        if remaining <= 0:
+            truncated = True
+            break
         try:
-            namespace_files = await client.list_workspace_files(
+            listing = await client.list_workspace_files(
                 uid,
                 mapping.agentscope_agent_id,
                 mapping.agentscope_session_id,
                 root=f"/workspace/{namespace}",
+                max_entries=remaining,
             )
         except AgentScopeServiceError as exc:
             if exc.status_code == 404:
                 continue
             raise
-        for item in namespace_files:
+        truncated = truncated or listing.truncated
+        for item in listing.items:
             try:
                 item = {**item, "path": workspace_to_virtual_path(str(item["path"]))}
             except (KeyError, ValueError):
                 continue
             files.append(item)
-    return files
+    return WorkspaceFileListing(items=files, truncated=truncated)
 
 
 async def read_file(db, *, uid: str, thread_id: str, virtual_path: str, max_bytes: int = 25 * 1024 * 1024) -> bytes:

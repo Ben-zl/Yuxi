@@ -117,7 +117,7 @@
 
 ## 复审补充边界（2026-08-16）
 
-- **内置 stdio MCP 不再装配**：agentscope fork 仅支持 http_mcp，`mcp-server-chart`（stdio）在新对话链路不可用；用户禁用 stdio 的管理面约束保留。如需恢复需 fork 增补 stdio 传输支持（当前"不改 fork"约束下接受）。
+- **内置 stdio MCP 已恢复**：不修改 AgentScope，通过 `extra_agent_tools` 在服务进程装配代码注册表中的内置 stdio；发现和调用均独立短连接。数据库中的用户 stdio 仍拒绝。
 - **install_skill 工具随旧栈清退**：元数据与禁用列表残留已同步清理，前端工具清单不再展示该条目。
 
 ## 两轴复审修复记录（2026-08-17）
@@ -134,3 +134,10 @@
 9. 环境数据修复：minimax provider 被改坏（is_enabled=false、enabled_models 清空、base_url/type 错写为 api.minimax.io/v1+openai）已恢复；SILICONFLOW/DOUBAO 坏 key 此前已清。
 
 **真实链路验证阻塞（fork 服务层，非 yuxi 代码）**：agentscope 服务自上次容器重建后，ChatService.run 上下文内的模型调用一律报 "Could not reach the model service"（CONNECTION 分类）。已排除：容器网络（服务名/bridge IP/公网均通）、Anthropic SDK 直调（同容器同参数成功）、fork AnthropicChatModel 直调（同 credential 成功）、服务重启。e2e（mcp/kb/team/skills 等）同根因失败；bisect 证明与本轮修复无关。需 fork 侧排查 BackgroundTaskManager 执行上下文中的模型客户端行为。上述阻塞下，浏览器级 P1/P2/P3 端到端复验待恢复后补做（代码路径由 29+ 项单测/集成测试覆盖）。
+
+## 功能对齐补验（2026-08-18）
+
+- Team 采用保留模式：worker 的 child Conversation/Run、消息、reasoning、工具调用、usage 和 binding 持久化；父 Thread 删除时清理 Team/Session 并停用 binding，不启动第二套 worker。
+- Token/上下文：AgentRun 保存真实用量，线程聚合累计值，Dashboard 从 Run 统计；模型上下文长度、压缩阈值、Summary 状态与输入构成进入线程状态。
+- 文件与交互：工作区树保留目录并返回 `truncated`，聊天和 Workspace 页面提示 500 项截断；主动提问支持刷新恢复、空回答拒绝和同一回复续接；Steer 等待完整工具批次后在模型边界接力。
+- 阻塞已解除。Docker 真实 E2E 已通过上下文压缩、主动提问、Steer、Team 生命周期、HTTP MCP/配置热更新和 workspace 集成；内置 stdio MCP 已实际发现并调用。页面黑盒截图另随本轮验收产物保存。

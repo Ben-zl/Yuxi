@@ -41,7 +41,7 @@ Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平�
 ### `backend/package/yuxi`
 
 - `agents` 保留智能体管理面的 backend 元数据、`BaseContext` 配置 Schema，以及 Skills/MCP/工具目录；不再包含独立执行图。实际执行适配集中在 `agentscope`。
-- `agentscope` 负责配置投影、Thread↔Session 映射、AgentScope HTTP 客户端、事件协议转换、取消/审批恢复和 worker 执行。
+- `agentscope` 负责配置投影、Thread↔Session 映射、AgentScope HTTP 客户端、事件协议转换、取消/审批恢复、Team 生命周期投影、上下文观测和 worker 执行。
 - `services` 是用例层。智能体主链路重点分为请求接入与排队、Run 生命周期、运行时配置、worker 执行和 SubAgent 调用；聊天历史、附件、工作区、文件预览、评估、认证和观测等跨模块流程也从这里找入口。
 - `repositories` 是 PostgreSQL 访问边界，封装业务对象、知识库元数据、AgentRun、请求队列、Task 和扩展配置查询。路由不应绕过 repository 直接拼装持久化逻辑。
 - `storage/postgres` 管理 SQLAlchemy 模型与业务连接池。
@@ -84,9 +84,10 @@ Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平�
 2. `web/src/apis/agent_api.js` 调用 `POST /api/agent/runs`，由请求队列服务在同一数据库事务落库运行事实（排队、互斥、幂等），提交后才投递 ARQ。
 3. `worker-dev` 的 `process_agent_run`（`yuxi/services/run_worker.py`）执行 `yuxi.agentscope.worker_job`：统一配置投影（`config_projection`）→ 线程会话保障（Thread↔Session 映射，存量线程按 cutover 时间戳只读拒发）→ `gateway` 协议转换把 AgentScope 事件流实时写入 `run:events:{run_id}`（复用既有 SSE 投递与断线续传）。
 4. 会话执行在独立的 AgentScope 服务（`server/agentscope_main.py`）。`DockerWorkspaceManager` 以 session 为单位创建隔离 workspace；附件上传到 `/workspace/uploads`，文件与命令工具在 workspace 中执行。
-5. 知识库、HTTP MCP、网页搜索、补充工具与按当前用户/session 隔离的 `AgentCreate` 模板，通过 `extra_agent_tools` 消费同一 `RuntimeProjection` 在每轮开始时装配。HTTP MCP 由 AgentScope 服务进程中的无状态 `MCPClient` 调用，真实 URL、Header 和凭据不会进入 workspace；stdio MCP 不进入该运行路径。
-6. 审批挂起经 `REQUIRE_USER_CONFIRM` 映射为 `human_approval_required` chunk，resume 载荷转换为 AgentScope 确认或外部执行结果事件。
-7. 执行结束：助手消息落回 Yuxi 消息表（前端历史视图数据源），AgentRun 终态与 token 用量回写，队头完成后派发下一条排队请求。前端消费 Request/Run SSE；断线经 `Last-Event-ID` 从 Redis Stream 续传。
+5. 知识库、HTTP MCP、内置 stdio MCP、网页搜索、补充工具与按当前用户/session 隔离的 `AgentCreate` 模板，通过 `extra_agent_tools` 消费同一 `RuntimeProjection` 在每轮开始时装配。HTTP MCP 由服务进程中的无状态 `MCPClient` 调用；内置 stdio MCP 只允许代码注册表定义，发现和调用各自短连接。两者的连接参数都不会写入 workspace，数据库中的用户 stdio 配置继续拒绝。
+6. 审批和主动提问经 `REQUIRE_USER_CONFIRM` 映射为页面挂起协议；刷新时从 Redis pending 状态恢复，resume 载荷再转换为 AgentScope 确认、外部执行结果或用户回答。Steer 只在模型调用前或完整工具批次结束后的安全点中断原 Run，再串行执行新的 Steer Run。
+7. AgentScope Team worker 保留到父 Thread 删除。worker 的回复、推理、工具调用、用量与终态投影到不可直接列出的 child Conversation/AgentRun；父线程状态可下钻 child 历史，删除父线程时清理 Team/Session 并停用 binding。
+8. 执行结束：助手消息落回 Yuxi 消息表（前端历史视图数据源），AgentRun 终态与真实 token 用量回写，队头完成后派发下一条排队请求。线程状态同时聚合当前 Run/线程累计 Token、AgentScope 上下文与 Summary 状态、Todo、目录和截断标记。Dashboard 从 AgentRun 用量统计；前端消费 Request/Run SSE，断线经 `Last-Event-ID` 从 Redis Stream 续传。
 
 审批或人机输入的 resume 请求仍经队列创建新 AgentRun，worker 将 decisions 载荷映射为审批恢复、文本回答映射为新输入。线程状态接口由 `ThreadStateService` 从 Conversation/Message、AgentRun、Redis 挂起事件和 workspace 产物聚合，不读取旧 checkpoint。
 

@@ -41,10 +41,26 @@ def _last_user_text(body: dict) -> str:
 
 # 关键词 → (工具名, 参数 dict)；e2e 按用户消息文本驱动确定性工具调用
 TOOL_TRIGGERS = {
+    "SLOW_TOOL": ("Bash", {"command": "sleep 12 && echo TOOL_FINISHED"}),
     "写文件": ("Write", {"file_path": WRITE_FILE_PATH, "content": WRITE_FILE_CONTENT}),
     "列出知识库": ("list_kbs", {}),
     "调用回声": ("mcp__e2e-echo-mcp__echo", {"text": "hi-mcp"}),
     "查看技能": ("Skill", {"skill": "e2e-skill-demo"}),
+    "需要确认方案": (
+        "ask_user_question",
+        {
+            "questions": [
+                {
+                    "header": "交付方式",
+                    "question": "希望采用哪种交付方式？",
+                    "options": [
+                        {"label": "一次交付", "description": "完成后一次性交付全部结果"},
+                        {"label": "分步交付", "description": "按阶段交付并逐步确认"},
+                    ],
+                }
+            ]
+        },
+    ),
 }
 
 TEAM_DONE_TEXT = "团队任务完成"
@@ -71,13 +87,26 @@ def _team_next_call(body: dict):
     if "AgentCreate" in called:
         return None  # worker 已创建，进入总结轮
     if "TeamCreate" in called:
+        subagent_type = "e2e-team-sub"
+        for tool in body.get("tools") or []:
+            function = tool.get("function") or {}
+            if function.get("name") != "AgentCreate":
+                continue
+            enum = (
+                ((function.get("parameters") or {}).get("properties") or {})
+                .get("subagent_type", {})
+                .get("enum")
+            )
+            if isinstance(enum, list) and enum:
+                subagent_type = str(enum[0])
+            break
         return (
             "AgentCreate",
             {
                 "name": "worker-1",
                 "description": "e2e 子智能体",
                 "prompt": "完成示例任务",
-                "subagent_type": "e2e-team-sub",
+                "subagent_type": subagent_type,
             },
         )
     return ("TeamCreate", {"name": "e2e-team", "description": "e2e 验证团队"})
@@ -113,6 +142,24 @@ def _matched_tool_trigger(body: dict):
         if not t.startswith("<system-reminder>")
     ]
     joined = user_texts[-1] if user_texts else ""
+    tool_names = {
+        str((tool.get("function") or {}).get("name") or "")
+        for tool in body.get("tools") or []
+    }
+    if "generate_structured_output" in tool_names:
+        return (
+            "generate_structured_output",
+            {
+                "task_overview": "用户要求处理长上下文并继续完成任务。",
+                "current_state": "已读取用户提供的背景资料，尚未输出最终答复。",
+                "important_discoveries": "上下文达到压缩阈值，需要保留任务目标。",
+                "next_steps": "基于压缩摘要给出简短确认。",
+                "context_to_preserve": "使用中文回答。",
+            },
+        )
+    if "<team-message" in joined and "TeamSay" in tool_names and "AgentCreate" not in tool_names:
+        if "TeamSay" not in _assistant_tool_names(body):
+            return "TeamSay", {"content": "worker 已完成调研并给出三点结论", "to": None}
     # 团队编排是状态机（多轮工具调用），先于一次性触发的工具结果短路
     if "组建团队" in joined or "简短调研" in joined:
         return _team_next_call(body)
@@ -129,6 +176,17 @@ def _matched_tool_trigger(body: dict):
 def _has_tool_result(body: dict) -> bool:
     """请求中是否已带工具结果（决定回复正文还是工具总结）。"""
     return any(m.get("role") == "tool" for m in body.get("messages") or [])
+
+
+def _reply_text(body: dict) -> str:
+    """按 E2E 场景返回可断言的最终正文。"""
+    if "STEER" in _last_user_text(body):
+        context = json.dumps(body.get("messages") or [], ensure_ascii=False)
+        suffix = "TOOL_CONTEXT_OK" if "TOOL_FINISHED" in context else "TOOL_CONTEXT_MISSING"
+        return f"STEER_COMPLETE {suffix}"
+    if "worker-1" in json.dumps(body.get("messages") or [], ensure_ascii=False) and _has_tool_result(body):
+        return TEAM_DONE_TEXT
+    return TOOL_REPLY_TEXT if _has_tool_result(body) else REPLY_TEXT
 
 
 def _sse(payload: dict) -> str:
@@ -193,17 +251,18 @@ async def chat_completions(body: dict):
                         ]
                     },
                 )
-                yield _sse_chunk(model, {}, finish_reason="tool_calls")
+                final_chunk = _chunk(model, {}, finish_reason="tool_calls")
+                final_chunk["usage"] = {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+                yield _sse(final_chunk)
             else:
-                if "worker-1" in json.dumps(body.get("messages") or [], ensure_ascii=False) and _has_tool_result(body):
-                    text = TEAM_DONE_TEXT
-                else:
-                    text = TOOL_REPLY_TEXT if _has_tool_result(body) else REPLY_TEXT
+                text = _reply_text(body)
                 chunks = [text[i : i + 6] for i in range(0, len(text), 6)]
                 for piece in chunks:
                     yield _sse_chunk(model, {"content": piece})
                     await asyncio.sleep(0.01)
-                yield _sse_chunk(model, {}, finish_reason="stop")
+                final_chunk = _chunk(model, {}, finish_reason="stop")
+                final_chunk["usage"] = {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+                yield _sse(final_chunk)
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_chunks(), media_type="text/event-stream")
@@ -246,7 +305,7 @@ async def chat_completions(body: dict):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": REPLY_TEXT},
+                "message": {"role": "assistant", "content": _reply_text(body)},
                 "finish_reason": "stop",
             }
         ],

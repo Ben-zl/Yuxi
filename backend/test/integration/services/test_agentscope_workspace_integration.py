@@ -116,7 +116,8 @@ async def test_write_tool_executes_in_docker_workspace(db_session):
             assert resp.text == WRITE_CONTENT
 
         visible = await list_visible_files(db_session, uid=uid, thread_id=thread_id)
-        assert [item["path"] for item in visible] == ["/home/gem/user-data/outputs/hello.txt"]
+        assert [item["path"] for item in visible.items] == ["/home/gem/user-data/outputs/hello.txt"]
+        assert visible.truncated is False
         assert (
             await read_file(
                 db_session,

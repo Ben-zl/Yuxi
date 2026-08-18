@@ -70,7 +70,8 @@ async def list_thread_files_view(
 
     if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is not None:
         virtual_path = (path or _get_virtual_root()).rstrip("/") or "/"
-        files = await list_visible_files(db, uid=uid, thread_id=thread_id)
+        listing = await list_visible_files(db, uid=uid, thread_id=thread_id)
+        files = listing.items
         if virtual_path == _get_virtual_root():
             namespaces = sorted({item["path"].split("/")[4] for item in files})
             entries = [
@@ -86,7 +87,7 @@ async def list_thread_files_view(
             ]
             if recursive:
                 entries.extend(_agentscope_file_entries(thread_id, files))
-            return {"path": path or _get_virtual_root(), "files": entries}
+            return {"path": path or _get_virtual_root(), "files": entries, "truncated": listing.truncated}
         entries = _agentscope_file_entries(thread_id, files)
         prefix = f"{virtual_path}/"
         if not recursive:
@@ -95,7 +96,7 @@ async def list_thread_files_view(
             ]
         else:
             entries = [item for item in entries if item["path"].startswith(prefix)]
-        return {"path": path or _get_virtual_root(), "files": entries}
+        return {"path": path or _get_virtual_root(), "files": entries, "truncated": listing.truncated}
 
     ensure_thread_dirs(thread_id, uid)
     virtual_path = path or _get_virtual_root()
@@ -141,10 +142,12 @@ def _agentscope_file_entries(thread_id: str, files: list[dict]) -> list[dict[str
         {
             "path": item["path"],
             "name": PurePosixPath(item["path"]).name,
-            "is_dir": False,
-            "size": int(item.get("size_bytes", 0) or 0),
+            "is_dir": bool(item.get("is_dir")),
+            "size": 0 if item.get("is_dir") else int(item.get("size_bytes", 0) or 0),
             "modified_at": utc_isoformat_from_timestamp(item.get("updated_at")) or "",
-            "artifact_url": f"/api/chat/thread/{thread_id}/artifacts/{item['path'].lstrip('/')}",
+            "artifact_url": None
+            if item.get("is_dir")
+            else f"/api/chat/thread/{thread_id}/artifacts/{item['path'].lstrip('/')}",
         }
         for item in files
     ]

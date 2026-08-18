@@ -53,6 +53,24 @@ def test_unmapped_events_are_ignored():
     assert event_to_chunks({}, request_id=REQUEST_ID) == []
 
 
+def test_context_compression_custom_event_reuses_existing_frontend_protocol():
+    chunks = event_to_chunks(
+        {
+            "type": "CUSTOM",
+            "name": "context_compression",
+            "value": {"status": "completed", "summary_active": True},
+        },
+        request_id=REQUEST_ID,
+    )
+
+    assert chunks[0]["status"] == "context_compression"
+    assert chunks[0]["compression"] == {
+        "type": "yuxi.context_compression",
+        "status": "completed",
+        "summary_active": True,
+    }
+
+
 def test_init_chunk_carries_user_message():
     chunk = init_chunk(REQUEST_ID, text="在吗")
     assert chunk["status"] == "init"

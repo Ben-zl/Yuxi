@@ -63,8 +63,23 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
     （Langfuse v3 原生收 OTLP），主链路 reply/model/tool span 自动上报。
     """
     from agentscope.middleware import TracingMiddleware
+    from yuxi.agentscope.middleware import (
+        build_context_observability_middleware,
+        build_steer_middleware,
+        build_team_lifecycle_middleware,
+    )
 
-    return [TracingMiddleware()]
+    middlewares = [
+        TracingMiddleware(),
+        build_context_observability_middleware(app.state.message_bus, session_id),
+    ]
+    team_lifecycle = await build_team_lifecycle_middleware(app.state.storage, user_id, agent_id, session_id)
+    if team_lifecycle is not None:
+        middlewares.append(team_lifecycle)
+    steer = await build_steer_middleware(user_id, agent_id, session_id)
+    if steer is not None:
+        middlewares.append(steer)
+    return middlewares
 
 
 async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> list:

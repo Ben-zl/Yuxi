@@ -78,7 +78,7 @@ async def list_workspace_tree(
             raise HTTPException(status_code=409, detail="工作区 agents/chats 已被现有文件或目录占用")
     if _chat_path_parts(path) is not None:
         if db is not None:
-            remote_entries = await _list_chat_directory_agentscope(
+            remote_listing = await _list_chat_directory_agentscope(
                 db,
                 uid=str(current_user.uid),
                 path=path,
@@ -86,8 +86,9 @@ async def list_workspace_tree(
                 recursive=recursive,
                 files_only=files_only,
             )
-            if remote_entries is not None:
-                return {"entries": remote_entries, "readonly": True}
+            if remote_listing is not None:
+                remote_entries, truncated = remote_listing
+                return {"entries": remote_entries, "readonly": True, "truncated": truncated}
         entries = await asyncio.to_thread(
             _list_chat_directory,
             path,
@@ -95,11 +96,11 @@ async def list_workspace_tree(
             recursive=recursive,
             files_only=files_only,
         )
-        return {"entries": entries, "readonly": True}
+        return {"entries": entries, "readonly": True, "truncated": False}
 
     target = _resolve_workspace_path(current_user, path)
     if not target.exists():
-        return {"entries": []}
+        return {"entries": [], "truncated": False}
     if not target.is_dir():
         raise HTTPException(status_code=400, detail="当前路径不是目录")
     entries = await asyncio.to_thread(_list_directory, root, target, recursive=recursive, files_only=files_only)
@@ -129,7 +130,7 @@ async def list_workspace_tree(
                 )
             )
         entries = _sort_entries(entries)
-    return {"entries": entries}
+    return {"entries": entries, "truncated": False}
 
 
 def resolve_workspace_file_path(*, path: str, current_user: User, thread_titles: dict[str, str] | None = None) -> Path:
@@ -556,8 +557,8 @@ async def _list_chat_directory_agentscope(
     thread_titles: dict[str, str],
     recursive: bool,
     files_only: bool,
-) -> list[dict] | None:
-    """将 AgentScope uploads/outputs 合并到历史对话虚拟目录。"""
+) -> tuple[list[dict], bool] | None:
+    """将 AgentScope uploads/outputs 合并到历史对话目录并保留截断状态。"""
     from yuxi.services.thread_workspace_service import list_visible_files, resolve_thread_workspace
 
     parts = _chat_path_parts(path)
@@ -566,10 +567,13 @@ async def _list_chat_directory_agentscope(
     if not parts:
         entries = _list_chat_directory(path, thread_titles=thread_titles, recursive=recursive, files_only=files_only)
         visible_threads = {entry["name"] for entry in entries if entry.get("is_dir")}
+        truncated = False
         for thread_id, title in thread_titles.items():
             if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is None:
                 continue
-            files = await list_visible_files(db, uid=uid, thread_id=thread_id)
+            listing = await list_visible_files(db, uid=uid, thread_id=thread_id)
+            truncated = truncated or listing.truncated
+            files = listing.items
             if not files:
                 continue
             if not files_only and thread_id not in visible_threads:
@@ -580,15 +584,24 @@ async def _list_chat_directory_agentscope(
                         thread_id, files, path=f"/agents/chats/{thread_id}", recursive=True, files_only=files_only
                     )
                 )
-        return _sort_chat_entries(list({entry["path"]: entry for entry in entries}.values()))
+        return _sort_chat_entries(list({entry["path"]: entry for entry in entries}.values())), truncated
 
     thread_id = parts[0]
     if thread_id not in thread_titles:
         raise HTTPException(status_code=403, detail="Access denied")
     if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is None:
         return None
-    files = await list_visible_files(db, uid=uid, thread_id=thread_id)
-    return _agentscope_chat_entries(thread_id, files, path=path, recursive=recursive, files_only=files_only)
+    listing = await list_visible_files(db, uid=uid, thread_id=thread_id)
+    return (
+        _agentscope_chat_entries(
+            thread_id,
+            listing.items,
+            path=path,
+            recursive=recursive,
+            files_only=files_only,
+        ),
+        listing.truncated,
+    )
 
 
 def _agentscope_chat_entries(
@@ -614,8 +627,11 @@ def _agentscope_chat_entries(
             for depth in range(1, len(remainder.parts)):
                 directory = requested.joinpath(*remainder.parts[:depth])
                 entries.setdefault(str(directory), _virtual_entry(str(directory), name=directory.name, is_dir=True))
-        entry = _virtual_entry(str(display), name=display.name, is_dir=False)
-        entry["size"] = int(item.get("size_bytes", 0) or 0)
+        is_dir = bool(item.get("is_dir"))
+        if files_only and is_dir:
+            continue
+        entry = _virtual_entry(str(display), name=display.name, is_dir=is_dir)
+        entry["size"] = 0 if is_dir else int(item.get("size_bytes", 0) or 0)
         entries[str(display)] = entry
     return _sort_entries(list(entries.values()))
 

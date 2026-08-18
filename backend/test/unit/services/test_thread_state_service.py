@@ -71,6 +71,11 @@ class _RunRepository:
         assert uid == "user-1"
         return []
 
+    async def list_run_usages_by_thread_for_user(self, thread_id: str, uid: str):
+        assert thread_id == "thread-1"
+        assert uid == "user-1"
+        return [{"total_tokens": 7, "summary_active": True}]
+
 
 class _ThreadRepository:
     def __init__(self, _db):
@@ -92,7 +97,9 @@ async def test_thread_state_uses_persisted_run_message_and_pending_confirm(monke
         return (
             [{"id": "task-1", "content": "整理资料", "status": "completed"}],
             {"/workspace/report.md": {"path": "/workspace/report.md", "name": "report.md"}},
+            False,
             ["/home/gem/user-data/outputs/report.md"],
+            False,
         )
 
     monkeypatch.setattr(service, "_load_agentscope_state", load_runtime_state)
@@ -115,9 +122,17 @@ async def test_thread_state_uses_persisted_run_message_and_pending_confirm(monke
     assert result["agent_state"] == {
         "todos": [{"id": "task-1", "content": "整理资料", "status": "completed"}],
         "files": {"/workspace/report.md": {"path": "/workspace/report.md", "name": "report.md"}},
+        "files_truncated": False,
         "artifacts": ["/home/gem/user-data/outputs/report.md"],
         "subagent_runs": [],
-        "token_usage": {"total_tokens": 7},
+        "token_usage": {
+            "total_tokens": 7,
+            "thread": {
+                "total": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 7},
+                "models": {},
+            },
+            "summary_active": True,
+        },
     }
     assert result["interrupt"]["status"] == "human_approval_required"
     assert result["interrupt"]["run_id"] == "run-1"

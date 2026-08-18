@@ -50,6 +50,7 @@ def test_get_configurable_items_filters_admin_fields_for_user():
 
     assert "system_prompt" in items
     assert "max_execution_steps" not in items
+    assert "summary_trigger_ratio" not in items
 
 
 def test_get_configurable_items_allows_admin_and_superadmin_fields():
@@ -58,6 +59,7 @@ def test_get_configurable_items_allows_admin_and_superadmin_fields():
 
     assert "max_execution_steps" in admin_items
     assert admin_items["max_execution_steps"]["name"] == "最大 ReAct 迭代次数"
+    assert admin_items["summary_trigger_ratio"]["name"] == "上下文压缩触发比例"
     assert "secret_setting" in superadmin_items
 
 

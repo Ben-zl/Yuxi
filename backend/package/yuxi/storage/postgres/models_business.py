@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
@@ -720,6 +721,41 @@ class AgentScopeThreadSession(Base):
     agentscope_session_id = Column(String(64), nullable=False)
     created_at = Column(DateTime, default=utc_now_naive)
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
+
+
+class AgentScopeTeamWorkerBinding(Base):
+    """AgentScope Team worker 与 Yuxi 子线程的长期绑定。"""
+
+    __tablename__ = "agentscope_team_worker_bindings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    uid = Column(String(64), nullable=False, index=True)
+    parent_thread_id = Column(String(64), nullable=False, index=True)
+    child_thread_id = Column(String(64), nullable=False, unique=True, index=True)
+    subagent_slug = Column(String(64), nullable=False, index=True)
+    created_by_run_id = Column(String(64), nullable=False, index=True)
+    subagent_thread_relation_id = Column(
+        Integer,
+        ForeignKey("subagent_threads.id"),
+        nullable=False,
+        unique=True,
+    )
+    team_id = Column(String(64), nullable=False, index=True)
+    worker_agent_id = Column(String(64), nullable=False)
+    worker_session_id = Column(String(64), nullable=False)
+    active_run_id = Column(String(64), nullable=True, index=True)
+    last_reply_id = Column(String(64), nullable=True)
+    runtime_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=utc_now_naive)
+    updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "uid",
+            "worker_session_id",
+            name="uq_agentscope_team_worker_session",
+        ),
+    )
 
 
 class TaskRecord(Base):

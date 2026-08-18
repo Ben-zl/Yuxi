@@ -748,7 +748,13 @@ async def test_agentscope_history_lists_and_reads_output(monkeypatch) -> None:
         return object(), object()
 
     async def visible(*_args, **_kwargs):
-        return [{"path": "/home/gem/user-data/outputs/report.md", "size_bytes": 6}]
+        return SimpleNamespace(
+            items=[
+                {"path": "/home/gem/user-data/outputs/nested", "is_dir": True},
+                {"path": "/home/gem/user-data/outputs/nested/report.md", "size_bytes": 6},
+            ],
+            truncated=True,
+        )
 
     async def read(*_args, **_kwargs):
         return b"report"
@@ -766,11 +772,12 @@ async def test_agentscope_history_lists_and_reads_output(monkeypatch) -> None:
         db=object(),
     )
     preview = await svc.read_workspace_file_content(
-        path="/agents/chats/thread-1/outputs/report.md",
+        path="/agents/chats/thread-1/outputs/nested/report.md",
         current_user=user,
         thread_titles=titles,
         db=object(),
     )
 
-    assert [entry["name"] for entry in tree["entries"]] == ["report.md"]
+    assert [entry["name"] for entry in tree["entries"]] == ["nested"]
+    assert tree["truncated"] is True
     assert preview["content"] == "report"

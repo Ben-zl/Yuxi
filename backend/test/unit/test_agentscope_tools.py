@@ -63,18 +63,14 @@ async def test_build_kb_tools_returns_toolset(monkeypatch, kb_manager):
 
 async def test_build_mcp_tools_runs_http_client_in_service_process(monkeypatch):
     """每轮仅装配启用的 HTTP MCP，并传递禁用工具配置。"""
-    created = []
+    requests = []
     exposed_tool = SimpleNamespace(name="mcp__internal-mcp__echo")
 
-    class FakeMCPClient:
-        async def list_tools(self):
-            return [exposed_tool]
+    async def fake_get_mcp_tools(slug, additional_servers=None, disabled_tools=None):
+        requests.append((slug, additional_servers, disabled_tools))
+        return [exposed_tool]
 
-    async def fake_get_mcp_client(config):
-        created.append(config)
-        return FakeMCPClient()
-
-    monkeypatch.setattr("yuxi.agents.mcp.service.get_mcp_client", fake_get_mcp_client)
+    monkeypatch.setattr("yuxi.agents.mcp.service.get_mcp_tools", fake_get_mcp_tools)
 
     result = await tools.build_mcp_tools(
         mcp_servers=[
@@ -90,9 +86,10 @@ async def test_build_mcp_tools_runs_http_client_in_service_process(monkeypatch):
     )
 
     assert result == [exposed_tool]
-    assert len(created) == 1
-    assert created == [
-        {
+    assert requests == [
+        (
+            "internal-mcp",
+            {
             "internal-mcp": {
                 "transport": "streamable_http",
                 "url": "http://internal-mcp:9000/mcp",
@@ -100,23 +97,22 @@ async def test_build_mcp_tools_runs_http_client_in_service_process(monkeypatch):
                 "timeout": 12,
                 "disabled_tools": ["admin"],
             }
-        }
+            },
+            ["admin"],
+        )
     ]
 
 
 async def test_build_mcp_tools_propagates_health_failure(monkeypatch):
     """已配置 MCP 不可达时显式终止本轮，不静默撤掉工具。"""
 
-    class BrokenMCPClient:
-        async def list_tools(self):
-            raise ConnectionError("mcp unavailable")
+    async def fake_get_mcp_tools(_slug, additional_servers=None, disabled_tools=None):
+        del additional_servers, disabled_tools
+        raise RuntimeError("mcp unavailable")
 
-    async def fake_get_mcp_client(_config):
-        return BrokenMCPClient()
+    monkeypatch.setattr("yuxi.agents.mcp.service.get_mcp_tools", fake_get_mcp_tools)
 
-    monkeypatch.setattr("yuxi.agents.mcp.service.get_mcp_client", fake_get_mcp_client)
-
-    with pytest.raises(ConnectionError, match="mcp unavailable"):
+    with pytest.raises(RuntimeError, match="mcp unavailable"):
         await tools.build_mcp_tools(
             mcp_servers=[
                 {
@@ -128,10 +124,41 @@ async def test_build_mcp_tools_propagates_health_failure(monkeypatch):
         )
 
 
-async def test_build_mcp_tools_rejects_stdio_projection():
-    """stdio 不得进入服务进程动态 MCP 装配。"""
-    with pytest.raises(ValueError, match="不允许"):
-        await tools.build_mcp_tools(mcp_servers=[{"slug": "stdio", "transport": "stdio"}])
+async def test_build_mcp_tools_starts_registered_builtin_stdio(monkeypatch):
+    """代码注册表投影的内置 stdio MCP 在服务进程装配。"""
+    requests = []
+    exposed_tool = SimpleNamespace(name="mcp__mcpServerChart__generateChart")
+
+    async def fake_get_mcp_tools(slug, additional_servers=None, disabled_tools=None):
+        requests.append((slug, additional_servers, disabled_tools))
+        return [exposed_tool]
+
+    monkeypatch.setattr("yuxi.agents.mcp.service.get_mcp_tools", fake_get_mcp_tools)
+    result = await tools.build_mcp_tools(
+        mcp_servers=[
+            {
+                "slug": "mcp-server-chart",
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@antv/mcp-server-chart"],
+            }
+        ]
+    )
+
+    assert result == [exposed_tool]
+    assert requests == [
+        (
+            "mcp-server-chart",
+            {
+            "mcp-server-chart": {
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@antv/mcp-server-chart"],
+            }
+            },
+            [],
+        )
+    ]
 
 
 async def test_build_subagent_tools_overrides_agent_create_with_session_templates():

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from yuxi.services import thread_workspace_service as service
+from yuxi.agentscope.client import WorkspaceFileListing
 
 
 def test_workspace_virtual_paths_only_allow_uploads_and_outputs():
@@ -30,7 +31,13 @@ async def test_list_visible_files_never_scans_internal_directories(monkeypatch):
     class Client:
         async def list_workspace_files(self, uid, agent_id, session_id, *, root, max_entries=500):
             roots.append(root)
-            return [{"path": f"{root}/file.txt", "size_bytes": 4}]
+            return WorkspaceFileListing(
+                items=[
+                    {"path": f"{root}/nested", "is_dir": True},
+                    {"path": f"{root}/nested/file.txt", "is_dir": False, "size_bytes": 4},
+                ],
+                truncated=root.endswith("outputs"),
+            )
 
     async def resolve(*_args, **_kwargs):
         return Client(), SimpleNamespace(agentscope_agent_id="a1", agentscope_session_id="s1")
@@ -39,10 +46,13 @@ async def test_list_visible_files_never_scans_internal_directories(monkeypatch):
     result = await service.list_visible_files(None, uid="u1", thread_id="t1")
 
     assert roots == ["/workspace/uploads", "/workspace/outputs"]
-    assert [item["path"] for item in result] == [
-        "/home/gem/user-data/uploads/file.txt",
-        "/home/gem/user-data/outputs/file.txt",
+    assert [item["path"] for item in result.items] == [
+        "/home/gem/user-data/uploads/nested",
+        "/home/gem/user-data/uploads/nested/file.txt",
+        "/home/gem/user-data/outputs/nested",
+        "/home/gem/user-data/outputs/nested/file.txt",
     ]
+    assert result.truncated is True
 
 
 @pytest.mark.asyncio

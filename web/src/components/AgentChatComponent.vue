@@ -497,7 +497,7 @@
               </section>
 
               <section
-                v-if="currentStateFiles.length"
+                v-if="currentStateFiles.length || currentAgentState?.files_truncated"
                 class="state-section"
                 :class="{ 'is-collapsed': !isStateSectionExpanded('files') }"
               >
@@ -523,9 +523,18 @@
                   id="state-section-files"
                   class="state-section-content"
                 >
+                  <div v-if="currentAgentState?.files_truncated" class="state-list-notice">
+                    文件较多，仅显示前 500 项
+                  </div>
                   <div class="state-list">
                     <div v-for="file in currentStateFiles" :key="file.key" class="state-list-item">
+                      <Folder
+                        v-if="file.isDir"
+                        :size="18"
+                        class="state-list-item-icon"
+                      />
                       <FileTypeIcon
+                        v-else
                         :name="file.name || file.path"
                         :size="18"
                         class="state-list-item-icon"
@@ -732,6 +741,7 @@ import { message } from 'ant-design-vue'
 import {
   ChevronDown,
   CornerDownRight,
+  Folder,
   FolderKanban,
   LayoutList,
   Play,
@@ -1620,6 +1630,7 @@ const currentStateFiles = computed(() => {
       key: path,
       path,
       name,
+      isDir: Boolean(entry?.is_dir),
       meta: [status, sizeLabel === '-' ? '' : sizeLabel, path].filter(Boolean).join(' · ')
     })
   }
@@ -4942,6 +4953,16 @@ watch(currentChatId, (threadId, oldThreadId) => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.state-list-notice {
+  margin-bottom: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--color-warning-100);
+  border-radius: 6px;
+  color: var(--color-warning-700);
+  background: var(--color-warning-50);
+  font-size: 12px;
 }
 
 .state-list-item {

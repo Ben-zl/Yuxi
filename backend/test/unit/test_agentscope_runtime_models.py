@@ -34,11 +34,13 @@ def test_custom_credential_is_deserialized_by_public_registry():
             "base_url": "http://model.test/v1",
             "default_headers": {"X-Test": "value"},
             "request_body_overrides": {"enable_thinking": True},
+            "context_size": 32768,
         }
     )
 
     assert credential.default_headers == {"X-Test": "value"}
     assert credential.request_body_overrides == {"enable_thinking": True}
+    assert credential.context_size == 32768
     assert credential.get_chat_model_class() is YuxiOpenAIChatModel
 
 
@@ -57,6 +59,7 @@ def test_openai_adapter_forwards_credential_extensions(monkeypatch):
             "api_key": "test-key",
             "default_headers": {"X-Test": "value"},
             "request_body_overrides": {"enable_thinking": True},
+            "context_size": 32768,
         }
     )
 
@@ -64,6 +67,31 @@ def test_openai_adapter_forwards_credential_extensions(monkeypatch):
 
     assert captured["client_kwargs"] == {"default_headers": {"X-Test": "value"}}
     assert captured["extra_body"] == {"enable_thinking": True}
+    assert captured["context_size"] == 32768
+
+
+def test_projection_carries_catalog_context_length_in_custom_credential():
+    """模型目录上下文长度经自定义 Credential 进入原版 AgentScope。"""
+    provider = type(
+        "Provider",
+        (),
+        {
+            "provider_id": "openai-test",
+            "provider_type": "openai",
+            "enabled_models": [
+                {"id": "test-model", "type": "chat", "context_length": 65536}
+            ],
+            "api_key": "test-key",
+            "api_key_env": None,
+            "base_url": "http://model.test/v1",
+            "headers_json": {},
+            "extra_json": {},
+        },
+    )()
+
+    credential, _model = project_chat_model(provider, "test-model")
+
+    assert credential["context_size"] == 65536
 
 
 def test_gemini_rejects_unsupported_request_body_overrides():

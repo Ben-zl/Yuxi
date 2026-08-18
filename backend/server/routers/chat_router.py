@@ -246,6 +246,7 @@ class ThreadFileEntry(BaseModel):
 class ThreadFileListResponse(BaseModel):
     path: str
     files: list[ThreadFileEntry]
+    truncated: bool = False
 
 
 class ThreadFileContentResponse(BaseModel):

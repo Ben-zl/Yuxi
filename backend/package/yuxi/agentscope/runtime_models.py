@@ -23,6 +23,8 @@ class YuxiOpenAIChatModel(OpenAIChatModel):
     """从 Yuxi Credential 读取客户端 Header 与请求体扩展。"""
 
     def __init__(self, credential, model: str, parameters=None, **kwargs) -> None:
+        if credential.context_size:
+            kwargs["context_size"] = credential.context_size
         super().__init__(
             credential=credential,
             model=model,
@@ -39,6 +41,8 @@ class YuxiAnthropicChatModel(AnthropicChatModel):
     """从 Yuxi Credential 读取 Anthropic 客户端 Header。"""
 
     def __init__(self, credential, model: str, parameters=None, **kwargs) -> None:
+        if credential.context_size:
+            kwargs["context_size"] = credential.context_size
         super().__init__(
             credential=credential,
             model=model,
@@ -54,6 +58,8 @@ class YuxiGeminiChatModel(GeminiChatModel):
     """从 Yuxi Credential 读取 Gemini HTTP Header。"""
 
     def __init__(self, credential, model: str, parameters=None, **kwargs) -> None:
+        if credential.context_size:
+            kwargs["context_size"] = credential.context_size
         client_kwargs = None
         if credential.default_headers:
             client_kwargs = {"http_options": {"headers": credential.default_headers}}
@@ -72,6 +78,7 @@ class YuxiOpenAICredential(OpenAICredential):
     type: Literal["yuxi_openai_credential"] = "yuxi_openai_credential"
     default_headers: dict[str, str] = Field(default_factory=dict)
     request_body_overrides: dict[str, Any] = Field(default_factory=dict)
+    context_size: int | None = Field(default=None, gt=0)
 
     @classmethod
     def get_chat_model_class(cls) -> type[ChatModelBase]:
@@ -84,6 +91,7 @@ class YuxiAnthropicCredential(AnthropicCredential):
 
     type: Literal["yuxi_anthropic_credential"] = "yuxi_anthropic_credential"
     default_headers: dict[str, str] = Field(default_factory=dict)
+    context_size: int | None = Field(default=None, gt=0)
 
     @classmethod
     def get_chat_model_class(cls) -> type[ChatModelBase]:
@@ -96,6 +104,7 @@ class YuxiGeminiCredential(GeminiCredential):
 
     type: Literal["yuxi_gemini_credential"] = "yuxi_gemini_credential"
     default_headers: dict[str, str] = Field(default_factory=dict)
+    context_size: int | None = Field(default=None, gt=0)
 
     @classmethod
     def get_chat_model_class(cls) -> type[ChatModelBase]:

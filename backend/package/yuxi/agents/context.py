@@ -13,6 +13,9 @@ from yuxi.utils.paths import WORKSPACE_AGENT_CONTEXT_FILES
 WORKSPACE_AGENTS_PROMPT_MAX_BYTES = 64 * 1024
 DEFAULT_MAX_EXECUTION_STEPS = 300
 DEFAULT_TOOL_RESULT_EVICTION_K_TOKENS = 3
+DEFAULT_SUMMARY_TRIGGER_RATIO = 0.8
+DEFAULT_SUMMARY_RESERVE_RATIO = 0.1
+DEFAULT_SUMMARY_TOOL_RESULT_TOKEN_LIMIT = 50000
 
 
 def _role_can_access(auth: str | None, role: str | None) -> bool:
@@ -179,8 +182,8 @@ class BaseContext:
             "name": "MCP服务器",
             "options": [],
             "description": (
-                "MCP服务器列表，默认选择当前用户可用的全部 MCP 服务器。运行时支持 SSE 和 "
-                "Streamable HTTP；stdio 服务请在项目外部启动并配置为 HTTP MCP。"
+                "MCP服务器列表，默认选择当前用户可用的全部 MCP 服务器。运行时支持 SSE、"
+                "Streamable HTTP 和平台内置 stdio；用户不能添加 stdio 命令。"
             ),
             "type": "list",
             "kind": "mcps",
@@ -207,6 +210,46 @@ class BaseContext:
                 "单次 AgentScope ReActAgent 运行允许的最大迭代次数，对应 react_config.max_iters，默认 "
                 f"{DEFAULT_MAX_EXECUTION_STEPS}。"
             ),
+            "type": "number",
+            "auth": "admin",
+        },
+    )
+
+    summary_trigger_ratio: float = field(
+        default=DEFAULT_SUMMARY_TRIGGER_RATIO,
+        metadata={
+            "name": "上下文压缩触发比例",
+            "description": "上下文达到模型窗口的该比例时，使用 AgentScope 原生摘要压缩。取值需大于 0 且小于 0.9。",
+            "type": "number",
+            "auth": "admin",
+        },
+    )
+
+    summary_reserve_ratio: float = field(
+        default=DEFAULT_SUMMARY_RESERVE_RATIO,
+        metadata={
+            "name": "压缩后保留比例",
+            "description": "摘要压缩后保留的最近上下文比例，必须小于触发比例。",
+            "type": "number",
+            "auth": "admin",
+        },
+    )
+
+    summary_prompt: str = field(
+        default="",
+        metadata={
+            "name": "上下文压缩提示词",
+            "description": "留空使用 AgentScope 默认压缩提示词；填写后完整替换默认提示词。",
+            "kind": "prompt",
+            "auth": "admin",
+        },
+    )
+
+    summary_tool_result_token_limit: int = field(
+        default=DEFAULT_SUMMARY_TOOL_RESULT_TOKEN_LIMIT,
+        metadata={
+            "name": "工具结果 Token 上限",
+            "description": "单个上下文中的工具结果超过该 Token 数时由 AgentScope 截断。",
             "type": "number",
             "auth": "admin",
         },

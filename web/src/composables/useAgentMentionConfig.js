@@ -65,7 +65,7 @@ export function useAgentMentionConfig({
 
     const pushFile = (entry) => {
       const path = entry?.path || ''
-      if (!path || seenPaths.has(path)) return
+      if (!path || entry?.is_dir || seenPaths.has(path)) return
       seenPaths.add(path)
       files.push(entry)
     }

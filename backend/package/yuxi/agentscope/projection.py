@@ -34,10 +34,27 @@ def project_agent_request(agent: Agent) -> dict:
     """投影为 agentscope 的 agent 创建请求（含 ReAct 迭代上限对齐）。"""
     context = agent_context(agent)
     max_steps = int(context.get("max_execution_steps") or DEFAULT_MAX_EXECUTION_STEPS)
+    trigger_ratio = float(context.get("summary_trigger_ratio", 0.8))
+    reserve_ratio = float(context.get("summary_reserve_ratio", 0.1))
+    tool_result_limit = int(context.get("summary_tool_result_token_limit", 50000))
+    if not 0 < trigger_ratio < 0.9:
+        raise ValueError("上下文压缩触发比例必须大于 0 且小于 0.9")
+    if not 0 < reserve_ratio < trigger_ratio:
+        raise ValueError("压缩后保留比例必须大于 0 且小于触发比例")
+    if tool_result_limit <= 0:
+        raise ValueError("工具结果 Token 上限必须大于 0")
+    context_config = {
+        "trigger_ratio": trigger_ratio,
+        "reserve_ratio": reserve_ratio,
+        "tool_result_limit": tool_result_limit,
+    }
+    if str(context.get("summary_prompt") or "").strip():
+        context_config["compression_prompt"] = str(context["summary_prompt"])
     return {
         "name": agent.name,
         "system_prompt": context.get("system_prompt") or "You are a helpful assistant.",
         "react_config": {"max_iters": max_steps},
+        "context_config": context_config,
     }
 
 
@@ -90,6 +107,8 @@ def project_chat_model(provider: ModelProvider, model_id: str) -> tuple[dict, di
         credential_data["base_url"] = base_url
     if provider.headers_json:
         credential_data["default_headers"] = dict(provider.headers_json)
+    if model.get("context_length"):
+        credential_data["context_size"] = int(model["context_length"])
 
     provider_extra = dict(provider.extra_json or {})
     parameters = dict(provider_extra.pop("parameters", {}) or {})

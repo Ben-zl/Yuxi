@@ -19,6 +19,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 async def test_delete_agentscope_thread_resources_removes_remote_mapping_and_workspace(tmp_path, monkeypatch):
     """线程删除必须清理独占的 AgentScope 资源和持久目录。"""
     from yuxi.agentscope import client as client_module
+    from yuxi.repositories import agentscope_team_workers as team_repo
     from yuxi.repositories import agentscope_thread_sessions as mapping_repo
 
     mapping = SimpleNamespace(
@@ -48,6 +49,14 @@ async def test_delete_agentscope_thread_resources_removes_remote_mapping_and_wor
         assert record is mapping
         calls.append(("mapping",))
 
+    class TeamWorkerRepository:
+        def __init__(self, _db):
+            pass
+
+        async def deactivate_parent_runtime(self, *, uid, parent_thread_id):
+            calls.append(("team_runtime", uid, parent_thread_id))
+            return []
+
     base = tmp_path / "agentscope-workspaces"
     workdir = base / "user-1" / "agent-1"
     workdir.mkdir(parents=True)
@@ -56,10 +65,22 @@ async def test_delete_agentscope_thread_resources_removes_remote_mapping_and_wor
     monkeypatch.setattr(client_module, "AgentScopeServiceClient", Client)
     monkeypatch.setattr(mapping_repo, "get_thread_session", get_mapping)
     monkeypatch.setattr(mapping_repo, "delete_thread_session", delete_mapping)
+    monkeypatch.setattr(team_repo, "AgentScopeTeamWorkerRepository", TeamWorkerRepository)
 
-    await svc._delete_agentscope_thread_resources(object(), uid="user-1", thread_id="thread-1")
+    class FakeDB:
+        async def flush(self):
+            calls.append(("flush",))
 
-    assert [call[0] for call in calls] == ["session", "agent", "credential", "mapping"]
+    await svc._delete_agentscope_thread_resources(FakeDB(), uid="user-1", thread_id="thread-1")
+
+    assert [call[0] for call in calls] == [
+        "session",
+        "agent",
+        "credential",
+        "mapping",
+        "team_runtime",
+        "flush",
+    ]
     assert not workdir.exists()
 
 

@@ -230,7 +230,7 @@ async def project_runtime(
     mcp_configs = {
         slug: config
         for slug, config in loaded_mcp_configs.items()
-        if config.get("transport") in {"sse", "streamable_http"}
+        if config.get("transport") in {"stdio", "sse", "streamable_http"}
     }
     if selected_mcps is not None:
         unavailable_mcps = [slug for slug in selected_mcps if slug not in mcp_configs]

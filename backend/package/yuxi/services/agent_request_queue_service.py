@@ -78,8 +78,6 @@ class IntakeResult:
     run_id: str | None = None
     # FIFO 队内位置；未在排队（dispatched/rejected/已存在）时为 None。
     queue_position: int | None = None
-    # steer 请求提交后需中断活跃会话（由 finalize_intake 在提交后执行）
-    needs_interrupt: bool = False
     uid: str | None = None
     agent_slug: str | None = None
 
@@ -293,9 +291,6 @@ async def intake_request(
         message_id=persisted_message.id,
         thread_id=thread_id,
         queue_position=await repo.get_queue_position(request_id),
-        # steer 请求在提交后中断活跃会话（网关翻转工单 14⑥），
-        # 使运行中的 Run 以 interrupted 终态收束、队列随即派发引导消息。
-        needs_interrupt=policy == "steer",
         uid=uid_str,
         agent_slug=agent_slug,
     )
@@ -389,17 +384,6 @@ async def finalize_intake(*, db: AsyncSession, intake: IntakeResult) -> None:
         else None
     )
     await finalize_dispatch(db=db, dispatch=dispatch)
-    if intake.needs_interrupt:
-        # steer 中断必须在提交后执行：先让排队行对 worker 可见，
-        # 再中断活跃会话触发终态后的队头派发，避免派发扑空的竞态。
-        from yuxi.agentscope.thread_guard import interrupt_thread_session
-
-        await interrupt_thread_session(
-            db,
-            uid=intake.uid,
-            agent_slug=intake.agent_slug,
-            thread_id=intake.thread_id,
-        )
 
 
 async def finalize_dispatch(*, db: AsyncSession, dispatch: DispatchResult | None) -> None:

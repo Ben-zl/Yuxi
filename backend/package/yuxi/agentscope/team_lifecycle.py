@@ -1,0 +1,464 @@
+"""把 AgentScope Team worker 投影为 Yuxi 的长期子线程生命周期。"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Any
+
+from yuxi.agentscope.protocol import ToolEventConverter, event_to_chunks, reply_end_to_terminal
+from yuxi.agentscope.usage import UsageAccumulator
+from yuxi.repositories.agent_repository import AgentRepository
+from yuxi.repositories.agent_run_repository import AgentRunRepository, TERMINAL_RUN_STATUSES
+from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerRepository
+from yuxi.repositories.agentscope_thread_sessions import get_thread_session_by_agentscope_context
+from yuxi.repositories.conversation_repository import ConversationRepository
+from yuxi.repositories.subagent_thread_repository import SubagentThreadRepository
+from yuxi.services.run_queue_service import append_run_stream_event
+from yuxi.storage.postgres.manager import pg_manager
+from yuxi.storage.postgres.models_business import Message, ToolCall
+from yuxi.utils.hash_utils import hash_id, subagent_child_thread_id
+from yuxi.utils.logging_config import logger
+
+
+@dataclass(frozen=True)
+class TeamRosterSnapshot:
+    """一次 Team roster 快照，只保留生命周期投影需要的字段。"""
+
+    team_id: str | None
+    members: dict[str, tuple[str, str]]
+
+
+class TeamLifecycleModule:
+    """隐藏 Team roster 差分、child Run 投影和 worker 事件持久化。"""
+
+    def __init__(self, *, storage, uid: str, agent_id: str, session_id: str):
+        self.storage = storage
+        self.uid = str(uid)
+        self.agent_id = agent_id
+        self.session_id = session_id
+
+    async def snapshot(self) -> TeamRosterSnapshot:
+        """读取当前 Session 所属 Team 的显式 worker roster。"""
+        session = await self.storage.get_session(self.uid, self.agent_id, self.session_id)
+        if session is None or session.team_id is None:
+            return TeamRosterSnapshot(team_id=None, members={})
+        team = await self.storage.get_team(self.uid, session.team_id)
+        if team is None:
+            return TeamRosterSnapshot(team_id=session.team_id, members={})
+        members = {
+            member.session_id: (member.agent_id, member.role)
+            for member in team.data.members
+            if member.owner_id == self.uid
+        }
+        return TeamRosterSnapshot(team_id=team.id, members=members)
+
+    async def project_created_member(
+        self,
+        *,
+        before: TeamRosterSnapshot,
+        after: TeamRosterSnapshot,
+        tool_call_id: str,
+        tool_input: dict[str, Any],
+    ) -> None:
+        """把一次成功 AgentCreate 差分幂等投影成 child Thread 和 Run。"""
+        new_session_ids = set(after.members) - set(before.members)
+        if len(new_session_ids) != 1 or not after.team_id:
+            return
+        worker_session_id = new_session_ids.pop()
+        worker_agent_id, role = after.members[worker_session_id]
+        if role != "created":
+            return
+
+        subagent_slug = str(tool_input.get("subagent_type") or "").strip()
+        prompt = str(tool_input.get("prompt") or "").strip()
+        if not subagent_slug or not prompt:
+            raise ValueError("AgentCreate 生命周期投影缺少 subagent_type 或 prompt")
+
+        async with pg_manager.get_async_session_context() as db:
+            binding_repo = AgentScopeTeamWorkerRepository(db)
+            if await binding_repo.get_by_worker_session(uid=self.uid, worker_session_id=worker_session_id):
+                return
+            leader = await get_thread_session_by_agentscope_context(
+                db,
+                uid=self.uid,
+                agentscope_agent_id=self.agent_id,
+                agentscope_session_id=self.session_id,
+            )
+            if leader is None:
+                raise ValueError("Team leader 不存在有效的 Yuxi 线程映射")
+            parent_run = await AgentRunRepository(db).get_active_run_by_thread_for_user(
+                uid=self.uid,
+                agent_slug=leader.agent_slug,
+                conversation_thread_id=leader.thread_id,
+            )
+            if parent_run is None:
+                # 低层 runner/框架测试可以直接调用 AgentScope，不具备 Yuxi
+                # AgentRun 产品上下文；这类调用只验证编排，不创建 child 投影。
+                return
+            subagent = await AgentRepository(db).get_by_slug(subagent_slug)
+            if subagent is None or not subagent.is_subagent:
+                raise ValueError(f"受管子智能体 {subagent_slug} 已不可用")
+
+            child_thread_id = subagent_child_thread_id(leader.thread_id, subagent_slug, tool_call_id)
+            conversation = await ConversationRepository(db).get_conversation_by_thread_id(child_thread_id)
+            if conversation is None:
+                conversation = await ConversationRepository(db).add_conversation(
+                    uid=self.uid,
+                    agent_id=subagent_slug,
+                    title=f"SubAgent: {subagent.name}",
+                    thread_id=child_thread_id,
+                    metadata={
+                        "source": "agentscope_team",
+                        "parent_thread_id": leader.thread_id,
+                        "created_by_run_id": parent_run.id,
+                        "parent_conversation_id": parent_run.conversation_id,
+                        "subagent_slug": subagent_slug,
+                    },
+                )
+                conversation.status = "subagent"
+            relation_repo = SubagentThreadRepository(db)
+            relation = await relation_repo.get_by_child_thread_for_user(child_thread_id, self.uid)
+            if relation is None:
+                relation = await relation_repo.create(
+                    uid=self.uid,
+                    parent_conversation_id=parent_run.conversation_id,
+                    child_conversation_id=conversation.id,
+                    child_thread_id=child_thread_id,
+                    subagent_slug=subagent_slug,
+                    created_by_run_id=parent_run.id,
+                )
+
+            request_id = hash_id("team:", f"{self.uid}:{worker_session_id}:{tool_call_id}", length=64)
+            input_message = Message(
+                conversation_id=conversation.id,
+                role="user",
+                content=prompt,
+                message_type="text",
+                request_id=request_id,
+                delivery_status="complete",
+                extra_metadata={"request_id": request_id, "source": "agentscope_team"},
+            )
+            db.add(input_message)
+            await db.flush()
+            run = await AgentRunRepository(db).create_run(
+                run_id=str(uuid.uuid4()),
+                conversation_thread_id=child_thread_id,
+                agent_slug=subagent_slug,
+                uid=self.uid,
+                request_id=request_id,
+                input_payload={
+                    "model_spec": (parent_run.input_payload or {}).get("model_spec"),
+                    "runtime": {
+                        "tool_call_id": tool_call_id,
+                        "subagent_name": subagent.name,
+                        "parent_thread_id": leader.thread_id,
+                        "file_thread_id": leader.thread_id,
+                        "worker_agent_id": worker_agent_id,
+                        "worker_session_id": worker_session_id,
+                        "team_id": after.team_id,
+                    },
+                },
+                source="subagent",
+                channel="internal",
+                conversation_id=conversation.id,
+                created_by_run_id=parent_run.id,
+                subagent_thread_relation_id=relation.id,
+                run_type="subagent",
+                input_message_id=input_message.id,
+            )
+            await AgentRunRepository(db).mark_running(run.id)
+            await binding_repo.create(
+                uid=self.uid,
+                parent_thread_id=leader.thread_id,
+                child_thread_id=child_thread_id,
+                subagent_slug=subagent_slug,
+                created_by_run_id=parent_run.id,
+                subagent_thread_relation_id=relation.id,
+                team_id=after.team_id,
+                worker_agent_id=worker_agent_id,
+                worker_session_id=worker_session_id,
+                active_run_id=run.id,
+            )
+            await db.commit()
+
+        await append_run_stream_event(
+            run.id,
+            "metadata",
+            {"run_type": "subagent", "source": "agentscope_team", "request_id": request_id},
+            thread_id=child_thread_id,
+        )
+
+    async def project_worker_reply(self, input_kwargs: dict, next_handler) -> AsyncIterator[Any]:
+        """透传 worker Reply，同时把事件、历史、用量和终态写入 child Run。"""
+        binding = await self._wait_for_binding()
+        if binding is None:
+            async for item in next_handler(**input_kwargs):
+                yield item
+            return
+
+        run_id: str | None = None
+        request_id: str | None = None
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_converter: ToolEventConverter | None = None
+        usage = UsageAccumulator(configured_model_spec=None)
+        try:
+            async for item in next_handler(**input_kwargs):
+                event = item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+                if not isinstance(event, dict):
+                    yield item
+                    continue
+                event_type = str(event.get("type") or "").upper()
+                if event_type == "REPLY_START":
+                    run_id, request_id = await self._open_worker_run(
+                        binding.worker_session_id,
+                        str(event.get("reply_id") or ""),
+                        input_kwargs,
+                    )
+                    tool_converter = ToolEventConverter(request_id)
+                if run_id and request_id:
+                    usage.observe(event)
+                    if event_type == "TEXT_BLOCK_DELTA":
+                        text_parts.append(str(event.get("delta") or ""))
+                    elif event_type == "THINKING_BLOCK_DELTA":
+                        reasoning_parts.append(str(event.get("delta") or ""))
+                    chunks = event_to_chunks(event, request_id=request_id)
+                    if tool_converter is not None:
+                        chunks.extend(tool_converter.feed(event))
+                    if chunks:
+                        await append_run_stream_event(
+                            run_id,
+                            "messages",
+                            {"items": chunks},
+                            thread_id=binding.child_thread_id,
+                        )
+                    if event_type == "REPLY_END":
+                        terminal = reply_end_to_terminal(event, request_id=request_id)
+                        await self._finish_worker_run(
+                            run_id=run_id,
+                            terminal_status=terminal.run_status,
+                            error_message=(event.get("error") or {}).get("message"),
+                            text="".join(text_parts),
+                            reasoning="".join(reasoning_parts),
+                            usage=usage.snapshot(complete=True),
+                            tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
+                        )
+                        await append_run_stream_event(
+                            run_id,
+                            "end",
+                            {"status": terminal.run_status, "chunk": terminal.chunk},
+                            thread_id=binding.child_thread_id,
+                        )
+                yield item
+        except BaseException as exc:
+            if run_id:
+                await self._finish_worker_run(
+                    run_id=run_id,
+                    terminal_status="failed",
+                    error_message=str(exc),
+                    text="".join(text_parts),
+                    reasoning="".join(reasoning_parts),
+                    usage=usage.snapshot(complete=False),
+                    tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
+                )
+            raise
+
+    async def _wait_for_binding(self):
+        """吸收 AgentCreate 投影与 worker wakeup 的短暂竞态。"""
+        for _ in range(30):
+            async with pg_manager.get_async_session_context() as db:
+                binding = await AgentScopeTeamWorkerRepository(db).get_by_worker_session(
+                    uid=self.uid,
+                    worker_session_id=self.session_id,
+                )
+                if binding is not None:
+                    return binding
+            await asyncio.sleep(0.1)
+        logger.debug("Team worker 没有 Yuxi 生命周期绑定 session=%s", self.session_id)
+        return None
+
+    async def _open_worker_run(self, worker_session_id: str, reply_id: str, input_kwargs: dict) -> tuple[str, str]:
+        """复用首个投影 Run；后续 worker Reply 创建新的 child Run。"""
+        async with pg_manager.get_async_session_context() as db:
+            bindings = AgentScopeTeamWorkerRepository(db)
+            binding = await bindings.get_by_worker_session(uid=self.uid, worker_session_id=worker_session_id)
+            if binding is None or not binding.runtime_active:
+                raise ValueError("Team worker runtime 已不存在")
+            runs = AgentRunRepository(db)
+            active = await runs.get_run(binding.active_run_id) if binding.active_run_id else None
+            if active is not None and active.status not in TERMINAL_RUN_STATUSES and not binding.last_reply_id:
+                binding.last_reply_id = reply_id
+                await db.commit()
+                return active.id, active.request_id
+
+            request_id = hash_id("team-reply:", f"{worker_session_id}:{reply_id}", length=64)
+            existing = await runs.get_run_by_request_id(request_id)
+            if existing is not None:
+                binding.active_run_id = existing.id
+                binding.last_reply_id = reply_id
+                await db.commit()
+                return existing.id, existing.request_id
+            relation = await SubagentThreadRepository(db).get_for_user(binding.subagent_thread_relation_id, self.uid)
+            conversation = await ConversationRepository(db).get_conversation_by_thread_id(binding.child_thread_id)
+            if relation is None or conversation is None:
+                raise ValueError("Team child Thread 投影已损坏")
+            prompt = _input_text(input_kwargs.get("inputs")) or "Team worker continuation"
+            message = Message(
+                conversation_id=conversation.id,
+                role="user",
+                content=prompt,
+                message_type="text",
+                request_id=request_id,
+                delivery_status="complete",
+                extra_metadata={"request_id": request_id, "source": "agentscope_team"},
+            )
+            db.add(message)
+            await db.flush()
+            parent = await runs.get_latest_run_by_thread_for_user(binding.parent_thread_id, self.uid)
+            run = await runs.create_run(
+                run_id=str(uuid.uuid4()),
+                conversation_thread_id=binding.child_thread_id,
+                agent_slug=binding.subagent_slug,
+                uid=self.uid,
+                request_id=request_id,
+                input_payload={
+                    "model_spec": (parent.input_payload or {}).get("model_spec") if parent else None,
+                    "runtime": {
+                        "parent_thread_id": binding.parent_thread_id,
+                        "file_thread_id": binding.parent_thread_id,
+                        "worker_agent_id": binding.worker_agent_id,
+                        "worker_session_id": binding.worker_session_id,
+                        "team_id": binding.team_id,
+                    },
+                },
+                source="subagent",
+                channel="internal",
+                conversation_id=conversation.id,
+                created_by_run_id=parent.id if parent else binding.created_by_run_id,
+                subagent_thread_relation_id=relation.id,
+                run_type="subagent",
+                input_message_id=message.id,
+            )
+            await runs.mark_running(run.id)
+            binding.active_run_id = run.id
+            binding.last_reply_id = reply_id
+            await db.commit()
+            return run.id, request_id
+
+    async def _finish_worker_run(
+        self,
+        *,
+        run_id: str,
+        terminal_status: str,
+        error_message: str | None,
+        text: str,
+        reasoning: str,
+        usage: dict,
+        tool_calls: list[dict],
+    ) -> None:
+        """原子保存 worker 输出和 child Run 终态，重复终态事件保持幂等。"""
+        async with pg_manager.get_async_session_context() as db:
+            runs = AgentRunRepository(db)
+            run = await runs.get_run(run_id)
+            if run is None or run.status in TERMINAL_RUN_STATUSES:
+                return
+            if run.status == "cancel_requested":
+                terminal_status = "cancelled"
+                error_message = None
+            output_message = None
+            if text or reasoning or tool_calls:
+                output_message = Message(
+                    conversation_id=run.conversation_id,
+                    role="assistant",
+                    content=text,
+                    message_type="text",
+                    run_id=run.id,
+                    request_id=run.request_id,
+                    delivery_status="complete",
+                    extra_metadata={
+                        "request_id": run.request_id,
+                        "run_id": run.id,
+                        "token_usage": usage,
+                        "additional_kwargs": {"reasoning_content": reasoning} if reasoning else {},
+                    },
+                )
+                db.add(output_message)
+                await db.flush()
+                for call in tool_calls:
+                    db.add(
+                        ToolCall(
+                            message_id=output_message.id,
+                            langgraph_tool_call_id=call.get("id"),
+                            tool_name=call.get("name") or "unknown",
+                            tool_input=call.get("args") or {},
+                            tool_output=call.get("output") or "",
+                            status=call.get("status") or "pending",
+                            error_message=call.get("error_message"),
+                        )
+                    )
+                await runs.set_output_message(run.id, output_message.id)
+            await runs.set_terminal_status(
+                run.id,
+                status=terminal_status,
+                error_type="agentscope_team" if terminal_status == "failed" else None,
+                error_message=error_message,
+                token_usage=usage,
+            )
+            await db.commit()
+
+
+async def interrupt_team_worker_runs(*, uid: str, run_ids: list[str]) -> None:
+    """把 Yuxi child Run 取消转发到唯一的 AgentScope worker Session。"""
+    async with pg_manager.get_async_session_context() as db:
+        bindings = await AgentScopeTeamWorkerRepository(db).list_for_active_runs(
+            uid=str(uid),
+            run_ids=run_ids,
+        )
+    if not bindings:
+        return
+
+    import os
+
+    from yuxi.agentscope.client import AgentScopeServiceClient
+
+    client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
+    results = await asyncio.gather(
+        *(
+            client.interrupt_session(
+                str(uid),
+                binding.worker_agent_id,
+                binding.worker_session_id,
+            )
+            for binding in bindings
+        ),
+        return_exceptions=True,
+    )
+    for binding, result in zip(bindings, results, strict=True):
+        if isinstance(result, Exception):
+            logger.warning(
+                "中断 Team worker 失败 session=%s: %s",
+                binding.worker_session_id,
+                result,
+            )
+
+
+def _input_text(value: Any) -> str:
+    """从 AgentScope Msg、Block 或列表提取可审计的输入文本。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(filter(None, (_input_text(item) for item in value))).strip()
+    if hasattr(value, "model_dump"):
+        return _input_text(value.model_dump(mode="json"))
+    if isinstance(value, dict):
+        for key in ("text", "hint", "content", "input"):
+            if key in value:
+                text = _input_text(value[key])
+                if text:
+                    return text
+    return ""

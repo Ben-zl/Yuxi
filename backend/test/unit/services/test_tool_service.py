@@ -13,7 +13,7 @@ def test_get_tool_metadata_uses_static_management_catalog():
         "present_artifacts",
         "ocr_parse_file",
         "ask_user_question",
-        "install_skill",
+        "read_media",
     }
     assert all("config_guide" in item for item in result)
 

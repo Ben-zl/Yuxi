@@ -529,6 +529,7 @@ async def _delete_agentscope_thread_resources(db: AsyncSession, *, uid: str, thr
     from pathlib import Path
 
     from yuxi.agentscope.client import AgentScopeServiceClient
+    from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerRepository
     from yuxi.repositories.agentscope_thread_sessions import delete_thread_session, get_thread_session
 
     mapping = await get_thread_session(db, uid=uid, thread_id=thread_id)
@@ -540,6 +541,16 @@ async def _delete_agentscope_thread_resources(db: AsyncSession, *, uid: str, thr
     await client.delete_agent(uid, mapping.agentscope_agent_id)
     await client.delete_credential(uid, mapping.agentscope_credential_id)
     await delete_thread_session(db, mapping)
+    bindings = await AgentScopeTeamWorkerRepository(db).deactivate_parent_runtime(
+        uid=uid,
+        parent_thread_id=thread_id,
+    )
+    child_conversations = ConversationRepository(db)
+    for binding in bindings:
+        child = await child_conversations.get_conversation_by_thread_id(binding.child_thread_id)
+        if child is not None:
+            child.status = "deleted"
+    await db.flush()
 
     base = Path(os.getenv("AGENTSCOPE_WORKSPACE_BASEDIR", "/app/saves/agentscope-workspaces")).resolve()
     target = (base / uid / mapping.agentscope_agent_id).resolve()

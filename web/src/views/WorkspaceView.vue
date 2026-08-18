@@ -73,29 +73,38 @@
         :style="workspaceMainStyle"
       >
         <template v-if="activeSourceKey === 'personal' || selectedDatabase">
-          <WorkspaceFileList
-            :entries="entries"
-            :current-path="currentPath"
-            :selected-path="selectedEntry?.path || ''"
-            :selected-paths="selectedPaths"
-            :deleting-paths="deletingPaths"
-            :selection-mode="selectionMode"
-            :loading="loadingTree"
-            :readonly="isReadonlyWorkspacePath"
-            :root-label="selectedDatabase?.name || '工作区'"
-            :breadcrumb-items="
-              isKnowledgeSource ? knowledgeBreadcrumbItems : workspaceBreadcrumbItems
-            "
-            :pagination="isKnowledgeSource ? knowledgePagination : null"
-            @select-entry="handleSelectEntry"
-            @breadcrumb-click="handleListBreadcrumbClick"
-            @update:selected-paths="selectedPaths = $event"
-            @update:selection-mode="handleSelectionModeChange"
-            @delete-selected="confirmDeleteEntries(selectedEntries)"
-            @delete-entry="(entry) => confirmDeleteEntries([entry])"
-            @download-entry="downloadEntry"
-            @page-change="handleKnowledgePageChange"
-          />
+          <div class="workspace-list-pane">
+            <a-alert
+              v-if="activeSourceKey === 'personal' && workspaceTreeTruncated"
+              class="workspace-tree-truncated"
+              type="warning"
+              show-icon
+              message="当前目录文件较多，仅显示前 500 项，请进入子目录继续浏览。"
+            />
+            <WorkspaceFileList
+              :entries="entries"
+              :current-path="currentPath"
+              :selected-path="selectedEntry?.path || ''"
+              :selected-paths="selectedPaths"
+              :deleting-paths="deletingPaths"
+              :selection-mode="selectionMode"
+              :loading="loadingTree"
+              :readonly="isReadonlyWorkspacePath"
+              :root-label="selectedDatabase?.name || '工作区'"
+              :breadcrumb-items="
+                isKnowledgeSource ? knowledgeBreadcrumbItems : workspaceBreadcrumbItems
+              "
+              :pagination="isKnowledgeSource ? knowledgePagination : null"
+              @select-entry="handleSelectEntry"
+              @breadcrumb-click="handleListBreadcrumbClick"
+              @update:selected-paths="selectedPaths = $event"
+              @update:selection-mode="handleSelectionModeChange"
+              @delete-selected="confirmDeleteEntries(selectedEntries)"
+              @delete-entry="(entry) => confirmDeleteEntries([entry])"
+              @download-entry="downloadEntry"
+              @page-change="handleKnowledgePageChange"
+            />
+          </div>
           <div
             v-if="showInlinePreview"
             class="workspace-preview-resizer"
@@ -233,6 +242,7 @@ const knowledgeBreadcrumbItems = ref([])
 const workspaceBreadcrumbItems = ref(null)
 const threadTitleMap = ref({})
 const entries = ref([])
+const workspaceTreeTruncated = ref(false)
 const selectedEntry = ref(null)
 const selectedPaths = ref([])
 const selectionMode = ref(false)
@@ -450,6 +460,7 @@ const loadWorkspaceEntries = async (path = '/') => {
   try {
     const response = await getWorkspaceTree(path)
     entries.value = response.entries || []
+    workspaceTreeTruncated.value = Boolean(response.truncated)
     currentPath.value = path
     knowledgeBreadcrumbItems.value = []
     if (comparablePath(path) === CHATS_WORKSPACE_PATH) {
@@ -463,6 +474,7 @@ const loadWorkspaceEntries = async (path = '/') => {
       selectionMode.value = false
     }
   } catch (error) {
+    workspaceTreeTruncated.value = false
     console.warn('加载工作区目录失败:', error)
     message.error('加载工作区目录失败')
   } finally {
@@ -1011,6 +1023,22 @@ watch(useInlinePreview, (isInline, wasInline) => {
   grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
+}
+
+.workspace-list-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-list-pane :deep(.workspace-file-list) {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.workspace-tree-truncated {
+  margin: 12px 16px 0;
 }
 
 .workspace-preview-resizer {

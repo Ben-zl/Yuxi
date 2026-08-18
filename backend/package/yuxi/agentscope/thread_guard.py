@@ -1,10 +1,8 @@
-"""线程接入守卫与 steer 中断钩子（迁移工单 14 · ①⑥）。
+"""线程接入守卫与挂起事件存储（迁移工单 14）。
 
 存量线程判据（cutover 时间戳）：无 agentscope 映射且存在**切换时刻之前**
 的消息 → 视为旧栈线程，只读、拒绝发送并提示开新线程，不建立空 Session。
 新栈线程的消息都在切换之后，intake 先落用户消息不影响判据。
-steer 钩子：排队 steer 请求后中断该线程的活跃 agentscope 会话，使运行中
-的 Run 提前结束（interrupted 终态），队列随即派发 steer 消息。
 """
 
 import json
@@ -14,7 +12,6 @@ from datetime import datetime, UTC
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session
 from yuxi.storage.postgres.models_business import Conversation, Message
 from yuxi.storage.redis.manager import get_async_redis_client
@@ -98,13 +95,3 @@ async def ensure_thread_eligible(db: AsyncSession, *, uid: str, thread_id: str) 
         return  # 已有映射（新栈线程），放行
     if await is_legacy_thread(db, thread_id=thread_id):
         raise ValueError(LEGACY_THREAD_MESSAGE)
-
-
-async def interrupt_thread_session(db: AsyncSession, *, uid: str, agent_slug: str, thread_id: str) -> bool:
-    """中断线程的活跃 agentscope 会话（steer 提前结束语义）。"""
-    mapping = await get_thread_session(db, uid=uid, thread_id=thread_id)
-    if mapping is None:
-        return False
-    client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
-    await client.interrupt_session(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)
-    return True

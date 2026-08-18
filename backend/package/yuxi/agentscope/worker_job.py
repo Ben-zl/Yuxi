@@ -33,8 +33,7 @@ from yuxi.services.run_queue_service import append_run_stream_event
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Message
 from yuxi.utils import logger
-
-_EMPTY_USAGE = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+from yuxi.agentscope.usage import UsageAccumulator
 
 
 async def execute_agent_run_job(run_id: str) -> None:
@@ -379,6 +378,7 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         event_count = 0
+        usage = UsageAccumulator(configured_model_spec=mapping.model_spec)
         tool_converter = ToolEventConverter(run.request_id)
         tool_converter.seed_tool_calls(
             tool_calls,
@@ -416,6 +416,7 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
             if isinstance(event, Exception):
                 raise event
             event_count += 1
+            usage.observe(event)
             event_type = str(event.get("type", "")).upper()
             if event_type == "TEXT_BLOCK_DELTA":
                 text_parts.append(event.get("delta", ""))
@@ -446,6 +447,7 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
                     reasoning_parts,
                     event_count,
                     tool_converter.history_tool_calls(),
+                    usage.snapshot(complete=False),
                 )
             if event_type == "REPLY_END":
                 terminal = reply_end_to_terminal(event, request_id=run.request_id)
@@ -460,7 +462,7 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
                     text="".join(text_parts),
                     reasoning="".join(reasoning_parts),
                     event_count=event_count,
-                    usage=_EMPTY_USAGE,
+                    usage=usage.snapshot(complete=True),
                     error_message=terminal.chunk.get("error_message"),
                     tool_calls=tool_converter.history_tool_calls(),
                 )
@@ -497,6 +499,7 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         event_count = 0
+        usage = UsageAccumulator(configured_model_spec=mapping.model_spec)
         tool_converter = ToolEventConverter(run.request_id)
         tool_converter.seed_tool_calls(
             pending_event.get("tool_calls") or [],
@@ -507,6 +510,7 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
             if isinstance(event, Exception):
                 raise event
             event_count += 1
+            usage.observe(event)
             event_type = str(event.get("type", "")).upper()
             if event_type == "TEXT_BLOCK_DELTA":
                 text_parts.append(event.get("delta", ""))
@@ -534,6 +538,7 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
                     reasoning_parts,
                     event_count,
                     tool_converter.history_tool_calls(),
+                    usage.snapshot(complete=False),
                 )
             if event_type == "REPLY_END":
                 terminal = reply_end_to_terminal(event, request_id=run.request_id)
@@ -548,7 +553,7 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
                     text="".join(text_parts),
                     reasoning="".join(reasoning_parts),
                     event_count=event_count,
-                    usage=_EMPTY_USAGE,
+                    usage=usage.snapshot(complete=True),
                     error_message=terminal.chunk.get("error_message"),
                     tool_calls=tool_converter.history_tool_calls(),
                 )
@@ -562,6 +567,7 @@ def _parked_resume_result(
     reasoning_parts: list[str],
     event_count: int,
     tool_calls: list[dict],
+    usage: dict,
 ) -> GatewayRoundResult:
     """把恢复期间再次出现的审批或问答转换为新的挂起结果。"""
     event_type = str(event.get("type", "")).upper()
@@ -571,7 +577,7 @@ def _parked_resume_result(
         reasoning="".join(reasoning_parts),
         event_count=event_count,
         parked="permission" if event_type == "REQUIRE_USER_CONFIRM" else "external",
-        usage=_EMPTY_USAGE,
+        usage=usage,
         pending_confirm=event,
         tool_calls=tool_calls,
     )

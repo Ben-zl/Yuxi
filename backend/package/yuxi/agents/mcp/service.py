@@ -15,6 +15,9 @@ from collections.abc import Callable
 from typing import Any
 
 from agentscope.mcp import HttpMCPConfig, MCPClient, StdioMCPConfig
+from agentscope.tool import MCPTool
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -212,10 +215,41 @@ async def get_mcp_client(
 
     return MCPClient(
         name=server_slug,
-        is_stateful=False,
+        is_stateful=transport == "stdio",
         mcp_config=mcp_config,
         disable_tools=list(config.get("disabled_tools") or []),
     )
+
+
+async def _build_stdio_mcp_tools(server_slug: str, config: dict[str, Any]) -> list[MCPTool]:
+    """发现内置 stdio 工具，并返回每次调用独立建连的工具对象。"""
+    params = StdioServerParameters(
+        command=config["command"],
+        args=list(config.get("args") or []),
+        env=config.get("env"),
+    )
+
+    def client_gen():
+        return stdio_client(params)
+
+    async with client_gen() as cli:
+        read_stream, write_stream = cli[0], cli[1]
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            response = await session.list_tools()
+
+    disabled_tools = set(config.get("disabled_tools") or [])
+    timeout = float(config.get("timeout") or config.get("sse_read_timeout") or 30.0)
+    return [
+        MCPTool(
+            mcp_name=server_slug,
+            tool=tool,
+            client_gen=client_gen,
+            timeout=timeout,
+        )
+        for tool in response.tools
+        if tool.name not in disabled_tools
+    ]
 
 
 def to_camel_case(s: str) -> str:
@@ -319,20 +353,26 @@ async def get_mcp_tools(
 
     if not all_processed_tools:
         try:
-            # disabled_tools 只影响返回值过滤，不参与 MCP client 建连参数。
-            client_config = {k: v for k, v in server_config.items() if k not in ("disabled_tools",)}
-
-            client = await get_mcp_client({server_slug: client_config})
-            raw_tools = list(await client.list_tools())
+            if server_config.get("transport") == "stdio":
+                raw_tools = list(await _build_stdio_mcp_tools(server_slug, server_config))
+            else:
+                # disabled_tools 只影响返回值过滤，不参与 MCP client 建连参数。
+                client_config = {k: v for k, v in server_config.items() if k not in ("disabled_tools",)}
+                client = await get_mcp_client({server_slug: client_config})
+                raw_tools = list(await client.list_tools())
 
             server_cc = to_camel_case(server_slug)
             for tool in raw_tools:
                 original_name = tool.name
+                namespaced_prefix = f"mcp__{server_slug}__"
+                if original_name.startswith(namespaced_prefix):
+                    original_name = original_name[len(namespaced_prefix) :]
                 tool_cc = to_camel_case(original_name)
                 unique_id = f"mcp__{server_cc}__{tool_cc}"
 
                 metadata = dict(getattr(tool, "metadata", {}) or {})
                 metadata["id"] = unique_id
+                metadata["mcp_tool_name"] = original_name
                 tool.metadata = metadata
                 all_processed_tools.append(tool)
 
@@ -346,7 +386,14 @@ async def get_mcp_tools(
                     _mcp_tools_cache[cache_key] = all_processed_tools
 
                 global_config_disabled = server_config.get("disabled_tools") or []
-                enabled_count = len([t for t in all_processed_tools if t.name not in global_config_disabled])
+                enabled_count = len(
+                    [
+                        tool
+                        for tool in all_processed_tools
+                        if (getattr(tool, "metadata", {}) or {}).get("mcp_tool_name", tool.name)
+                        not in global_config_disabled
+                    ]
+                )
                 _mcp_tools_stats[server_slug] = {
                     "total": len(all_processed_tools),
                     "enabled": enabled_count,
@@ -364,7 +411,12 @@ async def get_mcp_tools(
 
     # 3. Filtering (Apply to Return Value Only)
     if disabled_tools:
-        filtered_tools = [t for t in all_processed_tools if t.name not in disabled_tools]
+        filtered_tools = [
+            tool
+            for tool in all_processed_tools
+            if (getattr(tool, "metadata", {}) or {}).get("mcp_tool_name", tool.name)
+            not in disabled_tools
+        ]
         logger.debug(
             f"Returning {len(filtered_tools)}/{len(all_processed_tools)} tools for '{server_slug}' "
             f"(filtered {len(disabled_tools)} by argument)"

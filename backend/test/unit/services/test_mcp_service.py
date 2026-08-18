@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -38,6 +39,14 @@ async def mcp_session():
 class _FakeClient:
     def __init__(self, tools):
         self._tools = tools
+        self.connect_count = 0
+        self.close_count = 0
+
+    async def connect(self):
+        self.connect_count += 1
+
+    async def close(self):
+        self.close_count += 1
 
     async def list_tools(self):
         return self._tools
@@ -299,8 +308,8 @@ async def test_get_mcp_tools_rebuilds_cache_when_config_hash_changes(monkeypatch
     mcp_service.clear_mcp_cache()
 
     configs = [
-        {"transport": "stdio", "command": "demo-v1", "disabled_tools": []},
-        {"transport": "stdio", "command": "demo-v2", "disabled_tools": []},
+        {"transport": "streamable_http", "url": "http://demo-v1/mcp", "disabled_tools": []},
+        {"transport": "streamable_http", "url": "http://demo-v2/mcp", "disabled_tools": []},
     ]
     build_calls: list[str] = []
 
@@ -311,9 +320,9 @@ async def test_get_mcp_tools_rebuilds_cache_when_config_hash_changes(monkeypatch
 
     async def fake_get_mcp_client(server_configs):
         config = server_configs["demo"]
-        build_calls.append(config["command"])
-        tool = SimpleNamespace(name=f"tool_for_{config['command']}", metadata={})
-        return _FakeClient([tool])
+        version = config["url"].split("//", maxsplit=1)[1].split("/", maxsplit=1)[0]
+        build_calls.append(version)
+        return _FakeClient([SimpleNamespace(name=f"tool_for_{version}", metadata={})])
 
     monkeypatch.setattr(mcp_service, "get_enabled_mcp_server_config", fake_get_enabled_mcp_server_config)
     monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
@@ -363,13 +372,13 @@ async def test_get_tools_from_all_servers_loads_names_from_db_once(monkeypatch):
 async def test_get_mcp_tools_sets_stable_management_id(monkeypatch):
     mcp_service.clear_mcp_cache()
 
-    config = {"transport": "stdio", "command": "demo-tool", "disabled_tools": []}
+    config = {"transport": "streamable_http", "url": "http://demo-tool/mcp", "disabled_tools": []}
 
     async def fake_get_enabled_mcp_server_config(server_name: str, db=None):
-        del db
+        del server_name, db
         return config
 
-    async def fake_get_mcp_client(server_configs):
+    async def fake_get_mcp_client(_server_configs):
         tool = SimpleNamespace(name="demo_tool", metadata={})
         return _FakeClient([tool])
 
@@ -379,5 +388,157 @@ async def test_get_mcp_tools_sets_stable_management_id(monkeypatch):
     tools = await mcp_service.get_mcp_tools("demo")
     assert len(tools) == 1
     assert tools[0].metadata["id"] == "mcp__demo__demoTool"
+    assert tools[0].metadata["mcp_tool_name"] == "demo_tool"
 
     mcp_service.clear_mcp_cache()
+
+
+async def test_get_mcp_tools_filters_by_original_remote_name(monkeypatch):
+    """禁用列表使用 MCP 原始名，不受运行时命名空间改写影响。"""
+    mcp_service.clear_mcp_cache()
+
+    async def fake_get_mcp_client(_server_configs):
+        return _FakeClient([SimpleNamespace(name="mcp__demo__echo", metadata={})])
+
+    monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
+
+    tools = await mcp_service.get_mcp_tools(
+        "demo",
+        additional_servers={
+            "demo": {
+                "transport": "streamable_http",
+                "url": "http://demo-tool/mcp",
+                "disabled_tools": ["echo"],
+            }
+        },
+        disabled_tools=["echo"],
+    )
+
+    assert tools == []
+    mcp_service.clear_mcp_cache()
+
+
+async def test_get_mcp_tools_does_not_connect_stateless_http_client(monkeypatch):
+    """HTTP MCP 每次工具调用自行建连，不保持服务级 stateful 连接。"""
+    mcp_service.clear_mcp_cache()
+    client = _FakeClient([SimpleNamespace(name="echo", metadata={})])
+
+    async def fake_get_enabled_mcp_server_config(server_name: str, db=None):
+        del server_name, db
+        return {"transport": "streamable_http", "url": "http://mcp.example/mcp"}
+
+    async def fake_get_mcp_client(_server_configs):
+        return client
+
+    monkeypatch.setattr(mcp_service, "get_enabled_mcp_server_config", fake_get_enabled_mcp_server_config)
+    monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
+
+    await mcp_service.get_mcp_tools("remote")
+    assert client.connect_count == 0
+
+    mcp_service.clear_mcp_cache()
+    assert client.close_count == 0
+
+
+async def test_builtin_stdio_tools_open_and_close_within_discovery_and_call(monkeypatch):
+    """stdio 发现和调用各自使用同一 task 内的短连接。"""
+    lifecycle: list[str] = []
+
+    @asynccontextmanager
+    async def fake_stdio_client(_params):
+        lifecycle.append("transport-enter")
+        try:
+            yield (object(), object())
+        finally:
+            lifecycle.append("transport-exit")
+
+    class FakeSession:
+        def __init__(self, *_args):
+            pass
+
+        async def __aenter__(self):
+            lifecycle.append("session-enter")
+            return self
+
+        async def __aexit__(self, *_args):
+            lifecycle.append("session-exit")
+
+        async def initialize(self):
+            lifecycle.append("initialize")
+
+        async def list_tools(self):
+            return SimpleNamespace(
+                tools=[
+                    SimpleNamespace(
+                        name="generate_chart",
+                        description="Generate a chart",
+                        inputSchema={"type": "object", "properties": {}},
+                        annotations=None,
+                    )
+                ]
+            )
+
+        async def call_tool(self, name, arguments, read_timeout_seconds):
+            del read_timeout_seconds
+            lifecycle.append(f"call:{name}:{arguments['title']}")
+            return SimpleNamespace(content=[], isError=False)
+
+    monkeypatch.setattr(mcp_service, "stdio_client", fake_stdio_client)
+    monkeypatch.setattr(mcp_service, "ClientSession", FakeSession)
+    monkeypatch.setattr("agentscope.tool._adapters.ClientSession", FakeSession)
+
+    tools = await mcp_service._build_stdio_mcp_tools(
+        "mcp-server-chart",
+        {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@antv/mcp-server-chart"],
+        },
+    )
+    await tools[0].call(title="demo")
+
+    assert lifecycle == [
+        "transport-enter",
+        "session-enter",
+        "initialize",
+        "session-exit",
+        "transport-exit",
+        "transport-enter",
+        "session-enter",
+        "initialize",
+        "call:generate_chart:demo",
+        "session-exit",
+        "transport-exit",
+    ]
+
+
+async def test_get_mcp_client_uses_stateful_transport_only_for_builtin_stdio(monkeypatch):
+    """AgentScope 要求 stdio 有进程生命周期，HTTP 继续保持无状态。"""
+    created = []
+
+    def fake_client(**kwargs):
+        created.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(mcp_service, "MCPClient", fake_client)
+
+    await mcp_service.get_mcp_client(
+        {
+            "mcp-server-chart": {
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@antv/mcp-server-chart"],
+            }
+        }
+    )
+    await mcp_service.get_mcp_client(
+        {
+            "remote": {
+                "transport": "streamable_http",
+                "url": "http://mcp.example/mcp",
+            }
+        }
+    )
+
+    assert created[0]["is_stateful"] is True
+    assert created[1]["is_stateful"] is False

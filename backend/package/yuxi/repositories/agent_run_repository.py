@@ -93,6 +93,18 @@ class AgentRunRepository:
         )
         return result.scalar_one_or_none()
 
+    async def list_run_usages_by_thread_for_user(self, conversation_thread_id: str, uid: str) -> list[dict]:
+        """按时间顺序读取线程所有非空 Run 用量，用于线程累计。"""
+        result = await self.db.execute(
+            select(AgentRun.token_usage)
+            .where(
+                AgentRun.conversation_thread_id == conversation_thread_id,
+                AgentRun.uid == str(uid),
+            )
+            .order_by(AgentRun.created_at.asc(), AgentRun.id.asc())
+        )
+        return [dict(usage) for usage in result.scalars().all() if usage]
+
     async def get_latest_chat_or_resume_run(
         self,
         *,

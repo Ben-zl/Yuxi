@@ -8,11 +8,12 @@ Provides centralized dashboard APIs for monitoring system-wide statistics.
 
 import traceback
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import Integer, String, cast, distinct, func, select, text
+from sqlalchemy import distinct, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.utils.auth_middleware import get_db, get_superadmin_user
@@ -20,7 +21,7 @@ from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.storage.minio.client import normalize_public_minio_url
 from yuxi.storage.postgres.models_business import User
-from yuxi.utils.datetime_utils import UTC, ensure_shanghai, shanghai_now, utc_now
+from yuxi.utils.datetime_utils import UTC, ensure_shanghai, ensure_utc, shanghai_now, utc_now
 from yuxi.utils.logging_config import logger
 
 
@@ -740,7 +741,7 @@ async def get_call_timeseries_stats(
 ):
     """获取调用分析时间序列统计（超级管理员权限）"""
     try:
-        from yuxi.storage.postgres.models_business import Conversation, Message, ToolCall
+        from yuxi.storage.postgres.models_business import AgentRun, Conversation, ToolCall
 
         # 计算时间范围（使用北京时间 UTC+8）
         now = utc_now()
@@ -750,7 +751,6 @@ async def get_call_timeseries_stats(
             intervals = 14
             # 包含当前小时：从13小时前开始
             start_time = now - timedelta(hours=intervals - 1)
-            group_format = _get_time_group_format(Message.created_at, time_range)
             base_local_time = ensure_shanghai(start_time)
         elif time_range == "14weeks":
             intervals = 14
@@ -759,36 +759,57 @@ async def get_call_timeseries_stats(
             local_start = local_start - timedelta(days=local_start.weekday())
             local_start = local_start.replace(hour=0, minute=0, second=0, microsecond=0)
             start_time = local_start.astimezone(UTC)
-            group_format = _get_time_group_format(Message.created_at, time_range)
             base_local_time = local_start
         else:  # 14days (default)
             intervals = 14
             # 包含当前天：从13天前开始
             start_time = now - timedelta(days=intervals - 1)
-            group_format = _get_time_group_format(Message.created_at, time_range)
             base_local_time = ensure_shanghai(start_time)
 
         # Convert start_time to naive UTC datetime for PostgreSQL query
         # PostgreSQL with asyncpg and naive DateTime columns requires naive datetime objects
         query_start_time = start_time.replace(tzinfo=None)
 
+        def usage_date_key(created_at: datetime) -> str:
+            """将 AgentRun UTC 时间归入 Dashboard 的北京时间桶。"""
+            local = ensure_shanghai(ensure_utc(created_at))
+            if time_range == "14hours":
+                return local.strftime("%Y-%m-%d %H:00")
+            if time_range == "14weeks":
+                iso_year, iso_week, _ = local.isocalendar()
+                return f"{iso_year}-{iso_week:02d}"
+            return local.strftime("%Y-%m-%d")
+
+        async def load_usage_rows() -> list:
+            """从 AgentRun 稳定用量事实构造现有时间序列协议。"""
+            rows = (
+                await db.execute(
+                    select(AgentRun.created_at, AgentRun.token_usage).where(
+                        AgentRun.created_at >= query_start_time,
+                    )
+                )
+            ).all()
+            grouped: dict[tuple[str, str], int] = {}
+            for created_at, envelope in rows:
+                envelope = envelope or {}
+                run = envelope.get("run") or {}
+                if type == "models":
+                    for model_name, bucket in (run.get("models") or {}).items():
+                        key = (usage_date_key(created_at), model_name)
+                        grouped[key] = grouped.get(key, 0) + int(bucket.get("model_call_count") or 0)
+                else:
+                    total = run.get("total") or envelope
+                    for category in ("input_tokens", "output_tokens"):
+                        key = (usage_date_key(created_at), category)
+                        grouped[key] = grouped.get(key, 0) + int(total.get(category) or 0)
+            return [
+                SimpleNamespace(date=date, category=category, count=count)
+                for (date, category), count in grouped.items()
+            ]
+
         # 根据类型查询数据
         if type == "models":
-            # 模型调用统计（基于消息数量，按模型分组）
-            # 从message的extra_metadata中提取模型信息
-            category_expr = cast(Message.extra_metadata["response_metadata"]["model_name"], String)
-            query_result = await db.execute(
-                select(
-                    group_format.label("date"),
-                    func.count(Message.id).label("count"),
-                    category_expr.label("category"),
-                )
-                .filter(Message.role == "assistant", Message.created_at >= query_start_time)
-                .filter(Message.extra_metadata.isnot(None))
-                .group_by(group_format, category_expr)
-                .order_by(group_format)
-            )
-            query = query_result.all()
+            query = await load_usage_rows()
         elif type == "agents":
             # 智能体调用统计（基于对话更新时间，按智能体分组）
             # 为对话创建独立的时间格式化器（使用 PostgreSQL 兼容的 to_char + INTERVAL）
@@ -807,55 +828,7 @@ async def get_call_timeseries_stats(
             )
             query = query_result.all()
         elif type == "tokens":
-            # Token消耗统计（区分input/output tokens）
-            # 先查询input tokens
-            from sqlalchemy import literal
-
-            input_query_result = await db.execute(
-                select(
-                    group_format.label("date"),
-                    func.sum(
-                        func.coalesce(
-                            cast(cast(Message.extra_metadata["usage_metadata"]["input_tokens"], String), Integer), 0
-                        )
-                    ).label("count"),
-                    literal("input_tokens").label("category"),
-                )
-                .filter(
-                    Message.created_at >= query_start_time,
-                    Message.extra_metadata.isnot(None),
-                    Message.extra_metadata["usage_metadata"].isnot(None),
-                )
-                .group_by(group_format)
-                .order_by(group_format)
-            )
-            input_query = input_query_result.all()
-
-            # 查询output tokens
-            output_query_result = await db.execute(
-                select(
-                    group_format.label("date"),
-                    func.sum(
-                        func.coalesce(
-                            cast(cast(Message.extra_metadata["usage_metadata"]["output_tokens"], String), Integer), 0
-                        )
-                    ).label("count"),
-                    literal("output_tokens").label("category"),
-                )
-                .filter(
-                    Message.created_at >= query_start_time,
-                    Message.extra_metadata.isnot(None),
-                    Message.extra_metadata["usage_metadata"].isnot(None),
-                )
-                .group_by(group_format)
-                .order_by(group_format)
-            )
-            output_query = output_query_result.all()
-
-            # 合并两个查询结果
-            input_results = input_query
-            output_results = output_query
-            results = input_results + output_results
+            results = await load_usage_rows()
         elif type == "tools":
             # 工具调用统计（按工具名称分组）
             # 为工具调用创建独立的时间格式化器（使用 PostgreSQL 兼容的 to_char + INTERVAL）

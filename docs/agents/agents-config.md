@@ -36,11 +36,15 @@ context_schema
 | `mcps` | 每轮在服务进程装配的 HTTP MCP |
 | `skills` | 创建会话时安装到 workspace 的 Skills |
 | `max_execution_steps` | AgentScope `react_config.max_iters`，默认 300 |
+| `summary_trigger_ratio` | 触发 AgentScope 上下文压缩的窗口比例 |
+| `summary_reserve_ratio` | 压缩后为后续回复保留的窗口比例 |
+| `summary_prompt` | 可选的上下文压缩提示词 |
+| `summary_tool_result_token_limit` | 压缩阶段保留的工具结果 Token 上限 |
 | `thread_id` / `uid` / `run_id` / `request_id` | 运行标识，不作为表单字段展示 |
 
 `ChatBotContext` 增加 `subagents`。`SubAgentContext` 保留父线程等隐藏字段供管理接口识别，但旧 LangGraph 子任务执行体已经移除。
 
-旧版 `summary_threshold`、`summary_keep_messages`、`summary_prompt`、`summary_tool_result_token_limit`、`summary_l2_trigger_ratio` 和 `model_retry_times` 已删除。AgentScope 当前不消费这些配置，继续展示会形成“能保存但不生效”的错误契约。
+旧版 `summary_threshold`、`summary_keep_messages`、`summary_l2_trigger_ratio` 和 `model_retry_times` 已删除。上述四个 Summary 字段会投影为 AgentScope `ContextConfig`；模型目录的 `context_length` 通过 Yuxi Credential/ChatModel adapter 作为真实上下文窗口参与压缩判断。
 
 资源字段的空值语义需要区分：
 
@@ -69,14 +73,16 @@ AgentScope agent 创建请求包含 `system_prompt` 和 `react_config.max_iters`
 - 知识库工具在 AgentScope 服务进程执行，并在调用时再次校验用户可见性。
 - HTTP MCP 使用 AgentScope 无状态 `MCPClient` 在服务进程执行；URL、Header 和凭据不写入 Docker workspace。
 - `disabled_tools`、MCP 更新和删除会在下一轮工具构建时生效；不可达 MCP 会显式使本轮失败。
-- stdio MCP 不进入当前运行路径。
+- 内置 stdio MCP 只从代码注册表装配，发现和每次调用均使用独立短连接；数据库中的用户 stdio 配置继续拒绝。
 - `present_artifacts` 读取 AgentScope workspace 的 `/workspace/outputs`；OCR 和网页搜索只在对应服务或凭据已配置时装配。
 
 ### 3.3 附件、事件和状态
 
 附件先由 Yuxi 校验归属、数量和大小，再上传到当前 AgentScope session 的 `/workspace/uploads`。模型只收到 workspace 路径，不会把整份文件作为长文本内联。
 
-AgentScope 事件经 gateway 转换为既有 Run SSE；助手消息、Run 终态和 token usage 回写 Yuxi PostgreSQL。线程状态由 `ThreadStateService` 聚合 Conversation/Message、AgentRun、Redis 挂起事件和 workspace 产物，不读取旧 checkpoint。
+AgentScope 事件经 gateway 转换为既有 Run SSE；助手消息、Run 终态和 token usage 回写 Yuxi PostgreSQL。模型调用前的 middleware 记录上下文窗口、输入构成、Summary 阈值和压缩状态；线程状态聚合当前 Run 与线程累计用量，Dashboard 从 AgentRun 统计。文件状态保留目录节点并显式返回 500 项截断标记，不再静默丢弃。
+
+Team 采用保留模式：`AgentCreate` 创建的 worker 在父 Thread 生命周期内复用，worker 回复投影为 child Conversation/AgentRun；child 不进入普通会话列表，但可从父线程运行状态下钻。父 Thread 删除时才清理 AgentScope Team/Session 并停用 binding。
 
 ## 4. 自定义 backend 和运行能力
 

@@ -30,7 +30,10 @@ async def test_worker_preserves_mixed_approval_decisions(monkeypatch):
         input_payload={},
     )
     message = SimpleNamespace(extra_metadata={"resume": {"decisions": [{"type": "approve"}, {"type": "reject"}]}})
-    mapping = SimpleNamespace(agentscope_agent_id="agent-id", agentscope_session_id="session-id")
+    mapping = SimpleNamespace(
+        agentscope_agent_id="agent-id",
+        agentscope_session_id="session-id",
+    )
     pending = {
         "type": "REQUIRE_USER_CONFIRM",
         "reply_id": "reply",
@@ -65,7 +68,10 @@ async def test_resume_failure_keeps_pending_confirmation(monkeypatch):
         input_payload={},
     )
     message = SimpleNamespace(extra_metadata={"resume": {"decisions": [{"type": "approve"}]}})
-    mapping = SimpleNamespace(agentscope_agent_id="agent-id", agentscope_session_id="session-id")
+    mapping = SimpleNamespace(
+        agentscope_agent_id="agent-id",
+        agentscope_session_id="session-id",
+    )
     pending = {
         "type": "REQUIRE_USER_CONFIRM",
         "reply_id": "reply",
@@ -94,7 +100,11 @@ async def test_resume_streams_reasoning_tools_and_terminal_event(monkeypatch):
         request_id="request",
         conversation_thread_id="thread",
     )
-    mapping = SimpleNamespace(agentscope_agent_id="agent-id", agentscope_session_id="session-id")
+    mapping = SimpleNamespace(
+        agentscope_agent_id="agent-id",
+        agentscope_session_id="session-id",
+        model_spec="provider:model",
+    )
     confirm_event = {
         "reply_id": "reply",
         "tool_calls": [

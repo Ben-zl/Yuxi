@@ -45,6 +45,7 @@ async def execute_run(
         thread_id=run.conversation_thread_id,
         read_timeout=read_timeout,
         image_content=image_content,
+        configured_model_spec=mapping.model_spec,
     )
     await finalize_run(db, run, result)
     return result

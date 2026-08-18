@@ -103,6 +103,15 @@ def event_to_chunks(event: dict, *, request_id: str) -> list[dict]:
         else:
             msg["reasoning_content"] = event.get("delta", "")
         return [make_chunk(request_id, status="loading", msg=msg)]
+    if event_type == "CUSTOM" and event.get("name") == "context_compression":
+        value = event.get("value") if isinstance(event.get("value"), dict) else {}
+        return [
+            make_chunk(
+                request_id,
+                status="context_compression",
+                compression={"type": "yuxi.context_compression", **value},
+            )
+        ]
     return []
 
 

@@ -10,6 +10,9 @@ from typing import Any
 import httpx
 import pytest
 
+from test.e2e.agentscope_e2e_fixtures import PROVIDER_ID, upsert_mock_provider
+from yuxi.storage.postgres.manager import pg_manager
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.e2e, pytest.mark.slow]
 
 
@@ -35,10 +38,17 @@ async def _create_steer_agent(
     uid: str,
 ) -> str:
     """创建只开放沙盒基础能力的临时真实模型 Agent。"""
+    pg_manager.initialize()
+    async with pg_manager.get_async_session_context() as db:
+        await upsert_mock_provider(db)
+    refresh = await client.post("/api/system/model-providers/models/cache/refresh", headers=headers)
+    assert refresh.status_code == 200, refresh.text
+
     slug = f"e2e-steer-agent-{uuid.uuid4().hex[:8]}"
     context: dict[str, Any] = {
+        "model": f"{PROVIDER_ID}:mock-chat-model",
         "system_prompt": (
-            "你是 Steer 端到端测试智能体。用户消息以 SLOW_TOOL 开头时，必须立即且仅调用一次 execute，"
+            "你是 Steer 端到端测试智能体。用户消息以 SLOW_TOOL 开头时，必须立即且仅调用一次 Bash，"
             "command 必须是 `sleep 12 && echo TOOL_FINISHED`；工具结束后原任务本应回答 OLD_SHOULD_NOT_COMPLETE。"
             "用户消息以 STEER 开头时，禁止调用工具；如果上下文中能看到工具结果 TOOL_FINISHED，"
             "只回答 STEER_COMPLETE TOOL_CONTEXT_OK，否则只回答 STEER_COMPLETE TOOL_CONTEXT_MISSING。"
@@ -76,7 +86,7 @@ async def _watch_run_until_end(
     run_id: str,
     tool_started: asyncio.Event,
 ) -> list[str]:
-    """消费真实 Run SSE，并在 execute tool call 出现时通知测试主协程。"""
+    """消费真实 Run SSE，并在 Bash tool call 出现时通知测试主协程。"""
     data_lines: list[str] = []
     async with client.stream("GET", f"/api/agent/runs/{run_id}/events", headers=headers) as response:
         assert response.status_code == 200, await response.aread()
@@ -85,7 +95,7 @@ async def _watch_run_until_end(
                 continue
             payload = line[6:]
             data_lines.append(payload)
-            if "execute" in payload and "sleep 12" in payload:
+            if "Bash" in payload and "sleep 12" in payload:
                 tool_started.set()
     return data_lines
 
@@ -133,7 +143,7 @@ async def test_real_tool_steer_runs_next_from_checkpoint(
     e2e_headers: dict[str, str],
     e2e_agent_context: dict[str, str],
 ):
-    """工具不中断，安全点后旧 Run 完成并由 Steer 作为下一条请求执行。"""
+    """工具不中断，安全点后旧 Run 中断并由 Steer 作为下一条请求执行。"""
     uid = e2e_agent_context["uid"]
     agent_slug = await _create_steer_agent(e2e_client, e2e_headers, uid)
     thread_id = await _create_thread(e2e_client, e2e_headers, agent_slug)
@@ -195,8 +205,10 @@ async def test_real_tool_steer_runs_next_from_checkpoint(
         )
         target_events = await asyncio.wait_for(target_stream_task, timeout=30)
 
-        assert target_run["status"] == "completed"
+        assert target_run["status"] == "interrupted"
         assert replacement_run["status"] == "completed"
+        assert target_run["token_usage"]["run"]["total"]["total_tokens"] == 30
+        assert replacement_run["token_usage"]["run"]["total"]["total_tokens"] == 30
         assert "TOOL_FINISHED" in "\n".join(target_events)
         assert "OLD_SHOULD_NOT_COMPLETE" not in "\n".join(target_events)
 
@@ -207,5 +219,25 @@ async def test_real_tool_steer_runs_next_from_checkpoint(
         assert "TOOL_CONTEXT_OK" in history_text
         assert "TOOL_CONTEXT_MISSING" not in history_text
         assert "STEER：改为直接确认引导成功" in history_text
+
+        state_response = await e2e_client.get(f"/api/chat/thread/{thread_id}/state", headers=e2e_headers)
+        assert state_response.status_code == 200, state_response.text
+        token_usage = state_response.json()["agent_state"]["token_usage"]
+        assert token_usage["run"]["total"]["total_tokens"] == 30
+        assert token_usage["thread"]["total"]["total_tokens"] == 60
+        assert token_usage["llm_input_tokens"] > 0
+        assert token_usage["context_window"] == 32768
+        assert token_usage["summary_trigger_tokens"] == 26214
+        assert token_usage["tools_tokens"] > 0
+        assert token_usage["tool_count"] > 0
+
+        dashboard_response = await e2e_client.get(
+            "/api/dashboard/stats/calls/timeseries?type=tokens&time_range=14hours",
+            headers=e2e_headers,
+        )
+        assert dashboard_response.status_code == 200, dashboard_response.text
+        dashboard = dashboard_response.json()
+        assert {"input_tokens", "output_tokens"} <= set(dashboard["categories"])
+        assert dashboard["total_count"] >= 60
     finally:
         await e2e_client.delete(f"/api/agent/{agent_slug}", headers=e2e_headers)

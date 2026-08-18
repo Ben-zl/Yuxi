@@ -149,7 +149,13 @@ def _build_run_response(run) -> dict:
 
 
 def _validate_resume_input(resume: object) -> None:
-    if not isinstance(resume, dict) or "decisions" not in resume:
+    if not isinstance(resume, dict):
+        return
+    if "answer" in resume:
+        answer = resume.get("answer")
+        if answer is None or answer == {} or answer == [] or (isinstance(answer, str) and not answer.strip()):
+            raise HTTPException(status_code=422, detail="answer 不能为空")
+    if "decisions" not in resume:
         return
     decisions = resume.get("decisions")
     if not isinstance(decisions, list) or not decisions:
@@ -897,6 +903,9 @@ async def request_cancel_agent_run(
     run = await repo.request_cancel(run_id)
     cancelled_ids.append(run_id)
     await db.commit()
+    from yuxi.agentscope.team_lifecycle import interrupt_team_worker_runs
+
+    await interrupt_team_worker_runs(uid=str(current_uid), run_ids=cancelled_ids)
     await asyncio.gather(*(publish_cancel_signal(cid) for cid in cancelled_ids))
     return run
 

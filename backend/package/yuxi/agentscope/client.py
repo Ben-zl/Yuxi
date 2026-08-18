@@ -6,6 +6,7 @@ service；身份以 X-User-ID 头透传，接入统一认证后在网关注入�
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
@@ -20,6 +21,14 @@ class AgentScopeServiceError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class WorkspaceFileListing:
+    """一次 workspace 递归枚举的条目及完整性。"""
+
+    items: list[dict]
+    truncated: bool = False
 
 
 def _sniff_image_media_type(b64: str) -> str:
@@ -319,11 +328,15 @@ class AgentScopeServiceClient:
         *,
         root: str = "",
         max_entries: int = 500,
-    ) -> list[dict]:
-        """递归列出会话 workspace 文件，限制条目数避免状态接口失控。"""
+    ) -> WorkspaceFileListing:
+        """递归列出会话 workspace 条目，并显式报告数量截断。"""
         pending = [root]
-        files: list[dict] = []
-        while pending and len(files) < max_entries:
+        items: list[dict] = []
+        truncated = False
+        while pending:
+            if len(items) >= max_entries:
+                truncated = True
+                break
             path = pending.pop(0)
             resp = await self._request(
                 "GET",
@@ -334,15 +347,17 @@ class AgentScopeServiceClient:
             listing = resp.json()
             base = str(listing.get("path") or "").rstrip("/")
             for entry in listing.get("entries", []):
+                if len(items) >= max_entries:
+                    truncated = True
+                    break
                 item = dict(entry)
                 item["path"] = f"{base}/{entry['name']}"
+                items.append(item)
                 if item.get("is_dir"):
                     pending.append(item["path"])
-                else:
-                    files.append(item)
-                    if len(files) >= max_entries:
-                        break
-        return files
+        if pending:
+            truncated = True
+        return WorkspaceFileListing(items=items, truncated=truncated)
 
     async def list_workspace_directory(
         self,

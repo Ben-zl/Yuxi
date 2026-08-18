@@ -21,6 +21,7 @@ from yuxi.agentscope.protocol import (
 from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
 from yuxi.agentscope.runner import SUBSCRIBE_SETTLE_SECONDS
 from yuxi.services.run_queue_service import append_run_stream_event
+from yuxi.agentscope.usage import UsageAccumulator
 
 
 # team 编排轮次的静默收束参数：REPLY_END 后成员回报（wakeup）可能驱动
@@ -29,15 +30,6 @@ from yuxi.services.run_queue_service import append_run_stream_event
 TEAM_TOOL_NAMES = {"TeamCreate", "AgentCreate", "TeamSay", "TeamInvite"}
 TEAM_QUIESCE_SECONDS = 45.0
 TEAM_EXTENSION_BUDGET_SECONDS = 600.0
-
-
-def _usage(input_tokens: int, output_tokens: int) -> dict:
-    """按 AgentRun.token_usage 口径聚合一轮对话的模型用量。"""
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
-    }
 
 
 @dataclass
@@ -116,6 +108,7 @@ async def stream_round_to_run_events(
     thread_id: str,
     read_timeout: float = READ_TIMEOUT_SECONDS,
     image_content: str | None = None,
+    configured_model_spec: str | None = None,
 ) -> GatewayRoundResult:
     """触发一轮对话，事件实时转换为 chunk 并写入 run 事件流，直至终态。
 
@@ -153,8 +146,7 @@ async def stream_round_to_run_events(
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         event_count = 0
-        input_tokens = 0
-        output_tokens = 0
+        usage = UsageAccumulator(configured_model_spec=configured_model_spec)
         tool_converter = ToolEventConverter(request_id)
         team_tool_seen = False
         pending_terminal = None  # team 静默期内暂存的终态，收束时落 end 帧
@@ -177,9 +169,10 @@ async def stream_round_to_run_events(
             if isinstance(event, Exception):
                 raise event
             event_type = str(event.get("type", "")).upper()
+            usage.observe(event)
             event_reply_id = str(event.get("reply_id") or "")
             if event_type == "CUSTOM" and event.get("name") == "state_updated":
-                files = await client.list_workspace_files(uid, agent_id, session_id)
+                listing = await client.list_workspace_files(uid, agent_id, session_id)
                 state_chunk = make_chunk(
                     request_id,
                     status="agent_state",
@@ -187,7 +180,8 @@ async def stream_round_to_run_events(
                         "todos": tasks_to_todos(
                             (event.get("value") or {}).get("tasks_context") or {}
                         ),
-                        "files": files_to_state(files),
+                        "files": files_to_state(listing.items),
+                        "files_truncated": listing.truncated,
                     },
                 )
                 await append_run_stream_event(
@@ -196,6 +190,16 @@ async def stream_round_to_run_events(
                     {"items": [state_chunk]},
                     thread_id=thread_id,
                 )
+                continue
+            if event_type == "CUSTOM" and event.get("name") == "context_compression":
+                await append_run_stream_event(
+                    run_id,
+                    "messages",
+                    {"items": event_to_chunks(event, request_id=request_id)},
+                    thread_id=thread_id,
+                )
+                continue
+            if event_type == "CUSTOM" and event.get("name") == "token_context":
                 continue
             if not event_reply_id:
                 continue
@@ -232,7 +236,7 @@ async def stream_round_to_run_events(
                     reasoning="".join(reasoning_parts),
                     event_count=event_count + 1,
                     parked=parked,
-                    usage=_usage(input_tokens, output_tokens),
+                    usage=usage.snapshot(complete=False),
                     pending_confirm=event,
                     tool_calls=tool_converter.history_tool_calls(),
                 )
@@ -253,7 +257,7 @@ async def stream_round_to_run_events(
                         reasoning="".join(reasoning_parts),
                         event_count=event_count,
                         error_message=terminal.chunk.get("error_message"),
-                        usage=_usage(input_tokens, output_tokens),
+                        usage=usage.snapshot(complete=True),
                         tool_calls=tool_converter.history_tool_calls(),
                     )
                 # team 轮次：暂存终态，等待成员回报驱动的续写（静默窗口）
@@ -268,9 +272,6 @@ async def stream_round_to_run_events(
                 text_parts.append(event.get("delta", ""))
             elif event_type == "THINKING_BLOCK_DELTA":
                 reasoning_parts.append(event.get("delta", ""))
-            elif event_type == "MODEL_CALL_END":
-                input_tokens += int(event.get("input_tokens") or 0)
-                output_tokens += int(event.get("output_tokens") or 0)
             chunks = event_to_chunks(event, request_id=request_id)
             chunks.extend(tool_converter.feed(event))
             if chunks:
@@ -289,7 +290,7 @@ async def stream_round_to_run_events(
             reasoning="".join(reasoning_parts),
             event_count=event_count,
             error_message=pending_terminal.chunk.get("error_message"),
-            usage=_usage(input_tokens, output_tokens),
+            usage=usage.snapshot(complete=True),
             tool_calls=tool_converter.history_tool_calls(),
         )
     finally:
