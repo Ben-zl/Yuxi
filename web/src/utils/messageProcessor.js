@@ -126,7 +126,10 @@ export class MessageProcessor {
 
         const filepaths = Array.isArray(args?.filepaths) ? args.filepaths : []
         for (const filepath of filepaths) {
-          const normalizedPath = typeof filepath === 'string' ? filepath.trim() : ''
+          const rawPath = typeof filepath === 'string' ? filepath.trim() : ''
+          const normalizedPath = rawPath.startsWith('/workspace/outputs/')
+            ? `/home/gem/user-data/outputs/${rawPath.slice('/workspace/outputs/'.length)}`
+            : rawPath
           if (!normalizedPath || seenPaths.has(normalizedPath)) continue
           seenPaths.add(normalizedPath)
           artifacts.push(normalizedPath)

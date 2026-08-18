@@ -14,7 +14,7 @@ test('交付物只归属于调用 present_artifacts 的对话', () => {
             tool_call_result: { content: '已将交付物展示给用户' },
             args: JSON.stringify({
               filepaths: [
-                '/home/gem/user-data/outputs/bubble_sort.py',
+                '/workspace/outputs/bubble_sort.py',
                 '/home/gem/user-data/outputs/bubble_sort.js'
               ]
             })
