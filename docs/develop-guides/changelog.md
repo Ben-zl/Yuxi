@@ -13,6 +13,7 @@
 
 - 完成 AgentScope 收口：统一投影逐轮装配 HTTP MCP、知识库与按用户/session 隔离的 Team worker 模板，凭据不进入 workspace；动态模板自动保留 `TeamSay` 回报协议，避免自定义系统提示覆盖团队协作约束；失败运行会继续派发 FIFO；线程状态改由 Yuxi 事实源聚合；移除 LangChain/LangGraph/DeepAgents 运行代码、依赖及无效摘要配置。
 - 补齐 AgentScope 功能对齐：Team worker 采用父线程生命周期保留模式并投影 child 历史；Token 卡片与 Dashboard 使用真实 Run/线程累计用量；Summary 配置映射到 AgentScope 上下文压缩；文件树保留目录并提示 500 项截断；Steer 仅在工具批次后的安全点接力；主动提问支持刷新恢复与回答续接。
+- 新增 Agent 任务中心（工单 01）：以 NativeScheduleBlockMiddleware 在模型调用边界移除 AgentScope 原生 Schedule 工具，所有定时触发统一走 Yuxi 的 AgentTask/TaskExecution 事实链路；既有工具、审批与 AgentRun 链路回归通过。
 - 恢复内置 stdio MCP：仅代码注册表可启动，发现与调用使用独立短连接；HTTP MCP 继续在服务进程执行。MCP 禁用、配置更新、删除下一轮生效，并按远端原始工具名过滤。
 
 - AgentScope 网关承接队列执行、持久 Session、审批/取消/steer、Team、Skills、KB 和隔离 workspace；生产 Compose 同步新增内部 AgentScope 服务与固定切换时间配置。

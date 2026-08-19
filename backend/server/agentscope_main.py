@@ -64,6 +64,7 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
     """
     from agentscope.middleware import TracingMiddleware
     from yuxi.agentscope.middleware import (
+        NativeScheduleBlockMiddleware,
         build_context_observability_middleware,
         build_steer_middleware,
         build_team_lifecycle_middleware,
@@ -71,6 +72,7 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
 
     middlewares = [
         TracingMiddleware(),
+        NativeScheduleBlockMiddleware(),
         build_context_observability_middleware(app.state.message_bus, session_id),
     ]
     team_lifecycle = await build_team_lifecycle_middleware(app.state.storage, user_id, agent_id, session_id)

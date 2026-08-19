@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from agentscope.message import TextBlock
+from agentscope.model import ChatResponse, ChatUsage
 from agentscope.tool import ToolChunk
 
 from yuxi.agentscope.middleware import (
@@ -108,6 +109,60 @@ async def test_context_observability_publishes_token_context_before_model_call()
     assert snapshot["summary_trigger_tokens"] == 800
     assert snapshot["summary_active"] is True
     assert snapshot["tool_count"] == 1
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_context_observability_publishes_complete_model_usage(stream):
+    """模型观测保留普通输入与 Anthropic 缓存输入的原始分类。"""
+    events = []
+
+    class Bus:
+        async def session_publish_event(self, _session_id, event):
+            events.append(event)
+
+    response = ChatResponse(
+        content=[],
+        is_last=True,
+        usage=ChatUsage(
+            input_tokens=39,
+            output_tokens=5,
+            time=0.1,
+            cache_creation_input_tokens=3,
+            cache_input_tokens=128,
+        ),
+    )
+
+    async def response_stream():
+        yield ChatResponse(content=[], is_last=False)
+        yield response
+
+    async def next_handler(**_kwargs):
+        return response_stream() if stream else response
+
+    model = SimpleNamespace(context_size=1000, count_tokens=AsyncMock(return_value=170))
+    agent = SimpleNamespace(
+        state=SimpleNamespace(context=[], summary="", reply_id="reply-1"),
+        context_config=SimpleNamespace(trigger_ratio=0.8),
+    )
+    result = await ContextObservabilityMiddleware(Bus(), "session-1").on_model_call(
+        agent,
+        {"current_model": model, "messages": [], "tools": []},
+        next_handler,
+    )
+    if stream:
+        assert [item async for item in result][-1] is response
+    else:
+        assert result is response
+
+    usage_event = events[-1]
+    assert usage_event["name"] == "model_usage"
+    assert usage_event["value"] == {
+        "reply_id": "reply-1",
+        "input_tokens": 39,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 3,
+        "cache_read_input_tokens": 128,
+    }
 
 
 async def test_context_observability_publishes_compression_lifecycle():
@@ -212,3 +267,53 @@ async def test_only_worker_reply_enters_team_lifecycle_projection():
     assert calls == []
     assert [item async for item in worker.on_reply(None, {"inputs": "worker"}, next_handler)] == ["reply"]
     assert calls == [{"inputs": "worker"}]
+
+
+async def test_native_schedule_tools_filtered_from_model_call():
+    """任务中心工单 01：原生 Schedule 工具不得进入模型请求的工具面。"""
+    from yuxi.agentscope.middleware import NativeScheduleBlockMiddleware
+
+    mw = NativeScheduleBlockMiddleware()
+    seen: dict = {}
+
+    async def next_handler(**kwargs):
+        seen.update(kwargs)
+        return "model-response"
+
+    result = await mw.on_model_call(
+        None,
+        {
+            "messages": [],
+            "tools": [
+                {"type": "function", "function": {"name": "Bash"}},
+                {"type": "function", "function": {"name": "ScheduleCreate"}},
+                {"type": "function", "function": {"name": "ScheduleList"}},
+                {"type": "function", "function": {"name": "ScheduleView"}},
+                {"type": "function", "function": {"name": "ScheduleDelete"}},
+                {"type": "function", "function": {"name": "TeamSay"}},
+            ],
+            "tool_choice": None,
+        },
+        next_handler,
+    )
+    names = [t["function"]["name"] for t in seen["tools"]]
+    assert result == "model-response"
+    assert names == ["Bash", "TeamSay"]
+    assert not any(n.startswith("Schedule") for n in names)
+
+
+async def test_native_schedule_block_keeps_calls_without_tools():
+    """无 tools 或空 tools 的模型调用原样透传。"""
+    from yuxi.agentscope.middleware import NativeScheduleBlockMiddleware
+
+    mw = NativeScheduleBlockMiddleware()
+    seen: dict = {}
+
+    async def next_handler(**kwargs):
+        seen.update(kwargs)
+        return "ok"
+
+    r1 = await mw.on_model_call(None, {"messages": [], "tools": None, "tool_choice": None}, next_handler)
+    r2 = await mw.on_model_call(None, {"messages": [], "tools": [], "tool_choice": None}, next_handler)
+    assert r1 == r2 == "ok"
+    assert seen["tools"] in (None, [])

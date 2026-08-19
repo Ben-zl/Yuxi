@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -35,6 +35,36 @@ class SteerMiddleware(MiddlewareBase):
             raise asyncio.CancelledError
 
 
+# AgentScope 原生 Schedule 工具名前缀：平台层会话调度与 Yuxi 的
+# AgentTask/TaskExecution 事实链路冲突，统一在此从模型工具面移除。
+NATIVE_SCHEDULE_TOOL_PREFIX = "Schedule"
+
+
+class NativeScheduleBlockMiddleware(MiddlewareBase):
+    """从模型请求的工具面移除 AgentScope 原生 Schedule 工具。
+
+    任务中心（父规格 #958）要求所有受支持触发都产生 Yuxi 的
+    TaskExecution/AgentRun 事实；原生 ScheduleCreate 等工具允许智能体
+    绕过该链路自建定时执行，故在 on_model_call 边界统一过滤。
+    """
+
+    async def on_model_call(self, agent, input_kwargs, next_handler):
+        """剔除 Schedule* 工具 schema 后透传模型调用。"""
+        tools = input_kwargs.get("tools")
+        if tools:
+            kept = [
+                tool
+                for tool in tools
+                if not str(
+                    (tool.get("function") or {}).get("name")
+                    or tool.get("name")
+                    or ""
+                ).startswith(NATIVE_SCHEDULE_TOOL_PREFIX)
+            ]
+            input_kwargs = {**input_kwargs, "tools": kept}
+        return await next_handler(**input_kwargs)
+
+
 class ContextObservabilityMiddleware(MiddlewareBase):
     """发布 Token 上下文快照与压缩生命周期，供 Yuxi 状态面板消费。"""
 
@@ -48,6 +78,35 @@ class ContextObservabilityMiddleware(MiddlewareBase):
             self._session_id,
             event.model_dump(mode="json"),
         )
+
+    async def _publish_model_usage(self, response: Any, reply_id: str) -> None:
+        """发布模型原始用量，保留 Anthropic 缓存输入分类。"""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        await self._publish(
+            "model_usage",
+            {
+                "reply_id": reply_id,
+                "input_tokens": max(int(getattr(usage, "input_tokens", 0) or 0), 0),
+                "output_tokens": max(int(getattr(usage, "output_tokens", 0) or 0), 0),
+                "cache_creation_input_tokens": max(
+                    int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+                    0,
+                ),
+                "cache_read_input_tokens": max(
+                    int(getattr(usage, "cache_input_tokens", 0) or 0),
+                    0,
+                ),
+            },
+        )
+
+    async def _observe_stream(self, stream: AsyncGenerator, reply_id: str) -> AsyncGenerator:
+        """透传流式响应，并在最终块到达时发布完整用量。"""
+        async for response in stream:
+            if getattr(response, "is_last", False):
+                await self._publish_model_usage(response, reply_id)
+            yield response
 
     @staticmethod
     def _estimate_tokens(value: Any) -> int:
@@ -122,7 +181,12 @@ class ContextObservabilityMiddleware(MiddlewareBase):
                 "measured_at": datetime.now(UTC).isoformat(),
             },
         )
-        return await next_handler(**input_kwargs)
+        response = await next_handler(**input_kwargs)
+        reply_id = str(getattr(agent.state, "reply_id", "") or "")
+        if isinstance(response, AsyncGenerator):
+            return self._observe_stream(response, reply_id)
+        await self._publish_model_usage(response, reply_id)
+        return response
 
     async def on_compress_context(self, agent, input_kwargs, next_handler):
         """把 AgentScope 压缩阶段映射为 main 分支已有的页面协议。"""
