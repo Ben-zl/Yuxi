@@ -65,6 +65,7 @@ cache
 *.local.js
 *.local.yaml
 *.local/*
+backend/package/yuxi/agents/skills/buildin/unity-profiler-analyzer/.upa-config.json
 
 *.pdf
 src/data

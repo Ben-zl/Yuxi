@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agentscope.message import TextBlock
+from agentscope.message import TextBlock, ToolResultState
 from agentscope.model import ChatResponse, ChatUsage
 from agentscope.tool import ToolChunk
 
@@ -14,6 +14,7 @@ from yuxi.agentscope.middleware import (
     ContextObservabilityMiddleware,
     SteerMiddleware,
     TeamLifecycleMiddleware,
+    build_team_lifecycle_middleware,
 )
 
 
@@ -222,6 +223,8 @@ async def test_team_delete_is_retained_without_calling_agentscope_delete():
 
     assert len(result) == 1
     assert "retained" in result[0].content[0].text
+    assert result[0].is_last is True
+    assert result[0].state == ToolResultState.SUCCESS
 
 
 async def test_agent_create_projects_the_single_roster_delta_before_returning_result():
@@ -267,6 +270,76 @@ async def test_only_worker_reply_enters_team_lifecycle_projection():
     assert calls == []
     assert [item async for item in worker.on_reply(None, {"inputs": "worker"}, next_handler)] == ["reply"]
     assert calls == [{"inputs": "worker"}]
+
+
+@pytest.mark.parametrize(
+    ("is_worker", "expected"),
+    [
+        (False, ["旧任务", "系统状态", "最新任务"]),
+        (True, ["系统状态", "最新任务"]),
+    ],
+)
+async def test_only_worker_reasoning_removes_stale_team_hints(is_worker, expected):
+    """只有 worker 推理会丢弃旧 Team 指令，leader 上下文必须保持不变。"""
+    content = [
+        SimpleNamespace(source='{"label":"team"}', hint="旧任务"),
+        SimpleNamespace(source='{"label":"system"}', hint="系统状态"),
+        SimpleNamespace(source='{"label":"team"}', hint="最新任务"),
+    ]
+    agent = SimpleNamespace(state=SimpleNamespace(context=[SimpleNamespace(content=content)]))
+
+    async def next_handler(**_kwargs):
+        yield "reasoning"
+
+    middleware = TeamLifecycleMiddleware(SimpleNamespace(), is_worker=is_worker)
+
+    assert [item async for item in middleware.on_reasoning(agent, {}, next_handler)] == ["reasoning"]
+    assert [block.hint for block in content] == expected
+
+
+async def test_worker_failure_notifier_targets_only_team_leader(monkeypatch):
+    """平台代发的 worker 失败不得广播并唤醒其他 Team 成员。"""
+    worker_session = SimpleNamespace(team_id="team-1")
+    team = SimpleNamespace(session_id="leader-session")
+    leader_session = SimpleNamespace(agent_id="leader-agent")
+    leader_agent = SimpleNamespace(data=SimpleNamespace(name="性能监控主智能体"))
+
+    class _Storage:
+        async def get_session(self, user_id, agent_id, session_id):
+            if session_id == "worker-session":
+                return worker_session
+            if session_id == "leader-session":
+                return leader_session
+            return None
+
+        async def get_team(self, user_id, team_id):
+            return team
+
+        async def get_agent(self, user_id, agent_id):
+            return leader_agent
+
+    calls = []
+
+    class _TeamSay:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __call__(self, *, content, to):
+            calls.append((content, to))
+            return SimpleNamespace(state=None)
+
+    monkeypatch.setattr("agentscope.app._tool.TeamSay", _TeamSay)
+    middleware = await build_team_lifecycle_middleware(
+        _Storage(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        "u",
+        "worker-agent",
+        "worker-session",
+    )
+
+    await middleware._lifecycle.failure_notifier("子智能体执行失败")
+    assert calls == [("子智能体执行失败", "性能监控主智能体")]
 
 
 async def test_native_schedule_tools_filtered_from_model_call():

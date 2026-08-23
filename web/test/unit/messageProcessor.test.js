@@ -3,6 +3,20 @@ import test from 'node:test'
 
 import { MessageProcessor } from '../../src/utils/messageProcessor.js'
 
+test('执行后取消的完整问答仍可组成历史对话', () => {
+  const conversations = MessageProcessor.convertServerHistoryToMessages([
+    { type: 'human', content: '查询性能', delivery_status: 'cancelled' },
+    { type: 'ai', content: '已生成部分结果', delivery_status: 'complete' }
+  ])
+
+  assert.equal(conversations.length, 1)
+  assert.equal(conversations[0].status, 'finished')
+  assert.deepEqual(
+    conversations[0].messages.map((message) => message.content),
+    ['查询性能', '已生成部分结果']
+  )
+})
+
 test('交付物只归属于调用 present_artifacts 的对话', () => {
   const artifactConversation = {
     messages: [

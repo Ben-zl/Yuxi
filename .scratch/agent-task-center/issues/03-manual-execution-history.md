@@ -4,7 +4,7 @@
 
 **Blocked by:** 02 — 建立个人 AgentTask 定义管理
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Source:** [父规格 #958](https://github.com/xerrors/Yuxi/issues/958)
 

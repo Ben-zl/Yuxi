@@ -929,10 +929,22 @@ async def get_thread_history_view(
         raise HTTPException(status_code=404, detail="对话线程不存在")
 
     messages = await conv_repo.get_messages_by_thread_id(thread_id)
+    runs_with_assistant_output = {
+        message.run_id for message in messages if message.role == "assistant" and message.run_id
+    }
     messages = [
         message
         for message in messages
-        if not (message.role == "user" and message.delivery_status in {"queued", "cancelled", "rejected"})
+        if not (
+            message.role == "user"
+            and (
+                message.delivery_status == "queued"
+                or (
+                    message.delivery_status in {"cancelled", "rejected"}
+                    and message.run_id not in runs_with_assistant_output
+                )
+            )
+        )
     ]
 
     run_ids_in_messages = {msg.run_id for msg in messages if msg.run_id}

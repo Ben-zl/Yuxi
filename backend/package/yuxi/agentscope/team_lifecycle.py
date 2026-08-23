@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,14 +32,38 @@ class TeamRosterSnapshot:
     members: dict[str, tuple[str, str]]
 
 
+def retain_latest_team_hint(agent) -> None:
+    """推理前移除旧 Team 消息，只让最新派发要求进入本轮模型输入。"""
+    context = list(getattr(agent.state, "context", None) or [])
+    if not context:
+        return
+    content = getattr(context[-1], "content", None)
+    if not isinstance(content, list):
+        return
+    team_indexes = [index for index, block in enumerate(content) if _is_team_hint(block)]
+    if len(team_indexes) <= 1:
+        return
+    latest = team_indexes[-1]
+    content[:] = [block for index, block in enumerate(content) if index not in team_indexes or index == latest]
+
+
 class TeamLifecycleModule:
     """隐藏 Team roster 差分、child Run 投影和 worker 事件持久化。"""
 
-    def __init__(self, *, storage, uid: str, agent_id: str, session_id: str):
+    def __init__(
+        self,
+        *,
+        storage,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        failure_notifier: Callable[[str], Awaitable[None]] | None = None,
+    ):
         self.storage = storage
         self.uid = str(uid)
         self.agent_id = agent_id
         self.session_id = session_id
+        self.failure_notifier = failure_notifier
 
     async def snapshot(self) -> TeamRosterSnapshot:
         """读取当前 Session 所属 Team 的显式 worker roster。"""
@@ -205,6 +230,9 @@ class TeamLifecycleModule:
         reasoning_parts: list[str] = []
         tool_converter: ToolEventConverter | None = None
         usage = UsageAccumulator(configured_model_spec=None)
+        failure_reported = False
+        reply_id: str | None = None
+        prompt: str | None = None
         try:
             async for item in next_handler(**input_kwargs):
                 event = item.model_dump(mode="json") if hasattr(item, "model_dump") else item
@@ -213,12 +241,18 @@ class TeamLifecycleModule:
                     continue
                 event_type = str(event.get("type") or "").upper()
                 if event_type == "REPLY_START":
-                    run_id, request_id = await self._open_worker_run(
-                        binding.worker_session_id,
-                        str(event.get("reply_id") or ""),
-                        input_kwargs,
-                    )
-                    tool_converter = ToolEventConverter(request_id)
+                    reply_id = str(event.get("reply_id") or "")
+                elif run_id is None and reply_id:
+                    if event_type == "HINT_BLOCK":
+                        prompt = _team_message_text(event) or prompt
+                    else:
+                        run_id, request_id = await self._open_worker_run(
+                            binding.worker_session_id,
+                            reply_id,
+                            input_kwargs,
+                            prompt=prompt,
+                        )
+                        tool_converter = ToolEventConverter(request_id)
                 if run_id and request_id:
                     usage.observe(event)
                     if event_type == "TEXT_BLOCK_DELTA":
@@ -237,10 +271,14 @@ class TeamLifecycleModule:
                         )
                     if event_type == "REPLY_END":
                         terminal = reply_end_to_terminal(event, request_id=request_id)
+                        error_message = (event.get("error") or {}).get("message") or terminal.chunk.get("error_message")
+                        if terminal.run_status == "failed":
+                            await self._report_worker_failure(error_message)
+                            failure_reported = True
                         await self._finish_worker_run(
                             run_id=run_id,
                             terminal_status=terminal.run_status,
-                            error_message=(event.get("error") or {}).get("message"),
+                            error_message=error_message,
                             text="".join(text_parts),
                             reasoning="".join(reasoning_parts),
                             usage=usage.snapshot(complete=True),
@@ -255,6 +293,8 @@ class TeamLifecycleModule:
                 yield item
         except BaseException as exc:
             if run_id:
+                if not failure_reported and not isinstance(exc, asyncio.CancelledError):
+                    await self._report_worker_failure(str(exc))
                 await self._finish_worker_run(
                     run_id=run_id,
                     terminal_status="failed",
@@ -265,6 +305,17 @@ class TeamLifecycleModule:
                     tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
                 )
             raise
+
+    async def _report_worker_failure(self, error_message: str | None) -> None:
+        """在 child Run 结束前向 leader 报告失败并触发续写。"""
+        if self.failure_notifier is None:
+            return
+        detail = error_message or "未知错误"
+        message = f"子智能体执行失败，未能返回结果：{detail}"
+        try:
+            await self.failure_notifier(message)
+        except Exception as exc:  # noqa: BLE001 - 通知失败不能阻断 child Run 终态持久化
+            logger.warning("Team worker 失败通知 leader 未送达 session=%s: %s", self.session_id, exc)
 
     async def _wait_for_binding(self):
         """吸收 AgentCreate 投影与 worker wakeup 的短暂竞态。"""
@@ -280,7 +331,14 @@ class TeamLifecycleModule:
         logger.debug("Team worker 没有 Yuxi 生命周期绑定 session=%s", self.session_id)
         return None
 
-    async def _open_worker_run(self, worker_session_id: str, reply_id: str, input_kwargs: dict) -> tuple[str, str]:
+    async def _open_worker_run(
+        self,
+        worker_session_id: str,
+        reply_id: str,
+        input_kwargs: dict,
+        *,
+        prompt: str | None = None,
+    ) -> tuple[str, str]:
         """复用首个投影 Run；后续 worker Reply 创建新的 child Run。"""
         async with pg_manager.get_async_session_context() as db:
             bindings = AgentScopeTeamWorkerRepository(db)
@@ -305,7 +363,7 @@ class TeamLifecycleModule:
             conversation = await ConversationRepository(db).get_conversation_by_thread_id(binding.child_thread_id)
             if relation is None or conversation is None:
                 raise ValueError("Team child Thread 投影已损坏")
-            prompt = _input_text(input_kwargs.get("inputs")) or "Team worker continuation"
+            prompt = prompt or _input_text(input_kwargs.get("inputs")) or "Team worker continuation"
             message = Message(
                 conversation_id=conversation.id,
                 role="user",
@@ -462,3 +520,32 @@ def _input_text(value: Any) -> str:
                 if text:
                     return text
     return ""
+
+
+def _is_team_hint(block: Any) -> bool:
+    """识别 AgentScope Team inbox 注入的 HintBlock。"""
+    source = getattr(block, "source", None)
+    if not isinstance(source, str):
+        return False
+    try:
+        return json.loads(source).get("label") == "team"
+    except (TypeError, ValueError):
+        return False
+
+
+def _team_message_text(event: dict[str, Any]) -> str:
+    """从 Team HintBlockEvent 中提取 leader 派发的正文。"""
+    source = event.get("source")
+    if not isinstance(source, str):
+        return ""
+    try:
+        if json.loads(source).get("label") != "team":
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    hint = str(event.get("hint") or "")
+    start = hint.find(">\n")
+    suffix = "\n</team-message>"
+    if start < 0 or not hint.endswith(suffix):
+        return ""
+    return hint[start + 2 : -len(suffix)].strip()

@@ -16,12 +16,14 @@ export * from './tool_api' // 工具 API
 export * from './mention_api' // 提及搜索 API
 export * from './user_api' // 用户资源 API
 export * from './user_config_api' // 用户配置 API
+export * from './agent_task_api' // Agent 任务中心 API
 
 // 导出基础工具函数
 export {
   apiGet,
   apiPost,
   apiPut,
+  apiPatch,
   apiDelete,
   apiAdminGet,
   apiAdminPost,

@@ -121,6 +121,61 @@ async def test_queue_history_keeps_each_request_with_its_reply(session):
     ]
 
 
+async def test_history_keeps_cancelled_request_when_run_has_assistant_output(session):
+    """执行后取消的 Run 已有回复时，历史必须保留完整问答。"""
+    started_at = datetime(2026, 8, 21, 13, 0, 0)
+    session.add(Conversation(id=1, thread_id="thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(
+        AgentRun(
+            id="run-cancelled",
+            conversation_thread_id="thread-1",
+            agent_slug="main",
+            uid="user-1",
+            request_id="request-cancelled",
+            conversation_id=1,
+            input_payload={},
+            status="cancelled",
+            created_at=started_at,
+        )
+    )
+    session.add_all(
+        [
+            Message(
+                id=1,
+                conversation_id=1,
+                role="user",
+                content="查询性能",
+                request_id="request-cancelled",
+                run_id="run-cancelled",
+                delivery_status="cancelled",
+                created_at=started_at,
+            ),
+            Message(
+                id=2,
+                conversation_id=1,
+                role="assistant",
+                content="已生成部分结果",
+                request_id="request-cancelled",
+                run_id="run-cancelled",
+                delivery_status="complete",
+                created_at=started_at + timedelta(seconds=1),
+            ),
+        ]
+    )
+    await session.commit()
+
+    response = await get_thread_history_view(
+        thread_id="thread-1",
+        current_uid="user-1",
+        db=session,
+    )
+
+    assert [message["content"] for message in response["history"]] == [
+        "查询性能",
+        "已生成部分结果",
+    ]
+
+
 async def test_history_restores_reasoning_and_tool_calls(session):
     """历史接口应恢复实时阶段可见的推理内容与工具执行详情。"""
     session.add(Conversation(id=1, thread_id="thread-1", uid="user-1", agent_id="main", status="active"))

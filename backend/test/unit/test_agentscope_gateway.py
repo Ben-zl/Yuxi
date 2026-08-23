@@ -46,7 +46,7 @@ def capture_events(monkeypatch):
 
     monkeypatch.setattr(gateway, "append_run_stream_event", _append)
     monkeypatch.setattr(gateway, "TEAM_QUIESCE_SECONDS", 0.3)
-    monkeypatch.setattr(gateway, "TEAM_EXTENSION_BUDGET_SECONDS", 3.0)
+    monkeypatch.setattr(gateway, "TEAM_CHILD_WAIT_SEGMENT_SECONDS", 3.0)
     return calls
 
 
@@ -79,6 +79,158 @@ async def test_team_round_collects_wakeup_continuation(capture_events):
     # end 帧只在静默收束时写一次
     end_frames = [p for name, p in capture_events if name == "end"]
     assert len(end_frames) == 1 and end_frames[0]["status"] == "completed"
+
+
+async def test_team_continuation_without_new_team_tool_finishes_immediately(
+    capture_events,
+    monkeypatch,
+):
+    """成员回报后的最终续写没有新 Team 工具时，不再等待静默窗口。"""
+    monkeypatch.setattr(gateway, "TEAM_QUIESCE_SECONDS", 5.0)
+    queue = asyncio.Queue()
+    for event in [
+        {"type": "REPLY_START", "reply_id": "r1"},
+        {
+            "type": "TOOL_CALL_START",
+            "reply_id": "r1",
+            "tool_call_id": "t1",
+            "tool_call_name": "TeamSay",
+        },
+        {"type": "REPLY_END", "reply_id": "r1", "finished_reason": "completed"},
+        {"type": "REPLY_START", "reply_id": "r2"},
+        {"type": "TEXT_BLOCK_DELTA", "reply_id": "r2", "delta": "最终结论"},
+        {"type": "REPLY_END", "reply_id": "r2", "finished_reason": "completed"},
+    ]:
+        queue.put_nowait(event)
+
+    result = await asyncio.wait_for(
+        gateway.collect_run_events(
+            queue,
+            _StubClient([]),
+            uid="u",
+            agent_id="a",
+            session_id="s",
+            run_id="run-final",
+            request_id="req-final",
+            thread_id="th-final",
+            read_timeout=5.0,
+        ),
+        timeout=0.2,
+    )
+
+    assert result.run_status == "completed"
+    assert result.text == "最终结论"
+
+
+async def test_team_round_waits_while_child_run_is_active(capture_events):
+    """静默窗到期但 child Run 仍活跃时，父 Run 不得提前结束。"""
+    queue = asyncio.Queue()
+    for event in [
+        {"type": "REPLY_START", "reply_id": "r1"},
+        {
+            "type": "TOOL_CALL_START",
+            "reply_id": "r1",
+            "tool_call_id": "t1",
+            "tool_call_name": "AgentCreate",
+        },
+        {"type": "TEXT_BLOCK_DELTA", "reply_id": "r1", "delta": "已派发。"},
+        {"type": "REPLY_END", "reply_id": "r1", "finished_reason": "completed"},
+    ]:
+        queue.put_nowait(event)
+
+    checks = 0
+
+    async def _has_active_child_runs() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks == 1
+
+    async def _publish_leader_result() -> None:
+        while checks < 1:
+            await asyncio.sleep(0.01)
+        for event in [
+            {"type": "REPLY_START", "reply_id": "r2"},
+            {"type": "TEXT_BLOCK_DELTA", "reply_id": "r2", "delta": "子任务结果已返回。"},
+            {"type": "REPLY_END", "reply_id": "r2", "finished_reason": "completed"},
+        ]:
+            queue.put_nowait(event)
+
+    publisher = asyncio.create_task(_publish_leader_result())
+    try:
+        result = await gateway.collect_run_events(
+            queue,
+            _StubClient([]),
+            uid="u",
+            agent_id="a",
+            session_id="s",
+            run_id="run-active-child",
+            request_id="req-active-child",
+            thread_id="th-active-child",
+            read_timeout=5.0,
+            has_active_child_runs=_has_active_child_runs,
+        )
+    finally:
+        publisher.cancel()
+
+    assert checks >= 2
+    assert result.run_status == "completed"
+    assert result.text == "已派发。子任务结果已返回。"
+
+
+async def test_team_round_keeps_waiting_when_active_child_exceeds_extension_budget(
+    capture_events,
+    monkeypatch,
+):
+    """child Run 仍活跃时不得因父 Run 的单段等待预算而丢失回报。"""
+    monkeypatch.setattr(gateway, "TEAM_CHILD_WAIT_SEGMENT_SECONDS", 0.05)
+    queue = asyncio.Queue()
+    for event in [
+        {"type": "REPLY_START", "reply_id": "r1"},
+        {
+            "type": "TOOL_CALL_START",
+            "reply_id": "r1",
+            "tool_call_id": "t1",
+            "tool_call_name": "AgentCreate",
+        },
+        {"type": "REPLY_END", "reply_id": "r1", "finished_reason": "completed"},
+    ]:
+        queue.put_nowait(event)
+
+    child_active = True
+
+    async def _has_active_child_runs() -> bool:
+        return child_active
+
+    async def _publish_late_child_result() -> None:
+        nonlocal child_active
+        await asyncio.sleep(0.08)
+        child_active = False
+        for event in [
+            {"type": "REPLY_START", "reply_id": "r2"},
+            {"type": "TEXT_BLOCK_DELTA", "reply_id": "r2", "delta": "迟到的子任务结果。"},
+            {"type": "REPLY_END", "reply_id": "r2", "finished_reason": "completed"},
+        ]:
+            queue.put_nowait(event)
+
+    publisher = asyncio.create_task(_publish_late_child_result())
+    try:
+        result = await gateway.collect_run_events(
+            queue,
+            _StubClient([]),
+            uid="u",
+            agent_id="a",
+            session_id="s",
+            run_id="run-timeout",
+            request_id="req-timeout",
+            thread_id="th-timeout",
+            read_timeout=5.0,
+            has_active_child_runs=_has_active_child_runs,
+        )
+    finally:
+        publisher.cancel()
+
+    assert result.run_status == "completed"
+    assert result.text == "迟到的子任务结果。"
 
 
 async def test_team_round_ignores_unscoped_heartbeat_during_quiesce(capture_events):
@@ -151,11 +303,7 @@ async def test_replyless_state_update_emits_agent_state(capture_events):
                 "type": "CUSTOM",
                 "name": "state_updated",
                 "value": {
-                    "tasks_context": {
-                        "tasks": [
-                            {"id": "task-1", "subject": "整理资料", "state": "in_progress"}
-                        ]
-                    }
+                    "tasks_context": {"tasks": [{"id": "task-1", "subject": "整理资料", "state": "in_progress"}]}
                 },
             },
             {"type": "REPLY_END", "reply_id": "r1", "finished_reason": "completed"},
@@ -181,9 +329,7 @@ async def test_replyless_state_update_emits_agent_state(capture_events):
         for item in payload.get("items", [])
         if item.get("status") == "agent_state"
     ]
-    assert state_chunks[0]["agent_state"]["todos"] == [
-        {"id": "task-1", "content": "整理资料", "status": "in_progress"}
-    ]
+    assert state_chunks[0]["agent_state"]["todos"] == [{"id": "task-1", "content": "整理资料", "status": "in_progress"}]
     assert "/workspace/outputs/report.md" in state_chunks[0]["agent_state"]["files"]
     assert state_chunks[0]["agent_state"]["files_truncated"] is True
 

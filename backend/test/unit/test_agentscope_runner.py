@@ -10,6 +10,18 @@ from yuxi.agentscope import runner
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _no_retained_team_workers(monkeypatch):
+    """默认线程没有长期 Team worker；相关用例单独覆盖。"""
+    monkeypatch.setattr(
+        runner,
+        "AgentScopeTeamWorkerRepository",
+        lambda _db: SimpleNamespace(
+            list_active_for_parent_thread=AsyncMock(return_value=[]),
+        ),
+    )
+
+
 async def test_existing_thread_switches_model_after_remote_update(monkeypatch):
     """已有线程模型变化时先更新远端，再提交本地映射。"""
     record = SimpleNamespace(
@@ -55,6 +67,79 @@ async def test_existing_thread_switches_model_after_remote_update(monkeypatch):
     )
     update_mapping.assert_awaited_once()
     db.commit.assert_awaited_once()
+
+
+async def test_existing_thread_updates_retained_team_workers_before_deleting_old_credential(monkeypatch):
+    """主线程轮换凭证时，长期 worker 必须先同步模型配置再删除旧凭证。"""
+    call_order = []
+
+    async def update_session_model(*args):
+        call_order.append(("update", args[2]))
+
+    async def delete_credential(*_args):
+        call_order.append(("delete", "credential-old"))
+
+    record = SimpleNamespace(
+        model_spec="p:old",
+        agentscope_agent_id="leader-agent",
+        agentscope_session_id="leader-session",
+        agentscope_credential_id="credential-old",
+    )
+    projection = SimpleNamespace(
+        model_spec="p:new",
+        agent_request={"name": "leader"},
+        credential_data={"type": "openai_credential", "api_key": "secret"},
+        chat_model_config={"model": "new", "credential_id": None},
+        skills=[],
+    )
+    worker = SimpleNamespace(
+        worker_agent_id="worker-agent",
+        worker_session_id="worker-session",
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+    client = SimpleNamespace(
+        create_credential=AsyncMock(return_value="credential-new"),
+        update_agent=AsyncMock(),
+        update_session_model=AsyncMock(side_effect=update_session_model),
+        list_workspace_skills=AsyncMock(return_value=[]),
+        remove_workspace_skill=AsyncMock(),
+        add_workspace_skill=AsyncMock(),
+        delete_credential=AsyncMock(side_effect=delete_credential),
+    )
+    monkeypatch.setattr(runner.thread_session_repo, "get_thread_session", AsyncMock(return_value=record))
+    monkeypatch.setattr(runner, "project_runtime", AsyncMock(return_value=projection))
+    monkeypatch.setattr(
+        runner.thread_session_repo,
+        "update_thread_session_model",
+        AsyncMock(return_value=record),
+    )
+    list_workers = AsyncMock(return_value=[worker])
+    monkeypatch.setattr(
+        runner,
+        "AgentScopeTeamWorkerRepository",
+        lambda _db: SimpleNamespace(list_active_for_parent_thread=list_workers),
+        raising=False,
+    )
+
+    await runner.ensure_thread_session(
+        db,
+        client,
+        uid="u",
+        thread_id="thread",
+        agent_slug="leader",
+        model_spec="p:new",
+    )
+
+    list_workers.assert_awaited_once_with(uid="u", parent_thread_id="thread")
+    assert client.update_session_model.await_args_list == [
+        (("u", "leader-agent", "leader-session", {"model": "new", "credential_id": "credential-new"}),),
+        (("u", "worker-agent", "worker-session", {"model": "new", "credential_id": "credential-new"}),),
+    ]
+    assert call_order == [
+        ("update", "leader-session"),
+        ("update", "worker-session"),
+        ("delete", "credential-old"),
+    ]
 
 
 async def test_existing_thread_model_update_failure_keeps_mapping(monkeypatch):

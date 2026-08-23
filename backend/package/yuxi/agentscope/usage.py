@@ -13,8 +13,22 @@ def _total(input_tokens: int = 0, output_tokens: int = 0) -> dict[str, int]:
     }
 
 
-def _model_bucket(model_name: str, usage: dict, call_count: int) -> dict:
+def _model_bucket(
+    model_name: str,
+    usage: dict,
+    call_count: int,
+    *,
+    cache_observed_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+    cache_observed_call_count: int = 0,
+) -> dict:
     """构造前端可稳定消费、且不虚构缓存数据的模型分桶。"""
+    cache_hit_ratio = (
+        cache_read_input_tokens / cache_observed_input_tokens
+        if cache_observed_input_tokens
+        else None
+    )
     return {
         "model": {
             "configured_model_spec": model_name,
@@ -23,7 +37,11 @@ def _model_bucket(model_name: str, usage: dict, call_count: int) -> dict:
         },
         "usage": usage,
         "model_call_count": call_count,
-        "cache_observed_call_count": 0,
+        "cache_observed_input_tokens": cache_observed_input_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "cache_observed_call_count": cache_observed_call_count,
+        "cache_hit_ratio": cache_hit_ratio,
     }
 
 
@@ -33,8 +51,10 @@ class UsageAccumulator:
 
     configured_model_spec: str | None = None
     current_model: str | None = None
+    reply_models: dict[str, str] = field(default_factory=dict)
     calls: list[tuple[str, dict]] = field(default_factory=list)
     context: dict = field(default_factory=dict)
+    pending_model_usages: dict[str, dict] = field(default_factory=dict)
 
     def observe(self, event: dict) -> None:
         """消费单个事件；无用量语义的事件被忽略。"""
@@ -45,14 +65,38 @@ class UsageAccumulator:
                 self.context.update(value)
             elif event.get("name") == "context_compression" and "summary_active" in value:
                 self.context["summary_active"] = bool(value["summary_active"])
+            elif event.get("name") == "model_usage":
+                reply_id = str(value.get("reply_id") or "")
+                input_tokens = max(int(value.get("input_tokens") or 0), 0)
+                output_tokens = max(int(value.get("output_tokens") or 0), 0)
+                cache_creation = max(int(value.get("cache_creation_input_tokens") or 0), 0)
+                cache_read = max(int(value.get("cache_read_input_tokens") or 0), 0)
+                total_input = input_tokens + cache_creation + cache_read
+                cache_observed = cache_creation > 0 or cache_read > 0
+                self.pending_model_usages[reply_id] = {
+                    **_total(total_input, output_tokens),
+                    "cache_observed_input_tokens": total_input if cache_observed else 0,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_observed_call_count": int(cache_observed),
+                }
             return
         if event_type == "MODEL_CALL_START":
             self.current_model = str(event.get("model_name") or self.configured_model_spec or "unknown_model")
+            reply_id = str(event.get("reply_id") or "")
+            if reply_id:
+                self.reply_models[reply_id] = self.current_model
             return
         if event_type != "MODEL_CALL_END":
             return
-        model_name = self.current_model or self.configured_model_spec or "unknown_model"
-        usage = _total(
+        reply_id = str(event.get("reply_id") or "")
+        model_name = (
+            self.reply_models.pop(reply_id, None)
+            or self.current_model
+            or self.configured_model_spec
+            or "unknown_model"
+        )
+        usage = self.pending_model_usages.pop(reply_id, None) or _total(
             max(int(event.get("input_tokens") or 0), 0),
             max(int(event.get("output_tokens") or 0), 0),
         )
@@ -63,6 +107,7 @@ class UsageAccumulator:
         totals = _total()
         model_totals: dict[str, dict] = {}
         model_counts: dict[str, int] = {}
+        model_cache: dict[str, dict[str, int]] = {}
         for model_name, usage in self.calls:
             totals["input_tokens"] += usage["input_tokens"]
             totals["output_tokens"] += usage["output_tokens"]
@@ -71,8 +116,24 @@ class UsageAccumulator:
             for key in totals:
                 bucket[key] += usage[key]
             model_counts[model_name] = model_counts.get(model_name, 0) + 1
+            cache = model_cache.setdefault(
+                model_name,
+                {
+                    "cache_observed_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_observed_call_count": 0,
+                },
+            )
+            for key in cache:
+                cache[key] += max(int(usage.get(key) or 0), 0)
         models = {
-            model_name: _model_bucket(model_name, usage, model_counts[model_name])
+            model_name: _model_bucket(
+                model_name,
+                usage,
+                model_counts[model_name],
+                **model_cache[model_name],
+            )
             for model_name, usage in model_totals.items()
         }
         latest = None
@@ -111,6 +172,18 @@ def aggregate_thread_usage(run_usages: list[dict]) -> dict:
             for key in totals:
                 target["usage"][key] += max(int(source_usage.get(key) or 0), 0)
             target["model_call_count"] += max(int(bucket.get("model_call_count") or 0), 0)
+            for key in (
+                "cache_observed_input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "cache_observed_call_count",
+            ):
+                target[key] += max(int(bucket.get(key) or 0), 0)
+            target["cache_hit_ratio"] = (
+                target["cache_read_input_tokens"] / target["cache_observed_input_tokens"]
+                if target["cache_observed_input_tokens"]
+                else None
+            )
     return {"total": totals, "models": models}
 
 

@@ -20,7 +20,7 @@ async def get_db():
         yield db
 
 
-async def _verify_api_key(key: str, db: AsyncSession) -> tuple[User | None, APIKey | None]:
+async def verify_api_key(key: str, db: AsyncSession) -> tuple[User | None, APIKey | None]:
     """验证 API Key 并返回关联用户和 APIKey 对象"""
     key_hash = hashlib.sha256(key.encode()).hexdigest()
 
@@ -71,7 +71,7 @@ async def get_current_user(
     # 根据 token 前缀判断认证方式
     if token.startswith("yxkey_"):
         # API Key 认证
-        user, api_key_obj = await _verify_api_key(token, db)
+        user, api_key_obj = await verify_api_key(token, db)
         if user is not None and api_key_obj is not None:
             api_key_obj.last_used_at = utc_now_naive()
             await db.commit()

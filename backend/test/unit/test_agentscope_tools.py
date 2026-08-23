@@ -193,10 +193,14 @@ async def test_build_subagent_tools_overrides_agent_create_with_session_template
         "researcher",
         "verifier",
     ]
+    subagent_description = built[0].input_schema["properties"]["subagent_type"]["description"]
+    assert "researcher: 调研" in subagent_description
+    assert "verifier: 核验" in subagent_description
     assert "subagent_type" in built[0].input_schema["required"]
     researcher_prompt = built[0]._sub_agent_templates["researcher"].system_prompt_template
     assert researcher_prompt.startswith("research {member_name}")
     assert "必须调用 TeamSay" in researcher_prompt
+    assert "不要使用 to=null 广播" in researcher_prompt
     assert "TeamSay 成功前不得结束本轮" in researcher_prompt
 
 

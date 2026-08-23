@@ -19,6 +19,31 @@ allowed-tools: Bash, Read, Write
 
 自动化测试平台数据查询工具 - 查询流水线、任务详情和性能数据。
 
+## 执行契约
+
+激活 Skill 后，把返回的安装目录记为 `<skill-dir>`。运行时已经包含 CLI、SDK 和依赖，直接执行
+`python3 <skill-dir>/scripts/cli.py ...`；禁止安装依赖、列目录或阅读 Python 源码。
+
+不知道任务/流水线 ID 时，读取本文件后的第一个工具调用必须是任务发现：
+
+```bash
+AUTOMATION_PROJECT_ID=<project_id> AUTOMATION_USER_ID=<user_id> \
+python3 <skill-dir>/scripts/cli.py tasks \
+  --build-name "<平台或任务关键词>" \
+  --start-time "YYYY-MM-DD" --end-time "YYYY-MM-DD" \
+  --count 100 --discover
+```
+
+从发现结果选出匹配任务后，直接查询详情：
+
+```bash
+AUTOMATION_PROJECT_ID=<project_id> AUTOMATION_USER_ID=<user_id> \
+python3 <skill-dir>/scripts/cli.py builds --id <build_id> --device-executions
+```
+
+仅在 CLI 返回的数据需要字段解释或专项分析时读取对应 reference。每次运行必须在完成分析后返回结果；
+Team worker 必须在迭代上限前调用 `TeamSay`，即使 CLI 失败也要回传错误和已执行命令。
+
 ## 🔥 核心原则
 
 **获取任务详情或进行性能对比时，不管任务和用例的状态如何，都必须获取和展示所有相关数据！**
@@ -35,15 +60,8 @@ allowed-tools: Bash, Read, Write
 
 ### 环境配置
 
-```bash
-# 安装依赖
-pip install -r requirements.txt
-
-# 配置环境变量（在 .env 或系统环境中）
-AUTOMATION_BASE_URL=https://automation-api.testplus.cn
-AUTOMATION_PROJECT_ID=your_project_id
-AUTOMATION_USER_ID=your_user_id
-```
+调用 CLI 时传入 `AUTOMATION_PROJECT_ID` 和 `AUTOMATION_USER_ID`；服务地址使用内置默认值，只有用户明确
+提供其他地址时才覆盖 `AUTOMATION_BASE_URL`。
 
 ## 工作流决策指南
 

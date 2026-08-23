@@ -12,7 +12,7 @@ from agentscope.event import CustomEvent
 from agentscope.middleware import MiddlewareBase
 from yuxi.utils.logging_config import logger
 
-from yuxi.agentscope.team_lifecycle import TeamLifecycleModule
+from yuxi.agentscope.team_lifecycle import TeamLifecycleModule, retain_latest_team_hint
 
 
 class SteerMiddleware(MiddlewareBase):
@@ -55,11 +55,9 @@ class NativeScheduleBlockMiddleware(MiddlewareBase):
             kept = [
                 tool
                 for tool in tools
-                if not str(
-                    (tool.get("function") or {}).get("name")
-                    or tool.get("name")
-                    or ""
-                ).startswith(NATIVE_SCHEDULE_TOOL_PREFIX)
+                if not str((tool.get("function") or {}).get("name") or tool.get("name") or "").startswith(
+                    NATIVE_SCHEDULE_TOOL_PREFIX
+                )
             ]
             input_kwargs = {**input_kwargs, "tools": kept}
         return await next_handler(**input_kwargs)
@@ -133,17 +131,14 @@ class ContextObservabilityMiddleware(MiddlewareBase):
             llm_input_tokens = self._estimate_tokens([messages, tools])
 
         message_payloads = [
-            message.model_dump(mode="json") if hasattr(message, "model_dump") else message
-            for message in messages
+            message.model_dump(mode="json") if hasattr(message, "model_dump") else message for message in messages
         ]
         system_messages = [item for item in message_payloads if isinstance(item, dict) and item.get("role") == "system"]
         non_system_messages = [
             item for item in message_payloads if not (isinstance(item, dict) and item.get("role") == "system")
         ]
         tool_messages = [
-            item
-            for item in non_system_messages
-            if "tool_result" in json.dumps(item, ensure_ascii=False, default=str)
+            item for item in non_system_messages if "tool_result" in json.dumps(item, ensure_ascii=False, default=str)
         ]
         content_messages = [item for item in non_system_messages if item not in tool_messages]
         context_window = max(int(getattr(model, "context_size", 0) or 0), 0) or None
@@ -170,9 +165,7 @@ class ContextObservabilityMiddleware(MiddlewareBase):
                 "context_usage_ratio": (
                     min(round(llm_input_tokens / context_window, 4), 1.0) if context_window else None
                 ),
-                "remaining_context_tokens": (
-                    max(context_window - llm_input_tokens, 0) if context_window else None
-                ),
+                "remaining_context_tokens": (max(context_window - llm_input_tokens, 0) if context_window else None),
                 "summary_active": bool(summary),
                 "summary_message_tokens": self._estimate_tokens(summary),
                 "summary_trigger_tokens": int(context_window * trigger_ratio) if context_window else None,
@@ -206,6 +199,7 @@ class ContextObservabilityMiddleware(MiddlewareBase):
             {"status": "completed", "summary_active": bool(summary_after)},
         )
 
+
 class TeamLifecycleMiddleware(MiddlewareBase):
     """保留 AgentScope Team runtime，并投影为 Yuxi 长期 child Thread。"""
 
@@ -217,11 +211,12 @@ class TeamLifecycleMiddleware(MiddlewareBase):
         """观察 AgentCreate roster 差分，并把 TeamDelete 收口到父线程删除。"""
         tool_call = input_kwargs["tool_call"]
         if tool_call.name == "TeamDelete":
-            from agentscope.message import TextBlock
+            from agentscope.message import TextBlock, ToolResultState
             from agentscope.tool import ToolChunk
 
             yield ToolChunk(
                 content=[TextBlock(text="Team runtime retained until the parent thread is deleted.")],
+                state=ToolResultState.SUCCESS,
             )
             return
         if tool_call.name != "AgentCreate":
@@ -258,6 +253,13 @@ class TeamLifecycleMiddleware(MiddlewareBase):
         async for item in self._lifecycle.project_worker_reply(input_kwargs, next_handler):
             yield item
 
+    async def on_reasoning(self, agent, input_kwargs, next_handler):
+        """worker 推理前丢弃失败重试遗留的旧 Team 派发消息。"""
+        if self._is_worker:
+            retain_latest_team_hint(agent)
+        async for item in next_handler(**input_kwargs):
+            yield item
+
 
 async def build_steer_middleware(user_id: str, agent_id: str, session_id: str) -> SteerMiddleware | None:
     """为顶层 Yuxi Session 解析当前 Run；Team worker 不注入。"""
@@ -289,7 +291,14 @@ async def build_steer_middleware(user_id: str, agent_id: str, session_id: str) -
     return SteerMiddleware(should_stop)
 
 
-async def build_team_lifecycle_middleware(storage, user_id: str, agent_id: str, session_id: str):
+async def build_team_lifecycle_middleware(
+    storage,
+    message_bus,
+    workspace_manager,
+    user_id: str,
+    agent_id: str,
+    session_id: str,
+):
     """按 Session 角色创建 Team 生命周期 Middleware。"""
     session = await storage.get_session(user_id, agent_id, session_id)
     if session is None:
@@ -298,12 +307,40 @@ async def build_team_lifecycle_middleware(storage, user_id: str, agent_id: str, 
     if session.team_id is not None:
         team = await storage.get_team(user_id, session.team_id)
         is_worker = team is not None and team.session_id != session_id
+
+    failure_notifier = None
+    if is_worker:
+        from agentscope.app._tool import TeamSay
+        from agentscope.message import ToolResultState
+
+        leader_session = await storage.get_session(user_id, "", team.session_id)
+        if leader_session is None:
+            raise ValueError("AgentScope Team leader Session 不存在")
+        leader_agent = await storage.get_agent(user_id, leader_session.agent_id)
+        leader_name = leader_agent.data.name if leader_agent is not None else leader_session.agent_id
+        team_say = TeamSay(
+            storage=storage,
+            message_bus=message_bus,
+            workspace_manager=workspace_manager,
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            role="worker",
+        )
+
+        async def failure_notifier(message: str) -> None:
+            """通过 AgentScope Team inbox 向 leader 投递 worker 失败。"""
+            result = await team_say(content=message, to=leader_name)
+            if result.state == ToolResultState.ERROR:
+                raise RuntimeError("TeamSay 失败通知投递失败")
+
     return TeamLifecycleMiddleware(
         TeamLifecycleModule(
             storage=storage,
             uid=user_id,
             agent_id=agent_id,
             session_id=session_id,
+            failure_notifier=failure_notifier,
         ),
         is_worker=is_worker,
     )

@@ -4,6 +4,7 @@
 POST /v1/chat/completions 支持 stream 与非 stream 两种响应。
 行为按最近一条用户消息驱动，回复确定性生成，便于断言：
 - 消息包含「写文件」→ 先流式返回 Write 工具调用，工具结果回来后返回总结文本；
+- 消息包含「编辑已有文件」→ 依次返回 Read、Edit 工具调用，再返回总结文本；
 - 其余消息 → 直接返回固定文本。
 """
 
@@ -18,8 +19,10 @@ app = FastAPI(title="openai-mock")
 
 REPLY_TEXT = "你好，我是 e2e mock 模型。这条回复经由 agentscope 全链路返回。"
 TOOL_REPLY_TEXT = "文件已写入沙盒。"
+EDIT_REPLY_TEXT = "文件已完成编辑。"
 WRITE_FILE_PATH = "/workspace/outputs/hello.txt"
 WRITE_FILE_CONTENT = "agentscope workspace 写入测试\n"
+EDIT_FILE_CONTENT = "agentscope workspace 编辑成功\n"
 
 
 def _message_text(message: dict) -> str:
@@ -92,11 +95,7 @@ def _team_next_call(body: dict):
             function = tool.get("function") or {}
             if function.get("name") != "AgentCreate":
                 continue
-            enum = (
-                ((function.get("parameters") or {}).get("properties") or {})
-                .get("subagent_type", {})
-                .get("enum")
-            )
+            enum = ((function.get("parameters") or {}).get("properties") or {}).get("subagent_type", {}).get("enum")
             if isinstance(enum, list) and enum:
                 subagent_type = str(enum[0])
             break
@@ -129,6 +128,23 @@ def _skill_gateway_next_call(body: dict):
     return ("Skill", {"skill": "deep-research"})
 
 
+def _edit_existing_file_next_call(body: dict):
+    """已有文件编辑：Read → Edit → 总结。"""
+    called = _assistant_tool_names(body)
+    if "Edit" in called:
+        return None
+    if "Read" in called:
+        return (
+            "Edit",
+            {
+                "file_path": WRITE_FILE_PATH,
+                "old_string": WRITE_FILE_CONTENT,
+                "new_string": EDIT_FILE_CONTENT,
+            },
+        )
+    return "Read", {"file_path": WRITE_FILE_PATH}
+
+
 def _matched_tool_trigger(body: dict):
     """按最后一条真实用户消息匹配工具触发；无工具结果时才触发。
 
@@ -142,10 +158,7 @@ def _matched_tool_trigger(body: dict):
         if not t.startswith("<system-reminder>")
     ]
     joined = user_texts[-1] if user_texts else ""
-    tool_names = {
-        str((tool.get("function") or {}).get("name") or "")
-        for tool in body.get("tools") or []
-    }
+    tool_names = {str((tool.get("function") or {}).get("name") or "") for tool in body.get("tools") or []}
     if "generate_structured_output" in tool_names:
         return (
             "generate_structured_output",
@@ -165,6 +178,8 @@ def _matched_tool_trigger(body: dict):
         return _team_next_call(body)
     if "调用技能依赖" in joined:
         return _skill_gateway_next_call(body)
+    if "编辑已有文件" in joined:
+        return _edit_existing_file_next_call(body)
     if any(m.get("role") == "tool" for m in messages):
         return None
     for keyword, (name, args) in TOOL_TRIGGERS.items():
@@ -180,6 +195,8 @@ def _has_tool_result(body: dict) -> bool:
 
 def _reply_text(body: dict) -> str:
     """按 E2E 场景返回可断言的最终正文。"""
+    if "编辑已有文件" in _last_user_text(body) and _has_tool_result(body):
+        return EDIT_REPLY_TEXT
     if "STEER" in _last_user_text(body):
         context = json.dumps(body.get("messages") or [], ensure_ascii=False)
         suffix = "TOOL_CONTEXT_OK" if "TOOL_FINISHED" in context else "TOOL_CONTEXT_MISSING"

@@ -1054,3 +1054,125 @@ Index(
     AgentRunRequest.created_at,
     AgentRunRequest.id,
 )
+
+
+class AgentTask(Base):
+    """AgentTask table - 可重复触发的智能体任务定义（任务中心）"""
+
+    __tablename__ = "agent_tasks"
+
+    id = Column(String(36), primary_key=True, comment="Task ID (UUID)")
+    name = Column(String(128), nullable=False, comment="任务名称")
+    owner_uid = Column(String(64), index=True, nullable=False, comment="创建者 UID")
+    agent_id = Column(Integer, nullable=True, index=True, comment="引用智能体 ID；删除后置空")
+    agent_name_snapshot = Column(String(128), nullable=True, comment="智能体名称展示快照")
+    agent_slug_snapshot = Column(String(64), nullable=True, comment="智能体 slug 展示快照")
+    prompt = Column(Text, nullable=False, comment="任务提示词")
+    share_config = Column(JSON, nullable=False, default=dict, comment="个人/部门可见范围 v2")
+    enabled = Column(Boolean, nullable=False, default=True, comment="启用状态")
+    archived_at = Column(DateTime, nullable=True, comment="归档时间；非空即归档")
+    api_enabled = Column(Boolean, nullable=False, default=False, comment="是否允许 API 触发")
+    schedule_mode = Column(String(16), nullable=True, comment="定时模式: daily/weekly/cron；空表示未启用")
+    schedule_cron = Column(String(64), nullable=True, comment="5 段 POSIX Cron 表达式")
+    schedule_timezone = Column(String(64), nullable=True, comment="IANA 时区")
+    next_run_at = Column(DateTime, nullable=True, index=True, comment="下次计划运行时间（UTC naive）")
+    tool_approval_mode = Column(String(16), nullable=False, default="always_trust", comment="工具审批模式")
+    created_at = Column(DateTime, default=utc_now_naive, comment="Creation time")
+    updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive, comment="Update time")
+
+    executions = relationship("TaskExecution", back_populates="task", cascade="all, delete-orphan")
+
+    @property
+    def created_by(self) -> str | None:
+        """权限协议字段：任务创建者即所有者。"""
+        return self.owner_uid
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "owner_uid": self.owner_uid,
+            "agent_id": self.agent_id,
+            "agent_name": self.agent_name_snapshot,
+            "agent_slug": self.agent_slug_snapshot,
+            "prompt": self.prompt,
+            "share_config": self.share_config or {},
+            "enabled": bool(self.enabled),
+            "archived_at": format_utc_datetime(self.archived_at),
+            "api_enabled": bool(self.api_enabled),
+            "schedule": (
+                {
+                    "mode": self.schedule_mode,
+                    "cron": self.schedule_cron,
+                    "timezone": self.schedule_timezone,
+                    "next_run_at": format_utc_datetime(self.next_run_at),
+                }
+                if self.schedule_mode
+                else None
+            ),
+            "tool_approval_mode": self.tool_approval_mode,
+            "created_at": format_utc_datetime(self.created_at),
+            "updated_at": format_utc_datetime(self.updated_at),
+        }
+
+
+# TaskExecution 状态集：queued/running/interrupted/succeeded/failed/cancelled/skipped/missed
+TASK_EXECUTION_ACTIVE_STATUSES = ("queued", "running", "interrupted")
+TASK_EXECUTION_TERMINAL_STATUSES = ("succeeded", "failed", "cancelled", "skipped", "missed")
+
+
+class TaskExecution(Base):
+    """TaskExecution table - 一次任务触发事实（任务中心）"""
+
+    __tablename__ = "task_executions"
+
+    id = Column(String(36), primary_key=True, comment="Execution ID (UUID)，兼作标准 Run 的 request_id")
+    task_id = Column(String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), index=True, nullable=False)
+    trigger_type = Column(String(16), nullable=False, comment="触发方式: manual/api/schedule")
+    triggered_by_uid = Column(String(64), nullable=False, comment="触发者 UID")
+    execution_principal_uid = Column(String(64), nullable=False, comment="执行身份 UID")
+    agent_id = Column(Integer, nullable=True, comment="触发时固定的智能体 ID；删除后置空")
+    agent_slug = Column(String(64), nullable=False, comment="触发时固定的智能体 slug")
+    prompt = Column(Text, nullable=False, comment="触发时固定的提示词")
+    tool_approval_mode = Column(String(16), nullable=False, comment="触发时固定的审批模式")
+    scheduled_at = Column(DateTime, nullable=True, comment="计划执行时间（定时触发；UTC naive）")
+    idempotency_key = Column(String(128), nullable=False, comment="幂等键：任务+执行身份+key 唯一")
+    agent_run_id = Column(String(64), unique=True, nullable=True, index=True, comment="关联 AgentRun ID")
+    conversation_id = Column(Integer, unique=True, nullable=True, comment="关联 Conversation ID")
+    thread_id = Column(String(64), nullable=True, comment="执行线程 ID（确定性派生）")
+    status = Column(String(16), nullable=False, default="queued", index=True, comment="执行状态")
+    error_summary = Column(String(500), nullable=True, comment="错误摘要")
+    queued_at = Column(DateTime, default=utc_now_naive, comment="入队时间")
+    started_at = Column(DateTime, nullable=True, comment="开始时间")
+    finished_at = Column(DateTime, nullable=True, comment="结束时间")
+
+    task = relationship("AgentTask", back_populates="executions")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "execution_principal_uid",
+            "idempotency_key",
+            name="uq_task_execution_idempotency",
+        ),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "trigger_type": self.trigger_type,
+            "triggered_by_uid": self.triggered_by_uid,
+            "execution_principal_uid": self.execution_principal_uid,
+            "agent_slug": self.agent_slug,
+            "prompt": self.prompt,
+            "tool_approval_mode": self.tool_approval_mode,
+            "scheduled_at": format_utc_datetime(self.scheduled_at),
+            "agent_run_id": self.agent_run_id,
+            "thread_id": self.thread_id,
+            "status": self.status,
+            "error_summary": self.error_summary,
+            "queued_at": format_utc_datetime(self.queued_at),
+            "started_at": format_utc_datetime(self.started_at),
+            "finished_at": format_utc_datetime(self.finished_at),
+        }

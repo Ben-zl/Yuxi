@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from server.routers.auth_router import delete_user
 from server.routers.user_router import APIKeyCreate, create_api_key
-from server.utils.auth_middleware import _verify_api_key
+from server.utils.auth_middleware import verify_api_key
 from yuxi.repositories import user_repository as user_repository_module
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.storage.postgres.models_business import APIKey, Base, Department, User
@@ -104,7 +104,7 @@ async def test_api_key_rejects_deleted_bound_user_without_department_or_superadm
     db.add(api_key)
     await db.commit()
 
-    user, verified_key = await _verify_api_key(secret, db)
+    user, verified_key = await verify_api_key(secret, db)
 
     assert user is None
     assert verified_key is None
@@ -122,7 +122,7 @@ async def test_api_key_without_user_binding_is_rejected_before_department_mappin
     )
     fake_db = _FakeApiKeySession(api_key)
 
-    user, verified_key = await _verify_api_key(secret, fake_db)
+    user, verified_key = await verify_api_key(secret, fake_db)
 
     assert user is None
     assert verified_key is None

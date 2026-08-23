@@ -8,6 +8,7 @@ import {
   LibraryBig,
   Box,
   FolderKanban,
+  ListTodo,
   PanelLeft,
   PanelLeftOpen,
   MessageCirclePlus,
@@ -171,6 +172,14 @@ const mainList = computed(() => {
     path: '/workspace',
     icon: FolderKanban,
     activeIcon: FolderKanban
+  })
+
+  items.push({
+    name: '任务中心',
+    path: '/agent-tasks',
+    activePaths: ['/agent-tasks'],
+    icon: ListTodo,
+    activeIcon: ListTodo
   })
 
   items.push({

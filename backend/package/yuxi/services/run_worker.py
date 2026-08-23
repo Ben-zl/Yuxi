@@ -17,6 +17,21 @@ from yuxi.storage.redis import get_arq_redis_settings
 from yuxi.utils.logging_config import logger
 
 
+def _agent_task_scan_job():
+    """任务中心定时扫描（60 秒周期，工单 07/08/11）。"""
+    from arq import cron
+
+    from yuxi.services.agent_task_scheduler_service import scan_agent_task_schedules
+
+    return cron(
+        scan_agent_task_schedules,
+        minute=set(range(60)),
+        second={0},
+        unique=True,
+        max_tries=1,
+    )
+
+
 async def process_agent_run(ctx, run_id: str):
     """执行队列中的 AgentRun（agentscope 执行体）。
 
@@ -53,6 +68,7 @@ async def _worker_shutdown(ctx):
 
 class WorkerSettings:
     functions = [process_agent_run]
+    cron_jobs = [_agent_task_scan_job()]
     max_tries = 2
     retry_jobs = True
     # 单任务最长执行时间（秒），可配置：超长图谱构建/深度检索场景需调大，

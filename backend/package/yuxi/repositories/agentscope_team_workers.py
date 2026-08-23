@@ -53,6 +53,22 @@ class AgentScopeTeamWorkerRepository:
         )
         return list(result.scalars().all())
 
+    async def list_active_for_parent_thread(
+        self,
+        *,
+        uid: str,
+        parent_thread_id: str,
+    ) -> list[AgentScopeTeamWorkerBinding]:
+        """列出父线程仍保留运行时的 worker，用于同步会话模型配置。"""
+        result = await self.db.execute(
+            select(AgentScopeTeamWorkerBinding).where(
+                AgentScopeTeamWorkerBinding.uid == str(uid),
+                AgentScopeTeamWorkerBinding.parent_thread_id == parent_thread_id,
+                AgentScopeTeamWorkerBinding.runtime_active.is_(True),
+            )
+        )
+        return list(result.scalars().all())
+
     async def list_for_active_runs(self, *, uid: str, run_ids: list[str]) -> list[AgentScopeTeamWorkerBinding]:
         """批量解析待取消 child Run 对应的活动 worker。"""
         if not run_ids:

@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 — 贯通个人任务的手动执行与历史查看
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Source:** [父规格 #958](https://github.com/xerrors/Yuxi/issues/958)
 

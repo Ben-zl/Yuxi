@@ -25,7 +25,7 @@ MESSAGE_SEARCH_SNIPPET_MAX_LENGTH = 180
 MESSAGE_SEARCH_SNIPPETS_PER_THREAD = 2
 MESSAGE_SEARCH_ROLES = ("user", "assistant")
 MESSAGE_SEARCH_EXCLUDED_TYPES = ("tool_call", "tool_result")
-INVOCATION_CONVERSATION_SOURCES = ("agent_call", "agent_evaluation")
+INVOCATION_CONVERSATION_SOURCES = ("agent_call", "agent_evaluation", "agent_task")
 
 
 class ConversationRepository:

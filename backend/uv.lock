@@ -69,7 +69,7 @@ wheels = [
 [[package]]
 name = "agentscope"
 version = "2.0.6"
-source = { git = "https://github.com/Ben-zl/agentscope.git?rev=ae6a563c#ae6a563c7ad6cb26d3d9dc496341075c8c5c2ba9" }
+source = { git = "https://github.com/Ben-zl/agentscope.git?rev=c28b985cfab7c0b8e7bc196856c8f13b946458c9#c28b985cfab7c0b8e7bc196856c8f13b946458c9" }
 dependencies = [
     { name = "aiofiles" },
     { name = "aioitertools" },
@@ -4562,6 +4562,8 @@ dependencies = [
     { name = "agentscope", extra = ["service", "storage-sql", "workspace-docker"] },
     { name = "arq" },
     { name = "fastapi" },
+    { name = "jsonschema" },
+    { name = "pypdf" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "yuxi" },
 ]
@@ -4579,9 +4581,11 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agentscope", extras = ["service", "storage-sql", "workspace-docker"], git = "https://github.com/Ben-zl/agentscope.git?rev=ae6a563c" },
+    { name = "agentscope", extras = ["service", "storage-sql", "workspace-docker"], git = "https://github.com/Ben-zl/agentscope.git?rev=c28b985cfab7c0b8e7bc196856c8f13b946458c9" },
     { name = "arq", specifier = ">=0.26.3" },
     { name = "fastapi", specifier = ">=0.121" },
+    { name = "jsonschema", specifier = ">=4.26.0" },
+    { name = "pypdf", specifier = ">=6.13.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34.2" },
     { name = "yuxi", editable = "package" },
 ]

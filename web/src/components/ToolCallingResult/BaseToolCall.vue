@@ -28,7 +28,7 @@
         <template v-else>
           <slot
             name="header-success"
-            v-if="toolCall.status === 'success' || toolCall.tool_call_result"
+            v-if="effectiveStatus === 'completed'"
             :tool-name="toolName"
             :result-content="resultContent"
           >
@@ -37,7 +37,7 @@
 
           <slot
             name="header-error"
-            v-else-if="toolCall.status === 'error'"
+            v-else-if="effectiveStatus === 'error'"
             :tool-name="toolName"
             :error-message="toolCall.error_message"
           >
@@ -94,7 +94,13 @@ import { ref, computed } from 'vue'
 import { Loader, ChevronsUpDown, ChevronsDownUp, XCircle, CheckCircle } from 'lucide-vue-next'
 import { useAgentStore } from '@/stores/agent'
 import { storeToRefs } from 'pinia'
-import { getToolCallId, getToolIcon, getToolName, findToolInList } from './toolRegistry'
+import {
+  findToolInList,
+  getToolCallExecutionState,
+  getToolCallId,
+  getToolIcon,
+  getToolName
+} from './toolRegistry'
 
 const props = defineProps({
   toolCall: {
@@ -137,10 +143,8 @@ const toggleExpand = () => {
 
 // 图标状态：优先用外部传入的 status，否则按 tool_call_result/status 推断
 const effectiveStatus = computed(() => {
-  if (props.status) return props.status
-  if (props.toolCall.status === 'success' || props.toolCall.tool_call_result) return 'completed'
-  if (props.toolCall.status === 'error') return 'failed'
-  return 'running'
+  if (props.status) return props.status === 'failed' ? 'error' : props.status
+  return getToolCallExecutionState(props.toolCall)
 })
 
 // Tool Name Logic

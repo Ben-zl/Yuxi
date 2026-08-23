@@ -61,10 +61,14 @@ def project_agent_request(agent: Agent) -> dict:
 def project_subagent_template(agent: Agent) -> dict:
     """投影管理员配置的子智能体为 Team worker 模板载荷（装配在 Team 工单）。"""
     context = agent_context(agent)
+    max_steps = int(context.get("max_execution_steps") or DEFAULT_MAX_EXECUTION_STEPS)
+    if max_steps <= 0:
+        raise ValueError("子智能体最大执行步数必须大于 0")
     return {
         "type": agent.slug,
         "description": agent.description or agent.name,
         "system_prompt_template": context.get("system_prompt") or "You are a helpful assistant.",
+        "react_config": {"max_iters": max_steps},
     }
 
 

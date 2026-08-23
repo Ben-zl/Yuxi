@@ -15,6 +15,15 @@ from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.storage.postgres.models_business import AgentRun
 
 
+async def has_active_child_runs(run_id: str, uid: str) -> bool:
+    """查询父 Run 是否仍有未结束的 Team child Run。"""
+    from yuxi.storage.postgres.manager import pg_manager
+
+    async with pg_manager.get_async_session_context() as db:
+        children = await AgentRunRepository(db).list_active_child_runs_for_user(run_id, uid)
+        return bool(children)
+
+
 async def execute_run(
     db: AsyncSession,
     client: AgentScopeServiceClient,
@@ -46,6 +55,7 @@ async def execute_run(
         read_timeout=read_timeout,
         image_content=image_content,
         configured_model_spec=mapping.model_spec,
+        has_active_child_runs=lambda: has_active_child_runs(run.id, run.uid),
     )
     await finalize_run(db, run, result)
     return result

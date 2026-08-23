@@ -11,7 +11,27 @@ _Avoid_: 会话（对外产品语言统一用「线程」）
 
 **AgentRun（运行）**:
 一次用户请求触发的智能体执行实例；由提交即落库的运行事实与结束后的审计投影共同构成完整记录。
-_Avoid_: 任务（Task 专指 Tasker 通用后台任务）、Reply
+_Avoid_: 任务（任务专指可重复触发的 AgentTask 定义）、后台作业、Reply
+
+**AgentTask（任务）**:
+用户保存的、可通过手动、定时或 API 反复触发的智能体执行定义，可见范围为个人或部门，并具有独立的启停生命周期。
+_Avoid_: 定时任务（定时只是触发方式）、后台任务、Tasker 任务
+
+**TaskExecution（任务执行）**:
+某个 AgentTask 被触发一次所形成的执行记录；排队时独立存在，派发后至多关联一个 AgentRun 与对应线程。
+_Avoid_: AgentRun、任务实例、执行任务
+
+**BackgroundJob（后台作业）**:
+由 Tasker 承载的知识库解析、评估或图谱构建等平台内部异步作业。
+_Avoid_: 任务、AgentTask、AgentRun
+
+**任务队列（Task Queue）**:
+同一 AgentTask 的全部手动、定时与 API 触发按 FIFO 共享的单一执行序列。
+_Avoid_: 线程队列、调度队列、用户队列
+
+**执行身份（Execution Principal）**:
+一次任务执行实际使用其权限、凭据、环境变量与沙盒的用户身份；手动和 API 取触发者，定时触发取任务所有者。
+_Avoid_: 任务身份、Agent 身份、创建者身份
 
 **运行事实（Run Facts）**:
 请求提交与执行过程中的持久状态，是排队互斥、幂等提交与崩溃恢复的依据，先于派发写入。

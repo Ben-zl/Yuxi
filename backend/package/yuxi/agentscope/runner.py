@@ -20,6 +20,7 @@ from yuxi.agentscope.config_projection import project_runtime
 from yuxi.agentscope.event_stream import cancel_tasks, start_event_pump
 from yuxi.agentscope.thread_guard import ensure_thread_eligible
 from yuxi.repositories import agentscope_thread_sessions as thread_session_repo
+from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerRepository
 from yuxi.repositories.agentscope_thread_sessions import AgentScopeThreadSession
 
 # 订阅建立后的等待窗口：覆盖 HTTP 连接与回放建立，早于 chat 触发即可
@@ -65,6 +66,17 @@ async def ensure_thread_session(
             existing.agentscope_session_id,
             {**projection.chat_model_config, "credential_id": credential_id},
         )
+        workers = await AgentScopeTeamWorkerRepository(db).list_active_for_parent_thread(
+            uid=uid,
+            parent_thread_id=thread_id,
+        )
+        for worker in workers:
+            await client.update_session_model(
+                uid,
+                worker.worker_agent_id,
+                worker.worker_session_id,
+                {**projection.chat_model_config, "credential_id": credential_id},
+            )
         current_skills = set(
             await client.list_workspace_skills(
                 uid,

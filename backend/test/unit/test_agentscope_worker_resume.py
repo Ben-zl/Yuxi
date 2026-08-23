@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from yuxi.agentscope import worker_job
+from yuxi.agentscope import gateway, worker_job
 from yuxi.agentscope.gateway import GatewayRoundResult
 
 
@@ -146,9 +146,10 @@ async def test_resume_streams_reasoning_tools_and_terminal_event(monkeypatch):
     monkeypatch.setattr(worker_job, "start_event_pump", lambda *args, **kwargs: (queue, None))
     monkeypatch.setattr(worker_job, "start_cancel_watcher", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker_job, "cancel_tasks", AsyncMock())
+    monkeypatch.setattr(worker_job, "has_active_child_runs", AsyncMock(return_value=False))
     monkeypatch.setattr(worker_job, "SUBSCRIBE_SETTLE_SECONDS", 0)
     monkeypatch.setattr(worker_job, "_collect_asking_tool_calls", AsyncMock(return_value=confirm_event["tool_calls"]))
-    monkeypatch.setattr(worker_job, "append_run_stream_event", _append, raising=False)
+    monkeypatch.setattr(gateway, "append_run_stream_event", _append)
 
     result = await worker_job._resume_and_collect(
         client,
@@ -183,6 +184,70 @@ async def test_resume_streams_reasoning_tools_and_terminal_event(monkeypatch):
             },
         },
     )
+
+
+async def test_external_resume_waits_for_team_worker_wakeup(monkeypatch):
+    """用户回答后创建子智能体时，父 Run 必须收齐 worker 回报再结束。"""
+    run = SimpleNamespace(
+        uid="u",
+        id="run",
+        request_id="request",
+        conversation_thread_id="thread",
+    )
+    mapping = SimpleNamespace(
+        agentscope_agent_id="agent-id",
+        agentscope_session_id="session-id",
+        model_spec="provider:model",
+    )
+    pending_event = {
+        "reply_id": "question-reply",
+        "tool_calls": [{"id": "question", "name": "ask_user_question", "input": {}}],
+    }
+    events = [
+        {"type": "REPLY_START", "reply_id": "leader-1"},
+        {
+            "type": "TOOL_CALL_START",
+            "reply_id": "leader-1",
+            "tool_call_id": "create-worker",
+            "tool_call_name": "AgentCreate",
+        },
+        {"type": "TEXT_BLOCK_DELTA", "reply_id": "leader-1", "delta": "已派发。"},
+        {"type": "REPLY_END", "reply_id": "leader-1", "finished_reason": "completed"},
+        {"type": "REPLY_START", "reply_id": "leader-2"},
+        {
+            "type": "TEXT_BLOCK_DELTA",
+            "reply_id": "leader-2",
+            "delta": "子智能体分析完成。",
+        },
+        {"type": "REPLY_END", "reply_id": "leader-2", "finished_reason": "completed"},
+    ]
+    queue = asyncio.Queue()
+    for event in events:
+        queue.put_nowait(event)
+    emitted: list[tuple[str, dict]] = []
+
+    async def _append(run_id, event, payload, thread_id=None):
+        emitted.append((event, payload))
+
+    client = SimpleNamespace(resume_external_execution=AsyncMock())
+    monkeypatch.setattr(worker_job, "start_event_pump", lambda *args, **kwargs: (queue, None))
+    monkeypatch.setattr(worker_job, "start_cancel_watcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_job, "cancel_tasks", AsyncMock())
+    monkeypatch.setattr(worker_job, "SUBSCRIBE_SETTLE_SECONDS", 0)
+    monkeypatch.setattr(gateway, "append_run_stream_event", _append)
+    monkeypatch.setattr(gateway, "TEAM_QUIESCE_SECONDS", 0.01)
+    monkeypatch.setattr(gateway, "TEAM_CHILD_WAIT_SEGMENT_SECONDS", 1.0)
+
+    result = await worker_job._resume_external_and_collect(
+        client,
+        run,
+        mapping,
+        pending_event,
+        "开始分析",
+    )
+
+    assert result.text == "已派发。子智能体分析完成。"
+    assert len([payload for event, payload in emitted if event == "end"]) == 1
 
 
 async def test_permission_resume_requires_decisions(monkeypatch):

@@ -247,6 +247,34 @@ async def delete_agent(
         raise HTTPException(status_code=403, detail="不能删除非自己创建的智能体")
     if is_builtin_agent(item):
         raise HTTPException(status_code=409, detail="内置智能体不能删除")
+    # 任务中心工单 10：未归档任务引用时阻断删除；允许删除时置空引用保留快照
+    from sqlalchemy import select as _select
+
+    from yuxi.storage.postgres.models_business import AgentTask, TaskExecution
+
+    referencing = (
+        await db.execute(
+            _select(AgentTask.id).where(
+                AgentTask.agent_id == item.id, AgentTask.archived_at.is_(None)
+            )
+        )
+    ).all()
+    if referencing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该智能体被 {len(referencing)} 个未归档任务引用，请先归档相关任务再删除",
+        )
+    # 归档后允许删除：置空引用，保留 slug 快照供历史展示
+    await db.execute(
+        AgentTask.__table__.update()
+        .where(AgentTask.agent_id == item.id)
+        .values(agent_id=None)
+    )
+    await db.execute(
+        TaskExecution.__table__.update()
+        .where(TaskExecution.agent_id == item.id)
+        .values(agent_id=None)
+    )
     await repo.delete(agent=item)
     return {"success": True}
 
@@ -299,6 +327,8 @@ async def create_agent_run(
     meta = dict(payload.meta or {})
     request_id = meta.get("request_id") or str(uuid.uuid4())
     meta["request_id"] = request_id
+    # 前端可通过 meta.source 指定来源（如 agent_task），否则默认 chat
+    run_source = str(meta.pop("source", "") or "").strip() or "chat"
 
     input_message = build_chat_input_message(payload.query or "", payload.image_content)
 
@@ -308,7 +338,7 @@ async def create_agent_run(
             thread_id=payload.thread_id,
             request_id=request_id,
             input_message=input_message,
-            origin=RunOrigin(source="chat", channel="web"),
+            origin=RunOrigin(source=run_source, channel="web"),
             request_metadata={**meta, "tool_approval_mode": payload.tool_approval_mode},
             model_spec=payload.model_spec,
             tool_approval_mode=payload.tool_approval_mode,

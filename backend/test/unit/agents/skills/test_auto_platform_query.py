@@ -52,3 +52,12 @@ def test_auto_platform_query_loads_bundled_automation_api(monkeypatch: pytest.Mo
     sdk_module = importlib.import_module("automation_api")
     sdk_path = Path(sdk_module.__file__).resolve()
     assert sdk_path.is_relative_to(skill_dir / "utils" / "automation-api")
+
+
+def test_auto_platform_query_prioritizes_direct_cli_execution() -> None:
+    """Skill 应先执行已打包 CLI，避免准备步骤耗尽 Agent 迭代次数。"""
+    content = (_auto_platform_query_dir() / "SKILL.md").read_text(encoding="utf-8")
+
+    assert content.index("## 执行契约") < content.index("## 🔥 核心原则")
+    assert "python3 <skill-dir>/scripts/cli.py tasks" in content
+    assert "pip install" not in content

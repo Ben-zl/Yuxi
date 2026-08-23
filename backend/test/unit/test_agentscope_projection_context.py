@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from yuxi.agentscope.projection import project_agent_request
+from yuxi.agentscope.projection import project_agent_request, project_subagent_template
 
 
 def test_project_agent_request_uses_native_context_config():
@@ -31,6 +31,19 @@ def test_project_agent_request_uses_native_context_config():
         "compression_prompt": "生成可继续执行的摘要",
         "tool_result_limit": 12000,
     }
+
+
+def test_project_subagent_template_preserves_execution_limit():
+    agent = SimpleNamespace(
+        slug="researcher",
+        name="Researcher",
+        description="research",
+        config_json={"context": {"system_prompt": "prompt", "max_execution_steps": 42}},
+    )
+
+    template = project_subagent_template(agent)
+
+    assert template["react_config"] == {"max_iters": 42}
 
 
 @pytest.mark.parametrize(

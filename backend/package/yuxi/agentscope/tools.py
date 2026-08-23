@@ -22,8 +22,9 @@ _kb_initialized = False
 
 _TEAM_WORKER_PROTOCOL = """
 你是 Team worker。AgentCreate 的 prompt 会作为首个任务自动交给你。
-完成任务后必须调用 TeamSay，把完整结果报告给 leader；to 使用 null 即可广播给团队中的其他成员。
-TeamSay 成功前不得结束本轮，也不能只用普通文本声称已经完成。
+完成任务后必须调用 TeamSay，把完整结果报告给 leader（to={leader_name}）。
+不要使用 to=null 广播，不要响应其他成员的回报或重复发送 idle 状态。
+TeamSay 成功前不得结束本轮，也不能只用普通文本声称已经完成；报告成功后立即结束本轮。
 """.strip()
 
 
@@ -875,7 +876,12 @@ async def build_subagent_tools(
     tool._sub_agent_templates.pop("default", None)
     schema = deepcopy(tool.input_schema)
     schema["properties"]["subagent_type"]["enum"] = list(indexed)
-    schema["properties"]["subagent_type"]["description"] = "受管子智能体类型，必须来自当前允许集合。"
+    capabilities = "；".join(
+        f"{item['type']}: {item['description']}" for item in templates
+    )
+    schema["properties"]["subagent_type"]["description"] = (
+        f"受管子智能体类型，必须来自当前允许集合。可用能力：{capabilities}"
+    )
     schema.setdefault("required", []).append("subagent_type")
     tool.input_schema = schema
     return [tool]

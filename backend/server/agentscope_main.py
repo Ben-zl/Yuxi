@@ -75,7 +75,14 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
         NativeScheduleBlockMiddleware(),
         build_context_observability_middleware(app.state.message_bus, session_id),
     ]
-    team_lifecycle = await build_team_lifecycle_middleware(app.state.storage, user_id, agent_id, session_id)
+    team_lifecycle = await build_team_lifecycle_middleware(
+        app.state.storage,
+        app.state.message_bus,
+        app.state.workspace_manager,
+        user_id,
+        agent_id,
+        session_id,
+    )
     if team_lifecycle is not None:
         middlewares.append(team_lifecycle)
     steer = await build_steer_middleware(user_id, agent_id, session_id)
@@ -94,7 +101,10 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
         build_skill_dependency_gateway,
         build_subagent_tools,
     )
-    from yuxi.agentscope.runtime_resources import resolve_runtime_projection
+    from yuxi.agentscope.runtime_resources import (
+        resolve_runtime_projection,
+        sync_runtime_skills,
+    )
 
     async with pg_manager.get_async_session_context() as db:
         projection = await resolve_runtime_projection(
@@ -114,6 +124,7 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
         session_id,
         session.config.workspace_id,
     )
+    await sync_runtime_skills(workspace, projection, agent_id=agent_id)
 
     tools = await build_kb_tools(uid=user_id, knowledge_slugs=projection.knowledge_slugs)
     tools.extend(await build_mcp_tools(mcp_servers=projection.mcp_servers))

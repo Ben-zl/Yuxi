@@ -263,10 +263,23 @@ async def resolve_thread_artifact_view(
     db,
     path: str,
 ) -> Path | InMemoryArtifact:
+    """授权（线程所有者隔离）并解析线程产物路径。"""
     conv_repo = ConversationRepository(db)
     conversation = await require_user_conversation(conv_repo, thread_id, str(current_uid))
-    uid = str(conversation.uid)
+    return await resolve_thread_artifact_by_owner(
+        thread_id=thread_id, owner_uid=str(conversation.uid), db=db, path=path
+    )
 
+
+async def resolve_thread_artifact_by_owner(
+    *,
+    thread_id: str,
+    owner_uid: str,
+    db,
+    path: str,
+) -> Path | InMemoryArtifact:
+    """按文件所有者解析线程产物路径；调用方须自行校验可见性。"""
+    uid = owner_uid
     normalized = "/" + path.lstrip("/")
     if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is not None:
         raw = await read_agentscope_file(

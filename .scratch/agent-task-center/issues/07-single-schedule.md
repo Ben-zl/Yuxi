@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — 关闭 AgentScope 原生 Schedule 入口；04 — 实现任务级 FIFO 队列与生命周期操作
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Source:** [父规格 #958](https://github.com/xerrors/Yuxi/issues/958)
 

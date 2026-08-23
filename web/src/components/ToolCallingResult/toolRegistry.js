@@ -130,6 +130,14 @@ export const SUBAGENT_TOOL_IDS = [
 
 export const isSubagentToolCall = (toolCall) => SUBAGENT_TOOL_IDS.includes(getToolCallId(toolCall))
 
+const TOOL_CALL_FAILURE_STATUSES = new Set(['error', 'cancelled', 'interrupted'])
+
+export const getToolCallExecutionState = (toolCall) => {
+  if (toolCall?.tool_call_result || toolCall?.status === 'success') return 'completed'
+  if (TOOL_CALL_FAILURE_STATUSES.has(toolCall?.status)) return 'error'
+  return 'running'
+}
+
 export const parseToolCallResult = (toolCall) => {
   const content = toolCall?.tool_call_result?.content ?? toolCall?.result
   if (!content) return null

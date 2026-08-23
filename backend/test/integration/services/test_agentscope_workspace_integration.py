@@ -1,7 +1,7 @@
 """Docker workspace 与 AgentScope 服务集成测试（迁移工单 06）。
 
-真实链路验证：模型发起 Write 工具调用 → agentscope 在 Docker workspace
-容器内执行 → 文件落在线程隔离的工作区 → 经 workspace 文件端点读回。
+真实链路验证：模型先用 Write 创建文件，再在同一 session 用 Read/Edit 修改；
+工具在 Docker workspace 容器内执行，最终经 workspace 文件端点读回。
 前置：AGENTSCOPE_WORKSPACE_BACKEND=docker。
 """
 
@@ -26,6 +26,7 @@ CHATBOT_SLUG = "e2e-ws-chatbot"
 USER_ID = "e2e-ws"
 WRITE_PATH = "/workspace/outputs/hello.txt"
 WRITE_CONTENT = "agentscope workspace 写入测试\n"
+EDIT_CONTENT = "agentscope workspace 编辑成功\n"
 
 pytestmark = pytest.mark.integration
 
@@ -74,7 +75,7 @@ async def db_session():
     pg_manager._initialized = False
 
 
-async def test_write_tool_executes_in_docker_workspace(db_session):
+async def test_write_then_edit_tools_execute_in_docker_workspace(db_session):
     uid = USER_ID
     thread_id = f"e2e-ws-thread-{uuid.uuid4().hex[:12]}"
 
@@ -126,6 +127,54 @@ async def test_write_tool_executes_in_docker_workspace(db_session):
                 virtual_path="/home/gem/user-data/outputs/hello.txt",
             )
             == WRITE_CONTENT.encode()
+        )
+
+        edit_result = await collect_chat_round(
+            client,
+            uid=uid,
+            agent_id=mapping.agentscope_agent_id,
+            session_id=mapping.agentscope_session_id,
+            text="请编辑已有文件",
+            read_timeout=600.0,
+        )
+        called = {
+            event.get("tool_call_name")
+            for event in edit_result.events
+            if str(event.get("type", "")).upper() == "TOOL_CALL_START"
+        }
+        failed_results = [
+            event
+            for event in edit_result.events
+            if str(event.get("type", "")).upper() == "TOOL_RESULT_END"
+            and str(event.get("state", "")).lower() == "error"
+        ]
+        assert {"Read", "Edit"} <= called, called
+        assert not failed_results, failed_results
+
+        async with httpx.AsyncClient(
+            base_url=AGENTSCOPE_BASE_URL,
+            headers={"X-User-ID": uid},
+            timeout=60.0,
+        ) as http:
+            edited = await http.get(
+                "/workspace/files",
+                params={
+                    "agent_id": mapping.agentscope_agent_id,
+                    "session_id": mapping.agentscope_session_id,
+                    "path": WRITE_PATH,
+                },
+            )
+            assert edited.status_code == 200, edited.text
+            assert edited.text == EDIT_CONTENT
+
+        assert (
+            await read_file(
+                db_session,
+                uid=uid,
+                thread_id=thread_id,
+                virtual_path="/home/gem/user-data/outputs/hello.txt",
+            )
+            == EDIT_CONTENT.encode()
         )
     finally:
         await client.delete_session(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)

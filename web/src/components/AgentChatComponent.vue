@@ -803,7 +803,8 @@ import {
 const props = defineProps({
   agentId: { type: String, default: '' },
   singleMode: { type: Boolean, default: true },
-  sendDisabled: { type: Boolean, default: false }
+  sendDisabled: { type: Boolean, default: false },
+  runSource: { type: String, default: '' }
 })
 const emit = defineEmits(['thread-change'])
 
@@ -2941,7 +2942,9 @@ const selectThreadFromRoute = async (threadId) => {
 
   const targetThread = threads.value.find((thread) => thread.id === threadId)
   if (!targetThread) {
-    return false
+    // 线程不在最近列表中（如任务执行线程）— 直接加载，不阻断
+    await selectChat(threadId)
+    return true
   }
 
   await selectChat(threadId)
@@ -3041,7 +3044,8 @@ const handleSendMessage = async ({ image, queuePolicy = 'enqueue' } = {}) => {
       thread_id: threadId,
       meta: {
         request_id: requestId,
-        attachment_file_ids: pendingAttachmentFileIds
+        attachment_file_ids: pendingAttachmentFileIds,
+        ...(props.runSource ? { source: props.runSource } : {})
       },
       image_content: imageContent,
       model_spec: modelSpec,

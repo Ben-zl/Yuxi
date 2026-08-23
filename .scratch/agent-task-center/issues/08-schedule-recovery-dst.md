@@ -4,7 +4,7 @@
 
 **Blocked by:** 07 — 支持单条每日、每周或 Cron 定时规则
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Source:** [父规格 #958](https://github.com/xerrors/Yuxi/issues/958)
 

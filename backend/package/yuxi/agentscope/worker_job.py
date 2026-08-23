@@ -11,10 +11,15 @@ from pathlib import Path
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
-from yuxi.agentscope.execution import execute_run, finalize_run
+from yuxi.agentscope.execution import execute_run, finalize_run, has_active_child_runs
 from yuxi.agentscope.event_stream import cancel_tasks, start_event_pump
-from yuxi.agentscope.gateway import GatewayRoundResult, start_cancel_watcher
-from yuxi.agentscope.protocol import ToolEventConverter, event_to_chunks, reply_end_to_terminal
+from yuxi.agentscope.gateway import (
+    TEAM_TOOL_NAMES,
+    GatewayRoundResult,
+    collect_run_events,
+    start_cancel_watcher,
+)
+from yuxi.agentscope.protocol import ToolEventConverter
 from yuxi.agentscope.runner import SUBSCRIBE_SETTLE_SECONDS, ensure_thread_session
 from yuxi.agentscope.thread_guard import (
     LEGACY_THREAD_MESSAGE,
@@ -29,11 +34,9 @@ from yuxi.repositories.agent_run_repository import (
 )
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.services.agent_request_queue_service import dispatch_next_request
-from yuxi.services.run_queue_service import append_run_stream_event
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Message
 from yuxi.utils import logger
-from yuxi.agentscope.usage import UsageAccumulator
 
 
 async def execute_agent_run_job(run_id: str) -> None:
@@ -157,6 +160,17 @@ async def execute_agent_run_job(run_id: str) -> None:
                 run.conversation_thread_id,
                 {"status": result.run_status},
             )
+        await _notify_agent_task(run.id, result.run_status)
+
+
+async def _notify_agent_task(run_id: str, run_status: str) -> None:
+    """任务执行 Run 终态推进任务队列；普通 Run 直接返回。"""
+    from yuxi.services.agent_task_dispatcher import notify_agent_task_finished
+
+    try:
+        await notify_agent_task_finished(run_id, run_status)
+    except Exception as exc:  # noqa: BLE001 - 任务推进失败不改变 Run 终态
+        logger.warning(f"任务执行推进失败 run={run_id}: {exc}")
 
 
 async def _apply_permission_mode(client, run, mapping) -> None:
@@ -196,6 +210,7 @@ async def _fail_run(db, run_repo, run, message: str) -> None:
         agent_slug=run.agent_slug,
         thread_id=run.conversation_thread_id,
     )
+    await _notify_agent_task(run.id, "failed")
 
 
 async def _materialize_run_attachments(
@@ -330,7 +345,7 @@ async def _collect_asking_tool_calls(
 
 
 async def _resume_and_collect(client, run, mapping, confirm_event, approved: list[bool]) -> GatewayRoundResult:
-    """订阅在先、恢复在后，收集到 REPLY_END。"""
+    """订阅在先、恢复在后，并保留审批停滞自愈。"""
     queue, pump = start_event_pump(
         client,
         uid=run.uid,
@@ -349,7 +364,6 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
     # 个别 tool_call 可能在确认后才进入 asking。事件流停滞期间周期性
     # 检查会话，发现滞留 asking 即按本次决定补发确认。
     stall_poll_seconds = 15.0
-    total_deadline = asyncio.get_running_loop().time() + READ_TIMEOUT_SECONDS
     try:
         await asyncio.sleep(SUBSCRIBE_SETTLE_SECONDS)
         tool_calls = confirm_event.get("tool_calls") or []
@@ -375,97 +389,57 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
             tool_calls=pending_calls,
             confirmed=[decisions_by_id[call.get("id")] for call in pending_calls],
         )
-        text_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        event_count = 0
-        usage = UsageAccumulator(configured_model_spec=mapping.model_spec)
         tool_converter = ToolEventConverter(run.request_id)
         tool_converter.seed_tool_calls(
             tool_calls,
             reply_id=str(confirm_event.get("reply_id") or ""),
         )
-        loop = asyncio.get_running_loop()
-        while True:
-            remaining = total_deadline - loop.time()
-            if remaining <= 0:
-                raise TimeoutError("resume 收集超时：会话长时间无事件")
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=min(stall_poll_seconds, remaining))
-            except TimeoutError:
-                asking = await _collect_asking_tool_calls(
-                    client,
-                    uid=run.uid,
-                    agent_id=mapping.agentscope_agent_id,
-                    session_id=mapping.agentscope_session_id,
-                    reply_id=confirm_event.get("reply_id", ""),
-                )
-                if asking:
-                    unknown_ids = {call.get("id") for call in asking} - set(decisions_by_id)
-                    if unknown_ids:
-                        raise ValueError("会话出现未向用户展示的待审批工具调用")
-                    retry_decisions = [decisions_by_id[call.get("id")] for call in asking]
-                    await client.resume_confirm(
-                        run.uid,
-                        mapping.agentscope_agent_id,
-                        mapping.agentscope_session_id,
-                        reply_id=confirm_event.get("reply_id", ""),
-                        tool_calls=asking,
-                        confirmed=retry_decisions,
-                    )
-                continue
-            if isinstance(event, Exception):
-                raise event
-            event_count += 1
-            usage.observe(event)
-            event_type = str(event.get("type", "")).upper()
-            if event_type == "TEXT_BLOCK_DELTA":
-                text_parts.append(event.get("delta", ""))
-            elif event_type == "THINKING_BLOCK_DELTA":
-                reasoning_parts.append(event.get("delta", ""))
 
-            chunks = event_to_chunks(event, request_id=run.request_id)
-            chunks.extend(tool_converter.feed(event))
-            if chunks:
-                await append_run_stream_event(
-                    run.id,
-                    "messages",
-                    {"items": chunks},
-                    thread_id=run.conversation_thread_id,
-                )
+        async def _retry_stalled_confirmations() -> None:
+            """补发本轮审批决定，解除并行工具调用的 asking 停滞。"""
+            asking_calls = await _collect_asking_tool_calls(
+                client,
+                uid=run.uid,
+                agent_id=mapping.agentscope_agent_id,
+                session_id=mapping.agentscope_session_id,
+                reply_id=confirm_event.get("reply_id", ""),
+            )
+            if not asking_calls:
+                return
+            unknown_ids = {call.get("id") for call in asking_calls} - set(decisions_by_id)
+            if unknown_ids:
+                raise ValueError("会话出现未向用户展示的待审批工具调用")
+            await client.resume_confirm(
+                run.uid,
+                mapping.agentscope_agent_id,
+                mapping.agentscope_session_id,
+                reply_id=confirm_event.get("reply_id", ""),
+                tool_calls=asking_calls,
+                confirmed=[decisions_by_id[call.get("id")] for call in asking_calls],
+            )
 
-            if event_type in {
-                "REQUIRE_USER_CONFIRM",
-                "REQUIRE_EXTERNAL_EXECUTION",
-            }:
-                tool_converter.seed_tool_calls(
-                    event.get("tool_calls") or [],
-                    reply_id=str(event.get("reply_id") or ""),
-                )
-                return _parked_resume_result(
-                    event,
-                    text_parts,
-                    reasoning_parts,
-                    event_count,
-                    tool_converter.history_tool_calls(),
-                    usage.snapshot(complete=False),
-                )
-            if event_type == "REPLY_END":
-                terminal = reply_end_to_terminal(event, request_id=run.request_id)
-                await append_run_stream_event(
-                    run.id,
-                    "end",
-                    {"status": terminal.run_status, "chunk": terminal.chunk},
-                    thread_id=run.conversation_thread_id,
-                )
-                return GatewayRoundResult(
-                    run_status=terminal.run_status,
-                    text="".join(text_parts),
-                    reasoning="".join(reasoning_parts),
-                    event_count=event_count,
-                    usage=usage.snapshot(complete=True),
-                    error_message=terminal.chunk.get("error_message"),
-                    tool_calls=tool_converter.history_tool_calls(),
-                )
+        return await collect_run_events(
+            queue,
+            client,
+            uid=run.uid,
+            agent_id=mapping.agentscope_agent_id,
+            session_id=mapping.agentscope_session_id,
+            run_id=run.id,
+            request_id=run.request_id,
+            thread_id=run.conversation_thread_id,
+            read_timeout=READ_TIMEOUT_SECONDS,
+            configured_model_spec=mapping.model_spec,
+            tool_converter=tool_converter,
+            team_tool_seen=any(
+                decision and str(call.get("name") or "") in TEAM_TOOL_NAMES
+                for call, decision in zip(tool_calls, approved, strict=True)
+            ),
+            idle_callback=_retry_stalled_confirmations,
+            idle_poll_seconds=stall_poll_seconds,
+            total_timeout=READ_TIMEOUT_SECONDS,
+            emit_parked_end=False,
+            has_active_child_runs=lambda: has_active_child_runs(run.id, run.uid),
+        )
     finally:
         await cancel_tasks(pump, cancel_task)
 
@@ -496,91 +470,27 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
             tool_calls=pending_event.get("tool_calls") or [],
             answer=answer,
         )
-        text_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        event_count = 0
-        usage = UsageAccumulator(configured_model_spec=mapping.model_spec)
         tool_converter = ToolEventConverter(run.request_id)
-        tool_converter.seed_tool_calls(
-            pending_event.get("tool_calls") or [],
-            reply_id=str(pending_event.get("reply_id") or ""),
+        pending_calls = pending_event.get("tool_calls") or []
+        tool_converter.seed_tool_calls(pending_calls, reply_id=str(pending_event.get("reply_id") or ""))
+        return await collect_run_events(
+            queue,
+            client,
+            uid=run.uid,
+            agent_id=mapping.agentscope_agent_id,
+            session_id=mapping.agentscope_session_id,
+            run_id=run.id,
+            request_id=run.request_id,
+            thread_id=run.conversation_thread_id,
+            read_timeout=READ_TIMEOUT_SECONDS,
+            configured_model_spec=mapping.model_spec,
+            tool_converter=tool_converter,
+            team_tool_seen=any(str(call.get("name") or "") in TEAM_TOOL_NAMES for call in pending_calls),
+            emit_parked_end=False,
+            has_active_child_runs=lambda: has_active_child_runs(run.id, run.uid),
         )
-        while True:
-            event = await asyncio.wait_for(queue.get(), timeout=180.0)
-            if isinstance(event, Exception):
-                raise event
-            event_count += 1
-            usage.observe(event)
-            event_type = str(event.get("type", "")).upper()
-            if event_type == "TEXT_BLOCK_DELTA":
-                text_parts.append(event.get("delta", ""))
-            elif event_type == "THINKING_BLOCK_DELTA":
-                reasoning_parts.append(event.get("delta", ""))
-
-            chunks = event_to_chunks(event, request_id=run.request_id)
-            chunks.extend(tool_converter.feed(event))
-            if chunks:
-                await append_run_stream_event(
-                    run.id,
-                    "messages",
-                    {"items": chunks},
-                    thread_id=run.conversation_thread_id,
-                )
-
-            if event_type in {"REQUIRE_USER_CONFIRM", "REQUIRE_EXTERNAL_EXECUTION"}:
-                tool_converter.seed_tool_calls(
-                    event.get("tool_calls") or [],
-                    reply_id=str(event.get("reply_id") or ""),
-                )
-                return _parked_resume_result(
-                    event,
-                    text_parts,
-                    reasoning_parts,
-                    event_count,
-                    tool_converter.history_tool_calls(),
-                    usage.snapshot(complete=False),
-                )
-            if event_type == "REPLY_END":
-                terminal = reply_end_to_terminal(event, request_id=run.request_id)
-                await append_run_stream_event(
-                    run.id,
-                    "end",
-                    {"status": terminal.run_status, "chunk": terminal.chunk},
-                    thread_id=run.conversation_thread_id,
-                )
-                return GatewayRoundResult(
-                    run_status=terminal.run_status,
-                    text="".join(text_parts),
-                    reasoning="".join(reasoning_parts),
-                    event_count=event_count,
-                    usage=usage.snapshot(complete=True),
-                    error_message=terminal.chunk.get("error_message"),
-                    tool_calls=tool_converter.history_tool_calls(),
-                )
     finally:
         await cancel_tasks(pump, cancel_task)
-
-
-def _parked_resume_result(
-    event: dict,
-    text_parts: list[str],
-    reasoning_parts: list[str],
-    event_count: int,
-    tool_calls: list[dict],
-    usage: dict,
-) -> GatewayRoundResult:
-    """把恢复期间再次出现的审批或问答转换为新的挂起结果。"""
-    event_type = str(event.get("type", "")).upper()
-    return GatewayRoundResult(
-        run_status="interrupted",
-        text="".join(text_parts),
-        reasoning="".join(reasoning_parts),
-        event_count=event_count,
-        parked="permission" if event_type == "REQUIRE_USER_CONFIRM" else "external",
-        usage=usage,
-        pending_confirm=event,
-        tool_calls=tool_calls,
-    )
 
 
 async def _replace_pending_confirm(thread_id: str, result: GatewayRoundResult) -> None:

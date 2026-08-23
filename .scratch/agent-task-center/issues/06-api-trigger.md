@@ -4,7 +4,7 @@
 
 **Blocked by:** 05 — 支持部门共享、执行身份和工具审批
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Source:** [父规格 #958](https://github.com/xerrors/Yuxi/issues/958)
 

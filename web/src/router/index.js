@@ -98,6 +98,25 @@ const router = createRouter({
       ]
     },
     {
+      path: '/agent-tasks',
+      name: 'agent-tasks',
+      component: AppLayout,
+      children: [
+        {
+          path: '',
+          name: 'AgentTasksComp',
+          component: () => import('../views/AgentTasksView.vue'),
+          meta: { keepAlive: false, requiresAuth: true }
+        },
+        {
+          path: ':taskId/:executionId',
+          name: 'AgentTaskExecution',
+          component: () => import('../views/AgentTaskExecutionView.vue'),
+          meta: { keepAlive: false, requiresAuth: true }
+        }
+      ]
+    },
+    {
       path: '/extensions',
       name: 'extensions',
       component: AppLayout,
