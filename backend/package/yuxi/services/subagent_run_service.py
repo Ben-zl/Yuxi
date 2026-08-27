@@ -76,7 +76,9 @@ def serialize_subagent_run_state(run: AgentRun) -> dict:
         raise ValueError("subagent run 缺少 runtime")
     tool_call_id = str(runtime.get("tool_call_id") or "").strip()
     if not tool_call_id:
-        raise ValueError("subagent run 缺少 tool_call_id")
+        # TeamReply 产生的历史 child Run 没有对应的父工具调用。
+        # 使用 run id 作为稳定的展示标识，避免旧数据使状态接口整体失败。
+        tool_call_id = f"run:{run.id}"
 
     state = {
         "id": tool_call_id,

@@ -8,7 +8,11 @@ from fastapi import HTTPException
 import yuxi.services.agent_run_service as agent_run_service
 import yuxi.services.subagent_run_service as service_module
 from yuxi.services.input_message_service import build_chat_input_message
-from yuxi.services.subagent_run_service import SubagentRunBusy, SubagentRunService
+from yuxi.services.subagent_run_service import (
+    serialize_subagent_run_state,
+    SubagentRunBusy,
+    SubagentRunService,
+)
 from yuxi.utils.hash_utils import subagent_child_thread_id
 
 
@@ -95,6 +99,31 @@ def _child_run(*, relation_id: int = 77, created_by_run_id: str = "parent-run"):
         created_by_run_id=created_by_run_id,
         subagent_thread_relation_id=relation_id,
     )
+
+
+def test_serialize_subagent_run_state_falls_back_to_run_id_without_tool_call_id():
+    """历史 TeamReply Run 缺少 tool_call_id 时仍应返回可展示状态。"""
+    run = SimpleNamespace(
+        id="child-run",
+        input_payload={"runtime": {"subagent_name": "Worker"}},
+        agent_slug="worker",
+        conversation_thread_id="child-thread",
+        status="completed",
+        created_at=None,
+        finished_at=None,
+        error_message=None,
+    )
+
+    assert serialize_subagent_run_state(run) == {
+        "id": "run:child-run",
+        "run_id": "child-run",
+        "subagent_slug": "worker",
+        "subagent_name": "Worker",
+        "child_thread_id": "child-thread",
+        "status": "completed",
+        "events_url": "/api/agent/runs/child-run/events",
+        "result_url": "/api/agent/runs/child-run/result",
+    }
 
 
 def _patch_repos(

@@ -19,7 +19,7 @@ async def test_failed_worker_reply_notifies_leader_before_terminal(monkeypatch):
         uid="u",
         agent_id="worker-agent",
         session_id="worker-session",
-        failure_notifier=_notify,
+        leader_notifier=_notify,
     )
     binding = SimpleNamespace(worker_session_id="worker-session", child_thread_id="child-thread")
     monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
@@ -44,6 +44,133 @@ async def test_failed_worker_reply_notifies_leader_before_terminal(monkeypatch):
         ("notify", "子智能体执行失败，未能返回结果：运行失败: exceed_max_iters"),
         ("finish", "failed"),
     ]
+
+
+async def test_completed_worker_reply_without_team_say_notifies_leader(monkeypatch):
+    """worker 未主动 TeamSay 时，平台必须把完整结果代发给 leader。"""
+    order = []
+
+    async def _notify(message: str) -> None:
+        order.append(("notify", message))
+
+    lifecycle = TeamLifecycleModule(
+        storage=SimpleNamespace(),
+        uid="u",
+        agent_id="worker-agent",
+        session_id="worker-session",
+        leader_notifier=_notify,
+    )
+    binding = SimpleNamespace(worker_session_id="worker-session", child_thread_id="child-thread")
+    monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
+    monkeypatch.setattr(lifecycle, "_open_worker_run", AsyncMock(return_value=("child-run", "child-request")))
+
+    async def _finish_worker_run(**kwargs) -> None:
+        order.append(("finish", kwargs["terminal_status"]))
+
+    monkeypatch.setattr(lifecycle, "_finish_worker_run", _finish_worker_run)
+    monkeypatch.setattr(team_lifecycle, "append_run_stream_event", AsyncMock())
+
+    async def _reply(**_kwargs):
+        yield {"type": "REPLY_START", "reply_id": "reply-1"}
+        yield {"type": "TEXT_BLOCK_DELTA", "reply_id": "reply-1", "delta": "真实分析结果"}
+        yield {
+            "type": "TOOL_CALL_START",
+            "reply_id": "reply-1",
+            "tool_call_id": "bash-1",
+            "tool_call_name": "Bash",
+        }
+        yield {
+            "type": "TOOL_RESULT_TEXT_DELTA",
+            "reply_id": "reply-1",
+            "tool_call_id": "bash-1",
+            "delta": '{"perfeye_file":"/workspace/outputs/tmp/perfeye_169724.json"}',
+        }
+        yield {
+            "type": "TOOL_RESULT_END",
+            "reply_id": "reply-1",
+            "tool_call_id": "bash-1",
+            "state": "success",
+        }
+        yield {"type": "REPLY_END", "reply_id": "reply-1", "finished_reason": "completed"}
+
+    assert [item async for item in lifecycle.project_worker_reply({}, _reply)]
+    assert order == [
+        (
+            "notify",
+            "子智能体已完成，但未主动调用 TeamSay。以下为其完整结果：\n\n"
+            "真实分析结果\n\n可供后续子智能体复用的共享中间文件：\n"
+            "- /workspace/outputs/tmp/perfeye_169724.json",
+        ),
+        ("finish", "completed"),
+    ]
+
+
+async def test_completed_worker_reply_with_successful_team_say_is_not_duplicated(monkeypatch):
+    """worker 已成功 TeamSay 时，平台不得重复向 leader 投递结果。"""
+    notify = AsyncMock()
+    lifecycle = TeamLifecycleModule(
+        storage=SimpleNamespace(),
+        uid="u",
+        agent_id="worker-agent",
+        session_id="worker-session",
+        leader_notifier=notify,
+    )
+    binding = SimpleNamespace(worker_session_id="worker-session", child_thread_id="child-thread")
+    monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
+    monkeypatch.setattr(lifecycle, "_open_worker_run", AsyncMock(return_value=("child-run", "child-request")))
+    monkeypatch.setattr(lifecycle, "_finish_worker_run", AsyncMock())
+    monkeypatch.setattr(team_lifecycle, "append_run_stream_event", AsyncMock())
+
+    async def _reply(**_kwargs):
+        yield {"type": "REPLY_START", "reply_id": "reply-1"}
+        yield {
+            "type": "TOOL_CALL_START",
+            "reply_id": "reply-1",
+            "tool_call_id": "team-say-1",
+            "tool_call_name": "TeamSay",
+        }
+        yield {
+            "type": "TOOL_RESULT_END",
+            "reply_id": "reply-1",
+            "tool_call_id": "team-say-1",
+            "state": "success",
+        }
+        yield {"type": "REPLY_END", "reply_id": "reply-1", "finished_reason": "completed"}
+
+    assert [item async for item in lifecycle.project_worker_reply({}, _reply)]
+    notify.assert_not_awaited()
+
+
+async def test_worker_reply_stream_without_reply_end_still_finishes_child_run(monkeypatch):
+    """取消导致事件流直接耗尽时，child Run 也必须进入终态。"""
+    lifecycle = TeamLifecycleModule(
+        storage=SimpleNamespace(),
+        uid="u",
+        agent_id="worker-agent",
+        session_id="worker-session",
+    )
+    binding = SimpleNamespace(worker_session_id="worker-session", child_thread_id="child-thread")
+    monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
+    monkeypatch.setattr(lifecycle, "_open_worker_run", AsyncMock(return_value=("child-run", "child-request")))
+    finish_run = AsyncMock(return_value="cancelled")
+    monkeypatch.setattr(lifecycle, "_finish_worker_run", finish_run)
+    append_event = AsyncMock()
+    monkeypatch.setattr(team_lifecycle, "append_run_stream_event", append_event)
+
+    async def _reply(**_kwargs):
+        yield {"type": "REPLY_START", "reply_id": "reply-1"}
+        yield {"type": "TEXT_BLOCK_DELTA", "reply_id": "reply-1", "delta": "部分结果"}
+
+    assert [item async for item in lifecycle.project_worker_reply({}, _reply)]
+    finish_run.assert_awaited_once()
+    finish_kwargs = finish_run.await_args.kwargs
+    assert finish_kwargs["run_id"] == "child-run"
+    assert finish_kwargs["terminal_status"] == "failed"
+    assert finish_kwargs["error_message"] == "AgentScope worker reply stream ended without REPLY_END"
+    assert finish_kwargs["text"] == "部分结果"
+    assert finish_kwargs["usage"]["complete"] is False
+    assert append_event.await_args_list[-1].args[:2] == ("child-run", "end")
+    assert append_event.await_args_list[-1].args[2]["status"] == "cancelled"
 
 
 async def test_worker_reply_projects_latest_team_message_as_child_input(monkeypatch):

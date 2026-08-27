@@ -134,9 +134,7 @@ async def test_get_latest_top_level_runs_for_threads_picks_latest_chat_resume(se
     await _seed_thread_run(session, thread_id="t2", run_id="t2-done", status="completed")
     await session.commit()
 
-    result = await AgentRunRepository(session).get_latest_top_level_runs_for_threads(
-        "user-1", ["t1", "t2"]
-    )
+    result = await AgentRunRepository(session).get_latest_top_level_runs_for_threads("user-1", ["t1", "t2"])
 
     assert result["t1"] == ("t1-running", "running")
     assert result["t2"] == ("t2-done", "completed")
@@ -166,6 +164,57 @@ async def test_get_latest_top_level_runs_for_threads_scopes_by_user(session):
 async def test_get_latest_top_level_runs_for_threads_empty_input(session):
     result = await AgentRunRepository(session).get_latest_top_level_runs_for_threads("user-1", [])
     assert result == {}
+
+
+async def test_list_child_runs_by_thread_returns_children_from_all_top_level_runs(session):
+    first_parent = await _seed_thread_run(
+        session,
+        thread_id="thread-1",
+        run_id="parent-1",
+        status="completed",
+    )
+    second_parent = await _seed_thread_run(
+        session,
+        thread_id="thread-1",
+        run_id="parent-2",
+        status="completed",
+        run_type="resume",
+    )
+    session.add_all(
+        [
+            AgentRun(
+                id="child-1",
+                conversation_thread_id="child-thread-1",
+                agent_slug="worker-1",
+                uid="user-1",
+                status="completed",
+                request_id="child-request-1",
+                created_by_run_id=first_parent.id,
+                run_type="subagent",
+                input_payload={},
+            ),
+            AgentRun(
+                id="child-2",
+                conversation_thread_id="child-thread-2",
+                agent_slug="worker-2",
+                uid="user-1",
+                status="completed",
+                request_id="child-request-2",
+                created_by_run_id=second_parent.id,
+                run_type="subagent",
+                input_payload={},
+            ),
+        ]
+    )
+    await session.commit()
+
+    result = await AgentRunRepository(session).list_child_runs_by_thread_for_user(
+        "thread-1",
+        "user-1",
+    )
+
+    assert [run.id for run in result] == ["child-1", "child-2"]
+
 
 async def test_set_terminal_status_persists_token_usage_only_for_winner(session):
     repo = AgentRunRepository(session)

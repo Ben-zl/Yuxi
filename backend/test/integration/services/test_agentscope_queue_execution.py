@@ -54,6 +54,7 @@ async def env(monkeypatch):
         enqueued.append(run_id)
 
     monkeypatch.setattr(agent_request_queue_service, "enqueue_agent_run", _capture_enqueue)
+    monkeypatch.setattr(agent_request_queue_service, "reenqueue_agent_run", _capture_enqueue)
 
     async with session_factory() as db:
         db.add(
@@ -86,7 +87,9 @@ async def env(monkeypatch):
             db.add(provider)
         provider.display_name = "e2e mock provider"
         provider.provider_type = "openai"
-        provider.base_url = os.getenv("OPENAI_MOCK_BASE_URL", os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1"))
+        provider.base_url = os.getenv(
+            "OPENAI_MOCK_BASE_URL", os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1")
+        )
         provider.api_key = "e2e-mock-key"
         provider.capabilities = ["chat"]
         provider.enabled_models = [{"id": "mock-chat-model", "type": "chat"}]

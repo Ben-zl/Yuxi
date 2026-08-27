@@ -876,9 +876,7 @@ async def build_subagent_tools(
     tool._sub_agent_templates.pop("default", None)
     schema = deepcopy(tool.input_schema)
     schema["properties"]["subagent_type"]["enum"] = list(indexed)
-    capabilities = "；".join(
-        f"{item['type']}: {item['description']}" for item in templates
-    )
+    capabilities = "；".join(f"{item['type']}: {item['description']}" for item in templates)
     schema["properties"]["subagent_type"]["description"] = (
         f"受管子智能体类型，必须来自当前允许集合。可用能力：{capabilities}"
     )
@@ -981,11 +979,26 @@ def _present_artifacts_tool(workspace):
             if stat is None or getattr(stat, "is_dir", False):
                 raise ValueError(f"产出文件不存在或不是普通文件: {value}")
             validated.append(str(path))
+
+        manifest_path = "/workspace/data/yuxi-artifacts.json"
+        existing = []
+        if await backend.stat(manifest_path) is not None:
+            payload = json.loads(await backend.read_file(manifest_path))
+            persisted = payload.get("filepaths")
+            if not isinstance(persisted, list):
+                raise ValueError("交付物清单格式无效")
+            for value in persisted:
+                path = PurePosixPath(value) if isinstance(value, str) else None
+                if path is None or path == root or not path.is_relative_to(root):
+                    raise ValueError("交付物清单包含无效路径")
+                existing.append(str(path))
+
+        merged = list(dict.fromkeys([*existing, *validated]))
         await backend.write_file(
-            "/workspace/data/yuxi-artifacts.json",
-            json.dumps({"filepaths": validated}, ensure_ascii=False).encode("utf-8"),
+            manifest_path,
+            json.dumps({"filepaths": merged}, ensure_ascii=False).encode("utf-8"),
         )
-        return _json({"filepaths": validated})
+        return _json({"filepaths": merged})
 
     return FunctionTool(
         present_artifacts,

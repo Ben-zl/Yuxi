@@ -197,20 +197,29 @@ async def _sync_input_delivery_status(db, run, run_status: str) -> None:
 
 async def _fail_run(db, run_repo, run, message: str) -> None:
     """失败终态提交后续派 FIFO 队头。"""
-    await run_repo.set_terminal_status(run.id, status="failed", error_message=message)
+    from yuxi.services.run_queue_service import clear_cancel_signal, has_cancel_signal
+
+    cancelled = await has_cancel_signal(run.id)
+    terminal_status = "cancelled" if cancelled else "failed"
+    error_message = None if cancelled else message
+    end_payload = {"status": "cancelled"} if cancelled else {"status": "error", "error_message": message}
+
+    await run_repo.set_terminal_status(run.id, status=terminal_status, error_message=error_message)
     await _emit_end_event(
         run.id,
         run.conversation_thread_id,
-        {"status": "error", "error_message": message},
+        end_payload,
     )
-    await _sync_input_delivery_status(db, run, "failed")
+    await _sync_input_delivery_status(db, run, terminal_status)
     await db.commit()
+    if cancelled:
+        await clear_cancel_signal(run.id)
     await dispatch_next_request(
         uid=run.uid,
         agent_slug=run.agent_slug,
         thread_id=run.conversation_thread_id,
     )
-    await _notify_agent_task(run.id, "failed")
+    await _notify_agent_task(run.id, terminal_status)
 
 
 async def _materialize_run_attachments(

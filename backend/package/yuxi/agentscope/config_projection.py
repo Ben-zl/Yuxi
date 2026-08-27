@@ -53,6 +53,15 @@ def adapt_prompt_paths_for_agentscope(prompt: str) -> str:
     return prompt.replace(VIRTUAL_PATH_PREFIX, "/workspace")
 
 
+def build_agentscope_system_prompt(system_prompt: str) -> str:
+    """构造主、子智能体共享的平台提示词，并映射 AgentScope 文件路径。"""
+    from types import SimpleNamespace
+
+    from yuxi.agents.buildin.chatbot.prompt import build_prompt_with_context
+
+    return adapt_prompt_paths_for_agentscope(build_prompt_with_context(SimpleNamespace(system_prompt=system_prompt)))
+
+
 async def _load_user(db: AsyncSession, uid: str):
     """读取运行用户，缺失即显式失败。"""
     user = await UserRepository().get_by_uid_with_db(db, uid)
@@ -107,16 +116,9 @@ async def project_runtime(
     credential_data, chat_model_config = project_chat_model(provider, model_id)
     agent_request = project_agent_request(agent)
     if thread_id:
-        from types import SimpleNamespace
-
-        from yuxi.agents.buildin.chatbot.prompt import build_prompt_with_context
         from yuxi.agents.context import build_agent_input_context
 
-        platform_prompt = adapt_prompt_paths_for_agentscope(
-            build_prompt_with_context(
-                SimpleNamespace(system_prompt=context.get("system_prompt") or "")
-            )
-        )
+        platform_prompt = build_agentscope_system_prompt(context.get("system_prompt") or "")
         input_context = await build_agent_input_context(
             {"system_prompt": platform_prompt},
             thread_id=thread_id,
@@ -219,11 +221,7 @@ async def project_runtime(
             raise ValueError("智能体 MCP 配置只能包含非空 slug")
         selected_mcps = list(dict.fromkeys(slug.strip() for slug in configured_mcps))
     dependency_mcps = list(
-        dict.fromkeys(
-            slug
-            for dependencies in projection.skill_mcp_dependencies.values()
-            for slug in dependencies
-        )
+        dict.fromkeys(slug for dependencies in projection.skill_mcp_dependencies.values() for slug in dependencies)
     )
     requested_mcps = None if selected_mcps is None else list(dict.fromkeys([*selected_mcps, *dependency_mcps]))
     loaded_mcp_configs = await load_enabled_mcp_server_configs(names=requested_mcps, db=db)
@@ -242,14 +240,9 @@ async def project_runtime(
     projection.mcp_servers = [{"slug": slug, **mcp_configs[slug]} for slug in mcp_slugs]
     unavailable_skill_mcps = [slug for slug in dependency_mcps if slug not in mcp_configs]
     if unavailable_skill_mcps:
-        raise ValueError(
-            "Skill 引用了不存在、未启用或不允许的 MCP: " + ", ".join(unavailable_skill_mcps)
-        )
+        raise ValueError("Skill 引用了不存在、未启用或不允许的 MCP: " + ", ".join(unavailable_skill_mcps))
     projection.skill_mcp_servers = {
-        skill_slug: [
-            {"slug": mcp_slug, **mcp_configs[mcp_slug]}
-            for mcp_slug in dependencies
-        ]
+        skill_slug: [{"slug": mcp_slug, **mcp_configs[mcp_slug]} for mcp_slug in dependencies]
         for skill_slug, dependencies in projection.skill_mcp_dependencies.items()
     }
 
@@ -267,4 +260,6 @@ async def project_runtime(
             raise ValueError("智能体引用了当前用户不可访问的子智能体: " + ", ".join(inaccessible_subagents))
         visible_subagents = [visible_by_slug[slug] for slug in configured_subagents]
     projection.subagent_templates = [project_subagent_template(row) for row in visible_subagents]
+    for template in projection.subagent_templates:
+        template["system_prompt_template"] = build_agentscope_system_prompt(template["system_prompt_template"])
     return projection

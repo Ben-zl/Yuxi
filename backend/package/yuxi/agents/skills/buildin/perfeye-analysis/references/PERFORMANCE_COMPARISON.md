@@ -47,19 +47,19 @@ Step 3: AI Agent 生成性能对比分析报告
 
 ```bash
 # 获取任务 1 的数据
-python scripts/perfeye_cli.py --uuid <uuid1> --metrics -o task1.json
+python3 <skill-dir>/scripts/perfeye_cli.py --uuid <uuid1> --metrics -o /workspace/outputs/tmp/task1.json
 
 # 获取任务 2 的数据
-python scripts/perfeye_cli.py --uuid <uuid2> --metrics -o task2.json
+python3 <skill-dir>/scripts/perfeye_cli.py --uuid <uuid2> --metrics -o /workspace/outputs/tmp/task2.json
 
 # 获取任务 3 的数据
-python scripts/perfeye_cli.py --uuid <uuid3> --metrics -o task3.json
+python3 <skill-dir>/scripts/perfeye_cli.py --uuid <uuid3> --metrics -o /workspace/outputs/tmp/task3.json
 ```
 
 **或者** 获取完整数据（包含 LabelInfo.All）：
 
 ```bash
-python scripts/perfeye_cli.py --uuid <uuid> --full -o task_full.json
+python3 <skill-dir>/scripts/perfeye_cli.py --uuid <uuid> --full -o /workspace/outputs/tmp/task_full.json
 ```
 
 ## Step 2: 提交数据给 AI Agent

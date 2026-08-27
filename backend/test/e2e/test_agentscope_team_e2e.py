@@ -81,9 +81,19 @@ async def test_team_choreography_with_custom_template(db_session):
     assert result.parked is None
     assert result.text.startswith(TEAM_DONE_TEXT)
 
-    # leader 事件流含组队与建员工调用
-    called = {ev.get("tool_call_name") for ev in result.events if str(ev.get("type", "")).upper() == "TOOL_CALL_START"}
-    assert {"TeamCreate", "AgentCreate"} <= called, called
+    # TeamDelete 只执行一次并正常结束；保留模式下 worker runtime 仍存在。
+    tool_starts = [ev for ev in result.events if str(ev.get("type", "")).upper() == "TOOL_CALL_START"]
+    called = {ev.get("tool_call_name") for ev in tool_starts}
+    assert {"TeamCreate", "AgentCreate", "TeamDelete"} <= called, called
+    delete_starts = [ev for ev in tool_starts if ev.get("tool_call_name") == "TeamDelete"]
+    assert len(delete_starts) == 1
+    delete_call_id = delete_starts[0]["tool_call_id"]
+    delete_ends = [
+        ev
+        for ev in result.events
+        if str(ev.get("type", "")).upper() == "TOOL_RESULT_END" and ev.get("tool_call_id") == delete_call_id
+    ]
+    assert len(delete_ends) == 1
 
     # worker 以独立 team 会话落地，系统提示来自 yuxi 模板投影
     import asyncpg

@@ -25,7 +25,7 @@ pip install requests
 
 ```bash
 # 方式 1: 直接使用 UUID
-python scripts/perfeye_cli.py --uuid <task_uuid> --metrics
+python3 <skill-dir>/scripts/perfeye_cli.py --uuid <task_uuid> --metrics
 
 # 方式 2: 从 URL 提取 UUID（AI Agent 自动处理）
 # URL 格式: https://perfeye.testplus.cn/case/{uuid}/report?appKey={appkey}
@@ -34,7 +34,7 @@ python scripts/perfeye_cli.py --uuid <task_uuid> --metrics
 # 示例工作流程：
 # 用户提供: https://perfeye.testplus.cn/case/69816de7864483992eeb120d/report?appKey=test
 # AI Agent: 提取 UUID -> 69816de7864483992eeb120d
-# AI Agent: 执行 -> python scripts/perfeye_cli.py --uuid 69816de7864483992eeb120d --metrics
+# AI Agent: 执行 -> python3 <skill-dir>/scripts/perfeye_cli.py --uuid 69816de7864483992eeb120d --metrics
 
 # 然后告诉 AI Agent: "分析上述性能数据"
 ```
@@ -45,8 +45,8 @@ python scripts/perfeye_cli.py --uuid <task_uuid> --metrics
 
 ```bash
 # 获取多个任务数据
-python scripts/perfeye_cli.py --uuid <uuid1> --metrics -o task1.json
-python scripts/perfeye_cli.py --uuid <uuid2> --metrics -o task2.json
+python3 <skill-dir>/scripts/perfeye_cli.py --uuid <uuid1> --metrics -o /workspace/outputs/tmp/task1.json
+python3 <skill-dir>/scripts/perfeye_cli.py --uuid <uuid2> --metrics -o /workspace/outputs/tmp/task2.json
 
 # 或者用户直接提供多个 URL，AI Agent 自动提取 UUID 并执行上述命令
 
@@ -54,6 +54,10 @@ python scripts/perfeye_cli.py --uuid <uuid2> --metrics -o task2.json
 ```
 
 **详细指南**: [references/PERFORMANCE_COMPARISON.md](references/PERFORMANCE_COMPARISON.md)
+
+如果确实需要临时编写脚本，脚本必须写入 `/workspace/outputs/tmp/`，执行时使用绝对路径，
+例如 `python3 /workspace/outputs/tmp/analyze.py`。Bash 当前目录不是稳定协议，不要执行
+依赖当前目录的 `python3 analyze.py`；能直接用 Read 读取 JSON 并由 Agent 统计时，不要额外写脚本。
 
 ## 参考文档
 
@@ -108,13 +112,13 @@ DrawCall 和面数达标标准根据画质设置有所不同：
 
 ```bash
 # 获取性能指标
-python scripts/perfeye_cli.py --uuid <task_uuid> --metrics
+python3 <skill-dir>/scripts/perfeye_cli.py --uuid <task_uuid> --metrics
 
 # 输出到文件
-python scripts/perfeye_cli.py --uuid <task_uuid> --metrics -o output.json
+python3 <skill-dir>/scripts/perfeye_cli.py --uuid <task_uuid> --metrics -o /workspace/outputs/tmp/output.json
 
 # 检查 API 连接
-python scripts/perfeye_cli.py --check
+python3 <skill-dir>/scripts/perfeye_cli.py --check
 ```
 
 ### URL 格式支持
@@ -136,5 +140,5 @@ http://perfeye.console.testplus.cn/case/{uuid}/report
 **AI Agent 处理流程**:
 1. 用户输入: `https://perfeye.testplus.cn/case/{uuid}/report?appKey={appkey}`
 2. AI Agent: 使用正则表达式提取 UUID 部分
-3. AI Agent: 执行 `python scripts/perfeye_cli.py --uuid {uuid} --metrics`
+3. AI Agent: 执行 `python3 <skill-dir>/scripts/perfeye_cli.py --uuid {uuid} --metrics`
 4. AI Agent: 分析返回的性能数据

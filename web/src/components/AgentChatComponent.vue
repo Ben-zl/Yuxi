@@ -1617,6 +1617,9 @@ const isStateSectionExpanded = (key) => !collapsedStateSections[key]
 const toggleStateSection = (key) => {
   collapsedStateSections[key] = !collapsedStateSections[key]
 }
+const USER_DATA_FILE_ROOT = '/home/gem/user-data'
+const isVisibleStateFile = (path) =>
+  path === USER_DATA_FILE_ROOT || path.startsWith(`${USER_DATA_FILE_ROOT}/`)
 const currentStateFiles = computed(() => {
   const files = []
   const seenPaths = new Set()
@@ -1638,7 +1641,9 @@ const currentStateFiles = computed(() => {
 
   const rawFiles = currentAgentState.value?.files || {}
   if (typeof rawFiles === 'object' && !Array.isArray(rawFiles)) {
-    Object.entries(rawFiles).forEach(([path, fileData]) => pushFile({ path, ...fileData }))
+    Object.entries(rawFiles).forEach(([path, fileData]) => {
+      if (isVisibleStateFile(path)) pushFile({ path, ...fileData })
+    })
   }
   currentThreadAttachments.value.forEach((attachment) => pushFile(attachment, '附件'))
 

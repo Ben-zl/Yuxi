@@ -1,6 +1,7 @@
 """把 AgentScope 会话上下文解析为唯一的 Yuxi 运行时投影。"""
 
 import asyncio
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,12 +14,20 @@ from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerReposi
 
 async def sync_runtime_skills(workspace, projection: RuntimeProjection, *, agent_id: str) -> None:
     """将当前 Agent 的 workspace Skill 对齐到运行时投影。"""
-    current_skills = {item.name for item in await workspace.list_skills(agent_id=agent_id)}
+    current_skills = {item.name: item for item in await workspace.list_skills(agent_id=agent_id)}
     desired_skills = {item["slug"]: item["source_dir"] for item in projection.skills}
 
-    for slug in sorted(current_skills - desired_skills.keys()):
+    for slug in sorted(current_skills.keys() - desired_skills.keys()):
         await workspace.remove_skill(slug, agent_id=agent_id)
-    for slug in sorted(desired_skills.keys() - current_skills):
+
+    for slug, source_dir in desired_skills.items():
+        current = current_skills.get(slug)
+        if current is not None:
+            source_markdown = (Path(source_dir) / "SKILL.md").read_text(encoding="utf-8")
+            if current.markdown == source_markdown:
+                continue
+            # AgentScope 按 Skill 名称去重，不会覆盖同名旧副本。
+            await workspace.remove_skill(slug, agent_id=agent_id)
         await workspace.add_skill(desired_skills[slug], agent_id=agent_id)
 
 

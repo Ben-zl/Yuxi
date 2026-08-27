@@ -10,7 +10,7 @@
 使用 `cli.py` 获取 perfeye 任务数据：
 
 ```bash
-python scripts/perfeye_cli.py --uuid <task_uuid> --metrics
+python3 <skill-dir>/scripts/perfeye_cli.py --uuid <task_uuid> --metrics
 ```
 
 ## LabelInfo.All 数据结构

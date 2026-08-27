@@ -61,11 +61,6 @@ def tasks_to_todos(tasks_context: dict) -> list[dict]:
     ]
 
 
-def files_to_state(files: list[dict]) -> dict[str, dict]:
-    """按路径索引 workspace 文件，保持前端历史状态契约。"""
-    return {str(item["path"]): item for item in files if item.get("path")}
-
-
 def start_cancel_watcher(
     client: AgentScopeServiceClient,
     *,
@@ -168,14 +163,13 @@ async def collect_run_events(
         event_reply_id = str(event.get("reply_id") or "")
         usage.observe(event)
         if event_type == "CUSTOM" and event.get("name") == "state_updated":
-            listing = await client.list_workspace_files(uid, agent_id, session_id)
             state_chunk = make_chunk(
                 request_id,
                 status="agent_state",
                 agent_state={
                     "todos": tasks_to_todos((event.get("value") or {}).get("tasks_context") or {}),
-                    "files": files_to_state(listing.items),
-                    "files_truncated": listing.truncated,
+                    "files": {},
+                    "files_truncated": False,
                 },
             )
             await append_run_stream_event(

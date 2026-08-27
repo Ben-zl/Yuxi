@@ -9,25 +9,26 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+DEFAULT_CACHE_DIR = Path("/workspace/outputs/tmp")
+
 
 class PerfeyeCache:
-    """Perfeye UUID 缓存管理器"""
+    """Perfeye UUID 中间文件管理器。"""
 
     def __init__(self, cache_dir: str = None):
         """
         初始化缓存管理器
 
         Args:
-            cache_dir: 缓存目录路径，默认为 .cache
+            cache_dir: 缓存目录路径，默认写入会话共享的 outputs/tmp
         """
-        skill_dir = Path(__file__).parent.parent.parent
         if cache_dir:
             self.cache_dir = Path(cache_dir)
         else:
-            self.cache_dir = skill_dir / ".cache"
+            self.cache_dir = DEFAULT_CACHE_DIR
 
         # 确保缓存目录存在
-        self.cache_dir.mkdir(exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_task_cache_path(self, task_id: int) -> Path:
         """获取任务对应的缓存文件路径"""
@@ -50,7 +51,7 @@ class PerfeyeCache:
             uuids: UUID 数据字典
 
         Returns:
-            缓存文件的相对路径（用于 JSON 输出）
+            中间文件的绝对路径（用于 JSON 输出）
         """
         cache_path = self._get_task_cache_path(task_id)
 
@@ -63,8 +64,7 @@ class PerfeyeCache:
         with open(cache_path, 'w', encoding='utf-8') as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
 
-        # 返回相对于技能目录的路径，用于在输出中引用
-        return f".cache/perfeye_{task_id}.json"
+        return str(cache_path)
 
     def save_trend_uuids(self, pipeline_id: int, uuids: Dict[str, Any]) -> str:
         """
@@ -75,7 +75,7 @@ class PerfeyeCache:
             uuids: UUID 数据字典
 
         Returns:
-            缓存文件的相对路径（用于 JSON 输出）
+            中间文件的绝对路径（用于 JSON 输出）
         """
         cache_path = self._get_trend_cache_path(pipeline_id)
 
@@ -88,7 +88,7 @@ class PerfeyeCache:
         with open(cache_path, 'w', encoding='utf-8') as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
 
-        return f".cache/perfeye_trend_{pipeline_id}.json"
+        return str(cache_path)
 
     def load_uuids(self, cache_path: str) -> Optional[Dict[str, Any]]:
         """
@@ -206,7 +206,7 @@ class PerfeyeCache:
             date_range: 时间范围 {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}
 
         Returns:
-            缓存文件的相对路径
+            中间文件的绝对路径
         """
         cache_path = self._get_trend_cache_path(pipeline_id)
 
@@ -288,7 +288,7 @@ class PerfeyeCache:
         with open(cache_path, 'w', encoding='utf-8') as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
 
-        return f".cache/perfeye_trend_{pipeline_id}.json"
+        return str(cache_path)
 
     def load_trend_uuids_enhanced(self, pipeline_id: int) -> Optional[Dict[str, Any]]:
         """

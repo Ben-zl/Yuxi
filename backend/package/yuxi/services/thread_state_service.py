@@ -9,14 +9,14 @@ from fastapi import HTTPException
 
 from yuxi.agentscope.protocol import event_to_chunks
 from yuxi.agentscope.client import AgentScopeServiceClient
-from yuxi.agentscope.gateway import files_to_state, tasks_to_todos
+from yuxi.agentscope.gateway import tasks_to_todos
 from yuxi.agentscope.thread_guard import load_pending_confirm
 from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.repositories.subagent_thread_repository import SubagentThreadRepository
 from yuxi.services.subagent_run_service import serialize_subagent_run_state
-from yuxi.services.thread_workspace_service import list_artifacts, list_visible_files
+from yuxi.services.thread_workspace_service import list_artifacts, workspace_to_virtual_path
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.logging_config import logger
 from yuxi.agentscope.usage import token_usage_view
@@ -28,7 +28,7 @@ async def _load_agentscope_state(
     uid: str,
     thread_id: str,
 ) -> tuple[list[dict], dict, bool, list[str], bool]:
-    """从 AgentScope Session 与 workspace 恢复 Todo 和文件事实。"""
+    """从 AgentScope Session 与 workspace 恢复 Todo 和交付物事实。"""
     mapping = await get_thread_session(db, uid=uid, thread_id=thread_id)
     if mapping is None:
         return [], {}, False, [], False
@@ -39,12 +39,11 @@ async def _load_agentscope_state(
         mapping.agentscope_session_id,
     )
     state = session.get("state") or {}
-    files = await list_visible_files(db, uid=uid, thread_id=thread_id)
     artifacts = await list_artifacts(db, uid=uid, thread_id=thread_id)
     return (
         tasks_to_todos(state.get("tasks_context") or {}),
-        files_to_state(files.items),
-        files.truncated,
+        {},
+        False,
         artifacts,
         bool(state.get("summary")),
     )
@@ -68,6 +67,24 @@ def _serialize_message(message: Any) -> dict[str, Any]:
     if message.tool_calls:
         result["tool_calls"] = [tool_call.to_dict() for tool_call in message.tool_calls]
     return result
+
+
+def _artifacts_from_messages(messages: list[Any]) -> list[str]:
+    """从成功的 present_artifacts 工具记录恢复线程历史交付物。"""
+    artifacts = []
+    for message in messages:
+        if str(message.role) != "assistant":
+            continue
+        for tool_call in message.tool_calls or []:
+            if tool_call.tool_name != "present_artifacts" or tool_call.status != "success":
+                continue
+            tool_input = tool_call.tool_input if isinstance(tool_call.tool_input, dict) else {}
+            for path in tool_input.get("filepaths") or []:
+                try:
+                    artifacts.append(workspace_to_virtual_path(path))
+                except (TypeError, ValueError):
+                    continue
+    return list(dict.fromkeys(artifacts))
 
 
 def _pending_interrupt(event: dict, *, thread_id: str, run_id: str) -> dict:
@@ -101,28 +118,29 @@ async def get_thread_state_view(
     run_repo = AgentRunRepository(db)
     latest_run = await run_repo.get_latest_run_by_thread_for_user(thread_id, uid)
     run_usages = await run_repo.list_run_usages_by_thread_for_user(thread_id, uid)
+    messages = await conversation_repo.get_messages_by_thread_id(thread_id)
     subagent_runs = []
-    if latest_run is not None:
-        for child_run in await run_repo.list_child_runs_for_user(latest_run.id, uid):
-            try:
-                subagent_runs.append(serialize_subagent_run_state(child_run))
-            except ValueError as exc:
-                logger.error(
-                    "子智能体运行记录格式异常: parent_run_id=%s, run_id=%s, %s",
-                    latest_run.id,
-                    child_run.id,
-                    exc,
-                )
-                raise HTTPException(
-                    status_code=500,
-                    detail="子智能体运行记录格式异常",
-                ) from exc
+    for child_run in await run_repo.list_child_runs_by_thread_for_user(thread_id, uid):
+        try:
+            subagent_runs.append(serialize_subagent_run_state(child_run))
+        except ValueError as exc:
+            logger.error(
+                "子智能体运行记录格式异常: thread_id=%s, run_id=%s, %s",
+                thread_id,
+                child_run.id,
+                exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="子智能体运行记录格式异常",
+            ) from exc
 
     todos, files, files_truncated, artifacts, summary_active = await _load_agentscope_state(
         db,
         uid=uid,
         thread_id=thread_id,
     )
+    artifacts = list(dict.fromkeys([*_artifacts_from_messages(messages), *artifacts]))
     token_usage = token_usage_view(
         dict(latest_run.token_usage or {}) if latest_run else None,
         run_usages,
@@ -181,6 +199,5 @@ async def get_thread_state_view(
                     ) from exc
 
     if include_messages:
-        messages = await conversation_repo.get_messages_by_thread_id(thread_id)
         response["messages"] = [_serialize_message(message) for message in messages]
     return response

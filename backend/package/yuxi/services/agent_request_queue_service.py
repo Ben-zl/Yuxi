@@ -23,6 +23,7 @@ from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.services.agent_run_service import (
     create_agent_run_input_message,
     enqueue_agent_run,
+    reenqueue_agent_run,
     resolve_agent_run_config,
 )
 from yuxi.services.input_message_service import AgentRunInputMessage
@@ -434,12 +435,16 @@ async def dispatch_next_request(
 
 
 async def recover_pending_dispatches() -> None:
-    """恢复 pending 投递及 completed hook 留下的 ready 队列。"""
+    """恢复未终态 Run 投递及 completed hook 留下的 ready 队列。"""
     async with pg_manager.get_async_session_context() as db:
-        pending_result = await db.execute(
-            select(AgentRun.uid, AgentRun.agent_slug, AgentRun.conversation_thread_id).where(
-                AgentRun.status == "pending"
-            )
+        active_runs_result = await db.execute(
+            select(
+                AgentRun.id,
+                AgentRun.status,
+                AgentRun.uid,
+                AgentRun.agent_slug,
+                AgentRun.conversation_thread_id,
+            ).where(AgentRun.status.in_(("pending", "running")))
         )
         scopes_result = await db.execute(
             select(
@@ -450,18 +455,22 @@ async def recover_pending_dispatches() -> None:
             .where(AgentRunRequest.status == REQUEST_STATUS_QUEUED)
             .distinct()
         )
-        scopes = {tuple(row) for row in pending_result.all()}
-        scopes.update(tuple(row) for row in scopes_result.all())
+        active_runs = active_runs_result.all()
+        active_scopes = {(row.uid, row.agent_slug, row.conversation_thread_id) for row in active_runs}
+        ready_scopes = {tuple(row) for row in scopes_result.all()} - active_scopes
 
-    recovered = await asyncio.gather(
+    await asyncio.gather(*(reenqueue_agent_run(row.id) for row in active_runs))
+    dispatched = await asyncio.gather(
         *(
             dispatch_next_request(uid=uid, agent_slug=agent_slug, thread_id=thread_id)
-            for uid, agent_slug, thread_id in scopes
+            for uid, agent_slug, thread_id in ready_scopes
         )
     )
-    for run_id in recovered:
+    for run_id in dispatched:
         if run_id:
-            logger.info(f"Recovered pending run or queue: {run_id}")
+            logger.info(f"Recovered ready queue: {run_id}")
+    for run in active_runs:
+        logger.info(f"Recovered {run.status} run: {run.id}")
 
 
 async def cancel_queued_request(

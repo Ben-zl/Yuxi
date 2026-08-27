@@ -5,7 +5,6 @@ import asyncio
 import pytest
 
 from yuxi.agentscope import gateway
-from yuxi.agentscope.client import WorkspaceFileListing
 
 
 class _StubClient:
@@ -24,12 +23,6 @@ class _StubClient:
 
     async def list_messages(self, uid, agent_id, session_id):
         return self._messages
-
-    async def list_workspace_files(self, uid, agent_id, session_id):
-        return WorkspaceFileListing(
-            items=[{"path": "/workspace/outputs/report.md", "name": "report.md", "is_dir": False}],
-            truncated=True,
-        )
 
     async def stream_events(self, uid, agent_id, session_id, read_timeout=180.0):
         for event in self._events:
@@ -330,8 +323,8 @@ async def test_replyless_state_update_emits_agent_state(capture_events):
         if item.get("status") == "agent_state"
     ]
     assert state_chunks[0]["agent_state"]["todos"] == [{"id": "task-1", "content": "整理资料", "status": "in_progress"}]
-    assert "/workspace/outputs/report.md" in state_chunks[0]["agent_state"]["files"]
-    assert state_chunks[0]["agent_state"]["files_truncated"] is True
+    assert state_chunks[0]["agent_state"]["files"] == {}
+    assert state_chunks[0]["agent_state"]["files_truncated"] is False
 
 
 async def test_round_result_collects_tool_call_for_history(capture_events):

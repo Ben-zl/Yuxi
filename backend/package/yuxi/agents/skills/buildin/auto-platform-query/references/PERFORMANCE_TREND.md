@@ -165,6 +165,10 @@ python scripts/cli.py pipeline --id 947 --trend "2026-02-10" "2026-02-12"
 2. **禁止省略任何章节或改变表格结构**
 3. **直接生成报告**：使用 write 工具将报告保存到本地，不使用脚本生成
 
+如因数据量确实需要临时脚本，必须把脚本保存到 `/workspace/outputs/tmp/`，并使用绝对路径执行
+（例如 `python3 /workspace/outputs/tmp/analyze.py`）。Bash 当前目录不是稳定协议，不得执行
+依赖当前目录的相对路径命令。
+
 ### ⚠️ 报告保存要求
 
 **生成报告后，必须：**
@@ -308,7 +312,7 @@ AI Agent 会在报告中自动生成以下内容：
 
 从性能趋势数据的返回结果中，找到 `perfeye_file` 字段，读取缓存文件获取 UUID 列表：
 
-- 缓存文件路径：`perfeye_file` 字段指定的路径
+- 中间文件路径：`perfeye_file` 指定的 `/workspace/outputs/tmp/perfeye_*.json`
 - 文件格式：包含各用例在不同设备上的 Perfeye UUID 列表
 
 #### 步骤 2：调用 perfeye-analysis skill
@@ -342,7 +346,7 @@ Perfeye UUID：[用户指定的单个 UUID]
 ### 重要说明
 
 1. **默认行为**：当用户未明确指定时，系统自动执行多任务性能对比（最早 vs 最新）
-2. **数据来源**：UUID 始终从 `perfeye_file` 指向的缓存文件中获取
+2. **数据来源**：UUID 始终从 `perfeye_file` 指向的共享中间文件中获取
 3. **时间范围**：多任务性能对比涵盖整个趋势时间范围的起点和终点
 4. **分析目的**：多任务性能对比旨在定位性能变化的具体原因，单次分析则针对特定执行记录进行深入诊断
 

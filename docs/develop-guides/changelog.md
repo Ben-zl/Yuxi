@@ -12,15 +12,17 @@
 :::
 
 - 完成 AgentScope 收口：统一投影逐轮装配 HTTP MCP、知识库与按用户/session 隔离的 Team worker 模板，凭据不进入 workspace；动态模板自动保留 `TeamSay` 回报协议，避免自定义系统提示覆盖团队协作约束；失败运行会继续派发 FIFO；线程状态改由 Yuxi 事实源聚合；移除 LangChain/LangGraph/DeepAgents 运行代码、依赖及无效摘要配置。
-- 修复 Team worker 首轮默认 20 次迭代导致的 `exceed_max_iters`：子智能体模板继承 `max_execution_steps`；回报协议仅通知 leader；主线程轮换模型凭证前同步长期 worker Session；失败重试只向模型保留最新 Team 指令，后续 child Run 记录真实 `TeamSay` 任务正文；leader 最终续写未再调用 Team 工具且无活跃 child Run 时立即收束，不再固定等待 45 秒；TeamDelete 显式成功，避免工具和会话长期运行。
-- 修复执行后取消的 AgentRun 对话内容为空：历史接口在已有助手输出时保留 cancelled/rejected 用户消息，避免前端收到孤立助手消息后无法组成对话；未执行的排队取消请求仍保持隐藏。
+- 公共智能体系统提示词新增产出物交付约束：最终文件写入 outputs 后必须调用 `present_artifacts`，由主智能体统一登记并展示，临时文件不纳入交付。
+- 修复 Team worker 首轮默认 20 次迭代导致的 `exceed_max_iters`：子智能体模板继承 `max_execution_steps`；回报协议仅通知 leader；worker 完成后未主动 `TeamSay` 时由平台代发完整结果并触发 leader 续写；失败重试只保留最新 Team 指令；后续 TeamReply Run 写入稳定展示标识，历史缺失 `tool_call_id` 的 Run 不再导致线程状态接口 500；保留模式的 TeamDelete 返回终态响应。
+- 修复执行后取消的 AgentRun 对话内容为空：历史接口在已有助手输出时保留 cancelled/rejected 用户消息；Team worker 中断后即使缺少 `REPLY_END` 也会结束 child Run，父 Run 异常路径按取消信号归一为 cancelled；未执行的排队取消请求仍保持隐藏。
+- 修复开发环境 ARQ worker 异常后只留下 `watchfiles` 与 zombie 子进程、容器假存活：监督器自动重启 ARQ 并保留热重载，Compose 增加真实 healthcheck；启动恢复同时接管 `pending/running` Run，清理确定性 Job 的陈旧 retry/in-progress 状态后重新投递。
 - 补齐 AgentScope 功能对齐：Team worker 采用父线程生命周期保留模式、投影 child 历史并按子智能体配置装配 Skill/工具/MCP/知识库；Token 卡片与 Dashboard 使用真实 Run/线程累计用量，Anthropic 输入包含普通、缓存创建与缓存读取 Token；Summary 配置映射到 AgentScope 上下文压缩；文件树保留目录并提示 500 项截断；Steer 仅在工具批次后的安全点接力；主动提问支持刷新恢复与回答续接。
 - 新增 Agent 任务中心（工单 01-11）：以 NativeScheduleBlockMiddleware 在模型调用边界移除 AgentScope 原生 Schedule 工具；建立 AgentTask/TaskExecution 领域模型与 CRUD、手动/API/定时三入口触发收口、任务级 FIFO 串行队列与崩溃恢复；定时规则编译为 5 段 POSIX Cron 并按 IANA 时区计算下次运行，APScheduler DOW 约定差异在构造前统一转换；支持部门共享、执行身份审批隔离、Agent 删除阻断；前端新增任务中心页面（列表/创建/编辑/详情/执行历史/线程）与 SSE 事件流/产物只读接口。
 - 修复 APScheduler CronTrigger day-of-week 约定差异：`from_crontab` 使用 0=Monday（Python 约定），与 POSIX Cron 0=Sunday 不同；在 `_build_trigger` 构造前将 DOW 字段从 POSIX 统一转换为 APScheduler 约定，避免每周定时任务在错误的星期执行。
 - 恢复内置 stdio MCP：仅代码注册表可启动，发现与调用使用独立短连接；HTTP MCP 继续在服务进程执行。MCP 禁用、配置更新、删除下一轮生效，并按远端原始工具名过滤。
 
 - AgentScope 网关承接队列执行、持久 Session、审批/取消/steer、Team、Skills、KB 和隔离 workspace；生产 Compose 同步新增内部 AgentScope 服务与固定切换时间配置。
-- AgentScope 线程文件统一仅暴露 uploads/outputs：交付物清单可跨刷新恢复，文件可从对话保存到个人工作区并出现在历史对话目录；个人工作区由服务进程受限工具访问，不向 Docker 容器暴露宿主路径；删除线程同步清理 Session、Agent、Credential、映射和持久 workspace。
+- AgentScope 的“附件/文件”与 main 分支保持一致，仅展示会话附件及显式状态文件，不再把 workspace 文件树中的 sessions、skills、data 或 outputs 混入该区域；子 Agent 执行记录和交付物按线程历史累计，成功工具记录可恢复旧 manifest 已覆盖的交付物；主、子 Agent 统一继承公共文件生命周期约束，中间数据写入 `outputs/tmp`，系统提示要求生产者回报准确路径、主 Agent 原样交接、消费者判定缺少输入前检查共享中间目录，具体 Skill 不再重复平台协议；长期 Team worker 每轮使用当前提示词投影并刷新同名 Skill 副本；交付物继续在独立区域展示，uploads/outputs 仍可通过文件树浏览；文件可从对话保存到个人工作区并出现在历史对话目录；个人工作区由服务进程受限工具访问；删除线程同步清理 Session、Agent、Credential、映射和持久 workspace。
 - 修复 AgentScope Docker/远端 workspace 的 `Read -> Edit/Write`：已读证明改用 backend mtime 校验，无法验证文件状态时失败关闭；每次实际写入尝试前立即失效缓存，即使 Docker mtime 固定或写入失败也必须重新 Read，避免连续编辑覆盖前一次结果。
 - 补齐 AgentScope 功能对齐：工具白名单、主动提问挂起及多轮恢复、逐轮配置同步、平台上下文、Todo/文件状态及图片/PDF/OCR；模型级 URL/Header/参数由 Yuxi 自定义 Credential 与 ChatModel Adapter 承接，图片/PDF 读取由独立 `read_media` 工具承接，Skill 依赖通过按查看状态门控的 `SkillDependencyGateway` 执行，固定 AgentScope 版本无需源码修改；Deep Research 改用 Team/Task 协议，刷新后保留推理与工具调用；生成文件写入持久 workspace，文件树支持列表、预览、下载和删除，服务重启后保留。
 - 修复并行工具审批、resume 再挂起、Team 父 Run 固定等待预算早于长耗时子 Agent 结束及子 Agent 失败无回报、无归属事件破坏终态、模型切换、附件绑定和终态竞态；推理内容与工具调用在实时流、审批恢复和刷新历史中保持一致；真实浏览器、MiniMax-M3、OTLP 与 Docker E2E 已验证。

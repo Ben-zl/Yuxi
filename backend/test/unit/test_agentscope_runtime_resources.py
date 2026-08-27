@@ -52,8 +52,8 @@ async def test_team_worker_uses_subagent_resources_with_parent_run_context(monke
         side_effect=[
             None,
             SimpleNamespace(
-            subagent_slug="automation-analysis-agent",
-            parent_thread_id="thread-1",
+                subagent_slug="automation-analysis-agent",
+                parent_thread_id="thread-1",
             ),
         ]
     )
@@ -133,6 +133,70 @@ async def test_runtime_skills_reconcile_to_subagent_projection():
         "/skills/auto-platform-query",
         agent_id="worker-agent",
     )
+
+
+async def test_runtime_skills_refresh_existing_projected_skill(tmp_path):
+    """同名 workspace Skill 必须覆盖为当前 Yuxi 配置源版本。"""
+    skill_dir = tmp_path / "auto-platform-query"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("current manifest", encoding="utf-8")
+    workspace = SimpleNamespace(
+        list_skills=AsyncMock(return_value=[SimpleNamespace(name="auto-platform-query", markdown="stale manifest")]),
+        remove_skill=AsyncMock(),
+        add_skill=AsyncMock(),
+    )
+    projection = SimpleNamespace(
+        skills=[
+            {
+                "slug": "auto-platform-query",
+                "source_dir": str(skill_dir),
+            }
+        ]
+    )
+
+    await runtime_resources.sync_runtime_skills(
+        workspace,
+        projection,
+        agent_id="worker-agent",
+    )
+
+    workspace.remove_skill.assert_awaited_once_with(
+        "auto-platform-query",
+        agent_id="worker-agent",
+    )
+    workspace.add_skill.assert_awaited_once_with(
+        str(skill_dir),
+        agent_id="worker-agent",
+    )
+
+
+async def test_runtime_skills_keep_current_projected_skill(tmp_path):
+    """配置源 manifest 未变化时不重复复制 Skill。"""
+    skill_dir = tmp_path / "auto-platform-query"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("current manifest", encoding="utf-8")
+    workspace = SimpleNamespace(
+        list_skills=AsyncMock(return_value=[SimpleNamespace(name="auto-platform-query", markdown="current manifest")]),
+        remove_skill=AsyncMock(),
+        add_skill=AsyncMock(),
+    )
+    projection = SimpleNamespace(
+        skills=[
+            {
+                "slug": "auto-platform-query",
+                "source_dir": str(skill_dir),
+            }
+        ]
+    )
+
+    await runtime_resources.sync_runtime_skills(
+        workspace,
+        projection,
+        agent_id="worker-agent",
+    )
+
+    workspace.remove_skill.assert_not_awaited()
+    workspace.add_skill.assert_not_awaited()
 
 
 async def test_unmapped_non_team_session_fails_explicitly(monkeypatch):

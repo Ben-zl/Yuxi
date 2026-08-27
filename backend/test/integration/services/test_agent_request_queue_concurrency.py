@@ -355,8 +355,8 @@ async def test_dispatch_retry_reenqueues_existing_pending_run(monkeypatch: pytes
 async def test_startup_recovery_reenqueues_pending_runs_without_queue_requests(monkeypatch: pytest.MonkeyPatch):
     uid = f"pytest-user-{uuid.uuid4()}"
     run_specs = [
-        (f"pytest-resume-{uuid.uuid4()}", "main", "resume"),
-        (f"pytest-subagent-{uuid.uuid4()}", "worker", "subagent"),
+        (f"pytest-resume-{uuid.uuid4()}", "main", "resume", "pending"),
+        (f"pytest-subagent-{uuid.uuid4()}", "worker", "subagent", "running"),
     ]
     run_ids = [str(uuid.uuid4()) for _ in run_specs]
     engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
@@ -373,16 +373,16 @@ async def test_startup_recovery_reenqueues_pending_runs_without_queue_requests(m
                 await db.rollback()
                 raise
 
-    async def fake_enqueue(run_id: str):
+    async def fake_reenqueue(run_id: str):
         enqueue_calls.append(run_id)
 
-    monkeypatch.setattr(agent_request_queue_service, "enqueue_agent_run", fake_enqueue)
+    monkeypatch.setattr(agent_request_queue_service, "reenqueue_agent_run", fake_reenqueue)
     monkeypatch.setattr(agent_request_queue_service.pg_manager, "get_async_session_context", session_context)
 
     async with session_factory() as db:
         conversations = [
             Conversation(thread_id=thread_id, uid=uid, agent_id=agent_slug, status="active")
-            for thread_id, agent_slug, _ in run_specs
+            for thread_id, agent_slug, _, _ in run_specs
         ]
         db.add_all(conversations)
         await db.flush()
@@ -396,10 +396,10 @@ async def test_startup_recovery_reenqueues_pending_runs_without_queue_requests(m
                     request_id=f"startup-{run_type}-{uuid.uuid4()}",
                     conversation_id=conversation.id,
                     input_payload={"model_spec": "model"},
-                    status="pending",
+                    status=status,
                     run_type=run_type,
                 )
-                for run_id, conversation, (thread_id, agent_slug, run_type) in zip(
+                for run_id, conversation, (thread_id, agent_slug, run_type, status) in zip(
                     run_ids, conversations, run_specs, strict=True
                 )
             ]
@@ -414,18 +414,18 @@ async def test_startup_recovery_reenqueues_pending_runs_without_queue_requests(m
                 (
                     await db.scalars(
                         select(AgentRunRequest).where(
-                            AgentRunRequest.conversation_thread_id.in_([s[0] for s in run_specs])
+                            AgentRunRequest.conversation_thread_id.in_([spec[0] for spec in run_specs])
                         )
                     )
                 ).all()
             )
 
-        assert sorted(enqueue_calls) == sorted(run_ids)
+        assert set(run_ids).issubset(enqueue_calls)
         assert request_count == 0
     finally:
         async with session_factory() as db:
             await db.execute(delete(AgentRun).where(AgentRun.id.in_(run_ids)))
-            await db.execute(delete(Conversation).where(Conversation.thread_id.in_([s[0] for s in run_specs])))
+            await db.execute(delete(Conversation).where(Conversation.thread_id.in_([spec[0] for spec in run_specs])))
             await db.commit()
         await engine.dispose()
 
@@ -447,7 +447,6 @@ async def test_terminal_status_loser_does_not_change_message_delivery_status(mon
             except Exception:
                 await db.rollback()
                 raise
-
 
     async with session_factory() as db:
         conversation = Conversation(thread_id=thread_id, uid=uid, agent_id="main", status="active")

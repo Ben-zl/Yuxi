@@ -85,10 +85,12 @@ def _assistant_tool_names(body: dict) -> set[str]:
 
 
 def _team_next_call(body: dict):
-    """团队编排：TeamCreate → AgentCreate(自定义模板) → 总结。"""
+    """团队编排：TeamCreate → AgentCreate → TeamDelete → 总结。"""
     called = _assistant_tool_names(body)
     if "AgentCreate" in called:
-        return None  # worker 已创建，进入总结轮
+        if "TeamDelete" not in called:
+            return "TeamDelete", {}
+        return None
     if "TeamCreate" in called:
         subagent_type = "e2e-team-sub"
         for tool in body.get("tools") or []:

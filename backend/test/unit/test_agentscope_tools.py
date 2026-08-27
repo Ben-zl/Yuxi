@@ -1,5 +1,6 @@
 """知识库工具可见性与 LITE 门控单测（迁移工单 07）。"""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -90,13 +91,13 @@ async def test_build_mcp_tools_runs_http_client_in_service_process(monkeypatch):
         (
             "internal-mcp",
             {
-            "internal-mcp": {
-                "transport": "streamable_http",
-                "url": "http://internal-mcp:9000/mcp",
-                "headers": {"Authorization": "secret"},
-                "timeout": 12,
-                "disabled_tools": ["admin"],
-            }
+                "internal-mcp": {
+                    "transport": "streamable_http",
+                    "url": "http://internal-mcp:9000/mcp",
+                    "headers": {"Authorization": "secret"},
+                    "timeout": 12,
+                    "disabled_tools": ["admin"],
+                }
             },
             ["admin"],
         )
@@ -150,11 +151,11 @@ async def test_build_mcp_tools_starts_registered_builtin_stdio(monkeypatch):
         (
             "mcp-server-chart",
             {
-            "mcp-server-chart": {
-                "transport": "stdio",
-                "command": "npx",
-                "args": ["-y", "@antv/mcp-server-chart"],
-            }
+                "mcp-server-chart": {
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@antv/mcp-server-chart"],
+                }
             },
             [],
         )
@@ -499,6 +500,39 @@ async def test_present_artifacts_persists_validated_manifest():
     assert "report.md" in str(result.content)
     assert writes[0][0] == "/workspace/data/yuxi-artifacts.json"
     assert b"/workspace/outputs/report.md" in writes[0][1]
+
+
+@pytest.mark.asyncio
+async def test_present_artifacts_merges_existing_manifest():
+    writes = []
+
+    class Backend:
+        async def stat(self, path):
+            if path in {
+                "/workspace/data/yuxi-artifacts.json",
+                "/workspace/outputs/old.md",
+                "/workspace/outputs/new.md",
+            }:
+                return SimpleNamespace(is_dir=False)
+            return None
+
+        async def read_file(self, path):
+            assert path == "/workspace/data/yuxi-artifacts.json"
+            return b'{"filepaths":["/workspace/outputs/old.md"]}'
+
+        async def write_file(self, path, content):
+            writes.append((path, content))
+
+    tool = tools._present_artifacts_tool(SimpleNamespace(get_backend=lambda: Backend()))
+
+    await tool.call(filepaths=["/workspace/outputs/new.md"])
+
+    assert json.loads(writes[0][1]) == {
+        "filepaths": [
+            "/workspace/outputs/old.md",
+            "/workspace/outputs/new.md",
+        ]
+    }
 
 
 @pytest.mark.asyncio

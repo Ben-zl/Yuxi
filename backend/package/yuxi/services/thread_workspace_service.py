@@ -47,7 +47,7 @@ async def resolve_thread_workspace(db, *, uid: str, thread_id: str):
 
 
 async def list_visible_files(db, *, uid: str, thread_id: str, max_entries: int = 500) -> WorkspaceFileListing:
-    """仅列出 uploads/outputs，并保留目录和完整性标记。"""
+    """仅列出文件树可见的 uploads/outputs，并保留目录和完整性标记。"""
     context = await resolve_thread_workspace(db, uid=uid, thread_id=thread_id)
     if context is None:
         return WorkspaceFileListing(items=[])

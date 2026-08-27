@@ -3,14 +3,15 @@
 """
 
 import sys
-from typing import Optional
+from pathlib import Path
 from rich.console import Console
 from rich.syntax import Syntax
 
 console = Console()
+error_console = Console(stderr=True)
 
 
-def print_output(content: str, output_file: Optional[str] = None) -> None:
+def print_output(content: str, output_file: str | None = None) -> None:
     """
     输出内容到终端或文件
 
@@ -20,18 +21,19 @@ def print_output(content: str, output_file: Optional[str] = None) -> None:
     """
     if output_file:
         try:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(content)
+            path = Path(output_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
             console.print(f"[green]✓[/green] 输出到文件: {output_file}")
-        except IOError as e:
-            console.print(f"[red]✗[/red] 写入文件失败: {e}", file=sys.stderr)
+        except OSError as e:
+            error_console.print(f"[red]✗[/red] 写入文件失败: {e}")
             sys.exit(1)
     else:
         # 直接使用 print，避免 rich.console.print 的自动换行
         print(content)
 
 
-def print_json(content: str, output_file: Optional[str] = None) -> None:
+def print_json(content: str, output_file: str | None = None) -> None:
     """
     输出 JSON 格式的内容（带语法高亮）
 
@@ -57,9 +59,7 @@ def print_error(message: str) -> None:
     Args:
         message: 错误消息
     """
-    from rich.console import Console
-    err_console = Console(stderr=True)
-    err_console.print(f"[red]✗[/red] 错误: {message}")
+    error_console.print(f"[red]✗[/red] 错误: {message}")
 
 
 def print_success(message: str) -> None:

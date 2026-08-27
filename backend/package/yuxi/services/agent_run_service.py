@@ -21,6 +21,14 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from arq.constants import (
+    abort_jobs_ss,
+    default_queue_name,
+    in_progress_key_prefix,
+    job_key_prefix,
+    result_key_prefix,
+    retry_key_prefix,
+)
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -793,6 +801,25 @@ async def enqueue_agent_run(run_id: str) -> None:
     """把已持久化的 run 投递到后台 worker 队列。"""
     queue = await get_arq_pool()
     await queue.enqueue_job("process_agent_run", run_id, _job_id=f"run:{run_id}")
+
+
+async def reenqueue_agent_run(run_id: str) -> None:
+    """清理确定性 ARQ Job 的陈旧状态并重新投递，用于 worker 启动恢复。"""
+    queue = await get_arq_pool()
+    job_id = f"run:{run_id}"
+
+    async with queue.pipeline(transaction=True) as pipeline:
+        pipeline.delete(
+            f"{job_key_prefix}{job_id}",
+            f"{result_key_prefix}{job_id}",
+            f"{retry_key_prefix}{job_id}",
+            f"{in_progress_key_prefix}{job_id}",
+        )
+        pipeline.zrem(default_queue_name, job_id)
+        pipeline.zrem(abort_jobs_ss, job_id)
+        await pipeline.execute()
+
+    await queue.enqueue_job("process_agent_run", run_id, _job_id=job_id)
 
 
 async def get_agent_run_view(*, run_id: str, current_uid: str, db: AsyncSession) -> dict:

@@ -1465,6 +1465,58 @@ async def test_create_chat_run_persists_validated_model_spec(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
+async def test_reenqueue_agent_run_clears_stale_arq_metadata(monkeypatch: pytest.MonkeyPatch):
+    operations: list[tuple] = []
+
+    class Pipeline:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+        def delete(self, *keys: str):
+            operations.append(("delete", *keys))
+            return self
+
+        def zrem(self, key: str, member: str):
+            operations.append(("zrem", key, member))
+            return self
+
+        async def execute(self):
+            operations.append(("execute",))
+
+    class Queue:
+        def pipeline(self, *, transaction: bool):
+            assert transaction is True
+            return Pipeline()
+
+        async def enqueue_job(self, job_name: str, run_id: str, _job_id: str):
+            operations.append(("enqueue", job_name, run_id, _job_id))
+
+    async def fake_get_arq_pool():
+        return Queue()
+
+    monkeypatch.setattr(agent_run_service, "get_arq_pool", fake_get_arq_pool)
+
+    await agent_run_service.reenqueue_agent_run("run-1")
+
+    assert operations == [
+        (
+            "delete",
+            "arq:job:run:run-1",
+            "arq:result:run:run-1",
+            "arq:retry:run:run-1",
+            "arq:in-progress:run:run-1",
+        ),
+        ("zrem", "arq:queue", "run:run-1"),
+        ("zrem", "arq:abort", "run:run-1"),
+        ("execute",),
+        ("enqueue", "process_agent_run", "run-1", "run:run-1"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_create_chat_run_with_image_persists_multimodal_message_type(monkeypatch: pytest.MonkeyPatch):
     db = _patch_agent_run_creation(monkeypatch)
 

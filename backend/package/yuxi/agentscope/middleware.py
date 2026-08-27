@@ -40,6 +40,22 @@ class SteerMiddleware(MiddlewareBase):
 NATIVE_SCHEDULE_TOOL_PREFIX = "Schedule"
 
 
+class RuntimeSystemPromptMiddleware(MiddlewareBase):
+    """用当前 Yuxi 投影替换持久 Agent 中可能过期的基础提示词。"""
+
+    _SESSION_NOTIFICATION_MARKER = "<system-notification>"
+
+    def __init__(self, system_prompt: str):
+        self._system_prompt = system_prompt
+
+    async def on_system_prompt(self, agent, current_prompt: str) -> str:
+        """保留 AgentScope 动态追加的会话、Skill 与 workspace 指令。"""
+        _, marker, runtime_instructions = current_prompt.partition(self._SESSION_NOTIFICATION_MARKER)
+        if not marker:
+            raise RuntimeError("AgentScope 系统提示词缺少会话通知边界")
+        return f"{self._system_prompt}\n\n{marker}{runtime_instructions}"
+
+
 class NativeScheduleBlockMiddleware(MiddlewareBase):
     """从模型请求的工具面移除 AgentScope 原生 Schedule 工具。
 
@@ -212,9 +228,9 @@ class TeamLifecycleMiddleware(MiddlewareBase):
         tool_call = input_kwargs["tool_call"]
         if tool_call.name == "TeamDelete":
             from agentscope.message import TextBlock, ToolResultState
-            from agentscope.tool import ToolChunk
+            from agentscope.tool import ToolResponse
 
-            yield ToolChunk(
+            yield ToolResponse(
                 content=[TextBlock(text="Team runtime retained until the parent thread is deleted.")],
                 state=ToolResultState.SUCCESS,
             )
@@ -308,7 +324,7 @@ async def build_team_lifecycle_middleware(
         team = await storage.get_team(user_id, session.team_id)
         is_worker = team is not None and team.session_id != session_id
 
-    failure_notifier = None
+    leader_notifier = None
     if is_worker:
         from agentscope.app._tool import TeamSay
         from agentscope.message import ToolResultState
@@ -328,11 +344,11 @@ async def build_team_lifecycle_middleware(
             role="worker",
         )
 
-        async def failure_notifier(message: str) -> None:
-            """通过 AgentScope Team inbox 向 leader 投递 worker 失败。"""
+        async def leader_notifier(message: str) -> None:
+            """通过 AgentScope Team inbox 向 leader 投递 worker 结果。"""
             result = await team_say(content=message, to=leader_name)
             if result.state == ToolResultState.ERROR:
-                raise RuntimeError("TeamSay 失败通知投递失败")
+                raise RuntimeError("TeamSay 结果通知投递失败")
 
     return TeamLifecycleMiddleware(
         TeamLifecycleModule(
@@ -340,7 +356,7 @@ async def build_team_lifecycle_middleware(
             uid=user_id,
             agent_id=agent_id,
             session_id=session_id,
-            failure_notifier=failure_notifier,
+            leader_notifier=leader_notifier,
         ),
         is_worker=is_worker,
     )

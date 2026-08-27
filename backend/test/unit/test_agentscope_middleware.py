@@ -6,12 +6,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agentscope.message import TextBlock, ToolResultState
+from agentscope.agent import Agent
+from agentscope.event import ToolResultEndEvent, ToolResultStartEvent
+from agentscope.message import TextBlock, ToolCallBlock, ToolResultState
 from agentscope.model import ChatResponse, ChatUsage
-from agentscope.tool import ToolChunk
+from agentscope.permission import PermissionMode
+from agentscope.tool import FunctionTool, Toolkit, ToolChunk, ToolResponse
 
 from yuxi.agentscope.middleware import (
     ContextObservabilityMiddleware,
+    RuntimeSystemPromptMiddleware,
     SteerMiddleware,
     TeamLifecycleMiddleware,
     build_team_lifecycle_middleware,
@@ -27,6 +31,24 @@ async def _collect(middleware, items):
     async for item in middleware.on_reasoning(None, {}, next_handler):
         result.append(item)
     return result
+
+
+async def test_runtime_system_prompt_replaces_stale_agent_prompt_and_keeps_runtime_instructions():
+    """长期 Team worker 必须使用当前投影，同时保留 AgentScope 动态指令。"""
+    middleware = RuntimeSystemPromptMiddleware("当前平台提示\n中间文件：/workspace/outputs/tmp")
+    stale_prompt = (
+        "旧子智能体提示\n\n"
+        "<system-notification>session attachment</system-notification>\n"
+        "activated skill instructions\nworkspace instructions"
+    )
+
+    prompt = await middleware.on_system_prompt(None, stale_prompt)
+
+    assert prompt.startswith("当前平台提示\n中间文件：/workspace/outputs/tmp")
+    assert "旧子智能体提示" not in prompt
+    assert "<system-notification>session attachment</system-notification>" in prompt
+    assert "activated skill instructions" in prompt
+    assert "workspace instructions" in prompt
 
 
 async def test_steer_stops_before_model_when_already_pending():
@@ -222,9 +244,32 @@ async def test_team_delete_is_retained_without_calling_agentscope_delete():
     result = await _collect_acting(middleware, tool_call, [])
 
     assert len(result) == 1
+    assert isinstance(result[0], ToolResponse)
     assert "retained" in result[0].content[0].text
-    assert result[0].is_last is True
     assert result[0].state == ToolResultState.SUCCESS
+
+
+async def test_team_delete_emits_one_terminal_tool_result_event():
+    """TeamDelete 必须完成 AgentScope 工具生命周期，且不执行原删除工具。"""
+
+    async def TeamDelete() -> ToolResponse:  # noqa: N802 - 匹配 AgentScope 内置工具名
+        """删除当前 Team。"""
+        raise AssertionError("保留模式不应执行 AgentScope TeamDelete")
+
+    agent = Agent(
+        name="team-leader",
+        system_prompt="test",
+        model=SimpleNamespace(count_tokens=AsyncMock(return_value=1)),
+        toolkit=Toolkit(tools=[FunctionTool(TeamDelete)]),
+        middlewares=[TeamLifecycleMiddleware(SimpleNamespace(), is_worker=False)],
+    )
+    agent.state.permission_context.mode = PermissionMode.BYPASS
+    tool_call = ToolCallBlock(id="delete-1", name="TeamDelete", input="{}")
+
+    events = [event async for event in agent._execute_tool_call(tool_call)]  # noqa: SLF001
+
+    assert len([event for event in events if isinstance(event, ToolResultStartEvent)]) == 1
+    assert len([event for event in events if isinstance(event, ToolResultEndEvent)]) == 1
 
 
 async def test_agent_create_projects_the_single_roster_delta_before_returning_result():
@@ -338,7 +383,7 @@ async def test_worker_failure_notifier_targets_only_team_leader(monkeypatch):
         "worker-session",
     )
 
-    await middleware._lifecycle.failure_notifier("子智能体执行失败")
+    await middleware._lifecycle.leader_notifier("子智能体执行失败")
     assert calls == [("子智能体执行失败", "性能监控主智能体")]
 
 

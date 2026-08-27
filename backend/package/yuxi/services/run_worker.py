@@ -71,6 +71,7 @@ class WorkerSettings:
     cron_jobs = [_agent_task_scan_job()]
     max_tries = 2
     retry_jobs = True
+    health_check_interval = 15
     # 单任务最长执行时间（秒），可配置：超长图谱构建/深度检索场景需调大，
     # 避免长任务被 arq 取消并误标为 cancelled。
     job_timeout = int(os.getenv("YUXI_JOB_TIMEOUT_SECONDS", "3600"))

@@ -57,7 +57,7 @@ async def _ensure_database_exists(database_url: str) -> None:
 
 
 async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str) -> list:
-    """每轮 chat 注入观测中间件（OTel GenAI 语义；未配置 provider 时近零开销）。
+    """每轮 chat 注入当前提示词、观测和运行控制中间件。
 
     Langfuse 对接：设置 OTEL_EXPORTER_OTLP_ENDPOINT 等 OTel 环境变量即可
     （Langfuse v3 原生收 OTLP），主链路 reply/model/tool span 自动上报。
@@ -65,13 +65,25 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
     from agentscope.middleware import TracingMiddleware
     from yuxi.agentscope.middleware import (
         NativeScheduleBlockMiddleware,
+        RuntimeSystemPromptMiddleware,
         build_context_observability_middleware,
         build_steer_middleware,
         build_team_lifecycle_middleware,
     )
+    from yuxi.agentscope.runtime_resources import resolve_runtime_projection
+
+    async with pg_manager.get_async_session_context() as db:
+        projection = await resolve_runtime_projection(
+            db,
+            app.state.storage,
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
 
     middlewares = [
         TracingMiddleware(),
+        RuntimeSystemPromptMiddleware(projection.agent_request["system_prompt"]),
         NativeScheduleBlockMiddleware(),
         build_context_observability_middleware(app.state.message_bus, session_id),
     ]

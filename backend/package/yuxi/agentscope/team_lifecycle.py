@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from yuxi.agentscope.protocol import ToolEventConverter, event_to_chunks, reply_end_to_terminal
+from yuxi.agentscope.protocol import ToolEventConverter, event_to_chunks, make_chunk, reply_end_to_terminal
 from yuxi.agentscope.usage import UsageAccumulator
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_repository import AgentRunRepository, TERMINAL_RUN_STATUSES
@@ -22,6 +23,39 @@ from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Message, ToolCall
 from yuxi.utils.hash_utils import hash_id, subagent_child_thread_id
 from yuxi.utils.logging_config import logger
+
+
+def _shared_intermediate_paths(tool_calls: list[dict]) -> list[str]:
+    """从工具结果中提取可供后续 Team worker 复用的中间文件路径。"""
+    paths: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect(item)
+            return
+        if not isinstance(value, str):
+            return
+
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None and parsed != value:
+            collect(parsed)
+
+        for match in re.findall(r"/workspace/outputs/tmp/[^\s\"'<>`]+", value):
+            path = match.rstrip(".,;:)]}")
+            if path and path not in paths:
+                paths.append(path)
+
+    for call in tool_calls:
+        collect(call.get("output"))
+    return paths
 
 
 @dataclass(frozen=True)
@@ -57,13 +91,13 @@ class TeamLifecycleModule:
         uid: str,
         agent_id: str,
         session_id: str,
-        failure_notifier: Callable[[str], Awaitable[None]] | None = None,
+        leader_notifier: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.storage = storage
         self.uid = str(uid)
         self.agent_id = agent_id
         self.session_id = session_id
-        self.failure_notifier = failure_notifier
+        self.leader_notifier = leader_notifier
 
     async def snapshot(self) -> TeamRosterSnapshot:
         """读取当前 Session 所属 Team 的显式 worker roster。"""
@@ -231,8 +265,11 @@ class TeamLifecycleModule:
         tool_converter: ToolEventConverter | None = None
         usage = UsageAccumulator(configured_model_spec=None)
         failure_reported = False
+        team_say_call_ids: set[str] = set()
+        team_say_succeeded = False
         reply_id: str | None = None
         prompt: str | None = None
+        reply_ended = False
         try:
             async for item in next_handler(**input_kwargs):
                 event = item.model_dump(mode="json") if hasattr(item, "model_dump") else item
@@ -259,6 +296,14 @@ class TeamLifecycleModule:
                         text_parts.append(str(event.get("delta") or ""))
                     elif event_type == "THINKING_BLOCK_DELTA":
                         reasoning_parts.append(str(event.get("delta") or ""))
+                    elif event_type == "TOOL_CALL_START" and event.get("tool_call_name") == "TeamSay":
+                        team_say_call_ids.add(str(event.get("tool_call_id") or ""))
+                    elif (
+                        event_type == "TOOL_RESULT_END"
+                        and str(event.get("tool_call_id") or "") in team_say_call_ids
+                        and str(event.get("state") or "success").lower() == "success"
+                    ):
+                        team_say_succeeded = True
                     chunks = event_to_chunks(event, request_id=request_id)
                     if tool_converter is not None:
                         chunks.extend(tool_converter.feed(event))
@@ -270,11 +315,15 @@ class TeamLifecycleModule:
                             thread_id=binding.child_thread_id,
                         )
                     if event_type == "REPLY_END":
+                        reply_ended = True
                         terminal = reply_end_to_terminal(event, request_id=request_id)
                         error_message = (event.get("error") or {}).get("message") or terminal.chunk.get("error_message")
+                        history_tool_calls = tool_converter.history_tool_calls() if tool_converter else []
                         if terminal.run_status == "failed":
                             await self._report_worker_failure(error_message)
                             failure_reported = True
+                        elif terminal.run_status == "completed" and not team_say_succeeded:
+                            await self._report_worker_completion("".join(text_parts), history_tool_calls)
                         await self._finish_worker_run(
                             run_id=run_id,
                             terminal_status=terminal.run_status,
@@ -282,7 +331,7 @@ class TeamLifecycleModule:
                             text="".join(text_parts),
                             reasoning="".join(reasoning_parts),
                             usage=usage.snapshot(complete=True),
-                            tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
+                            tool_calls=history_tool_calls,
                         )
                         await append_run_stream_event(
                             run_id,
@@ -291,6 +340,36 @@ class TeamLifecycleModule:
                             thread_id=binding.child_thread_id,
                         )
                 yield item
+            if run_id and request_id and not reply_ended:
+                error_message = "AgentScope worker reply stream ended without REPLY_END"
+                terminal_status = await self._finish_worker_run(
+                    run_id=run_id,
+                    terminal_status="failed",
+                    error_message=error_message,
+                    text="".join(text_parts),
+                    reasoning="".join(reasoning_parts),
+                    usage=usage.snapshot(complete=False),
+                    tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
+                )
+                if terminal_status == "failed":
+                    await self._report_worker_failure(error_message)
+                if terminal_status:
+                    chunk = (
+                        make_chunk(request_id, status="interrupted", message="对话已取消")
+                        if terminal_status == "cancelled"
+                        else make_chunk(
+                            request_id,
+                            status="error",
+                            error_type="agentscope_team",
+                            error_message=error_message,
+                        )
+                    )
+                    await append_run_stream_event(
+                        run_id,
+                        "end",
+                        {"status": terminal_status, "chunk": chunk},
+                        thread_id=binding.child_thread_id,
+                    )
         except BaseException as exc:
             if run_id:
                 if not failure_reported and not isinstance(exc, asyncio.CancelledError):
@@ -308,14 +387,26 @@ class TeamLifecycleModule:
 
     async def _report_worker_failure(self, error_message: str | None) -> None:
         """在 child Run 结束前向 leader 报告失败并触发续写。"""
-        if self.failure_notifier is None:
+        if self.leader_notifier is None:
             return
         detail = error_message or "未知错误"
         message = f"子智能体执行失败，未能返回结果：{detail}"
         try:
-            await self.failure_notifier(message)
+            await self.leader_notifier(message)
         except Exception as exc:  # noqa: BLE001 - 通知失败不能阻断 child Run 终态持久化
             logger.warning("Team worker 失败通知 leader 未送达 session=%s: %s", self.session_id, exc)
+
+    async def _report_worker_completion(self, text: str, tool_calls: list[dict]) -> None:
+        """worker 未主动 TeamSay 时，把完整结果代发给 leader 并触发续写。"""
+        if self.leader_notifier is None:
+            return
+        detail = text.strip() or "子智能体未生成可展示文本，请检查其工具调用与运行记录。"
+        shared_paths = _shared_intermediate_paths(tool_calls)
+        if shared_paths:
+            detail += "\n\n可供后续子智能体复用的共享中间文件：\n" + "\n".join(
+                f"- {path}" for path in shared_paths
+            )
+        await self.leader_notifier(f"子智能体已完成，但未主动调用 TeamSay。以下为其完整结果：\n\n{detail}")
 
     async def _wait_for_binding(self):
         """吸收 AgentCreate 投影与 worker wakeup 的短暂竞态。"""
@@ -385,6 +476,7 @@ class TeamLifecycleModule:
                 input_payload={
                     "model_spec": (parent.input_payload or {}).get("model_spec") if parent else None,
                     "runtime": {
+                        "tool_call_id": f"team-reply:{reply_id}",
                         "parent_thread_id": binding.parent_thread_id,
                         "file_thread_id": binding.parent_thread_id,
                         "worker_agent_id": binding.worker_agent_id,
@@ -416,13 +508,15 @@ class TeamLifecycleModule:
         reasoning: str,
         usage: dict,
         tool_calls: list[dict],
-    ) -> None:
+    ) -> str | None:
         """原子保存 worker 输出和 child Run 终态，重复终态事件保持幂等。"""
         async with pg_manager.get_async_session_context() as db:
             runs = AgentRunRepository(db)
             run = await runs.get_run(run_id)
-            if run is None or run.status in TERMINAL_RUN_STATUSES:
-                return
+            if run is None:
+                return None
+            if run.status in TERMINAL_RUN_STATUSES:
+                return run.status
             if run.status == "cancel_requested":
                 terminal_status = "cancelled"
                 error_message = None
@@ -466,6 +560,7 @@ class TeamLifecycleModule:
                 token_usage=usage,
             )
             await db.commit()
+            return terminal_status
 
 
 async def interrupt_team_worker_runs(*, uid: str, run_ids: list[str]) -> None:

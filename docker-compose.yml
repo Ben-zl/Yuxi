@@ -117,8 +117,14 @@ services:
       - .env
     environment:
       <<: *api-worker-env
-    command: watchfiles --filter python "arq server.worker_main.WorkerSettings" /app/server /app/package
+    command: uv run --no-sync --no-dev python -m server.worker_dev
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "arq server.worker_main.WorkerSettings --check || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
