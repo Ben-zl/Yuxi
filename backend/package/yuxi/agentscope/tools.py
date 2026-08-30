@@ -834,7 +834,26 @@ async def build_subagent_tools(
         if team is None:
             raise ValueError("AgentScope Team 已不存在，无法装配子智能体模板")
         if team.session_id != session_id:
-            return []
+            from yuxi.agentscope.team_protocol import resolve_worker_team_leader
+
+            leader = await resolve_worker_team_leader(
+                storage,
+                uid=user_id,
+                agent_id=agent_id,
+                session_id=session_id,
+            )
+            if leader is None:
+                raise ValueError("AgentScope Team worker 缺少 leader")
+            return [
+                _build_worker_team_say(
+                    storage=storage,
+                    message_bus=message_bus,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    leader=leader,
+                )
+            ]
 
     from copy import deepcopy
 
@@ -883,6 +902,120 @@ async def build_subagent_tools(
     schema.setdefault("required", []).append("subagent_type")
     tool.input_schema = schema
     return [tool]
+
+
+def _build_worker_team_say(
+    *,
+    storage,
+    message_bus,
+    user_id: str,
+    agent_id: str,
+    session_id: str,
+    leader,
+):
+    """构建只允许 worker 向真实 leader 回报的 TeamSay。"""
+    from agentscope.app.message_bus import MessageBusKeys
+    from agentscope.message import HintBlock, TextBlock, ToolResultState
+    from agentscope.permission import PermissionBehavior, PermissionDecision
+    from agentscope.tool import ToolBase, ToolChunk
+
+    from yuxi.agentscope.team_protocol import resolve_worker_team_leader
+
+    async def deliver_to_leader(payload: dict, leader_session_id: str, leader_agent_id: str) -> None:
+        # 与 AgentScope inbox producer 使用同一锁协议，避免消息落在 consumer
+        # 最后一次 drain 之后却没有新的 wakeup。
+        async with message_bus.acquire_lock(
+            MessageBusKeys.inbox_lock(leader_session_id),
+            ttl_secs=MessageBusKeys.INBOX_LOCK_TTL_SECS,
+        ):
+            await message_bus.queue_push(MessageBusKeys.inbox(leader_session_id), payload)
+            consumer = await message_bus.registry_get(
+                MessageBusKeys.inbox_consumer(leader_session_id),
+                MessageBusKeys.INBOX_CONSUMER_FIELD,
+            )
+        if consumer is None:
+            await message_bus.queue_push(
+                MessageBusKeys.wakeup_queue(),
+                {
+                    "user_id": user_id,
+                    "session_id": leader_session_id,
+                    "agent_id": leader_agent_id,
+                    "kind": MessageBusKeys.WAKEUP_KIND_WAKE,
+                    "input": None,
+                },
+            )
+            await message_bus.publish(MessageBusKeys.wakeup_signal(), {})
+
+    class WorkerTeamSay(ToolBase):
+        """将 worker 回报定向投递给当前 Team leader。"""
+
+        name = "TeamSay"
+        description = f"完成任务后将结果报告给 Team leader {leader.name!r}。不得向其他成员发送完成确认。"
+        is_concurrency_safe = True
+        is_read_only = True
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "向 leader 回报的完整结果。",
+                },
+                "to": {
+                    "anyOf": [
+                        {"type": "string", "enum": [leader.name]},
+                        {"type": "null"},
+                    ],
+                    "default": leader.name,
+                    "description": "接收者必须是当前 Team leader；null 会归一为 leader。",
+                },
+            },
+            "required": ["content"],
+            "additionalProperties": False,
+        }
+
+        async def check_permissions(self, tool_input, context) -> PermissionDecision:
+            """Team 内部回报不触发用户审批。"""
+            return PermissionDecision(
+                behavior=PermissionBehavior.ALLOW,
+                decision_reason="worker TeamSay is restricted to the leader",
+                message="允许 worker 向 Team leader 回报",
+            )
+
+        async def call(self, content: str, to: str | None = None) -> ToolChunk:
+            """把空目标归一为 leader，并拒绝任何 peer 目标。"""
+            current_leader = await resolve_worker_team_leader(
+                storage,
+                uid=user_id,
+                agent_id=agent_id,
+                session_id=session_id,
+            )
+            if current_leader is None:
+                return _gateway_error("TeamSay: 当前 Session 已不是 Team worker。")
+            if to not in {None, current_leader.name}:
+                return _gateway_error(f"TeamSay: worker 只能向 leader {current_leader.name!r} 回报。")
+
+            sender_agent = await storage.get_agent(user_id, agent_id)
+            sender_name = sender_agent.data.name if sender_agent is not None else agent_id
+            hint = HintBlock(
+                hint=(f'<team-message from="{sender_name}">\n{content}\n</team-message>'),
+                source=json.dumps(
+                    {"label": "team", "sublabel": sender_name},
+                    ensure_ascii=False,
+                ),
+            )
+            await deliver_to_leader(
+                hint.model_dump(mode="json"),
+                current_leader.session_id,
+                current_leader.agent_id,
+            )
+            return ToolChunk(
+                content=[TextBlock(text=f"Delivered to leader {current_leader.name!r}.")],
+                state=ToolResultState.SUCCESS,
+                metadata={"team_target": current_leader.name},
+            )
+
+    return WorkerTeamSay()
 
 
 async def build_extra_tools(

@@ -389,7 +389,8 @@ async def test_only_worker_reasoning_removes_stale_team_hints(is_worker, expecte
     async def next_handler(**_kwargs):
         yield "reasoning"
 
-    middleware = TeamLifecycleMiddleware(SimpleNamespace(), is_worker=is_worker)
+    lifecycle = SimpleNamespace(resolve_leader_name=AsyncMock(return_value=None))
+    middleware = TeamLifecycleMiddleware(lifecycle, is_worker=is_worker)
 
     assert [item async for item in middleware.on_reasoning(agent, {}, next_handler)] == ["reasoning"]
     assert [block.hint for block in content] == expected
@@ -399,6 +400,7 @@ async def test_worker_lifecycle_does_not_install_duplicate_leader_notifier():
     """worker 成败通知完全交给 AgentScope 原生 Team 链路。"""
     worker_session = SimpleNamespace(team_id="team-1")
     team = SimpleNamespace(session_id="leader-session")
+
     class _Storage:
         async def get_session(self, user_id, agent_id, session_id):
             if session_id == "worker-session":

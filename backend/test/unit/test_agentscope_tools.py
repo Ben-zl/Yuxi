@@ -224,15 +224,34 @@ async def test_build_subagent_tools_disables_agent_create_when_allowlist_is_empt
 
 
 async def test_build_subagent_tools_does_not_expose_agent_create_to_worker():
-    """Team worker 不得因动态覆盖重新获得 leader 专属工具。"""
+    """Team worker 只覆盖 TeamSay，不得重新获得 leader 专属工具。"""
+    from agentscope.app.message_bus import InMemoryMessageBus, MessageBusKeys
+
+    message_bus = InMemoryMessageBus()
     storage = SimpleNamespace(
         get_session=AsyncMock(return_value=SimpleNamespace(team_id="team")),
-        get_team=AsyncMock(return_value=SimpleNamespace(session_id="leader-session")),
+        get_team=AsyncMock(
+            return_value=SimpleNamespace(
+                id="team",
+                session_id="leader-session",
+                leader_agent_id="leader-agent",
+            )
+        ),
+        get_agent=AsyncMock(
+            side_effect=lambda _uid, agent_id: SimpleNamespace(
+                data=SimpleNamespace(
+                    name={
+                        "leader-agent": "leader-name",
+                        "worker": "worker-name",
+                    }[agent_id]
+                )
+            )
+        ),
     )
 
     built = await tools.build_subagent_tools(
         storage=storage,
-        message_bus=SimpleNamespace(),
+        message_bus=message_bus,
         workspace_manager=SimpleNamespace(),
         user_id="u",
         agent_id="worker",
@@ -246,7 +265,20 @@ async def test_build_subagent_tools_does_not_expose_agent_create_to_worker():
         ],
     )
 
-    assert built == []
+    assert [tool.name for tool in built] == ["TeamSay"]
+    assert built[0].input_schema["properties"]["to"]["anyOf"] == [
+        {"type": "string", "enum": ["leader-name"]},
+        {"type": "null"},
+    ]
+
+    result = await built[0].call(content="分析完成", to=None)
+
+    assert result.state.value == "success"
+    leader_inbox = await message_bus.queue_drain(MessageBusKeys.inbox("leader-session"))
+    assert len(leader_inbox) == 1
+    assert leader_inbox[0][1]["hint"] == ('<team-message from="worker-name">\n分析完成\n</team-message>')
+    wakeups = await message_bus.queue_drain(MessageBusKeys.wakeup_queue())
+    assert wakeups[0][1]["session_id"] == "leader-session"
 
 
 def test_textual_inline_guards_empty_data():

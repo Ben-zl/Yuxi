@@ -84,9 +84,71 @@ def _assistant_tool_names(body: dict) -> set[str]:
     return names
 
 
+def _assistant_tool_inputs(body: dict, tool_name: str) -> list[dict]:
+    """读取历史中指定工具的完整参数。"""
+    inputs = []
+    for message in body.get("messages") or []:
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            if function.get("name") != tool_name:
+                continue
+            try:
+                value = json.loads(function.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                value = {}
+            inputs.append(value if isinstance(value, dict) else {})
+    return inputs
+
+
+def _subagent_types(body: dict) -> list[str]:
+    """读取 AgentCreate schema 中当前允许的子智能体类型。"""
+    for tool in body.get("tools") or []:
+        function = tool.get("function") or {}
+        if function.get("name") != "AgentCreate":
+            continue
+        values = (
+            ((function.get("parameters") or {}).get("properties") or {})
+            .get(
+                "subagent_type",
+                {},
+            )
+            .get("enum")
+        )
+        if isinstance(values, list):
+            return [str(value) for value in values]
+    return []
+
+
 def _team_next_call(body: dict):
     """团队编排：TeamCreate → AgentCreate → TeamDelete → 总结。"""
     called = _assistant_tool_names(body)
+    context = json.dumps(body.get("messages") or [], ensure_ascii=False)
+    if "双 worker 回环验证" in context:
+        created = {str(item.get("name") or "") for item in _assistant_tool_inputs(body, "AgentCreate")}
+        subagent_types = _subagent_types(body)
+        if "TeamCreate" not in called:
+            return "TeamCreate", {"name": "e2e-dual-team", "description": "双 worker 回环验证"}
+        if "worker-a" not in created:
+            return "AgentCreate", {
+                "name": "worker-a",
+                "description": "e2e worker A",
+                "prompt": "完成 A 模块分析并回报 leader",
+                "subagent_type": subagent_types[0],
+            }
+        if "worker-b" not in created:
+            return "AgentCreate", {
+                "name": "worker-b",
+                "description": "e2e worker B",
+                "prompt": "完成 B 模块分析并回报 leader",
+                "subagent_type": subagent_types[1],
+            }
+        both_reported = all(f'<team-message from="{name}">' in context for name in ("worker-a", "worker-b"))
+        if both_reported and "TeamDelete" not in called:
+            return "TeamDelete", {}
+        return None
+
     if "AgentCreate" in called:
         worker_reported = any(
             '<team-message from="worker-1">' in _message_text(message)
@@ -97,15 +159,8 @@ def _team_next_call(body: dict):
             return "TeamDelete", {}
         return None
     if "TeamCreate" in called:
-        subagent_type = "e2e-team-sub"
-        for tool in body.get("tools") or []:
-            function = tool.get("function") or {}
-            if function.get("name") != "AgentCreate":
-                continue
-            enum = ((function.get("parameters") or {}).get("properties") or {}).get("subagent_type", {}).get("enum")
-            if isinstance(enum, list) and enum:
-                subagent_type = str(enum[0])
-            break
+        subagent_types = _subagent_types(body)
+        subagent_type = subagent_types[0] if subagent_types else "e2e-team-sub"
         return (
             "AgentCreate",
             {
@@ -181,7 +236,7 @@ def _matched_tool_trigger(body: dict):
         if "TeamSay" not in _assistant_tool_names(body):
             return "TeamSay", {"content": "worker 已完成调研并给出三点结论", "to": None}
     # 团队编排是状态机（多轮工具调用），先于一次性触发的工具结果短路
-    if "组建团队" in joined or "简短调研" in joined:
+    if "组建团队" in joined or "简短调研" in joined or "双 worker 回环验证" in joined:
         return _team_next_call(body)
     if "调用技能依赖" in joined:
         return _skill_gateway_next_call(body)
@@ -261,6 +316,9 @@ async def chat_completions(body: dict):
             if trigger:
                 tool_name, tool_args = trigger
                 args = json.dumps(tool_args, ensure_ascii=False)
+                call_suffix = ""
+                if tool_name == "AgentCreate":
+                    call_suffix = f"_{tool_args.get('name', 'worker')}"
                 yield _sse_chunk(model, {"role": "assistant", "content": None})
                 yield _sse_chunk(
                     model,
@@ -268,7 +326,7 @@ async def chat_completions(body: dict):
                         "tool_calls": [
                             {
                                 "index": 0,
-                                "id": f"call_mock_{tool_name}",
+                                "id": f"call_mock_{tool_name}{call_suffix}",
                                 "type": "function",
                                 "function": {"name": tool_name, "arguments": args},
                             }

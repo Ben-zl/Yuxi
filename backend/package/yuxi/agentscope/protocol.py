@@ -250,6 +250,7 @@ class ToolEventConverter:
                     "output": "".join(self._result_fragments.get(tool_call_id, [])),
                     "status": state,
                     "error_message": error_message,
+                    "metadata": metadata,
                 }
             )
         return calls

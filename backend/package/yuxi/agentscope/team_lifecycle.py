@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from yuxi.agentscope.protocol import ToolEventConverter, event_to_chunks, make_chunk, reply_end_to_terminal
+from yuxi.agentscope.team_protocol import resolve_worker_team_leader
 from yuxi.agentscope.usage import UsageAccumulator
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_repository import AgentRunRepository, TERMINAL_RUN_STATUSES
@@ -35,8 +36,8 @@ class TeamRosterSnapshot:
     members: dict[str, tuple[str, str]]
 
 
-def retain_latest_team_hint(agent) -> None:
-    """推理前移除旧 Team 消息，只让最新派发要求进入本轮模型输入。"""
+def retain_latest_team_hint(agent, *, leader_name: str | None = None) -> None:
+    """推理前移除 peer 回报和旧 Team 消息，只保留 leader 最新任务。"""
     context = list(getattr(agent.state, "context", None) or [])
     if not context:
         return
@@ -44,9 +45,12 @@ def retain_latest_team_hint(agent) -> None:
     if not isinstance(content, list):
         return
     team_indexes = [index for index, block in enumerate(content) if _is_team_hint(block)]
-    if len(team_indexes) <= 1:
+    if not team_indexes:
         return
-    latest = team_indexes[-1]
+    leader_indexes = [
+        index for index in team_indexes if leader_name is None or _team_hint_sender(content[index]) == leader_name
+    ]
+    latest = leader_indexes[-1] if leader_indexes else None
     content[:] = [block for index, block in enumerate(content) if index not in team_indexes or index == latest]
 
 
@@ -80,6 +84,16 @@ class TeamLifecycleModule:
             if member.owner_id == self.uid
         }
         return TeamRosterSnapshot(team_id=team.id, members=members)
+
+    async def resolve_leader_name(self) -> str | None:
+        """解析当前 worker 的真实 leader 展示名。"""
+        leader = await resolve_worker_team_leader(
+            self.storage,
+            uid=self.uid,
+            agent_id=self.agent_id,
+            session_id=self.session_id,
+        )
+        return leader.name if leader is not None else None
 
     async def project_created_member(
         self,
@@ -243,7 +257,9 @@ class TeamLifecycleModule:
         usage = UsageAccumulator(configured_model_spec=None)
         reply_id: str | None = None
         prompt: str | None = None
-        leader_name: str | None = None
+        leader_name = await self.resolve_leader_name()
+        leader_instruction_seen = False
+        peer_message_seen = False
         completed_reply_ends = 0
         terminal = None
         terminal_error_message: str | None = None
@@ -259,9 +275,18 @@ class TeamLifecycleModule:
                     reply_id = str(event.get("reply_id") or "")
                 elif run_id is None and reply_id:
                     if event_type == "HINT_BLOCK":
-                        prompt = _team_message_text(event) or prompt
-                        leader_name = _team_message_sender(event) or leader_name
+                        sender = _team_message_sender(event)
+                        if sender and leader_name and sender != leader_name:
+                            peer_message_seen = True
+                        else:
+                            team_text = _team_message_text(event)
+                            if team_text:
+                                prompt = team_text
+                                leader_instruction_seen = True
                     else:
+                        if peer_message_seen and not leader_instruction_seen:
+                            yield item
+                            continue
                         run_id, request_id = await self._open_worker_run(
                             binding.worker_session_id,
                             reply_id,
@@ -626,6 +651,20 @@ def _is_team_hint(block: Any) -> bool:
         return False
 
 
+def _team_hint_sender(block: Any) -> str:
+    """读取上下文 Team HintBlock 的发送者展示名。"""
+    source = getattr(block, "source", None)
+    if not isinstance(source, str):
+        return ""
+    try:
+        payload = json.loads(source)
+    except (TypeError, ValueError):
+        return ""
+    if payload.get("label") not in {"team", "team_message"}:
+        return ""
+    return str(payload.get("sublabel") or "").strip()
+
+
 def _team_message_text(event: dict[str, Any]) -> str:
     """从 Team HintBlockEvent 中提取 leader 派发的正文。"""
     source = event.get("source")
@@ -659,11 +698,13 @@ def _team_message_sender(event: dict[str, Any]) -> str:
 
 
 def _reported_to_team_leader(tool_calls: list[dict], leader_name: str | None) -> bool:
-    """判断本轮最后一次工具调用是否成功向 leader 或全队回报。"""
+    """判断本轮最后一次工具调用是否成功定向回报真实 leader。"""
     if not tool_calls:
         return False
     last_call = tool_calls[-1]
     if last_call.get("name") != "TeamSay" or last_call.get("status") != "success":
         return False
-    target = (last_call.get("args") or {}).get("to")
-    return target is None or bool(leader_name and target == leader_name)
+    target = (last_call.get("metadata") or {}).get("team_target")
+    if target is None:
+        target = (last_call.get("args") or {}).get("to")
+    return bool(leader_name and target == leader_name)

@@ -297,7 +297,10 @@ class TeamLifecycleMiddleware(MiddlewareBase):
     async def on_reasoning(self, agent, input_kwargs, next_handler):
         """worker 推理前丢弃失败重试遗留的旧 Team 派发消息。"""
         if self._is_worker:
-            retain_latest_team_hint(agent)
+            retain_latest_team_hint(
+                agent,
+                leader_name=await self._lifecycle.resolve_leader_name(),
+            )
         async for item in next_handler(**input_kwargs):
             yield item
 
