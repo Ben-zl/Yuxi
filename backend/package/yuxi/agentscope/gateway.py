@@ -41,6 +41,7 @@ class GatewayRoundResult:
     text: str
     reasoning: str
     event_count: int
+    error_type: str | None = None
     error_message: str | None = None  # AgentScope 终态中的可展示错误
     parked: str | None = None  # 挂起原因（permission=等待工具审批）
     usage: dict | None = None  # 聚合的 token 用量（input/output/total）
@@ -259,6 +260,7 @@ async def collect_run_events(
                     text="".join(text_parts),
                     reasoning="".join(reasoning_parts),
                     event_count=event_count,
+                    error_type=terminal.chunk.get("error_type"),
                     error_message=terminal.chunk.get("error_message"),
                     usage=usage.snapshot(complete=True),
                     tool_calls=converter.history_tool_calls(),
@@ -298,6 +300,7 @@ async def collect_run_events(
         text="".join(text_parts),
         reasoning="".join(reasoning_parts),
         event_count=event_count,
+        error_type=pending_terminal.chunk.get("error_type"),
         error_message=pending_terminal.chunk.get("error_message"),
         usage=usage.snapshot(complete=True),
         tool_calls=converter.history_tool_calls(),

@@ -15,8 +15,10 @@
 - 公共智能体系统提示词新增产出物交付约束：最终文件写入 outputs 后必须调用 `present_artifacts`，由主智能体统一登记并展示，临时文件不纳入交付。
 - 修复 Team worker 首轮默认 20 次迭代导致的 `exceed_max_iters`：子智能体模板继承 `max_execution_steps`；回报协议仅通知 leader；worker 完成后未主动 `TeamSay` 时由平台代发完整结果并触发 leader 续写；失败重试只保留最新 Team 指令；后续 TeamReply Run 写入稳定展示标识，历史缺失 `tool_call_id` 的 Run 不再导致线程状态接口 500；保留模式的 TeamDelete 返回终态响应。
 - 修复执行后取消的 AgentRun 对话内容为空：历史接口在已有助手输出时保留 cancelled/rejected 用户消息；Team worker 中断后即使缺少 `REPLY_END` 也会结束 child Run，父 Run 异常路径按取消信号归一为 cancelled；未执行的排队取消请求仍保持隐藏。
+- 修复 AgentScope 后台续写遗留提问挂起后普通消息无回复：Yuxi 无 pending 事实时先中断陈旧等待态再执行新消息；失败 Run 没有助手输出时，历史仍持续展示明确错误原因。
+- 升级 AgentScope 至 2.0.7.post1：持久化 parent/worker Workspace ID 并清理新旧目录与残留容器；Team child Run 只写一次终态；按 provider 归一缓存 Token 并按 reply 去重；最大迭代保留文本和失败事实。真实 MiniMax、浏览器 Team、删除和回滚链路已验证。
 - 修复开发环境 ARQ worker 异常后只留下 `watchfiles` 与 zombie 子进程、容器假存活：监督器自动重启 ARQ 并保留热重载，Compose 增加真实 healthcheck；启动恢复同时接管 `pending/running` Run，清理确定性 Job 的陈旧 retry/in-progress 状态后重新投递。
-- 补齐 AgentScope 功能对齐：Team worker 采用父线程生命周期保留模式、投影 child 历史并按子智能体配置装配 Skill/工具/MCP/知识库；Token 卡片与 Dashboard 使用真实 Run/线程累计用量，Anthropic 输入包含普通、缓存创建与缓存读取 Token；Summary 配置映射到 AgentScope 上下文压缩；文件树保留目录并提示 500 项截断；Steer 仅在工具批次后的安全点接力；主动提问支持刷新恢复与回答续接。
+- 补齐 AgentScope 功能对齐：Team worker 保留生命周期并按子智能体配置装配资源；Token 卡片与 Dashboard 使用真实 Run/线程累计用量，合并 Anthropic 兼容流在 `message_delta` 上报的输入与缓存用量；Summary 映射到上下文压缩；文件树提示 500 项截断；Steer 在工具批次后接力；主动提问支持刷新恢复与回答续接。
 - 新增 Agent 任务中心（工单 01-11）：以 NativeScheduleBlockMiddleware 在模型调用边界移除 AgentScope 原生 Schedule 工具；建立 AgentTask/TaskExecution 领域模型与 CRUD、手动/API/定时三入口触发收口、任务级 FIFO 串行队列与崩溃恢复；定时规则编译为 5 段 POSIX Cron 并按 IANA 时区计算下次运行，APScheduler DOW 约定差异在构造前统一转换；支持部门共享、执行身份审批隔离、Agent 删除阻断；前端新增任务中心页面（列表/创建/编辑/详情/执行历史/线程）与 SSE 事件流/产物只读接口。
 - 修复 APScheduler CronTrigger day-of-week 约定差异：`from_crontab` 使用 0=Monday（Python 约定），与 POSIX Cron 0=Sunday 不同；在 `_build_trigger` 构造前将 DOW 字段从 POSIX 统一转换为 APScheduler 约定，避免每周定时任务在错误的星期执行。
 - 恢复内置 stdio MCP：仅代码注册表可启动，发现与调用使用独立短连接；HTTP MCP 继续在服务进程执行。MCP 禁用、配置更新、删除下一轮生效，并按远端原始工具名过滤。

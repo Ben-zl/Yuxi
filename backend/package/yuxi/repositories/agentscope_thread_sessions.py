@@ -27,6 +27,7 @@ async def create_thread_session(
     agentscope_agent_id: str,
     agentscope_credential_id: str,
     agentscope_session_id: str,
+    agentscope_workspace_id: str,
 ) -> AgentScopeThreadSession:
     """写入映射事实；uid+thread 冲突时抛 IntegrityError（调用方保证先查后写）。"""
     record = AgentScopeThreadSession(
@@ -37,8 +38,21 @@ async def create_thread_session(
         agentscope_agent_id=agentscope_agent_id,
         agentscope_credential_id=agentscope_credential_id,
         agentscope_session_id=agentscope_session_id,
+        agentscope_workspace_id=agentscope_workspace_id,
     )
     db.add(record)
+    await db.flush()
+    return record
+
+
+async def set_thread_session_workspace_id(
+    db: AsyncSession,
+    record: AgentScopeThreadSession,
+    *,
+    agentscope_workspace_id: str,
+) -> AgentScopeThreadSession:
+    """保存 AgentScope Session 分配的权威 Workspace ID。"""
+    record.agentscope_workspace_id = agentscope_workspace_id
     await db.flush()
     return record
 

@@ -88,7 +88,12 @@ def _team_next_call(body: dict):
     """团队编排：TeamCreate → AgentCreate → TeamDelete → 总结。"""
     called = _assistant_tool_names(body)
     if "AgentCreate" in called:
-        if "TeamDelete" not in called:
+        worker_reported = any(
+            '<team-message from="worker-1">' in _message_text(message)
+            for message in body.get("messages") or []
+            if message.get("role") == "user"
+        )
+        if "TeamDelete" not in called and worker_reported:
             return "TeamDelete", {}
         return None
     if "TeamCreate" in called:

@@ -10,6 +10,7 @@ import os
 import uuid
 
 import pytest
+from sqlalchemy import select
 
 from test.e2e.agentscope_e2e_fixtures import (
     PROVIDER_ID,
@@ -104,3 +105,71 @@ async def test_kb_tool_round_executes_and_streams(db_session):
     finally:
         await redis_client.delete(stream_key)
         await close_async_redis_client()
+
+
+async def test_max_iters_keeps_partial_text_and_failed_terminal(db_session):
+    """真实工具轮次达到上限时，保留文本但不得把 Run 误报为成功。"""
+    agent = await db_session.scalar(select(Agent).where(Agent.slug == CHATBOT_SLUG))
+    assert agent is not None
+    context = dict((agent.config_json or {}).get("context") or {})
+    agent.config_json = {"context": {**context, "max_execution_steps": 1}}
+    await db_session.commit()
+
+    run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
+    request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
+    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
+    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
+    mapping = await ensure_thread_session(
+        db_session,
+        client,
+        uid=USER_ID,
+        thread_id=thread_id,
+        agent_slug=CHATBOT_SLUG,
+    )
+    await client.set_permission_mode(
+        USER_ID,
+        mapping.agentscope_agent_id,
+        mapping.agentscope_session_id,
+        "bypass",
+    )
+    try:
+        result = await stream_round_to_run_events(
+            client,
+            uid=USER_ID,
+            agent_id=mapping.agentscope_agent_id,
+            session_id=mapping.agentscope_session_id,
+            text="请列出知识库",
+            run_id=run_id,
+            request_id=request_id,
+            thread_id=thread_id,
+            read_timeout=300.0,
+        )
+
+        assert result.run_status == "failed"
+        assert result.error_type == "exceed_max_iters"
+        assert result.text, "达到最大迭代时应保留 AgentScope 已产生的最终文本"
+
+        redis_client = await get_async_redis_client()
+        try:
+            frames = await redis_client.xrange(f"run:events:{run_id}")
+            assert frames[-1][1]["event_type"] == "end"
+            end_envelope = json.loads(frames[-1][1]["payload"])
+            assert end_envelope["payload"]["status"] == "failed"
+            assert end_envelope["payload"]["chunk"]["error_type"] == "exceed_max_iters"
+        finally:
+            await redis_client.delete(f"run:events:{run_id}")
+            await close_async_redis_client()
+    finally:
+        await client.delete_session(
+            USER_ID,
+            mapping.agentscope_agent_id,
+            mapping.agentscope_session_id,
+            missing_ok=True,
+        )
+        await client.destroy_thread_workspaces(USER_ID, thread_id)
+        await client.delete_agent(USER_ID, mapping.agentscope_agent_id, missing_ok=True)
+        await client.delete_credential(
+            USER_ID,
+            mapping.agentscope_credential_id,
+            missing_ok=True,
+        )

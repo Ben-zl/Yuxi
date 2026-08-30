@@ -87,22 +87,41 @@ class AgentScopeServiceClient:
         )
         return resp.json()["session_id"]
 
-    async def delete_session(self, uid: str, agent_id: str, session_id: str) -> None:
+    async def delete_session(
+        self,
+        uid: str,
+        agent_id: str,
+        session_id: str,
+        *,
+        missing_ok: bool = False,
+    ) -> None:
         """删除测试或回滚场景中的会话。"""
-        await self._request(
-            "DELETE",
-            f"/sessions/{session_id}",
-            uid,
-            params={"agent_id": agent_id},
-        )
+        try:
+            await self._request(
+                "DELETE",
+                f"/sessions/{session_id}",
+                uid,
+                params={"agent_id": agent_id},
+            )
+        except AgentScopeServiceError as exc:
+            if not missing_ok or exc.status_code != 404:
+                raise
 
-    async def delete_agent(self, uid: str, agent_id: str) -> None:
+    async def delete_agent(self, uid: str, agent_id: str, *, missing_ok: bool = False) -> None:
         """删除测试或回滚场景中的 AgentScope agent。"""
-        await self._request("DELETE", f"/agent/{agent_id}", uid)
+        try:
+            await self._request("DELETE", f"/agent/{agent_id}", uid)
+        except AgentScopeServiceError as exc:
+            if not missing_ok or exc.status_code != 404:
+                raise
 
-    async def delete_credential(self, uid: str, credential_id: str) -> None:
+    async def delete_credential(self, uid: str, credential_id: str, *, missing_ok: bool = False) -> None:
         """删除测试或回滚场景中的 AgentScope credential。"""
-        await self._request("DELETE", f"/credential/{credential_id}", uid)
+        try:
+            await self._request("DELETE", f"/credential/{credential_id}", uid)
+        except AgentScopeServiceError as exc:
+            if not missing_ok or exc.status_code != 404:
+                raise
 
     async def add_workspace_skill(self, uid: str, agent_id: str, session_id: str, skill_path: str) -> None:
         """把已授权 Skill 安装到指定会话 workspace。"""
@@ -319,6 +338,38 @@ class AgentScopeServiceClient:
             if session.get("id") == session_id:
                 return session
         raise AgentScopeServiceError(f"Session {session_id} 不存在", status_code=404)
+
+    async def get_session_workspace_id(self, uid: str, agent_id: str, session_id: str) -> str:
+        """精确读取 Session 持久化配置中的 Workspace ID。"""
+        session = await self.get_session(uid, agent_id, session_id)
+        config = session.get("config") if isinstance(session.get("config"), dict) else {}
+        workspace_id = str(config.get("workspace_id") or "").strip()
+        if not workspace_id:
+            raise AgentScopeServiceError(
+                f"Session {session_id} 缺少 workspace_id",
+                status_code=409,
+            )
+        return workspace_id
+
+    async def destroy_thread_workspaces(self, uid: str, thread_id: str) -> dict:
+        """请求 AgentScope 服务清理线程持有的全部物理 Workspace。"""
+        resp = await self._request(
+            "DELETE",
+            "/yuxi/workspace/thread",
+            uid,
+            params={"thread_id": thread_id},
+        )
+        return resp.json()
+
+    async def get_session_status(self, uid: str, agent_id: str, session_id: str) -> str:
+        """读取 Session 的运行或挂起状态。"""
+        resp = await self._request(
+            "GET",
+            f"/sessions/{session_id}/status",
+            uid,
+            params={"agent_id": agent_id},
+        )
+        return str(resp.json()["status"])
 
     async def list_workspace_files(
         self,

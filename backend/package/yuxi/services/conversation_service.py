@@ -523,39 +523,71 @@ async def delete_thread_view(
 
 async def _delete_agentscope_thread_resources(db: AsyncSession, *, uid: str, thread_id: str) -> None:
     """删除线程独占的 AgentScope 资源与持久 workspace。"""
-    import asyncio
     import os
-    import shutil
-    from pathlib import Path
 
     from yuxi.agentscope.client import AgentScopeServiceClient
     from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerRepository
-    from yuxi.repositories.agentscope_thread_sessions import delete_thread_session, get_thread_session
+    from yuxi.repositories.agentscope_thread_sessions import (
+        delete_thread_session,
+        get_thread_session,
+        set_thread_session_workspace_id,
+    )
 
     mapping = await get_thread_session(db, uid=uid, thread_id=thread_id)
     if mapping is None:
         return
 
     client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
-    await client.delete_session(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)
-    await client.delete_agent(uid, mapping.agentscope_agent_id)
-    await client.delete_credential(uid, mapping.agentscope_credential_id)
-    await delete_thread_session(db, mapping)
-    bindings = await AgentScopeTeamWorkerRepository(db).deactivate_parent_runtime(
+    binding_repo = AgentScopeTeamWorkerRepository(db)
+    bindings = await binding_repo.list_for_parent_thread(
         uid=uid,
         parent_thread_id=thread_id,
     )
+
+    if not mapping.agentscope_workspace_id:
+        workspace_id = await client.get_session_workspace_id(
+            uid,
+            mapping.agentscope_agent_id,
+            mapping.agentscope_session_id,
+        )
+        await set_thread_session_workspace_id(
+            db,
+            mapping,
+            agentscope_workspace_id=workspace_id,
+        )
+    for binding in bindings:
+        if binding.agentscope_workspace_id:
+            continue
+        workspace_id = await client.get_session_workspace_id(
+            uid,
+            binding.worker_agent_id,
+            binding.worker_session_id,
+        )
+        await binding_repo.set_workspace_id(
+            binding,
+            agentscope_workspace_id=workspace_id,
+        )
+    await db.commit()
+
+    await client.delete_session(
+        uid,
+        mapping.agentscope_agent_id,
+        mapping.agentscope_session_id,
+        missing_ok=True,
+    )
+    await client.destroy_thread_workspaces(uid, thread_id)
+    await client.delete_agent(uid, mapping.agentscope_agent_id, missing_ok=True)
+    await client.delete_credential(uid, mapping.agentscope_credential_id, missing_ok=True)
+
+    bindings = await binding_repo.deactivate_parent_runtime(uid=uid, parent_thread_id=thread_id)
     child_conversations = ConversationRepository(db)
     for binding in bindings:
         child = await child_conversations.get_conversation_by_thread_id(binding.child_thread_id)
         if child is not None:
             child.status = "deleted"
+    await delete_thread_session(db, mapping)
     await db.flush()
-
-    base = Path(os.getenv("AGENTSCOPE_WORKSPACE_BASEDIR", "/app/saves/agentscope-workspaces")).resolve()
-    target = (base / uid / mapping.agentscope_agent_id).resolve()
-    if target != base and target.is_relative_to(base) and target.exists() and not target.is_symlink():
-        await asyncio.to_thread(shutil.rmtree, target)
+    await db.commit()
 
 
 async def update_thread_view(
@@ -948,17 +980,33 @@ async def get_thread_history_view(
     ]
 
     run_ids_in_messages = {msg.run_id for msg in messages if msg.run_id}
-    run_created_at: dict[str, Any] = {}
+    run_details: dict[str, dict[str, Any]] = {}
     if run_ids_in_messages:
         run_result = await db.execute(
-            select(AgentRun.id, AgentRun.created_at)
+            select(
+                AgentRun.id,
+                AgentRun.created_at,
+                AgentRun.finished_at,
+                AgentRun.status,
+                AgentRun.error_type,
+                AgentRun.error_message,
+            )
             .where(AgentRun.id.in_(run_ids_in_messages))
             .order_by(AgentRun.created_at.asc(), AgentRun.id.asc())
         )
-        run_created_at = {run_id: created_at for run_id, created_at in run_result.all()}
+        run_details = {
+            run_id: {
+                "created_at": created_at,
+                "finished_at": finished_at,
+                "status": status,
+                "error_type": error_type,
+                "error_message": error_message,
+            }
+            for run_id, created_at, finished_at, status, error_type, error_message in run_result.all()
+        }
     messages.sort(
         key=lambda message: (
-            run_created_at.get(message.run_id) or message.created_at,
+            (run_details.get(message.run_id) or {}).get("created_at") or message.created_at,
             0 if message.role == "user" else 1,
             message.created_at,
             message.id,
@@ -1032,6 +1080,37 @@ async def get_thread_history_view(
             ]
 
         history.append(msg_dict)
+
+        run = run_details.get(msg.run_id) or {}
+        if (
+            msg.role == "user"
+            and msg.delivery_status == "failed"
+            and msg.run_id not in runs_with_assistant_output
+            and run.get("status") == "failed"
+        ):
+            error_type = run.get("error_type") or "agent_error"
+            error_message = run.get("error_message") or "智能体执行失败"
+            history.append(
+                {
+                    "id": f"run-error:{msg.run_id}",
+                    "type": "ai",
+                    "content": "",
+                    "created_at": (run.get("finished_at") or msg.created_at).isoformat(),
+                    "run_id": msg.run_id,
+                    "request_id": msg.request_id,
+                    "delivery_status": "failed",
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "extra_metadata": {
+                        "error_type": error_type,
+                        "error_message": error_message,
+                        "synthetic_run_error": True,
+                    },
+                    "message_type": "text",
+                    "image_content": None,
+                    "feedback": None,
+                }
+            )
 
     logger.info(f"Loaded {len(history)} messages with feedback for thread {thread_id}")
     return {"history": history}

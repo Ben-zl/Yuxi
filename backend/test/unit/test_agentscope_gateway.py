@@ -423,6 +423,33 @@ async def test_failed_round_preserves_provider_error(capture_events):
     assert result.error_message == "模型服务连接超时"
 
 
+async def test_max_iters_preserves_final_text_while_run_remains_failed(capture_events):
+    """达到最大迭代时展示最终文本，但终态仍保留 exceed_max_iters。"""
+    client = _StubClient(
+        [
+            {"type": "REPLY_START", "reply_id": "r-max"},
+            {"type": "TEXT_BLOCK_DELTA", "reply_id": "r-max", "delta": "已完成的部分结果"},
+            {"type": "REPLY_END", "reply_id": "r-max", "finished_reason": "exceed_max_iters"},
+        ]
+    )
+
+    result = await gateway.stream_round_to_run_events(
+        client,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        text="问题",
+        run_id="run-max",
+        request_id="req-max",
+        thread_id="th-max",
+        read_timeout=5.0,
+    )
+
+    assert result.text == "已完成的部分结果"
+    assert result.run_status == "failed"
+    assert result.error_type == "exceed_max_iters"
+
+
 async def test_new_round_ignores_previous_reply_replay(capture_events):
     """新一轮订阅不得把 replay 中上一轮终态当成本轮结果。"""
     client = _StubClient(

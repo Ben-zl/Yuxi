@@ -7,19 +7,15 @@ from yuxi.agentscope import team_lifecycle
 from yuxi.agentscope.team_lifecycle import TeamLifecycleModule, retain_latest_team_hint
 
 
-async def test_failed_worker_reply_notifies_leader_before_terminal(monkeypatch):
-    """worker 失败时必须先通知 leader，再结束 child Run。"""
+async def test_failed_worker_reply_uses_native_notification_and_finishes_once(monkeypatch):
+    """worker 失败由原生链路通知，Yuxi 只写一次 child 终态。"""
     order = []
-
-    async def _notify(message: str) -> None:
-        order.append(("notify", message))
 
     lifecycle = TeamLifecycleModule(
         storage=SimpleNamespace(),
         uid="u",
         agent_id="worker-agent",
         session_id="worker-session",
-        leader_notifier=_notify,
     )
     binding = SimpleNamespace(worker_session_id="worker-session", child_thread_id="child-thread")
     monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
@@ -40,25 +36,18 @@ async def test_failed_worker_reply_notifies_leader_before_terminal(monkeypatch):
         }
 
     assert [item async for item in lifecycle.project_worker_reply({}, _reply)]
-    assert order == [
-        ("notify", "子智能体执行失败，未能返回结果：运行失败: exceed_max_iters"),
-        ("finish", "failed"),
-    ]
+    assert order == [("finish", "failed")]
 
 
-async def test_completed_worker_reply_without_team_say_notifies_leader(monkeypatch):
-    """worker 未主动 TeamSay 时，平台必须把完整结果代发给 leader。"""
+async def test_intermediate_reply_ends_are_candidates_until_generator_exhausts(monkeypatch):
+    """原生纠正循环吞掉的中间 REPLY_END 不得提前结束 child Run。"""
     order = []
-
-    async def _notify(message: str) -> None:
-        order.append(("notify", message))
 
     lifecycle = TeamLifecycleModule(
         storage=SimpleNamespace(),
         uid="u",
         agent_id="worker-agent",
         session_id="worker-session",
-        leader_notifier=_notify,
     )
     binding = SimpleNamespace(worker_session_id="worker-session", child_thread_id="child-thread")
     monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
@@ -92,28 +81,23 @@ async def test_completed_worker_reply_without_team_say_notifies_leader(monkeypat
             "state": "success",
         }
         yield {"type": "REPLY_END", "reply_id": "reply-1", "finished_reason": "completed"}
+        yield {"type": "HINT_BLOCK", "reply_id": "reply-1", "hint": "必须调用 TeamSay"}
+        yield {"type": "TEXT_BLOCK_DELTA", "reply_id": "reply-1", "delta": "补充回报"}
+        yield {"type": "REPLY_END", "reply_id": "reply-1", "finished_reason": "completed"}
 
     assert [item async for item in lifecycle.project_worker_reply({}, _reply)]
-    assert order == [
-        (
-            "notify",
-            "子智能体已完成，但未主动调用 TeamSay。以下为其完整结果：\n\n"
-            "真实分析结果\n\n可供后续子智能体复用的共享中间文件：\n"
-            "- /workspace/outputs/tmp/perfeye_169724.json",
-        ),
-        ("finish", "completed"),
-    ]
+    assert order == [("finish", "completed")]
+    end_events = [call for call in team_lifecycle.append_run_stream_event.await_args_list if call.args[1] == "end"]
+    assert len(end_events) == 1
 
 
 async def test_completed_worker_reply_with_successful_team_say_is_not_duplicated(monkeypatch):
     """worker 已成功 TeamSay 时，平台不得重复向 leader 投递结果。"""
-    notify = AsyncMock()
     lifecycle = TeamLifecycleModule(
         storage=SimpleNamespace(),
         uid="u",
         agent_id="worker-agent",
         session_id="worker-session",
-        leader_notifier=notify,
     )
     binding = SimpleNamespace(worker_session_id="worker-session", child_thread_id="child-thread")
     monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
@@ -138,7 +122,92 @@ async def test_completed_worker_reply_with_successful_team_say_is_not_duplicated
         yield {"type": "REPLY_END", "reply_id": "reply-1", "finished_reason": "completed"}
 
     assert [item async for item in lifecycle.project_worker_reply({}, _reply)]
-    notify.assert_not_awaited()
+
+
+async def test_successful_team_say_finishes_before_final_reply_end_is_consumed(monkeypatch):
+    """外层在最终 REPLY_END 停止消费时，child Run 必须已经完成。"""
+    lifecycle = TeamLifecycleModule(
+        storage=SimpleNamespace(),
+        uid="u",
+        agent_id="worker-agent",
+        session_id="worker-session",
+    )
+    binding = SimpleNamespace(worker_session_id="worker-session", child_thread_id="child-thread")
+    monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
+    monkeypatch.setattr(lifecycle, "_open_worker_run", AsyncMock(return_value=("child-run", "child-request")))
+    finish_run = AsyncMock(return_value="completed")
+    monkeypatch.setattr(lifecycle, "_finish_worker_run", finish_run)
+    append_event = AsyncMock()
+    monkeypatch.setattr(team_lifecycle, "append_run_stream_event", append_event)
+
+    async def _reply(**_kwargs):
+        yield {"type": "REPLY_START", "reply_id": "reply-1"}
+        yield {
+            "type": "HINT_BLOCK",
+            "reply_id": "reply-1",
+            "hint": '<team-message from="leader-name">\n任务\n</team-message>',
+            "source": '{"label":"team_message","sublabel":"leader-name"}',
+        }
+        yield {
+            "type": "TOOL_CALL_START",
+            "reply_id": "reply-1",
+            "tool_call_id": "team-say-1",
+            "tool_call_name": "TeamSay",
+        }
+        yield {
+            "type": "TOOL_CALL_DELTA",
+            "reply_id": "reply-1",
+            "tool_call_id": "team-say-1",
+            "delta": '{"to":"leader-name","message":"done"}',
+        }
+        yield {
+            "type": "TOOL_RESULT_END",
+            "reply_id": "reply-1",
+            "tool_call_id": "team-say-1",
+            "state": "success",
+        }
+        yield {"type": "REPLY_END", "reply_id": "reply-1", "finished_reason": "completed"}
+
+    stream = lifecycle.project_worker_reply({}, _reply)
+    while (await anext(stream))["type"] != "REPLY_END":
+        pass
+
+    finish_run.assert_awaited_once()
+    assert finish_run.await_args.kwargs["terminal_status"] == "completed"
+    end_events = [call for call in append_event.await_args_list if call.args[1] == "end"]
+    assert len(end_events) == 1
+    await stream.aclose()
+    finish_run.assert_awaited_once()
+
+
+async def test_fourth_missing_team_say_finishes_as_failed_before_reply_end(monkeypatch):
+    """三次纠正后仍未 TeamSay 时，第四个候选终态必须立即失败。"""
+    lifecycle = TeamLifecycleModule(
+        storage=SimpleNamespace(),
+        uid="u",
+        agent_id="worker-agent",
+        session_id="worker-session",
+    )
+    binding = SimpleNamespace(worker_session_id="worker-session", child_thread_id="child-thread")
+    monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
+    monkeypatch.setattr(lifecycle, "_open_worker_run", AsyncMock(return_value=("child-run", "child-request")))
+    finish_run = AsyncMock(return_value="failed")
+    monkeypatch.setattr(lifecycle, "_finish_worker_run", finish_run)
+    monkeypatch.setattr(team_lifecycle, "append_run_stream_event", AsyncMock())
+
+    async def _reply(**_kwargs):
+        yield {"type": "REPLY_START", "reply_id": "reply-1"}
+        for _ in range(4):
+            yield {"type": "REPLY_END", "reply_id": "reply-1", "finished_reason": "completed"}
+
+    stream = lifecycle.project_worker_reply({}, _reply)
+    for _ in range(5):
+        await anext(stream)
+
+    finish_run.assert_awaited_once()
+    assert finish_run.await_args.kwargs["terminal_status"] == "failed"
+    assert finish_run.await_args.kwargs["error_message"] == ("Team worker 连续 3 次纠正后仍未通过 TeamSay 回报 leader")
+    await stream.aclose()
 
 
 async def test_worker_reply_stream_without_reply_end_still_finishes_child_run(monkeypatch):

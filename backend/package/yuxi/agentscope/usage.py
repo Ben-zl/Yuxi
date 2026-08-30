@@ -3,6 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
+
+from agentscope.model import AnthropicChatModel, GeminiChatModel, OpenAIChatModel
+
+CacheInputMode = Literal["additive", "inclusive", "unknown"]
+
+
+def cache_input_mode_for_model(model: object) -> CacheInputMode:
+    """按 AgentScope 模型适配器确定缓存输入 Token 口径。"""
+    if isinstance(model, AnthropicChatModel):
+        return "additive"
+    if isinstance(model, (OpenAIChatModel, GeminiChatModel)):
+        return "inclusive"
+    return "unknown"
 
 
 def _total(input_tokens: int = 0, output_tokens: int = 0) -> dict[str, int]:
@@ -52,9 +66,59 @@ class UsageAccumulator:
     configured_model_spec: str | None = None
     current_model: str | None = None
     reply_models: dict[str, str] = field(default_factory=dict)
+    reply_cache_modes: dict[str, CacheInputMode] = field(default_factory=dict)
+    reply_call_counts: dict[str, int] = field(default_factory=dict)
+    active_call_keys: dict[str, str] = field(default_factory=dict)
     calls: list[tuple[str, dict]] = field(default_factory=list)
     context: dict = field(default_factory=dict)
     pending_model_usages: dict[str, dict] = field(default_factory=dict)
+    pending_native_usages: dict[str, dict] = field(default_factory=dict)
+    completed_reply_ids: set[str] = field(default_factory=set)
+
+    def _call_key(self, reply_id: str) -> str:
+        """返回 reply 当前模型调用键；一次 ReAct reply 可包含多次调用。"""
+        return self.active_call_keys.get(reply_id, reply_id)
+
+    @staticmethod
+    def _normalize_usage(
+        *,
+        raw_input_tokens: int,
+        output_tokens: int,
+        cache_creation_input_tokens: int,
+        cache_read_input_tokens: int,
+        cache_input_mode: CacheInputMode,
+    ) -> dict:
+        """把 provider 原始计数归一为 Yuxi 的总输入和缓存分母。"""
+        raw_input = max(int(raw_input_tokens or 0), 0)
+        output = max(int(output_tokens or 0), 0)
+        cache_creation = max(int(cache_creation_input_tokens or 0), 0)
+        cache_read = max(int(cache_read_input_tokens or 0), 0)
+        total_input = raw_input + cache_creation + cache_read if cache_input_mode == "additive" else raw_input
+        cache_observed = cache_input_mode != "unknown" and (cache_creation > 0 or cache_read > 0)
+        return {
+            **_total(total_input, output),
+            "raw_input_tokens": raw_input,
+            "cache_input_mode": cache_input_mode,
+            "cache_observed_input_tokens": total_input if cache_observed else 0,
+            "cache_read_input_tokens": cache_read if cache_observed else 0,
+            "cache_creation_input_tokens": cache_creation if cache_observed else 0,
+            "cache_observed_call_count": int(cache_observed),
+        }
+
+    def _finalize_reply(self, reply_id: str) -> None:
+        """按完整自定义用量优先规则累计一个 reply。"""
+        if reply_id in self.completed_reply_ids:
+            return
+        custom = self.pending_model_usages.get(reply_id)
+        native = self.pending_native_usages.get(reply_id)
+        usage = custom if custom and custom.get("complete") else native
+        if usage is None:
+            return
+        model_name = self.reply_models.get(reply_id) or self.configured_model_spec or "unknown_model"
+        self.calls.append((model_name, usage))
+        self.completed_reply_ids.add(reply_id)
+        self.pending_model_usages.pop(reply_id, None)
+        self.pending_native_usages.pop(reply_id, None)
 
     def observe(self, event: dict) -> None:
         """消费单个事件；无用量语义的事件被忽略。"""
@@ -63,47 +127,67 @@ class UsageAccumulator:
             value = event.get("value") if isinstance(event.get("value"), dict) else {}
             if event.get("name") == "token_context":
                 self.context.update(value)
+                reply_id = str(value.get("reply_id") or "")
+                call_key = self._call_key(reply_id)
+                mode = str(value.get("cache_input_mode") or "unknown")
+                if call_key and mode in {"additive", "inclusive", "unknown"}:
+                    self.reply_cache_modes[call_key] = mode
             elif event.get("name") == "context_compression" and "summary_active" in value:
                 self.context["summary_active"] = bool(value["summary_active"])
             elif event.get("name") == "model_usage":
                 reply_id = str(value.get("reply_id") or "")
-                input_tokens = max(int(value.get("input_tokens") or 0), 0)
-                output_tokens = max(int(value.get("output_tokens") or 0), 0)
-                cache_creation = max(int(value.get("cache_creation_input_tokens") or 0), 0)
-                cache_read = max(int(value.get("cache_read_input_tokens") or 0), 0)
-                total_input = input_tokens + cache_creation + cache_read
-                cache_observed = cache_creation > 0 or cache_read > 0
-                self.pending_model_usages[reply_id] = {
-                    **_total(total_input, output_tokens),
-                    "cache_observed_input_tokens": total_input if cache_observed else 0,
-                    "cache_read_input_tokens": cache_read,
-                    "cache_creation_input_tokens": cache_creation,
-                    "cache_observed_call_count": int(cache_observed),
-                }
+                call_key = self._call_key(reply_id)
+                mode = str(value.get("cache_input_mode") or "unknown")
+                cache_input_mode: CacheInputMode = (
+                    mode if mode in {"additive", "inclusive", "unknown"} else "unknown"
+                )
+                self.reply_cache_modes[call_key] = cache_input_mode
+                usage = self._normalize_usage(
+                    raw_input_tokens=value.get("raw_input_tokens", value.get("input_tokens", 0)),
+                    output_tokens=value.get("output_tokens", 0),
+                    cache_creation_input_tokens=value.get("cache_creation_input_tokens", 0),
+                    cache_read_input_tokens=value.get("cache_read_input_tokens", 0),
+                    cache_input_mode=cache_input_mode,
+                )
+                usage["complete"] = bool(value.get("complete"))
+                self.pending_model_usages[call_key] = usage
+                if usage["complete"] and call_key in self.pending_native_usages:
+                    self._finalize_reply(call_key)
             return
         if event_type == "MODEL_CALL_START":
-            self.current_model = str(event.get("model_name") or self.configured_model_spec or "unknown_model")
             reply_id = str(event.get("reply_id") or "")
+            self.current_model = str(event.get("model_name") or self.configured_model_spec or "unknown_model")
             if reply_id:
-                self.reply_models[reply_id] = self.current_model
+                call_index = self.reply_call_counts.get(reply_id, 0) + 1
+                self.reply_call_counts[reply_id] = call_index
+                call_key = f"{reply_id}:{call_index}"
+                self.active_call_keys[reply_id] = call_key
+                self.reply_models[call_key] = self.current_model
             return
         if event_type != "MODEL_CALL_END":
             return
         reply_id = str(event.get("reply_id") or "")
-        model_name = (
-            self.reply_models.pop(reply_id, None)
-            or self.current_model
-            or self.configured_model_spec
-            or "unknown_model"
+        if reply_id and reply_id not in self.active_call_keys:
+            return
+        call_key = self.active_call_keys.pop(reply_id, "")
+        if not call_key:
+            call_key = f"native:{len(self.calls)}:{len(self.pending_native_usages)}"
+            self.reply_models[call_key] = self.current_model or self.configured_model_spec or "unknown_model"
+        cache_input_mode = self.reply_cache_modes.get(call_key, "unknown")
+        self.pending_native_usages[call_key] = self._normalize_usage(
+            raw_input_tokens=event.get("input_tokens", 0),
+            output_tokens=event.get("output_tokens", 0),
+            cache_creation_input_tokens=event.get("cache_creation_input_tokens", 0),
+            cache_read_input_tokens=event.get("cache_input_tokens", 0),
+            cache_input_mode=cache_input_mode,
         )
-        usage = self.pending_model_usages.pop(reply_id, None) or _total(
-            max(int(event.get("input_tokens") or 0), 0),
-            max(int(event.get("output_tokens") or 0), 0),
-        )
-        self.calls.append((model_name, usage))
+        self._finalize_reply(call_key)
 
     def snapshot(self, *, complete: bool) -> dict:
         """生成一轮 Run 用量；complete 表示是否观察到正常收束。"""
+        for reply_id, usage in list(self.pending_model_usages.items()):
+            if usage.get("complete"):
+                self._finalize_reply(reply_id)
         totals = _total()
         model_totals: dict[str, dict] = {}
         model_counts: dict[str, int] = {}
@@ -143,8 +227,8 @@ class UsageAccumulator:
         return {
             "schema_version": 1,
             "available": bool(self.calls),
-            "complete": complete,
             **self.context,
+            "complete": complete,
             **totals,
             "llm_input_tokens": self.context.get(
                 "llm_input_tokens",

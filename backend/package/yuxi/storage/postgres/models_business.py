@@ -719,6 +719,7 @@ class AgentScopeThreadSession(Base):
     agentscope_agent_id = Column(String(64), nullable=False)
     agentscope_credential_id = Column(String(64), nullable=False)
     agentscope_session_id = Column(String(64), nullable=False)
+    agentscope_workspace_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=utc_now_naive)
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
 
@@ -743,6 +744,7 @@ class AgentScopeTeamWorkerBinding(Base):
     team_id = Column(String(64), nullable=False, index=True)
     worker_agent_id = Column(String(64), nullable=False)
     worker_session_id = Column(String(64), nullable=False)
+    agentscope_workspace_id = Column(String(64), nullable=True)
     active_run_id = Column(String(64), nullable=True, index=True)
     last_reply_id = Column(String(64), nullable=True)
     runtime_active = Column(Boolean, nullable=False, default=True)

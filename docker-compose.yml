@@ -151,6 +151,7 @@ services:
       - ./backend/pyproject.toml:/app/pyproject.toml
       - ./backend/uv.lock:/app/uv.lock
       - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}/docker/volumes/yuxi/agentscope-workspaces:${PWD}/docker/volumes/yuxi/agentscope-workspaces
     networks:
       - app-network
     env_file:

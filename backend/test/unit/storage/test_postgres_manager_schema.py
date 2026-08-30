@@ -189,6 +189,27 @@ async def test_ensure_business_schema_adds_run_origin_snapshot_columns():
 
 
 @pytest.mark.asyncio
+async def test_ensure_business_schema_adds_nullable_workspace_ids_idempotently():
+    """启动升级必须为 parent 和 worker 映射补齐 nullable Workspace ID。"""
+    manager = PostgresManager()
+    original_initialized = manager._initialized
+    original_engine = manager.async_engine
+    connection = _RecordingConnection()
+
+    manager._initialized = True
+    manager.async_engine = _RecordingEngine(connection)
+    try:
+        await manager.ensure_business_schema()
+    finally:
+        manager._initialized = original_initialized
+        manager.async_engine = original_engine
+
+    statements = "\n".join(connection.statements)
+    assert "agentscope_thread_sessions ADD COLUMN IF NOT EXISTS agentscope_workspace_id VARCHAR(64)" in statements
+    assert "agentscope_team_worker_bindings ADD COLUMN IF NOT EXISTS agentscope_workspace_id VARCHAR(64)" in statements
+
+
+@pytest.mark.asyncio
 async def test_ensure_business_schema_removes_unbound_api_keys_before_requiring_user_id():
     manager = PostgresManager()
     original_initialized = manager._initialized

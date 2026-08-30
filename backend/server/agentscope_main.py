@@ -317,5 +317,37 @@ async def delete_yuxi_workspace_output(
         raise HTTPException(status_code=404, detail="文件不存在") from exc
 
 
+@app.delete("/yuxi/workspace/thread")
+async def delete_yuxi_thread_workspaces(
+    thread_id: str = Query(...),
+    x_user_id: str = Header(...),
+) -> dict:
+    """在 AgentScope Session 删除后清理线程的全部物理 Workspace。"""
+    from urllib.parse import unquote
+
+    from yuxi.agentscope.workspace_cleanup import (
+        WorkspaceCleanupConflict,
+        destroy_thread_workspaces,
+    )
+
+    try:
+        async with pg_manager.get_async_session_context() as db:
+            return await destroy_thread_workspaces(
+                db,
+                storage=app.state.storage,
+                workspace_manager=app.state.workspace_manager,
+                uid=unquote(x_user_id),
+                thread_id=thread_id,
+                base_dir=AGENTSCOPE_WORKSPACE_BASEDIR,
+                backend=AGENTSCOPE_WORKSPACE_BACKEND,
+            )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except WorkspaceCleanupConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Workspace 清理失败: {exc}") from exc
+
+
 if __name__ == "__main__":
     uvicorn.run("server.agentscope_main:app", host="0.0.0.0", port=8100)

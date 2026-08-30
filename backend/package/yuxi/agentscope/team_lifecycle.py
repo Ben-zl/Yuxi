@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,37 +24,7 @@ from yuxi.utils.hash_utils import hash_id, subagent_child_thread_id
 from yuxi.utils.logging_config import logger
 
 
-def _shared_intermediate_paths(tool_calls: list[dict]) -> list[str]:
-    """从工具结果中提取可供后续 Team worker 复用的中间文件路径。"""
-    paths: list[str] = []
-
-    def collect(value: Any) -> None:
-        if isinstance(value, dict):
-            for item in value.values():
-                collect(item)
-            return
-        if isinstance(value, list):
-            for item in value:
-                collect(item)
-            return
-        if not isinstance(value, str):
-            return
-
-        try:
-            parsed = json.loads(value)
-        except (TypeError, ValueError):
-            parsed = None
-        if parsed is not None and parsed != value:
-            collect(parsed)
-
-        for match in re.findall(r"/workspace/outputs/tmp/[^\s\"'<>`]+", value):
-            path = match.rstrip(".,;:)]}")
-            if path and path not in paths:
-                paths.append(path)
-
-    for call in tool_calls:
-        collect(call.get("output"))
-    return paths
+TEAM_MEMBER_MAX_NUDGES = 3
 
 
 @dataclass(frozen=True)
@@ -91,13 +60,11 @@ class TeamLifecycleModule:
         uid: str,
         agent_id: str,
         session_id: str,
-        leader_notifier: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.storage = storage
         self.uid = str(uid)
         self.agent_id = agent_id
         self.session_id = session_id
-        self.leader_notifier = leader_notifier
 
     async def snapshot(self) -> TeamRosterSnapshot:
         """读取当前 Session 所属 Team 的显式 worker roster。"""
@@ -135,6 +102,15 @@ class TeamLifecycleModule:
         prompt = str(tool_input.get("prompt") or "").strip()
         if not subagent_slug or not prompt:
             raise ValueError("AgentCreate 生命周期投影缺少 subagent_type 或 prompt")
+
+        worker_session = await self.storage.get_session(
+            self.uid,
+            worker_agent_id,
+            worker_session_id,
+        )
+        workspace_id = str(getattr(getattr(worker_session, "config", None), "workspace_id", "") or "")
+        if not workspace_id:
+            raise ValueError("AgentCreate 创建的 worker Session 缺少 workspace_id")
 
         async with pg_manager.get_async_session_context() as db:
             binding_repo = AgentScopeTeamWorkerRepository(db)
@@ -239,6 +215,7 @@ class TeamLifecycleModule:
                 team_id=after.team_id,
                 worker_agent_id=worker_agent_id,
                 worker_session_id=worker_session_id,
+                agentscope_workspace_id=workspace_id,
                 active_run_id=run.id,
             )
             await db.commit()
@@ -264,12 +241,13 @@ class TeamLifecycleModule:
         reasoning_parts: list[str] = []
         tool_converter: ToolEventConverter | None = None
         usage = UsageAccumulator(configured_model_spec=None)
-        failure_reported = False
-        team_say_call_ids: set[str] = set()
-        team_say_succeeded = False
         reply_id: str | None = None
         prompt: str | None = None
-        reply_ended = False
+        leader_name: str | None = None
+        completed_reply_ends = 0
+        terminal = None
+        terminal_error_message: str | None = None
+        finalized = False
         try:
             async for item in next_handler(**input_kwargs):
                 event = item.model_dump(mode="json") if hasattr(item, "model_dump") else item
@@ -282,6 +260,7 @@ class TeamLifecycleModule:
                 elif run_id is None and reply_id:
                     if event_type == "HINT_BLOCK":
                         prompt = _team_message_text(event) or prompt
+                        leader_name = _team_message_sender(event) or leader_name
                     else:
                         run_id, request_id = await self._open_worker_run(
                             binding.worker_session_id,
@@ -296,63 +275,88 @@ class TeamLifecycleModule:
                         text_parts.append(str(event.get("delta") or ""))
                     elif event_type == "THINKING_BLOCK_DELTA":
                         reasoning_parts.append(str(event.get("delta") or ""))
-                    elif event_type == "TOOL_CALL_START" and event.get("tool_call_name") == "TeamSay":
-                        team_say_call_ids.add(str(event.get("tool_call_id") or ""))
-                    elif (
-                        event_type == "TOOL_RESULT_END"
-                        and str(event.get("tool_call_id") or "") in team_say_call_ids
-                        and str(event.get("state") or "success").lower() == "success"
-                    ):
-                        team_say_succeeded = True
-                    chunks = event_to_chunks(event, request_id=request_id)
-                    if tool_converter is not None:
-                        chunks.extend(tool_converter.feed(event))
-                    if chunks:
-                        await append_run_stream_event(
-                            run_id,
-                            "messages",
-                            {"items": chunks},
-                            thread_id=binding.child_thread_id,
-                        )
                     if event_type == "REPLY_END":
-                        reply_ended = True
-                        terminal = reply_end_to_terminal(event, request_id=request_id)
-                        error_message = (event.get("error") or {}).get("message") or terminal.chunk.get("error_message")
-                        history_tool_calls = tool_converter.history_tool_calls() if tool_converter else []
-                        if terminal.run_status == "failed":
-                            await self._report_worker_failure(error_message)
-                            failure_reported = True
-                        elif terminal.run_status == "completed" and not team_say_succeeded:
-                            await self._report_worker_completion("".join(text_parts), history_tool_calls)
-                        await self._finish_worker_run(
-                            run_id=run_id,
-                            terminal_status=terminal.run_status,
-                            error_message=error_message,
-                            text="".join(text_parts),
-                            reasoning="".join(reasoning_parts),
-                            usage=usage.snapshot(complete=True),
-                            tool_calls=history_tool_calls,
+                        terminal_event = event
+                        reason = str(event.get("finished_reason") or "completed").lower()
+                        final_reply_end = reason not in {"completed", "exceed_max_iters"}
+                        if not final_reply_end:
+                            completed_reply_ends += 1
+                            tool_calls = tool_converter.history_tool_calls() if tool_converter else []
+                            final_reply_end = _reported_to_team_leader(tool_calls, leader_name)
+                            if completed_reply_ends > TEAM_MEMBER_MAX_NUDGES and not final_reply_end:
+                                terminal_event = {
+                                    **event,
+                                    "finished_reason": "error",
+                                    "error": {
+                                        "message": ("Team worker 连续 3 次纠正后仍未通过 TeamSay 回报 leader"),
+                                    },
+                                }
+                                final_reply_end = True
+
+                        terminal = reply_end_to_terminal(terminal_event, request_id=request_id)
+                        terminal_error_message = (event.get("error") or {}).get("message") or terminal.chunk.get(
+                            "error_message"
                         )
-                        await append_run_stream_event(
-                            run_id,
-                            "end",
-                            {"status": terminal.run_status, "chunk": terminal.chunk},
-                            thread_id=binding.child_thread_id,
-                        )
+                        if final_reply_end:
+                            await self._finish_worker_run(
+                                run_id=run_id,
+                                terminal_status=terminal.run_status,
+                                error_type=terminal.chunk.get("error_type"),
+                                error_message=terminal_error_message,
+                                text="".join(text_parts),
+                                reasoning="".join(reasoning_parts),
+                                usage=usage.snapshot(complete=True),
+                                tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
+                            )
+                            await append_run_stream_event(
+                                run_id,
+                                "end",
+                                {"status": terminal.run_status, "chunk": terminal.chunk},
+                                thread_id=binding.child_thread_id,
+                            )
+                            finalized = True
+                    else:
+                        chunks = event_to_chunks(event, request_id=request_id)
+                        if tool_converter is not None:
+                            chunks.extend(tool_converter.feed(event))
+                        if chunks:
+                            await append_run_stream_event(
+                                run_id,
+                                "messages",
+                                {"items": chunks},
+                                thread_id=binding.child_thread_id,
+                            )
                 yield item
-            if run_id and request_id and not reply_ended:
+
+            if run_id and request_id and terminal is not None and not finalized:
+                await self._finish_worker_run(
+                    run_id=run_id,
+                    terminal_status=terminal.run_status,
+                    error_type=terminal.chunk.get("error_type"),
+                    error_message=terminal_error_message,
+                    text="".join(text_parts),
+                    reasoning="".join(reasoning_parts),
+                    usage=usage.snapshot(complete=True),
+                    tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
+                )
+                await append_run_stream_event(
+                    run_id,
+                    "end",
+                    {"status": terminal.run_status, "chunk": terminal.chunk},
+                    thread_id=binding.child_thread_id,
+                )
+            elif run_id and request_id and not finalized:
                 error_message = "AgentScope worker reply stream ended without REPLY_END"
                 terminal_status = await self._finish_worker_run(
                     run_id=run_id,
                     terminal_status="failed",
+                    error_type="agentscope_team",
                     error_message=error_message,
                     text="".join(text_parts),
                     reasoning="".join(reasoning_parts),
                     usage=usage.snapshot(complete=False),
                     tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
                 )
-                if terminal_status == "failed":
-                    await self._report_worker_failure(error_message)
                 if terminal_status:
                     chunk = (
                         make_chunk(request_id, status="interrupted", message="对话已取消")
@@ -371,42 +375,35 @@ class TeamLifecycleModule:
                         thread_id=binding.child_thread_id,
                     )
         except BaseException as exc:
-            if run_id:
-                if not failure_reported and not isinstance(exc, asyncio.CancelledError):
-                    await self._report_worker_failure(str(exc))
-                await self._finish_worker_run(
+            if run_id and request_id and not finalized:
+                cancelled = isinstance(exc, asyncio.CancelledError)
+                terminal_status = await self._finish_worker_run(
                     run_id=run_id,
-                    terminal_status="failed",
-                    error_message=str(exc),
+                    terminal_status="cancelled" if cancelled else "failed",
+                    error_type=None if cancelled else "agentscope_team",
+                    error_message=None if cancelled else str(exc),
                     text="".join(text_parts),
                     reasoning="".join(reasoning_parts),
                     usage=usage.snapshot(complete=False),
                     tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
                 )
+                chunk = (
+                    make_chunk(request_id, status="interrupted", message="对话已取消")
+                    if terminal_status == "cancelled"
+                    else make_chunk(
+                        request_id,
+                        status="error",
+                        error_type="agentscope_team",
+                        error_message=str(exc),
+                    )
+                )
+                await append_run_stream_event(
+                    run_id,
+                    "end",
+                    {"status": terminal_status, "chunk": chunk},
+                    thread_id=binding.child_thread_id,
+                )
             raise
-
-    async def _report_worker_failure(self, error_message: str | None) -> None:
-        """在 child Run 结束前向 leader 报告失败并触发续写。"""
-        if self.leader_notifier is None:
-            return
-        detail = error_message or "未知错误"
-        message = f"子智能体执行失败，未能返回结果：{detail}"
-        try:
-            await self.leader_notifier(message)
-        except Exception as exc:  # noqa: BLE001 - 通知失败不能阻断 child Run 终态持久化
-            logger.warning("Team worker 失败通知 leader 未送达 session=%s: %s", self.session_id, exc)
-
-    async def _report_worker_completion(self, text: str, tool_calls: list[dict]) -> None:
-        """worker 未主动 TeamSay 时，把完整结果代发给 leader 并触发续写。"""
-        if self.leader_notifier is None:
-            return
-        detail = text.strip() or "子智能体未生成可展示文本，请检查其工具调用与运行记录。"
-        shared_paths = _shared_intermediate_paths(tool_calls)
-        if shared_paths:
-            detail += "\n\n可供后续子智能体复用的共享中间文件：\n" + "\n".join(
-                f"- {path}" for path in shared_paths
-            )
-        await self.leader_notifier(f"子智能体已完成，但未主动调用 TeamSay。以下为其完整结果：\n\n{detail}")
 
     async def _wait_for_binding(self):
         """吸收 AgentCreate 投影与 worker wakeup 的短暂竞态。"""
@@ -503,6 +500,7 @@ class TeamLifecycleModule:
         *,
         run_id: str,
         terminal_status: str,
+        error_type: str | None,
         error_message: str | None,
         text: str,
         reasoning: str,
@@ -555,7 +553,7 @@ class TeamLifecycleModule:
             await runs.set_terminal_status(
                 run.id,
                 status=terminal_status,
-                error_type="agentscope_team" if terminal_status == "failed" else None,
+                error_type=error_type if terminal_status == "failed" else None,
                 error_message=error_message,
                 token_usage=usage,
             )
@@ -623,7 +621,7 @@ def _is_team_hint(block: Any) -> bool:
     if not isinstance(source, str):
         return False
     try:
-        return json.loads(source).get("label") == "team"
+        return json.loads(source).get("label") in {"team", "team_message"}
     except (TypeError, ValueError):
         return False
 
@@ -634,7 +632,7 @@ def _team_message_text(event: dict[str, Any]) -> str:
     if not isinstance(source, str):
         return ""
     try:
-        if json.loads(source).get("label") != "team":
+        if json.loads(source).get("label") not in {"team", "team_message"}:
             return ""
     except (TypeError, ValueError):
         return ""
@@ -644,3 +642,28 @@ def _team_message_text(event: dict[str, Any]) -> str:
     if start < 0 or not hint.endswith(suffix):
         return ""
     return hint[start + 2 : -len(suffix)].strip()
+
+
+def _team_message_sender(event: dict[str, Any]) -> str:
+    """从 Team HintBlockEvent 来源中读取 leader 展示名。"""
+    source = event.get("source")
+    if not isinstance(source, str):
+        return ""
+    try:
+        payload = json.loads(source)
+    except (TypeError, ValueError):
+        return ""
+    if payload.get("label") not in {"team", "team_message"}:
+        return ""
+    return str(payload.get("sublabel") or "").strip()
+
+
+def _reported_to_team_leader(tool_calls: list[dict], leader_name: str | None) -> bool:
+    """判断本轮最后一次工具调用是否成功向 leader 或全队回报。"""
+    if not tool_calls:
+        return False
+    last_call = tool_calls[-1]
+    if last_call.get("name") != "TeamSay" or last_call.get("status") != "success":
+        return False
+    target = (last_call.get("args") or {}).get("to")
+    return target is None or bool(leader_name and target == leader_name)

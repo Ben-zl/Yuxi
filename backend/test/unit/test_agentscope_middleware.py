@@ -135,9 +135,10 @@ async def test_context_observability_publishes_token_context_before_model_call()
 
 
 @pytest.mark.parametrize("stream", [False, True])
-async def test_context_observability_publishes_complete_model_usage(stream):
+async def test_context_observability_publishes_complete_model_usage(stream, monkeypatch):
     """模型观测保留普通输入与 Anthropic 缓存输入的原始分类。"""
     events = []
+    monkeypatch.setattr("yuxi.agentscope.middleware.cache_input_mode_for_model", lambda _model: "additive")
 
     class Bus:
         async def session_publish_event(self, _session_id, event):
@@ -181,10 +182,62 @@ async def test_context_observability_publishes_complete_model_usage(stream):
     assert usage_event["name"] == "model_usage"
     assert usage_event["value"] == {
         "reply_id": "reply-1",
-        "input_tokens": 39,
+        "cache_input_mode": "additive",
+        "raw_input_tokens": 39,
+        "input_tokens": 170,
         "output_tokens": 5,
         "cache_creation_input_tokens": 3,
         "cache_read_input_tokens": 128,
+        "complete": True,
+    }
+
+
+async def test_context_observability_publishes_usage_when_stream_has_no_final_marker(monkeypatch):
+    """Anthropic 流结束时发布最后一个 usage，即使响应块未标记 is_last。"""
+    events = []
+    monkeypatch.setattr("yuxi.agentscope.middleware.cache_input_mode_for_model", lambda _model: "additive")
+
+    class Bus:
+        async def session_publish_event(self, _session_id, event):
+            events.append(event)
+
+    usage = ChatUsage(
+        input_tokens=39,
+        output_tokens=5,
+        time=0.1,
+        cache_creation_input_tokens=3,
+        cache_input_tokens=128,
+    )
+
+    async def response_stream():
+        yield ChatResponse(content=[], is_last=False, usage=usage)
+
+    async def next_handler(**_kwargs):
+        return response_stream()
+
+    model = SimpleNamespace(context_size=1000, count_tokens=AsyncMock(return_value=170))
+    agent = SimpleNamespace(
+        state=SimpleNamespace(context=[], summary="", reply_id="reply-1"),
+        context_config=SimpleNamespace(trigger_ratio=0.8),
+    )
+    result = await ContextObservabilityMiddleware(Bus(), "session-1").on_model_call(
+        agent,
+        {"current_model": model, "messages": [], "tools": []},
+        next_handler,
+    )
+
+    assert [item async for item in result]
+    usage_events = [event for event in events if event["name"] == "model_usage"]
+    assert len(usage_events) == 1
+    assert usage_events[0]["value"] == {
+        "reply_id": "reply-1",
+        "cache_input_mode": "additive",
+        "raw_input_tokens": 39,
+        "input_tokens": 170,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 3,
+        "cache_read_input_tokens": 128,
+        "complete": True,
     }
 
 
@@ -342,38 +395,19 @@ async def test_only_worker_reasoning_removes_stale_team_hints(is_worker, expecte
     assert [block.hint for block in content] == expected
 
 
-async def test_worker_failure_notifier_targets_only_team_leader(monkeypatch):
-    """平台代发的 worker 失败不得广播并唤醒其他 Team 成员。"""
+async def test_worker_lifecycle_does_not_install_duplicate_leader_notifier():
+    """worker 成败通知完全交给 AgentScope 原生 Team 链路。"""
     worker_session = SimpleNamespace(team_id="team-1")
     team = SimpleNamespace(session_id="leader-session")
-    leader_session = SimpleNamespace(agent_id="leader-agent")
-    leader_agent = SimpleNamespace(data=SimpleNamespace(name="性能监控主智能体"))
-
     class _Storage:
         async def get_session(self, user_id, agent_id, session_id):
             if session_id == "worker-session":
                 return worker_session
-            if session_id == "leader-session":
-                return leader_session
             return None
 
         async def get_team(self, user_id, team_id):
             return team
 
-        async def get_agent(self, user_id, agent_id):
-            return leader_agent
-
-    calls = []
-
-    class _TeamSay:
-        def __init__(self, **kwargs):
-            pass
-
-        async def __call__(self, *, content, to):
-            calls.append((content, to))
-            return SimpleNamespace(state=None)
-
-    monkeypatch.setattr("agentscope.app._tool.TeamSay", _TeamSay)
     middleware = await build_team_lifecycle_middleware(
         _Storage(),
         SimpleNamespace(),
@@ -383,8 +417,8 @@ async def test_worker_failure_notifier_targets_only_team_leader(monkeypatch):
         "worker-session",
     )
 
-    await middleware._lifecycle.leader_notifier("子智能体执行失败")
-    assert calls == [("子智能体执行失败", "性能监控主智能体")]
+    assert middleware._is_worker is True
+    assert not hasattr(middleware._lifecycle, "leader_notifier")
 
 
 async def test_native_schedule_tools_filtered_from_model_call():

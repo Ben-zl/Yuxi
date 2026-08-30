@@ -68,8 +68,8 @@ wheels = [
 
 [[package]]
 name = "agentscope"
-version = "2.0.6"
-source = { git = "https://github.com/Ben-zl/agentscope.git?rev=c28b985cfab7c0b8e7bc196856c8f13b946458c9#c28b985cfab7c0b8e7bc196856c8f13b946458c9" }
+version = "2.0.7.post1"
+source = { git = "https://github.com/Ben-zl/agentscope.git?rev=7a9ef73662fb96cde89e0eb984bd4a2c6334c07d#7a9ef73662fb96cde89e0eb984bd4a2c6334c07d" }
 dependencies = [
     { name = "aiofiles" },
     { name = "aioitertools" },
@@ -89,6 +89,7 @@ dependencies = [
     { name = "opentelemetry-exporter-otlp" },
     { name = "opentelemetry-sdk" },
     { name = "opentelemetry-semantic-conventions" },
+    { name = "pypdf" },
     { name = "python-datauri" },
     { name = "python-frontmatter" },
     { name = "python-socketio" },
@@ -4581,7 +4582,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agentscope", extras = ["service", "storage-sql", "workspace-docker"], git = "https://github.com/Ben-zl/agentscope.git?rev=c28b985cfab7c0b8e7bc196856c8f13b946458c9" },
+    { name = "agentscope", extras = ["service", "storage-sql", "workspace-docker"], git = "https://github.com/Ben-zl/agentscope.git?rev=7a9ef73662fb96cde89e0eb984bd4a2c6334c07d" },
     { name = "arq", specifier = ">=0.26.3" },
     { name = "fastapi", specifier = ">=0.121" },
     { name = "jsonschema", specifier = ">=4.26.0" },

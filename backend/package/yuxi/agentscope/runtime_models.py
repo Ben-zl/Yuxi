@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any, Literal
 
 from agentscope.credential import (
@@ -52,6 +53,52 @@ class YuxiAnthropicChatModel(AnthropicChatModel):
             else None,
             **kwargs,
         )
+
+    async def _parse_anthropic_stream_completion_response(
+        self,
+        start_datetime: Any,
+        response: Any,
+    ) -> AsyncGenerator[Any, None]:
+        """合并兼容端点在 message_delta 才返回的完整用量。"""
+        final_usage = None
+
+        async def observe_events(stream: AsyncIterator[Any]):
+            nonlocal final_usage
+            async for event in stream:
+                if event.type == "message_delta" and getattr(event, "usage", None) is not None:
+                    final_usage = event.usage
+                yield event
+
+        class ObservedResponse:
+            """保留 SDK 响应生命周期，同时观察进入后的事件流。"""
+
+            async def __aenter__(self):
+                stream = await response.__aenter__()
+                return observe_events(stream)
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                return await response.__aexit__(exc_type, exc_value, traceback)
+
+        latest_usage = None
+        async for item in super()._parse_anthropic_stream_completion_response(
+            start_datetime,
+            ObservedResponse(),
+        ):
+            if item.usage is not None:
+                latest_usage = item.usage
+            yield item
+
+        if final_usage is None or latest_usage is None:
+            return
+        for target, source in (
+            ("input_tokens", "input_tokens"),
+            ("output_tokens", "output_tokens"),
+            ("cache_creation_input_tokens", "cache_creation_input_tokens"),
+            ("cache_input_tokens", "cache_read_input_tokens"),
+        ):
+            value = getattr(final_usage, source, None)
+            if value is not None:
+                setattr(latest_usage, target, max(int(value), 0))
 
 
 class YuxiGeminiChatModel(GeminiChatModel):

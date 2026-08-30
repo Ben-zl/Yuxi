@@ -2,13 +2,20 @@
 
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from agentscope.credential import CredentialFactory
-from agentscope.model import OpenAIChatModel
-from yuxi.agentscope.runtime_models import YuxiOpenAIChatModel, register_yuxi_credentials
+from agentscope.model import AnthropicChatModel, OpenAIChatModel
+from agentscope.model._model_response import ChatResponse
+from agentscope.model._model_usage import ChatUsage
 from yuxi.agentscope.projection import project_chat_model
+from yuxi.agentscope.runtime_models import (
+    YuxiAnthropicChatModel,
+    YuxiOpenAIChatModel,
+    register_yuxi_credentials,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -119,3 +126,65 @@ def test_gemini_rejects_unsupported_request_body_overrides():
 
     with pytest.raises(ValueError, match="只有 OpenAI-compatible"):
         project_chat_model(provider, "gemini-test-model")
+
+
+async def test_anthropic_stream_merges_usage_reported_in_message_delta(monkeypatch):
+    """MiniMax 在 message_delta 上报的输入与缓存用量不会丢失。"""
+
+    async def upstream_parser(_self, _start_datetime, response):
+        usage = ChatUsage(input_tokens=0, output_tokens=0, time=0.1)
+        async with response as stream:
+            async for event in stream:
+                if event.type == "message_start":
+                    yield ChatResponse(content=[], is_last=False, usage=usage)
+                elif event.type == "message_delta":
+                    usage.output_tokens = event.usage.output_tokens
+
+    monkeypatch.setattr(
+        AnthropicChatModel,
+        "_parse_anthropic_stream_completion_response",
+        upstream_parser,
+    )
+
+    class ResponseStream:
+        """模拟 Anthropic SDK 返回的异步上下文管理器。"""
+
+        entered = False
+        exited = False
+
+        async def __aenter__(self):
+            self.entered = True
+            return self.events()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            self.exited = True
+
+        async def events(self):
+            yield SimpleNamespace(type="message_start")
+            yield SimpleNamespace(
+                type="message_delta",
+                usage=SimpleNamespace(
+                    input_tokens=223,
+                    output_tokens=2,
+                    cache_creation_input_tokens=None,
+                    cache_read_input_tokens=1024,
+                ),
+            )
+
+    model = object.__new__(YuxiAnthropicChatModel)
+    response_stream = ResponseStream()
+    responses = [
+        item
+        async for item in model._parse_anthropic_stream_completion_response(
+            None,
+            response_stream,
+        )
+    ]
+
+    assert response_stream.entered is True
+    assert response_stream.exited is True
+    assert len(responses) == 1
+    assert responses[0].usage.input_tokens == 223
+    assert responses[0].usage.output_tokens == 2
+    assert responses[0].usage.cache_creation_input_tokens == 0
+    assert responses[0].usage.cache_input_tokens == 1024

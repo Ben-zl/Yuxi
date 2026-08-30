@@ -29,6 +29,7 @@ async def test_existing_thread_switches_model_after_remote_update(monkeypatch):
         agentscope_agent_id="agent",
         agentscope_session_id="session",
         agentscope_credential_id="credential-old",
+        agentscope_workspace_id="workspace",
     )
     projection = SimpleNamespace(
         model_spec="p:new",
@@ -69,6 +70,123 @@ async def test_existing_thread_switches_model_after_remote_update(monkeypatch):
     db.commit.assert_awaited_once()
 
 
+async def test_existing_thread_lazily_backfills_workspace_id(monkeypatch):
+    """旧映射继续对话前从 AgentScope Session 精确回填 Workspace ID。"""
+    record = SimpleNamespace(
+        model_spec="p:model",
+        agentscope_agent_id="agent",
+        agentscope_session_id="session",
+        agentscope_credential_id="credential-old",
+        agentscope_workspace_id=None,
+    )
+    projection = SimpleNamespace(
+        model_spec="p:model",
+        agent_request={"name": "agent"},
+        credential_data={},
+        chat_model_config={"model": "model"},
+        skills=[],
+    )
+    client = SimpleNamespace(
+        get_session_workspace_id=AsyncMock(return_value="workspace"),
+        create_credential=AsyncMock(return_value="credential-new"),
+        update_agent=AsyncMock(),
+        update_session_model=AsyncMock(),
+        list_workspace_skills=AsyncMock(return_value=[]),
+        delete_credential=AsyncMock(),
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+    backfill = AsyncMock()
+    monkeypatch.setattr(runner.thread_session_repo, "get_thread_session", AsyncMock(return_value=record))
+    monkeypatch.setattr(runner.thread_session_repo, "set_thread_session_workspace_id", backfill)
+    monkeypatch.setattr(runner.thread_session_repo, "update_thread_session_model", AsyncMock())
+    monkeypatch.setattr(runner, "project_runtime", AsyncMock(return_value=projection))
+
+    await runner.ensure_thread_session(db, client, uid="u", thread_id="t", agent_slug="a")
+
+    client.get_session_workspace_id.assert_awaited_once_with("u", "agent", "session")
+    backfill.assert_awaited_once_with(db, record, agentscope_workspace_id="workspace")
+
+
+async def test_new_thread_persists_workspace_id_with_mapping(monkeypatch):
+    """新 Session 的 Workspace ID 必须和 Thread 映射在同一提交中落库。"""
+    projection = SimpleNamespace(
+        model_spec="p:model",
+        agent_request={"name": "agent"},
+        credential_data={},
+        chat_model_config={"model": "model"},
+        skills=[],
+    )
+    client = SimpleNamespace(
+        create_credential=AsyncMock(return_value="credential"),
+        create_agent=AsyncMock(return_value="agent"),
+        create_session=AsyncMock(return_value="session"),
+        get_session_workspace_id=AsyncMock(return_value="workspace"),
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+    record = SimpleNamespace()
+    create_mapping = AsyncMock(return_value=record)
+    monkeypatch.setattr(runner.thread_session_repo, "get_thread_session", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner.thread_session_repo, "create_thread_session", create_mapping)
+    monkeypatch.setattr(runner, "ensure_thread_eligible", AsyncMock())
+    monkeypatch.setattr(runner, "project_runtime", AsyncMock(return_value=projection))
+
+    result = await runner.ensure_thread_session(db, client, uid="u", thread_id="t", agent_slug="a")
+
+    assert result is record
+    create_mapping.assert_awaited_once_with(
+        db,
+        uid="u",
+        thread_id="t",
+        agent_slug="a",
+        model_spec="p:model",
+        agentscope_agent_id="agent",
+        agentscope_credential_id="credential",
+        agentscope_session_id="session",
+        agentscope_workspace_id="workspace",
+    )
+    db.commit.assert_awaited_once()
+
+
+async def test_recover_untracked_external_wait_before_next_user_message(monkeypatch):
+    """Yuxi 无 pending 事实时，应清理 AgentScope 后台续写遗留的等待态。"""
+    client = SimpleNamespace(
+        get_session_status=AsyncMock(
+            side_effect=["awaiting_external_result", "running", "idle"],
+        ),
+        interrupt_session=AsyncMock(),
+    )
+    monkeypatch.setattr(runner.asyncio, "sleep", AsyncMock())
+
+    recovered = await runner.recover_untracked_pending_session(
+        client,
+        uid="u",
+        agent_id="agent",
+        session_id="session",
+    )
+
+    assert recovered is True
+    client.interrupt_session.assert_awaited_once_with("u", "agent", "session")
+    assert client.get_session_status.await_count == 3
+
+
+async def test_idle_session_does_not_trigger_pending_recovery():
+    """正常 idle Session 不应产生额外 interrupt。"""
+    client = SimpleNamespace(
+        get_session_status=AsyncMock(return_value="idle"),
+        interrupt_session=AsyncMock(),
+    )
+
+    recovered = await runner.recover_untracked_pending_session(
+        client,
+        uid="u",
+        agent_id="agent",
+        session_id="session",
+    )
+
+    assert recovered is False
+    client.interrupt_session.assert_not_awaited()
+
+
 async def test_existing_thread_updates_retained_team_workers_before_deleting_old_credential(monkeypatch):
     """主线程轮换凭证时，长期 worker 必须先同步模型配置再删除旧凭证。"""
     call_order = []
@@ -84,6 +202,7 @@ async def test_existing_thread_updates_retained_team_workers_before_deleting_old
         agentscope_agent_id="leader-agent",
         agentscope_session_id="leader-session",
         agentscope_credential_id="credential-old",
+        agentscope_workspace_id="workspace",
     )
     projection = SimpleNamespace(
         model_spec="p:new",
@@ -149,6 +268,7 @@ async def test_existing_thread_model_update_failure_keeps_mapping(monkeypatch):
         agentscope_agent_id="agent",
         agentscope_session_id="session",
         agentscope_credential_id="credential-old",
+        agentscope_workspace_id="workspace",
     )
     db = SimpleNamespace(commit=AsyncMock())
     client = SimpleNamespace(
@@ -197,6 +317,7 @@ async def test_existing_thread_reconciles_agent_model_and_skills_each_round(monk
         agentscope_agent_id="agent",
         agentscope_session_id="session",
         agentscope_credential_id="credential-old",
+        agentscope_workspace_id="workspace",
     )
     projection = SimpleNamespace(
         model_spec="p:model",
