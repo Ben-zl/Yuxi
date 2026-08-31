@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import {
   Bot,
   Info,
+  MessageSquare,
   Microscope,
   RefreshCw,
   Settings2,
@@ -14,6 +15,7 @@ import {
 
 import { userApi } from '@/apis/user_api'
 import AgentRuntimeConfigForm from '@/components/AgentRuntimeConfigForm.vue'
+import WPSChannelManagePanel from '@/components/model-management/WPSChannelManagePanel.vue'
 import ShareConfigForm from '@/components/ShareConfigForm.vue'
 import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
 import { isBuiltinAgent, useAgentStore } from '@/stores/agent'
@@ -155,6 +157,9 @@ const agentModalMenuItems = computed(() => {
       { key: 'tools', label: '工具配置', icon: Wrench },
       { key: 'other', label: '其他配置', icon: Settings2 }
     )
+    if (userStore.isAdmin) {
+      items.push({ key: 'channels', label: '协作渠道', icon: MessageSquare })
+    }
   }
   return items
 })
@@ -565,6 +570,14 @@ defineExpose({
             :show-segmented="false"
           />
         </section>
+
+        <section
+          v-if="showAgentModal && editingAgentId && userStore.isAdmin"
+          v-show="agentModalActiveTab === 'channels'"
+          class="agent-modal-section channel-section"
+        >
+          <WPSChannelManagePanel :agent-slug="editingAgentId" />
+        </section>
       </div>
     </div>
   </a-modal>
@@ -757,6 +770,10 @@ defineExpose({
     padding: 0;
     overflow: visible;
   }
+}
+
+.channel-section {
+  min-height: 100%;
 }
 
 .section-heading {
@@ -1084,6 +1101,12 @@ defineExpose({
     overflow-x: auto;
     border-right: 0;
     border-bottom: 1px solid var(--gray-150);
+  }
+
+  .agent-modal-nav-item {
+    flex: 0 0 auto;
+    width: auto;
+    white-space: nowrap;
   }
 }
 

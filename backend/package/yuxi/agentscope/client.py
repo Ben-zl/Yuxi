@@ -77,6 +77,48 @@ class AgentScopeServiceClient:
         resp = await self._request("POST", "/credential/", uid, json={"data": data})
         return resp.json()["credential_id"]
 
+    async def update_credential(self, uid: str, credential_id: str, data: dict) -> None:
+        """完整替换已有 AgentScope 模型凭据。"""
+        await self._request(
+            "PATCH",
+            f"/credential/{credential_id}",
+            uid,
+            json={"data": data},
+        )
+
+    async def create_channel(self, uid: str, payload: dict) -> dict:
+        """创建 AgentScope Channel 并返回脱敏记录。"""
+        resp = await self._request("POST", "/channels/", uid, json=payload)
+        return resp.json()
+
+    async def update_channel(self, uid: str, channel_id: str, payload: dict) -> dict:
+        """更新 Channel 配置或完整替换凭据。"""
+        resp = await self._request("PATCH", f"/channels/{channel_id}", uid, json=payload)
+        return resp.json()
+
+    async def delete_channel(self, uid: str, channel_id: str, *, missing_ok: bool = False) -> None:
+        """删除 Channel，missing_ok 用于 reconcile/补偿。"""
+        try:
+            await self._request("DELETE", f"/channels/{channel_id}", uid)
+        except AgentScopeServiceError as exc:
+            if not missing_ok or exc.status_code != 404:
+                raise
+
+    async def set_channel_enabled(self, uid: str, channel_id: str, enabled: bool) -> None:
+        """启用或禁用 Channel。"""
+        action = "enable" if enabled else "disable"
+        await self._request("POST", f"/channels/{channel_id}/{action}", uid)
+
+    async def get_channel_status(self, uid: str, channel_id: str) -> dict:
+        """读取 AgentScope 聚合连接状态。"""
+        resp = await self._request("GET", f"/channels/{channel_id}/status", uid)
+        return resp.json()
+
+    async def list_channel_sessions(self, uid: str, channel_id: str) -> list[dict]:
+        """读取 Channel 已创建的 Session。"""
+        resp = await self._request("GET", f"/channels/{channel_id}/sessions", uid)
+        return list(resp.json().get("sessions") or [])
+
     async def create_session(self, uid: str, agent_id: str, chat_model_config: dict) -> str:
         """创建会话并绑定模型配置，返回 session_id。"""
         resp = await self._request(

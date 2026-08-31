@@ -17,6 +17,7 @@ from fastapi import File, Header, HTTPException, Query, UploadFile, status
 
 from yuxi.storage.postgres.manager import pg_manager
 from agentscope.app import create_app
+from agentscope.app.channel import WPSXiezuoChannel
 from agentscope.app.message_bus import RedisMessageBus
 from agentscope.app.storage import AsyncSQLAlchemyStorage
 from agentscope.app.workspace_manager import (
@@ -87,6 +88,20 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
         NativeScheduleBlockMiddleware(),
         build_context_observability_middleware(app.state.message_bus, session_id),
     ]
+    session = await app.state.storage.get_session(user_id, agent_id, session_id)
+    source = getattr(session, "source", None) if session is not None else None
+    if getattr(source, "value", source) == "channel":
+        from yuxi.agentscope.channel_middleware import (
+            build_channel_run_mirror_middleware,
+        )
+
+        middlewares.append(
+            build_channel_run_mirror_middleware(
+                uid=user_id,
+                agent_id=agent_id,
+                session_id=session_id,
+            ),
+        )
     team_lifecycle = await build_team_lifecycle_middleware(
         app.state.storage,
         app.state.message_bus,
@@ -203,6 +218,11 @@ def _create_service_app_sync():
     不能直接 asyncio.run，放到无运行循环的工作线程中执行。
     持久存储指向独立 database，实时 bus 走 Redis，workspace 先用本地目录。
     """
+    if not os.getenv("AGENTSCOPE_CHANNEL_CREDENTIAL_KEY"):
+        raise RuntimeError(
+            "注册 WPS 协作 Channel 必须配置 AGENTSCOPE_CHANNEL_CREDENTIAL_KEY",
+        )
+
     bootstrap_error = []
 
     async def _bootstrap() -> None:
@@ -255,6 +275,7 @@ def _create_service_app_sync():
         ),
         extra_agent_middlewares=_extra_agent_middlewares,
         extra_agent_tools=_extra_agent_tools,
+        channels=[WPSXiezuoChannel],
         workspace_manager=workspace_manager,
         title="Yuxi AgentScope Service",
     )

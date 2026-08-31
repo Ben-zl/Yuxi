@@ -400,7 +400,6 @@ async def test_worker_lifecycle_does_not_install_duplicate_leader_notifier():
     """worker 成败通知完全交给 AgentScope 原生 Team 链路。"""
     worker_session = SimpleNamespace(team_id="team-1")
     team = SimpleNamespace(session_id="leader-session")
-
     class _Storage:
         async def get_session(self, user_id, agent_id, session_id):
             if session_id == "worker-session":

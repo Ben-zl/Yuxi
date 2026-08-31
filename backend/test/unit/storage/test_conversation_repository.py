@@ -8,8 +8,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.repositories.conversation_repository import (
+    HIDDEN_USER_CONVERSATION_SOURCES,
     ConversationRepository,
-    INVOCATION_CONVERSATION_SOURCES,
     MAX_CONVERSATION_TITLE_LENGTH,
 )
 from yuxi.storage.postgres.models_business import Base, Conversation, Message, ToolCall
@@ -49,7 +49,7 @@ def test_normalize_title_trims_spaces():
 
 
 @pytest.mark.asyncio
-async def test_list_conversations_excludes_invocation_sources(conversation_session):
+async def test_list_conversations_excludes_hidden_user_sources(conversation_session):
     now = utc_now_naive()
     normal = Conversation(
         thread_id="thread-normal",
@@ -82,7 +82,17 @@ async def test_list_conversations_excludes_invocation_sources(conversation_sessi
         updated_at=now + timedelta(minutes=1),
         extra_metadata={"source": "agent_evaluation"},
     )
-    conversation_session.add_all([normal, agent_call, agent_eval])
+    channel = Conversation(
+        thread_id="thread-channel",
+        uid="user-a",
+        agent_id="agent-a",
+        title="WPS Channel Run",
+        status="active",
+        created_at=now,
+        updated_at=now + timedelta(minutes=3),
+        extra_metadata={"source": "agentscope_channel"},
+    )
+    conversation_session.add_all([normal, agent_call, agent_eval, channel])
     await conversation_session.commit()
 
     repo = ConversationRepository(conversation_session)
@@ -90,10 +100,42 @@ async def test_list_conversations_excludes_invocation_sources(conversation_sessi
         uid="user-a",
         limit=20,
         offset=0,
-        exclude_sources=INVOCATION_CONVERSATION_SOURCES,
+        exclude_sources=HIDDEN_USER_CONVERSATION_SOURCES,
     )
 
     assert [item.thread_id for item in items] == ["thread-normal"]
+    assert await repo.get_conversation_by_thread_id("thread-channel") is channel
+
+
+@pytest.mark.asyncio
+async def test_list_active_conversations_for_user_excludes_hidden_user_sources(conversation_session):
+    normal = Conversation(
+        thread_id="thread-active-normal",
+        uid="user-a",
+        agent_id="agent-a",
+        title="Normal",
+        status="active",
+        extra_metadata={},
+    )
+    channel = Conversation(
+        thread_id="thread-active-channel",
+        uid="user-a",
+        agent_id="agent-a",
+        title="WPS Channel Run",
+        status="active",
+        extra_metadata={"source": "agentscope_channel"},
+    )
+    conversation_session.add_all([normal, channel])
+    await conversation_session.commit()
+
+    repo = ConversationRepository(conversation_session)
+    items = await repo.list_active_conversations_for_user(
+        "user-a",
+        exclude_sources=HIDDEN_USER_CONVERSATION_SOURCES,
+    )
+
+    assert [item.thread_id for item in items] == ["thread-active-normal"]
+    assert await repo.get_conversation_by_thread_id("thread-active-channel") is channel
 
 
 @pytest.mark.asyncio
@@ -227,7 +269,7 @@ async def test_search_conversations_by_message_content_filters_user_status_and_t
 
 
 @pytest.mark.asyncio
-async def test_search_conversations_by_message_content_excludes_invocation_sources(conversation_session):
+async def test_search_conversations_by_message_content_excludes_hidden_user_sources(conversation_session):
     now = utc_now_naive()
     normal = Conversation(
         thread_id="thread-normal",
@@ -259,7 +301,17 @@ async def test_search_conversations_by_message_content_excludes_invocation_sourc
         updated_at=now + timedelta(minutes=1),
         extra_metadata={"source": "agent_evaluation"},
     )
-    conversation_session.add_all([normal, agent_call, agent_eval])
+    channel = Conversation(
+        thread_id="thread-channel",
+        uid="user-a",
+        agent_id="agent-a",
+        title="WPS Channel Run",
+        status="active",
+        created_at=now,
+        updated_at=now + timedelta(minutes=2),
+        extra_metadata={"source": "agentscope_channel"},
+    )
+    conversation_session.add_all([normal, agent_call, agent_eval, channel])
     await conversation_session.flush()
     conversation_session.add_all(
         [
@@ -278,6 +330,13 @@ async def test_search_conversations_by_message_content_excludes_invocation_sourc
                 message_type="text",
                 created_at=now,
             ),
+            Message(
+                conversation=channel,
+                role="user",
+                content="导航隐藏检查 channel",
+                message_type="text",
+                created_at=now,
+            ),
         ]
     )
     await conversation_session.commit()
@@ -288,7 +347,7 @@ async def test_search_conversations_by_message_content_excludes_invocation_sourc
         query="导航隐藏检查",
         limit=20,
         offset=0,
-        exclude_sources=INVOCATION_CONVERSATION_SOURCES,
+        exclude_sources=HIDDEN_USER_CONVERSATION_SOURCES,
     )
 
     assert has_more is False

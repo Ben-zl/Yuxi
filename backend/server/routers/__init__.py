@@ -6,6 +6,7 @@ from server.routers.agent_invocation_call_router import agent_invocation_call_ro
 from server.routers.agent_invocation_channel_router import agent_invocation_channel_router
 from server.routers.agent_invocation_eval_router import agent_invocation_eval_router
 from server.routers.agent_router import agent_router
+from server.routers.agent_channel_router import agent_channels
 from server.routers.auth_dept_router import department
 from server.routers.auth_router import auth
 from server.routers.chat_router import chat
@@ -30,6 +31,7 @@ router = APIRouter()
 router.include_router(system)  # /api/system/* 系统状态与全局配置
 router.include_router(auth)  # /api/auth/* 登录、用户信息与 CLI 浏览器登录授权
 router.include_router(agent_router)  # /api/agent/* 智能体管理与运行态
+router.include_router(agent_channels)  # /api/agent-channels/* 协作渠道管理
 router.include_router(agent_invocation_call_router)  # /api/agent-invocation/agent-call/*
 router.include_router(agent_invocation_channel_router)  # /api/agent-invocation/channel/*
 router.include_router(agent_invocation_eval_router)  # /api/agent-invocation/eval/*

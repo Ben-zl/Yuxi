@@ -15,7 +15,7 @@ from yuxi.config import config as app_config
 from yuxi.knowledge.parser.factory import DocumentProcessorFactory
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_repository import AgentRunRepository
-from yuxi.repositories.conversation_repository import INVOCATION_CONVERSATION_SOURCES, ConversationRepository
+from yuxi.repositories.conversation_repository import HIDDEN_USER_CONVERSATION_SOURCES, ConversationRepository
 from yuxi.services.mention_search_service import invalidate_mention_cache
 from yuxi.services.ocr_service import parse_document
 from yuxi.storage.minio import StorageError, get_minio_client
@@ -432,7 +432,7 @@ async def list_threads_view(
         status="active",
         limit=limit,
         offset=offset,
-        exclude_sources=INVOCATION_CONVERSATION_SOURCES,
+        exclude_sources=HIDDEN_USER_CONVERSATION_SOURCES,
     )
 
     run_repo = AgentRunRepository(db)
@@ -471,7 +471,7 @@ async def search_threads_view(
         query=normalized_query,
         limit=limit,
         offset=offset,
-        exclude_sources=INVOCATION_CONVERSATION_SOURCES,
+        exclude_sources=HIDDEN_USER_CONVERSATION_SOURCES,
     )
 
     items = []

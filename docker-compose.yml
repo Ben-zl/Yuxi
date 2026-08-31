@@ -30,6 +30,7 @@ x-api-worker-env: &api-worker-env
   TASKER_DEFAULT_TIMEOUT_SECONDS: ${TASKER_DEFAULT_TIMEOUT_SECONDS:-21600}
   # agentscope 承接（网关翻转）：队列执行体与 steer 钩子访问的会话服务
   AGENTSCOPE_BASE_URL: ${AGENTSCOPE_BASE_URL:-http://agentscope:8100}
+  AGENTSCOPE_CHANNEL_CREDENTIAL_KEY: ${AGENTSCOPE_CHANNEL_CREDENTIAL_KEY:?Set AGENTSCOPE_CHANNEL_CREDENTIAL_KEY to a Fernet key}
   AGENTSCOPE_LEGACY_CUTOFF: ${AGENTSCOPE_LEGACY_CUTOFF:?AGENTSCOPE_LEGACY_CUTOFF must be set}
   # Agent run
   RUN_CANCEL_KEY_TTL_SECONDS: ${RUN_CANCEL_KEY_TTL_SECONDS:-1800}
@@ -144,6 +145,7 @@ services:
     container_name: agentscope-dev
     working_dir: /app
     volumes:
+      - ${AGENTSCOPE_SOURCE_PATH:-../agentscope/src}:/app/agentscope-src:ro
       - ./backend/server:/app/server
       - ./backend/package:/app/package
       - ./docker/volumes/yuxi:/app/saves
@@ -158,6 +160,7 @@ services:
       - .env
     environment:
       <<: *api-worker-env
+      PYTHONPATH: /app/agentscope-src:/app/package
       AGENTSCOPE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/agentscope
       AGENTSCOPE_WORKSPACE_BASEDIR: ${PWD}/docker/volumes/yuxi/agentscope-workspaces
       AGENTSCOPE_WORKSPACE_BACKEND: docker

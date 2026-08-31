@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from yuxi.storage.postgres.manager import PostgresManager
+from yuxi.storage.postgres.models_business import Base as BusinessBase
 
 
 class _RecordingConnection:
@@ -30,6 +31,15 @@ class _RecordingEngine:
 
     def begin(self):
         return _RecordingBegin(self.connection)
+
+
+def test_business_schema_registers_agentscope_channel_bindings():
+    """WPS Channel binding 必须由业务 schema 创建，并保留唯一远端标识。"""
+    table = BusinessBase.metadata.tables["agentscope_channel_bindings"]
+
+    assert table.c.owner_uid.nullable is False
+    assert table.c.encrypted_app_secret.nullable is False
+    assert table.c.agentscope_channel_id.unique is True
 
 
 @pytest.mark.asyncio

@@ -724,6 +724,52 @@ class AgentScopeThreadSession(Base):
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
 
 
+class AgentScopeChannelBinding(Base):
+    """Yuxi Agent 与 AgentScope Channel 的控制面同步事实。"""
+
+    __tablename__ = "agentscope_channel_bindings"
+
+    id = Column(String(36), primary_key=True)
+    owner_uid = Column(String(64), nullable=False, index=True)
+    agent_slug = Column(String(64), nullable=False, index=True)
+    name = Column(String(128), nullable=False)
+    channel_type = Column(String(32), nullable=False, default="wps_xiezuo")
+    app_id = Column(String(128), nullable=False, unique=True, index=True)
+    encrypted_app_secret = Column(Text, nullable=False)
+    allow_from = Column(JSON, nullable=False, default=list)
+    group_reply_policy = Column(String(32), nullable=False, default="mention_only")
+    enabled = Column(Boolean, nullable=False, default=True)
+    model_spec = Column(String(200), nullable=True)
+    agentscope_channel_id = Column(String(64), nullable=True, unique=True, index=True)
+    agentscope_agent_id = Column(String(64), nullable=True)
+    agentscope_credential_id = Column(String(64), nullable=True)
+    sync_status = Column(String(16), nullable=False, default="pending", index=True)
+    last_error = Column(Text, nullable=True)
+    created_by = Column(String(64), nullable=False)
+    updated_by = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=utc_now_naive)
+    updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
+
+    def to_dict(self) -> dict[str, Any]:
+        """返回不包含凭据密文的管理视图。"""
+        return {
+            "id": self.id,
+            "owner_uid": self.owner_uid,
+            "agent_slug": self.agent_slug,
+            "name": self.name,
+            "channel_type": self.channel_type,
+            "app_id": self.app_id,
+            "allow_from": self.allow_from or [],
+            "group_reply_policy": self.group_reply_policy,
+            "enabled": bool(self.enabled),
+            "agentscope_channel_id": self.agentscope_channel_id,
+            "sync_status": self.sync_status,
+            "last_error": self.last_error,
+            "created_at": format_utc_datetime(self.created_at),
+            "updated_at": format_utc_datetime(self.updated_at),
+        }
+
+
 class AgentScopeTeamWorkerBinding(Base):
     """AgentScope Team worker 与 Yuxi 子线程的长期绑定。"""
 
