@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
 from yuxi.agentscope.gateway import GatewayRoundResult, stream_round_to_run_events
-from yuxi.agentscope.runner import ensure_thread_session
+from yuxi.agentscope.runner import ensure_thread_session, recover_untracked_pending_session
+from yuxi.agentscope.thread_guard import has_pending_confirm
+from yuxi.repositories.agentscope_thread_sessions import AgentScopeThreadSession
 from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.storage.postgres.models_business import AgentRun
 
@@ -33,16 +35,25 @@ async def execute_run(
     read_timeout: float = READ_TIMEOUT_SECONDS,
     model_spec: str | None = None,
     image_content: str | None = None,
+    mapping: AgentScopeThreadSession | None = None,
 ) -> GatewayRoundResult:
     """执行一个已派发的 Run：事件写入 Redis Stream，终态回写 AgentRun。"""
-    mapping = await ensure_thread_session(
-        db,
-        client,
-        uid=run.uid,
-        thread_id=run.conversation_thread_id,
-        agent_slug=run.agent_slug,
-        model_spec=model_spec,
-    )
+    if mapping is None:
+        mapping = await ensure_thread_session(
+            db,
+            client,
+            uid=run.uid,
+            thread_id=run.conversation_thread_id,
+            agent_slug=run.agent_slug,
+            model_spec=model_spec,
+        )
+    if not await has_pending_confirm(run.conversation_thread_id):
+        await recover_untracked_pending_session(
+            client,
+            uid=run.uid,
+            agent_id=mapping.agentscope_agent_id,
+            session_id=mapping.agentscope_session_id,
+        )
     result = await stream_round_to_run_events(
         client,
         uid=run.uid,
@@ -86,6 +97,7 @@ async def finalize_run(db: AsyncSession, run: AgentRun, result: GatewayRoundResu
     await AgentRunRepository(db).set_terminal_status(
         run.id,
         status=result.run_status,
+        error_type=result.error_type,
         error_message=_terminal_error_message(result),
         token_usage=result.usage or {},
     )

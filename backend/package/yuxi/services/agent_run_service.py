@@ -939,6 +939,19 @@ async def request_cancel_agent_run(
 
 async def cancel_agent_run_view(*, run_id: str, current_uid: str, db: AsyncSession) -> dict:
     """HTTP 取消入口：取消父 run 时默认级联取消活跃子 run。"""
+    repo = AgentRunRepository(db)
+    channel_run = await repo.get_run_for_user(run_id, str(current_uid))
+    if channel_run is not None and channel_run.source == "agentscope_channel":
+        from yuxi.services.agentscope_channel_run_service import (
+            cancel_agentscope_channel_run,
+        )
+
+        return await cancel_agentscope_channel_run(
+            run=channel_run,
+            current_uid=str(current_uid),
+            db=db,
+        )
+
     run = await request_cancel_agent_run(run_id=run_id, current_uid=current_uid, db=db, cascade_children=True)
     return {"run": run.to_dict() if run else None}
 

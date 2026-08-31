@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from yuxi.storage.postgres.manager import PostgresManager
+from yuxi.storage.postgres.models_business import Base as BusinessBase
 
 
 class _RecordingConnection:
@@ -30,6 +31,15 @@ class _RecordingEngine:
 
     def begin(self):
         return _RecordingBegin(self.connection)
+
+
+def test_business_schema_registers_agentscope_channel_bindings():
+    """WPS Channel binding 必须由业务 schema 创建，并保留唯一远端标识。"""
+    table = BusinessBase.metadata.tables["agentscope_channel_bindings"]
+
+    assert table.c.owner_uid.nullable is False
+    assert table.c.encrypted_app_secret.nullable is False
+    assert table.c.agentscope_channel_id.unique is True
 
 
 @pytest.mark.asyncio
@@ -186,6 +196,27 @@ async def test_ensure_business_schema_adds_run_origin_snapshot_columns():
     assert "agent_run_requests ADD COLUMN IF NOT EXISTS channel VARCHAR(32)" in statements
     assert "agent_run_requests ADD COLUMN IF NOT EXISTS external_id VARCHAR(128)" in statements
     assert "agent_run_requests ADD COLUMN IF NOT EXISTS origin_metadata JSONB" in statements
+
+
+@pytest.mark.asyncio
+async def test_ensure_business_schema_adds_nullable_workspace_ids_idempotently():
+    """启动升级必须为 parent 和 worker 映射补齐 nullable Workspace ID。"""
+    manager = PostgresManager()
+    original_initialized = manager._initialized
+    original_engine = manager.async_engine
+    connection = _RecordingConnection()
+
+    manager._initialized = True
+    manager.async_engine = _RecordingEngine(connection)
+    try:
+        await manager.ensure_business_schema()
+    finally:
+        manager._initialized = original_initialized
+        manager.async_engine = original_engine
+
+    statements = "\n".join(connection.statements)
+    assert "agentscope_thread_sessions ADD COLUMN IF NOT EXISTS agentscope_workspace_id VARCHAR(64)" in statements
+    assert "agentscope_team_worker_bindings ADD COLUMN IF NOT EXISTS agentscope_workspace_id VARCHAR(64)" in statements
 
 
 @pytest.mark.asyncio

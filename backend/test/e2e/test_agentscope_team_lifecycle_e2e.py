@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -98,7 +99,10 @@ async def test_team_worker_projects_child_thread_run_history_and_binding(
         )
         assert response.status_code == 200, response.text
         parent_run_id = str(response.json()["run_id"])
-        await _consume_until_end(e2e_client, e2e_headers, parent_run_id)
+        await asyncio.wait_for(
+            _consume_until_end(e2e_client, e2e_headers, parent_run_id),
+            timeout=120,
+        )
         parent_run = await _wait_for_run(e2e_client, e2e_headers, parent_run_id)
         assert parent_run["status"] == "completed", parent_run
 

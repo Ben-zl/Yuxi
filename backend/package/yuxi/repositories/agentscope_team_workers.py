@@ -90,6 +90,17 @@ class AgentScopeTeamWorkerRepository:
         await self.db.flush()
         return bindings
 
+    async def set_workspace_id(
+        self,
+        binding: AgentScopeTeamWorkerBinding,
+        *,
+        agentscope_workspace_id: str,
+    ) -> AgentScopeTeamWorkerBinding:
+        """保存 worker Session 分配的权威 Workspace ID。"""
+        binding.agentscope_workspace_id = agentscope_workspace_id
+        await self.db.flush()
+        return binding
+
     async def create(self, **values) -> AgentScopeTeamWorkerBinding:
         """创建唯一绑定；调用方负责在同一事务内创建子线程和 Run。"""
         binding = AgentScopeTeamWorkerBinding(**values)

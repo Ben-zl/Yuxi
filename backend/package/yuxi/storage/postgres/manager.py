@@ -904,6 +904,7 @@ class PostgresManager(metaclass=SingletonMeta):
                 agentscope_agent_id VARCHAR(64) NOT NULL,
                 agentscope_credential_id VARCHAR(64) NOT NULL,
                 agentscope_session_id VARCHAR(64) NOT NULL,
+                agentscope_workspace_id VARCHAR(64),
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
@@ -911,6 +912,14 @@ class PostgresManager(metaclass=SingletonMeta):
             (
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_agentscope_thread_sessions_thread "
                 "ON agentscope_thread_sessions(uid, thread_id)"
+            ),
+            (
+                "ALTER TABLE agentscope_thread_sessions "
+                "ADD COLUMN IF NOT EXISTS agentscope_workspace_id VARCHAR(64)"
+            ),
+            (
+                "ALTER TABLE agentscope_team_worker_bindings "
+                "ADD COLUMN IF NOT EXISTS agentscope_workspace_id VARCHAR(64)"
             ),
         ]
         async with self.async_engine.begin() as conn:

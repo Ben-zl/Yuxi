@@ -16,8 +16,8 @@ from yuxi.storage.postgres.models_business import AgentRun, Base, Conversation
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
-async def test_delete_agentscope_thread_resources_removes_remote_mapping_and_workspace(tmp_path, monkeypatch):
-    """线程删除必须清理独占的 AgentScope 资源和持久目录。"""
+async def test_delete_agentscope_thread_resources_uses_retryable_order(monkeypatch):
+    """先提交 Workspace ID，再删 Session、物理资源和映射。"""
     from yuxi.agentscope import client as client_module
     from yuxi.repositories import agentscope_team_workers as team_repo
     from yuxi.repositories import agentscope_thread_sessions as mapping_repo
@@ -26,6 +26,7 @@ async def test_delete_agentscope_thread_resources_removes_remote_mapping_and_wor
         agentscope_agent_id="agent-1",
         agentscope_session_id="session-1",
         agentscope_credential_id="credential-1",
+        agentscope_workspace_id="workspace-1",
     )
     calls = []
 
@@ -33,14 +34,17 @@ async def test_delete_agentscope_thread_resources_removes_remote_mapping_and_wor
         def __init__(self, *_args, **_kwargs):
             pass
 
-        async def delete_session(self, *args):
-            calls.append(("session", *args))
+        async def delete_session(self, *args, **kwargs):
+            calls.append(("session", *args, kwargs))
 
-        async def delete_agent(self, *args):
-            calls.append(("agent", *args))
+        async def destroy_thread_workspaces(self, *args):
+            calls.append(("workspace", *args))
 
-        async def delete_credential(self, *args):
-            calls.append(("credential", *args))
+        async def delete_agent(self, *args, **kwargs):
+            calls.append(("agent", *args, kwargs))
+
+        async def delete_credential(self, *args, **kwargs):
+            calls.append(("credential", *args, kwargs))
 
     async def get_mapping(*_args, **_kwargs):
         return mapping
@@ -53,35 +57,41 @@ async def test_delete_agentscope_thread_resources_removes_remote_mapping_and_wor
         def __init__(self, _db):
             pass
 
+        async def list_for_parent_thread(self, *, uid, parent_thread_id):
+            calls.append(("list_workers", uid, parent_thread_id))
+            return []
+
         async def deactivate_parent_runtime(self, *, uid, parent_thread_id):
             calls.append(("team_runtime", uid, parent_thread_id))
             return []
 
-    base = tmp_path / "agentscope-workspaces"
-    workdir = base / "user-1" / "agent-1"
-    workdir.mkdir(parents=True)
-    (workdir / "report.md").write_text("result", encoding="utf-8")
-    monkeypatch.setenv("AGENTSCOPE_WORKSPACE_BASEDIR", str(base))
     monkeypatch.setattr(client_module, "AgentScopeServiceClient", Client)
     monkeypatch.setattr(mapping_repo, "get_thread_session", get_mapping)
     monkeypatch.setattr(mapping_repo, "delete_thread_session", delete_mapping)
     monkeypatch.setattr(team_repo, "AgentScopeTeamWorkerRepository", TeamWorkerRepository)
 
     class FakeDB:
+        async def commit(self):
+            calls.append(("commit",))
+
         async def flush(self):
             calls.append(("flush",))
 
     await svc._delete_agentscope_thread_resources(FakeDB(), uid="user-1", thread_id="thread-1")
 
     assert [call[0] for call in calls] == [
+        "list_workers",
+        "commit",
         "session",
+        "workspace",
         "agent",
         "credential",
-        "mapping",
         "team_runtime",
+        "mapping",
         "flush",
+        "commit",
     ]
-    assert not workdir.exists()
+    assert calls[2][-1] == {"missing_ok": True}
 
 
 @pytest_asyncio.fixture()

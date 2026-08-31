@@ -25,6 +25,9 @@ from yuxi.repositories.agentscope_thread_sessions import AgentScopeThreadSession
 
 # 订阅建立后的等待窗口：覆盖 HTTP 连接与回放建立，早于 chat 触发即可
 SUBSCRIBE_SETTLE_SECONDS = 0.5
+STALE_PENDING_RECOVERY_ATTEMPTS = 100
+STALE_PENDING_RECOVERY_INTERVAL_SECONDS = 0.1
+_PENDING_SESSION_STATUSES = {"awaiting_permission", "awaiting_external_result"}
 
 
 @dataclass
@@ -34,6 +37,29 @@ class ChatRoundResult:
     events: list[dict]
     text: str
     parked: str | None = None  # 挂起原因（permission=等待工具审批）
+
+
+async def recover_untracked_pending_session(
+    client: AgentScopeServiceClient,
+    *,
+    uid: str,
+    agent_id: str,
+    session_id: str,
+) -> bool:
+    """清理由后台续写遗留、但 Yuxi 已无 pending 事实的挂起状态。"""
+    session_status = await client.get_session_status(uid, agent_id, session_id)
+    if session_status not in _PENDING_SESSION_STATUSES:
+        return False
+
+    await client.interrupt_session(uid, agent_id, session_id)
+    for _ in range(STALE_PENDING_RECOVERY_ATTEMPTS):
+        await asyncio.sleep(STALE_PENDING_RECOVERY_INTERVAL_SECONDS)
+        session_status = await client.get_session_status(uid, agent_id, session_id)
+        if session_status == "idle":
+            return True
+        if session_status not in {*_PENDING_SESSION_STATUSES, "running"}:
+            raise RuntimeError(f"AgentScope 挂起恢复进入未知状态: {session_status}")
+    raise TimeoutError("AgentScope 挂起状态恢复超时")
 
 
 async def ensure_thread_session(
@@ -51,6 +77,17 @@ async def ensure_thread_session(
     """
     existing = await thread_session_repo.get_thread_session(db, uid=uid, thread_id=thread_id)
     if existing is not None:
+        if not getattr(existing, "agentscope_workspace_id", None):
+            workspace_id = await client.get_session_workspace_id(
+                uid,
+                existing.agentscope_agent_id,
+                existing.agentscope_session_id,
+            )
+            await thread_session_repo.set_thread_session_workspace_id(
+                db,
+                existing,
+                agentscope_workspace_id=workspace_id,
+            )
         projection = await project_runtime(
             db,
             uid=uid,
@@ -123,6 +160,7 @@ async def ensure_thread_session(
     agent_id = await client.create_agent(uid, projection.agent_request)
     chat_model_config = {**projection.chat_model_config, "credential_id": credential_id}
     session_id = await client.create_session(uid, agent_id, chat_model_config)
+    workspace_id = await client.get_session_workspace_id(uid, agent_id, session_id)
     for skill in projection.skills:
         await client.add_workspace_skill(uid, agent_id, session_id, skill["source_dir"])
     record = await thread_session_repo.create_thread_session(
@@ -134,6 +172,7 @@ async def ensure_thread_session(
         agentscope_agent_id=agent_id,
         agentscope_credential_id=credential_id,
         agentscope_session_id=session_id,
+        agentscope_workspace_id=workspace_id,
     )
     await db.commit()
     return record

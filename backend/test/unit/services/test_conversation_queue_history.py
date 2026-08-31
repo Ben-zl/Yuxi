@@ -176,6 +176,57 @@ async def test_history_keeps_cancelled_request_when_run_has_assistant_output(ses
     ]
 
 
+async def test_history_exposes_failed_run_without_assistant_output(session):
+    """失败 Run 没有回复消息时，历史仍应展示明确的错误回复。"""
+    started_at = datetime(2026, 8, 28, 8, 5, 41)
+    session.add(Conversation(id=1, thread_id="thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(
+        AgentRun(
+            id="run-failed",
+            conversation_thread_id="thread-1",
+            agent_slug="main",
+            uid="user-1",
+            request_id="request-failed",
+            conversation_id=1,
+            input_payload={},
+            status="failed",
+            error_type="configuration_error",
+            error_message="执行失败: 模型供应商未配置 API Key",
+            created_at=started_at,
+            finished_at=started_at + timedelta(seconds=1),
+        )
+    )
+    session.add(
+        Message(
+            id=1,
+            conversation_id=1,
+            role="user",
+            content="进一步分析",
+            request_id="request-failed",
+            run_id="run-failed",
+            delivery_status="failed",
+            created_at=started_at,
+        )
+    )
+    await session.commit()
+
+    response = await get_thread_history_view(
+        thread_id="thread-1",
+        current_uid="user-1",
+        db=session,
+    )
+
+    assert [message["type"] for message in response["history"]] == ["human", "ai"]
+    error_reply = response["history"][1]
+    assert error_reply["id"] == "run-error:run-failed"
+    assert error_reply["run_id"] == "run-failed"
+    assert error_reply["request_id"] == "request-failed"
+    assert error_reply["delivery_status"] == "failed"
+    assert error_reply["error_type"] == "configuration_error"
+    assert error_reply["error_message"] == "执行失败: 模型供应商未配置 API Key"
+    assert error_reply["extra_metadata"]["synthetic_run_error"] is True
+
+
 async def test_history_restores_reasoning_and_tool_calls(session):
     """历史接口应恢复实时阶段可见的推理内容与工具执行详情。"""
     session.add(Conversation(id=1, thread_id="thread-1", uid="user-1", agent_id="main", status="active"))

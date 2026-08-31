@@ -233,6 +233,7 @@ async def test_external_resume_waits_for_team_worker_wakeup(monkeypatch):
     monkeypatch.setattr(worker_job, "start_event_pump", lambda *args, **kwargs: (queue, None))
     monkeypatch.setattr(worker_job, "start_cancel_watcher", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker_job, "cancel_tasks", AsyncMock())
+    monkeypatch.setattr(worker_job, "has_active_child_runs", AsyncMock(return_value=False))
     monkeypatch.setattr(worker_job, "SUBSCRIBE_SETTLE_SECONDS", 0)
     monkeypatch.setattr(gateway, "append_run_stream_event", _append)
     monkeypatch.setattr(gateway, "TEAM_QUIESCE_SECONDS", 0.01)
@@ -371,6 +372,8 @@ async def test_upload_failure_does_not_bind_attachment():
 
 async def test_projection_value_error_marks_run_failed(monkeypatch):
     """配置投影拒绝请求时 worker 必须结束 Run，不能遗留 running。"""
+    from yuxi.services import run_queue_service
+
     run = SimpleNamespace(
         id="run",
         uid="u",
@@ -421,6 +424,7 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
     monkeypatch.setattr(worker_job, "_emit_end_event", emit)
     dispatch = AsyncMock()
     monkeypatch.setattr(worker_job, "dispatch_next_request", dispatch)
+    monkeypatch.setattr(run_queue_service, "has_cancel_signal", AsyncMock(return_value=False))
 
     await worker_job.execute_agent_run_job("run")
 

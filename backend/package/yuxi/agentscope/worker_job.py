@@ -94,6 +94,7 @@ async def execute_agent_run_job(run_id: str) -> None:
                     text=text,
                     model_spec=model_spec,
                     image_content=input_message.image_content,
+                    mapping=mapping,
                 )
             if result.parked in {"permission", "external"} and result.pending_confirm:
                 await store_pending_confirm(run.conversation_thread_id, result.pending_confirm)

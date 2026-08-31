@@ -485,8 +485,8 @@ async def test_build_owned_thread_titles_uses_all_active_conversations(monkeypat
         def __init__(self, db):
             calls.append(db)
 
-        async def list_active_conversations_for_user(self, uid):
-            calls.append(uid)
+        async def list_active_conversations_for_user(self, uid, *, exclude_sources=()):
+            calls.append((uid, exclude_sources))
             return [
                 SimpleNamespace(
                     thread_id="unpinned-thread",
@@ -519,7 +519,7 @@ async def test_build_owned_thread_titles_uses_all_active_conversations(monkeypat
         "pinned-thread": "2026-08-10-置顶对话",
         "untitled-thread": "2026-08-08-未命名对话",
     }
-    assert calls[1] == "user-1"
+    assert calls[1] == ("user-1", ("agent_call", "agent_evaluation", "agent_task", "agentscope_channel"))
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,7 @@ MESSAGE_SEARCH_SNIPPETS_PER_THREAD = 2
 MESSAGE_SEARCH_ROLES = ("user", "assistant")
 MESSAGE_SEARCH_EXCLUDED_TYPES = ("tool_call", "tool_result")
 INVOCATION_CONVERSATION_SOURCES = ("agent_call", "agent_evaluation", "agent_task")
+HIDDEN_USER_CONVERSATION_SOURCES = (*INVOCATION_CONVERSATION_SOURCES, "agentscope_channel")
 
 
 class ConversationRepository:
@@ -393,12 +394,20 @@ class ConversationRepository:
 
         return pinned_conversations + non_pinned_conversations
 
-    async def list_active_conversations_for_user(self, uid: str) -> list[Conversation]:
+    async def list_active_conversations_for_user(
+        self,
+        uid: str,
+        *,
+        exclude_sources: tuple[str, ...] = (),
+    ) -> list[Conversation]:
         """返回用户全部 active 对话，按最近更新时间排序。"""
+        conditions = [
+            Conversation.uid == str(uid),
+            Conversation.status == "active",
+            *self._exclude_source_conditions(exclude_sources),
+        ]
         result = await self.db.execute(
-            select(Conversation)
-            .where(Conversation.uid == str(uid), Conversation.status == "active")
-            .order_by(Conversation.updated_at.desc())
+            select(Conversation).where(*conditions).order_by(Conversation.updated_at.desc())
         )
         return list(result.scalars().all())
 

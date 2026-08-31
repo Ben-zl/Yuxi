@@ -13,6 +13,7 @@ from agentscope.middleware import MiddlewareBase
 from yuxi.utils.logging_config import logger
 
 from yuxi.agentscope.team_lifecycle import TeamLifecycleModule, retain_latest_team_hint
+from yuxi.agentscope.usage import cache_input_mode_for_model
 
 
 class SteerMiddleware(MiddlewareBase):
@@ -93,34 +94,54 @@ class ContextObservabilityMiddleware(MiddlewareBase):
             event.model_dump(mode="json"),
         )
 
-    async def _publish_model_usage(self, response: Any, reply_id: str) -> None:
+    async def _publish_model_usage(self, response: Any, reply_id: str, cache_input_mode: str) -> None:
         """发布模型原始用量，保留 Anthropic 缓存输入分类。"""
         usage = getattr(response, "usage", None)
         if usage is None:
             return
+        raw_input_tokens = max(int(getattr(usage, "input_tokens", 0) or 0), 0)
+        cache_creation = max(int(getattr(usage, "cache_creation_input_tokens", 0) or 0), 0)
+        cache_read = max(int(getattr(usage, "cache_input_tokens", 0) or 0), 0)
+        input_tokens = (
+            raw_input_tokens + cache_creation + cache_read
+            if cache_input_mode == "additive"
+            else raw_input_tokens
+        )
         await self._publish(
             "model_usage",
             {
                 "reply_id": reply_id,
-                "input_tokens": max(int(getattr(usage, "input_tokens", 0) or 0), 0),
+                "cache_input_mode": cache_input_mode,
+                "raw_input_tokens": raw_input_tokens,
+                "input_tokens": input_tokens,
                 "output_tokens": max(int(getattr(usage, "output_tokens", 0) or 0), 0),
-                "cache_creation_input_tokens": max(
-                    int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
-                    0,
-                ),
-                "cache_read_input_tokens": max(
-                    int(getattr(usage, "cache_input_tokens", 0) or 0),
-                    0,
-                ),
+                "cache_creation_input_tokens": cache_creation,
+                "cache_read_input_tokens": cache_read,
+                "complete": True,
             },
         )
 
-    async def _observe_stream(self, stream: AsyncGenerator, reply_id: str) -> AsyncGenerator:
-        """透传流式响应，并在最终块到达时发布完整用量。"""
+    async def _observe_stream(
+        self,
+        stream: AsyncGenerator,
+        reply_id: str,
+        cache_input_mode: str,
+    ) -> AsyncGenerator:
+        """透传流式响应，并在流正常结束时发布完整用量。"""
+        latest_usage_response = None
+        usage_published = False
         async for response in stream:
-            if getattr(response, "is_last", False):
-                await self._publish_model_usage(response, reply_id)
+            if getattr(response, "usage", None) is not None:
+                latest_usage_response = response
+            if getattr(response, "is_last", False) and not usage_published:
+                await self._publish_model_usage(response, reply_id, cache_input_mode)
+                usage_published = True
             yield response
+
+        # AgentScope Anthropic 流把完整 usage 附在普通增量块上，不会额外
+        # 产生 is_last=True 的结束块；正常耗尽本身就是可靠的收束边界。
+        if latest_usage_response is not None and not usage_published:
+            await self._publish_model_usage(latest_usage_response, reply_id, cache_input_mode)
 
     @staticmethod
     def _estimate_tokens(value: Any) -> int:
@@ -135,6 +156,7 @@ class ContextObservabilityMiddleware(MiddlewareBase):
     async def on_model_call(self, agent, input_kwargs, next_handler):
         """在每次模型调用前发布当前实际输入与上下文上限。"""
         model = input_kwargs["current_model"]
+        cache_input_mode = cache_input_mode_for_model(model)
         messages = list(input_kwargs.get("messages") or [])
         tools = list(input_kwargs.get("tools") or [])
         state_messages = list(agent.state.context or [])
@@ -163,6 +185,9 @@ class ContextObservabilityMiddleware(MiddlewareBase):
         await self._publish(
             "token_context",
             {
+                "reply_id": str(getattr(agent.state, "reply_id", "") or ""),
+                "cache_input_mode": cache_input_mode,
+                "complete": False,
                 "state_message_count": len(state_messages),
                 "state_message_count_before_call": len(state_messages),
                 "state_messages_tokens": self._estimate_tokens(state_messages),
@@ -193,8 +218,8 @@ class ContextObservabilityMiddleware(MiddlewareBase):
         response = await next_handler(**input_kwargs)
         reply_id = str(getattr(agent.state, "reply_id", "") or "")
         if isinstance(response, AsyncGenerator):
-            return self._observe_stream(response, reply_id)
-        await self._publish_model_usage(response, reply_id)
+            return self._observe_stream(response, reply_id, cache_input_mode)
+        await self._publish_model_usage(response, reply_id, cache_input_mode)
         return response
 
     async def on_compress_context(self, agent, input_kwargs, next_handler):
@@ -324,39 +349,12 @@ async def build_team_lifecycle_middleware(
         team = await storage.get_team(user_id, session.team_id)
         is_worker = team is not None and team.session_id != session_id
 
-    leader_notifier = None
-    if is_worker:
-        from agentscope.app._tool import TeamSay
-        from agentscope.message import ToolResultState
-
-        leader_session = await storage.get_session(user_id, "", team.session_id)
-        if leader_session is None:
-            raise ValueError("AgentScope Team leader Session 不存在")
-        leader_agent = await storage.get_agent(user_id, leader_session.agent_id)
-        leader_name = leader_agent.data.name if leader_agent is not None else leader_session.agent_id
-        team_say = TeamSay(
-            storage=storage,
-            message_bus=message_bus,
-            workspace_manager=workspace_manager,
-            user_id=user_id,
-            agent_id=agent_id,
-            session_id=session_id,
-            role="worker",
-        )
-
-        async def leader_notifier(message: str) -> None:
-            """通过 AgentScope Team inbox 向 leader 投递 worker 结果。"""
-            result = await team_say(content=message, to=leader_name)
-            if result.state == ToolResultState.ERROR:
-                raise RuntimeError("TeamSay 结果通知投递失败")
-
     return TeamLifecycleMiddleware(
         TeamLifecycleModule(
             storage=storage,
             uid=user_id,
             agent_id=agent_id,
             session_id=session_id,
-            leader_notifier=leader_notifier,
         ),
         is_worker=is_worker,
     )

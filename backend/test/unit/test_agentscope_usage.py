@@ -49,6 +49,7 @@ def test_usage_accumulator_merges_context_snapshot_and_summary_state():
                 "context_window": 1000,
                 "summary_trigger_tokens": 800,
                 "summary_active": False,
+                "complete": False,
             },
         }
     )
@@ -66,6 +67,7 @@ def test_usage_accumulator_merges_context_snapshot_and_summary_state():
     assert usage["context_window"] == 1000
     assert usage["summary_trigger_tokens"] == 800
     assert usage["summary_active"] is True
+    assert usage["complete"] is True
 
 
 def test_usage_accumulator_includes_cached_anthropic_input_tokens():
@@ -77,6 +79,8 @@ def test_usage_accumulator_includes_cached_anthropic_input_tokens():
             "name": "model_usage",
             "value": {
                 "reply_id": "reply-1",
+                "cache_input_mode": "additive",
+                "complete": True,
                 "input_tokens": 39,
                 "output_tokens": 5,
                 "cache_creation_input_tokens": 3,
@@ -120,14 +124,26 @@ def test_usage_accumulator_pairs_interleaved_model_usage_by_reply():
         {
             "type": "CUSTOM",
             "name": "model_usage",
-            "value": {"reply_id": "a", "input_tokens": 10, "output_tokens": 1},
+            "value": {
+                "reply_id": "a",
+                "cache_input_mode": "inclusive",
+                "complete": True,
+                "input_tokens": 10,
+                "output_tokens": 1,
+            },
         }
     )
     accumulator.observe(
         {
             "type": "CUSTOM",
             "name": "model_usage",
-            "value": {"reply_id": "b", "input_tokens": 20, "output_tokens": 2},
+            "value": {
+                "reply_id": "b",
+                "cache_input_mode": "inclusive",
+                "complete": True,
+                "input_tokens": 20,
+                "output_tokens": 2,
+            },
         }
     )
     accumulator.observe(
@@ -140,3 +156,86 @@ def test_usage_accumulator_pairs_interleaved_model_usage_by_reply():
     models = accumulator.snapshot(complete=True)["run"]["models"]
     assert models["model-a"]["usage"]["input_tokens"] == 10
     assert models["model-b"]["usage"]["input_tokens"] == 20
+
+
+@pytest.mark.parametrize("mode", ["inclusive", "unknown"])
+def test_inclusive_and_unknown_modes_do_not_add_cached_tokens(mode):
+    """OpenAI/Gemini 输入已含缓存；未知 provider 不展示命中率。"""
+    accumulator = UsageAccumulator("model-a")
+    accumulator.observe({"type": "MODEL_CALL_START", "reply_id": "r", "model_name": "model-a"})
+    accumulator.observe(
+        {
+            "type": "CUSTOM",
+            "name": "model_usage",
+            "value": {
+                "reply_id": "r",
+                "cache_input_mode": mode,
+                "complete": True,
+                "raw_input_tokens": 100,
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 80,
+            },
+        }
+    )
+    accumulator.observe({"type": "MODEL_CALL_END", "reply_id": "r", "input_tokens": 100, "output_tokens": 5})
+
+    bucket = accumulator.snapshot(complete=True)["run"]["models"]["model-a"]
+    assert bucket["usage"]["input_tokens"] == 100
+    assert bucket["cache_hit_ratio"] == (pytest.approx(0.8) if mode == "inclusive" else None)
+
+
+def test_complete_custom_usage_wins_over_native_and_reply_is_counted_once():
+    """同一 reply 的双来源与重复终态只累计一次。"""
+    accumulator = UsageAccumulator("model-a")
+    accumulator.observe({"type": "MODEL_CALL_START", "reply_id": "r", "model_name": "model-a"})
+    accumulator.observe(
+        {
+            "type": "CUSTOM",
+            "name": "model_usage",
+            "value": {
+                "reply_id": "r",
+                "cache_input_mode": "additive",
+                "complete": True,
+                "raw_input_tokens": 10,
+                "input_tokens": 40,
+                "output_tokens": 2,
+                "cache_creation_input_tokens": 5,
+                "cache_read_input_tokens": 25,
+            },
+        }
+    )
+    native = {"type": "MODEL_CALL_END", "reply_id": "r", "input_tokens": 10, "output_tokens": 2}
+    accumulator.observe(native)
+    accumulator.observe(native)
+
+    snapshot = accumulator.snapshot(complete=True)
+    assert snapshot["run"]["total"] == {"input_tokens": 40, "output_tokens": 2, "total_tokens": 42}
+    assert snapshot["run"]["models"]["model-a"]["model_call_count"] == 1
+
+
+def test_multiple_model_calls_in_one_reply_are_all_counted():
+    """ReAct 多次模型调用共享 reply_id 时，每次调用都必须独立累计。"""
+    accumulator = UsageAccumulator("model-a")
+    for input_tokens in (10, 20):
+        accumulator.observe({"type": "MODEL_CALL_START", "reply_id": "r", "model_name": "model-a"})
+        accumulator.observe(
+            {
+                "type": "CUSTOM",
+                "name": "model_usage",
+                "value": {
+                    "reply_id": "r",
+                    "cache_input_mode": "inclusive",
+                    "complete": True,
+                    "raw_input_tokens": input_tokens,
+                    "output_tokens": 1,
+                },
+            }
+        )
+        accumulator.observe(
+            {"type": "MODEL_CALL_END", "reply_id": "r", "input_tokens": input_tokens, "output_tokens": 1}
+        )
+
+    snapshot = accumulator.snapshot(complete=True)
+    assert snapshot["run"]["total"] == {"input_tokens": 30, "output_tokens": 2, "total_tokens": 32}
+    assert snapshot["run"]["models"]["model-a"]["model_call_count"] == 2

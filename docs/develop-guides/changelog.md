@@ -12,6 +12,7 @@
 :::
 
 - 完成 AgentScope 收口：统一投影逐轮装配 HTTP MCP、知识库与按用户/session 隔离的 Team worker 模板，凭据不进入 workspace；动态模板自动保留 `TeamSay` 回报协议，避免自定义系统提示覆盖团队协作约束；失败运行会继续派发 FIFO；线程状态改由 Yuxi 事实源聚合；移除 LangChain/LangGraph/DeepAgents 运行代码、依赖及无效摘要配置。
+- 消息渠道发起的会话继续持久化 Conversation、Message、AgentRun、ToolCall 与 Token 用量，但不再出现在用户会话列表、搜索结果和工作区历史中；超级管理员 Dashboard 仍保留完整审计数据。WPS 协作渠道移除模型覆盖配置，始终跟随绑定智能体的当前模型。
 - 公共智能体系统提示词新增产出物交付约束：最终文件写入 outputs 后必须调用 `present_artifacts`，由主智能体统一登记并展示，临时文件不纳入交付。
 - 修复 Team worker 首轮默认 20 次迭代导致的 `exceed_max_iters`：子智能体模板继承 `max_execution_steps`；回报协议仅通知 leader；worker 完成后未主动 `TeamSay` 时由平台代发完整结果并触发 leader 续写；失败重试只保留最新 Team 指令；后续 TeamReply Run 写入稳定展示标识，历史缺失 `tool_call_id` 的 Run 不再导致线程状态接口 500；保留模式的 TeamDelete 返回终态响应。
 - 修复执行后取消的 AgentRun 对话内容为空：历史接口在已有助手输出时保留 cancelled/rejected 用户消息；Team worker 中断后即使缺少 `REPLY_END` 也会结束 child Run，父 Run 异常路径按取消信号归一为 cancelled；未执行的排队取消请求仍保持隐藏。

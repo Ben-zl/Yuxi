@@ -19,7 +19,7 @@ from yuxi.agents.backends.sandbox.paths import (
     sandbox_uploads_dir,
     validate_thread_id,
 )
-from yuxi.repositories.conversation_repository import ConversationRepository
+from yuxi.repositories.conversation_repository import HIDDEN_USER_CONVERSATION_SOURCES, ConversationRepository
 from yuxi.services.file_preview import (
     MAX_BINARY_PREVIEW_SIZE_BYTES,
     OfficePreviewConversionError,
@@ -345,7 +345,10 @@ async def download_workspace_file(
 async def build_owned_thread_titles(db: AsyncSession, uid: str) -> dict[str, str]:
     """查询用户全部 active 对话，返回网页历史文件映射使用的标题。"""
     repo = ConversationRepository(db)
-    conversations = await repo.list_active_conversations_for_user(str(uid))
+    conversations = await repo.list_active_conversations_for_user(
+        str(uid),
+        exclude_sources=HIDDEN_USER_CONVERSATION_SOURCES,
+    )
     thread_titles = {}
     for conversation in conversations:
         try:
