@@ -18,6 +18,7 @@
 - 修复执行后取消的 AgentRun 对话内容为空：历史接口在已有助手输出时保留 cancelled/rejected 用户消息；Team worker 中断后即使缺少 `REPLY_END` 也会结束 child Run，父 Run 异常路径按取消信号归一为 cancelled；未执行的排队取消请求仍保持隐藏。
 - 修复 AgentScope 后台续写遗留提问挂起后普通消息无回复：Yuxi 无 pending 事实时先中断陈旧等待态再执行新消息；失败 Run 没有助手输出时，历史仍持续展示明确错误原因。
 - 升级 AgentScope 至 2.0.7.post1：持久化 parent/worker Workspace ID 并清理新旧目录与残留容器；Team worker 的空目标回报定向归一到 leader，避免 peer 互唤和重复 child Run；按 provider 归一缓存 Token 并按 reply 去重；最大迭代保留文本和失败事实。
+- 接入 AgentScope ReMe 长期记忆：按用户与 Agent 隔离并跨对话共享，使用 BM25/向量混合检索和每日 Dream，Team worker 不装配记忆；新增长期记忆管理接口与前端弹窗，支持筛选、分页、单项删除和清空，Agent、用户删除前同步清理相关 scope。
 - 修复开发环境 ARQ worker 异常后只留下 `watchfiles` 与 zombie 子进程、容器假存活：监督器自动重启 ARQ 并保留热重载，Compose 增加真实 healthcheck；启动恢复同时接管 `pending/running` Run，清理确定性 Job 的陈旧 retry/in-progress 状态后重新投递。
 - 补齐 AgentScope 功能对齐：Team worker 保留生命周期并按子智能体配置装配资源；Token 卡片与 Dashboard 使用真实 Run/线程累计用量，合并 Anthropic 兼容流在 `message_delta` 上报的输入与缓存用量；Summary 映射到上下文压缩；文件树提示 500 项截断；Steer 在工具批次后接力；主动提问支持刷新恢复与回答续接。
 - 新增 Agent 任务中心（工单 01-11）：以 NativeScheduleBlockMiddleware 在模型调用边界移除 AgentScope 原生 Schedule 工具；建立 AgentTask/TaskExecution 领域模型与 CRUD、手动/API/定时三入口触发收口、任务级 FIFO 串行队列与崩溃恢复；定时规则编译为 5 段 POSIX Cron 并按 IANA 时区计算下次运行，APScheduler DOW 约定差异在构造前统一转换；支持部门共享、执行身份审批隔离、Agent 删除阻断；前端新增任务中心页面（列表/创建/编辑/详情/执行历史/线程）与 SSE 事件流/产物只读接口。

@@ -9,6 +9,7 @@ Redis 作 message bus，workspace 按 AGENTSCOPE_WORKSPACE_BACKEND 选择
 import asyncio
 import os
 import threading
+from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import asyncpg
@@ -37,6 +38,7 @@ AGENTSCOPE_WORKSPACE_BASEDIR = os.getenv("AGENTSCOPE_WORKSPACE_BASEDIR", "/app/s
 # docker 后端的 basedir 必须是 docker daemon 视角的路径（Docker Desktop 下
 # 为宿主路径，需将同一路径自镜像挂载进本容器）
 AGENTSCOPE_WORKSPACE_BACKEND = os.getenv("AGENTSCOPE_WORKSPACE_BACKEND", "docker")
+AGENTSCOPE_MEMORY_BASEDIR = os.getenv("AGENTSCOPE_MEMORY_BASEDIR", "/app/saves/memory/reme")
 
 
 async def _ensure_database_exists(database_url: str) -> None:
@@ -72,6 +74,14 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
         build_team_lifecycle_middleware,
     )
     from yuxi.agentscope.runtime_resources import resolve_runtime_projection
+    from yuxi.agentscope.memory import (
+        ScopedReMeMiddleware,
+        build_memory_models,
+        memory_scope_identity,
+        memory_workspace_path,
+    )
+    from yuxi.agentscope.memory_management import latest_memory_at
+    from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
 
     async with pg_manager.get_async_session_context() as db:
         projection = await resolve_runtime_projection(
@@ -81,6 +91,13 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
             agent_id=agent_id,
             session_id=session_id,
         )
+        if projection.memory_enabled:
+            await AgentMemoryScopeRepository(db).ensure(
+                user_id,
+                projection.agent_slug,
+                memory_scope_identity(user_id, projection.agent_slug),
+            )
+            await db.commit()
 
     middlewares = [
         TracingMiddleware(),
@@ -88,6 +105,34 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
         NativeScheduleBlockMiddleware(),
         build_context_observability_middleware(app.state.message_bus, session_id),
     ]
+    if projection.memory_enabled:
+        chat_model, embedding_model, fingerprint = build_memory_models(projection)
+
+        async def mark_memory_updated() -> None:
+            """仅在 ReMe 已实际生成卡片时推进 scope 最近记忆时间。"""
+            memory_at = latest_memory_at(
+                memory_workspace_path(AGENTSCOPE_MEMORY_BASEDIR, user_id, projection.agent_slug),
+            )
+            if memory_at is None:
+                return
+            async with pg_manager.get_async_session_context() as update_db:
+                repo = AgentMemoryScopeRepository(update_db)
+                record = await repo.get(user_id, projection.agent_slug)
+                if record is not None:
+                    await repo.mark_memory_at(record, memory_at)
+                    await update_db.commit()
+
+        middlewares.append(
+            ScopedReMeMiddleware(
+                registry=app.state.reme_registry,
+                uid=user_id,
+                agent_slug=projection.agent_slug,
+                fingerprint=fingerprint,
+                chat_model=chat_model,
+                embedding_model=embedding_model,
+                on_memory_updated=mark_memory_updated,
+            ),
+        )
     session = await app.state.storage.get_session(user_id, agent_id, session_id)
     source = getattr(session, "source", None) if session is not None else None
     if getattr(source, "value", source) == "channel":
@@ -261,7 +306,7 @@ def _create_service_app_sync():
         )
     else:
         workspace_manager = LocalWorkspaceManager(basedir=AGENTSCOPE_WORKSPACE_BASEDIR)
-    return create_app(
+    service_app = create_app(
         storage=AsyncSQLAlchemyStorage(
             AGENTSCOPE_DATABASE_URL,
             create_tables=True,
@@ -279,9 +324,227 @@ def _create_service_app_sync():
         workspace_manager=workspace_manager,
         title="Yuxi AgentScope Service",
     )
+    from yuxi.agentscope.memory import ReMeRegistry, ensure_memory_base_dir
+    from yuxi.agentscope.memory_scheduler import MemoryDreamScheduler
+
+    memory_base_dir = ensure_memory_base_dir(AGENTSCOPE_MEMORY_BASEDIR)
+    service_app.state.reme_registry = ReMeRegistry(base_dir=memory_base_dir)
+    service_app.state.memory_dream_scheduler = MemoryDreamScheduler(
+        registry=service_app.state.reme_registry,
+        base_dir=memory_base_dir,
+    )
+    original_lifespan = service_app.router.lifespan_context
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def yuxi_lifespan(current_app):
+        """在 AgentScope 原生资源关闭前释放 Yuxi 长期记忆资源。"""
+        async with original_lifespan(current_app):
+            await current_app.state.memory_dream_scheduler.start()
+            try:
+                yield
+            finally:
+                await current_app.state.memory_dream_scheduler.stop()
+                await current_app.state.reme_registry.close_all()
+
+    service_app.router.lifespan_context = yuxi_lifespan
+    return service_app
 
 
 app = _create_service_app_sync()
+
+
+async def _load_memory_projection(uid: str, agent_slug: str):
+    """为管理和 Dream 解析模型，即使用户当前已关闭 Memory。"""
+    from yuxi.agentscope.config_projection import project_runtime
+
+    async with pg_manager.get_async_session_context() as db:
+        return await project_runtime(
+            db,
+            uid=uid,
+            agent_slug=agent_slug,
+            include_memory_models=True,
+        )
+
+
+async def _reindex_memory(
+    uid: str,
+    agent_slug: str,
+    workspace: Path,
+    *,
+    daily_date: str | None = None,
+) -> None:
+    """使用短生命周期 ReMe 应用完整重建一个 scope 的混合索引。"""
+    from yuxi.agentscope.memory import build_memory_models, reme_maintenance_app
+
+    projection = await _load_memory_projection(uid, agent_slug)
+    chat_model, embedding_model, _fingerprint = build_memory_models(projection)
+    async with reme_maintenance_app(
+        workspace_dir=workspace,
+        chat_model=chat_model,
+        embedding_model=embedding_model,
+    ) as maintenance:
+        if daily_date is not None:
+            daily_response = await maintenance.run_job("daily_reindex", date=daily_date)
+            if getattr(daily_response, "success", True) is False:
+                raise RuntimeError(f"ReMe daily reindex failed: {getattr(daily_response, 'answer', '')}")
+        response = await maintenance.run_job("reindex")
+        if getattr(response, "success", True) is False:
+            raise RuntimeError(f"ReMe reindex failed: {getattr(response, 'answer', '')}")
+
+
+def _memory_busy() -> HTTPException:
+    """返回统一的 scope 忙错误。"""
+    return HTTPException(status_code=409, detail="memory_scope_busy")
+
+
+@app.get("/yuxi/memory")
+async def list_yuxi_memories(
+    agent_slug: str = Query(...),
+    kind: str = Query("all", pattern="^(all|daily|digest)$"),
+    category: str = Query("all", pattern="^(all|personal|procedure|wiki)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    x_user_id: str = Header(...),
+) -> dict:
+    """列出当前用户在一个 Agent scope 下可管理的记忆卡片。"""
+    from urllib.parse import unquote
+
+    from yuxi.agentscope.memory import memory_workspace_path
+    from yuxi.agentscope.memory_management import list_memory_cards
+    from yuxi.config import UserConfig
+    from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
+
+    uid = unquote(x_user_id)
+    async with pg_manager.get_async_session_context() as db:
+        record = await AgentMemoryScopeRepository(db).get(uid, agent_slug)
+        enabled = (await UserConfig.load(db, uid)).schema.enable_memory
+    workspace = memory_workspace_path(AGENTSCOPE_MEMORY_BASEDIR, uid, agent_slug)
+    result = list_memory_cards(workspace, kind=kind, category=category, page=page, page_size=page_size)
+    result["scope"] = {
+        "enabled": bool(enabled),
+        "last_memory_at": record.to_dict()["last_memory_at"] if record else None,
+        "last_dream_date": record.to_dict()["last_dream_date"] if record else None,
+        "dream_status": record.dream_status if record else None,
+    }
+    return result
+
+
+@app.delete("/yuxi/memory/item")
+async def delete_yuxi_memory_item(
+    agent_slug: str = Query(...),
+    memory_id: str = Query(..., min_length=64, max_length=64),
+    x_user_id: str = Header(...),
+) -> dict:
+    """删除一张记忆卡片，并在提交文件删除前完成完整 reindex。"""
+    from urllib.parse import unquote
+
+    from yuxi.agentscope.memory import MemoryScopeBusyError, memory_workspace_path
+    from yuxi.agentscope.memory_management import delete_memory_card
+
+    uid = unquote(x_user_id)
+    workspace = memory_workspace_path(AGENTSCOPE_MEMORY_BASEDIR, uid, agent_slug)
+    try:
+        async with app.state.reme_registry.acquire_exclusive(uid, agent_slug):
+            await delete_memory_card(
+                workspace,
+                memory_id,
+                maintain_index=lambda daily_date: _reindex_memory(
+                    uid,
+                    agent_slug,
+                    workspace,
+                    daily_date=daily_date,
+                ),
+            )
+    except MemoryScopeBusyError as exc:
+        raise _memory_busy() from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="memory_not_found") from exc
+    return {"success": True}
+
+
+async def _clear_memory_scope(uid: str, agent_slug: str) -> bool:
+    """清理一个 scope 的 Registry、目录和 catalog。"""
+    from yuxi.agentscope.memory import MemoryScopeBusyError
+
+    try:
+        async with app.state.reme_registry.acquire_exclusive(uid, agent_slug):
+            return await _delete_memory_scope_data(uid, agent_slug)
+    except MemoryScopeBusyError:
+        raise
+
+
+async def _delete_memory_scope_data(uid: str, agent_slug: str) -> bool:
+    """在调用方已持有独占 lease 时删除一个 scope 的目录和 catalog。"""
+    from yuxi.agentscope.memory import memory_workspace_path
+    from yuxi.agentscope.memory_management import clear_memory_workspace
+    from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
+
+    workspace = memory_workspace_path(AGENTSCOPE_MEMORY_BASEDIR, uid, agent_slug)
+    removed = clear_memory_workspace(workspace, base_dir=AGENTSCOPE_MEMORY_BASEDIR)
+    async with pg_manager.get_async_session_context() as db:
+        await AgentMemoryScopeRepository(db).delete(uid, agent_slug)
+        await db.commit()
+    return removed
+
+
+@app.delete("/yuxi/memory/scope")
+async def clear_yuxi_memory_scope(
+    agent_slug: str = Query(...),
+    x_user_id: str = Header(...),
+) -> dict:
+    """清空当前用户在指定 Agent 下的全部长期记忆。"""
+    from urllib.parse import unquote
+    from yuxi.agentscope.memory import MemoryScopeBusyError
+
+    try:
+        removed = await _clear_memory_scope(unquote(x_user_id), agent_slug)
+    except MemoryScopeBusyError as exc:
+        raise _memory_busy() from exc
+    return {"success": True, "already_absent": not removed}
+
+
+async def _clear_memory_records(records: list) -> dict:
+    """原子占用全部 scope 后执行批量幂等清理。"""
+    from yuxi.agentscope.memory import MemoryScopeBusyError
+
+    scopes = [(record.uid, record.agent_slug) for record in records]
+    cleared = []
+    try:
+        async with app.state.reme_registry.acquire_exclusive_many(scopes):
+            for record in records:
+                await _delete_memory_scope_data(record.uid, record.agent_slug)
+                cleared.append(record.workspace_id)
+    except MemoryScopeBusyError as exc:
+        raise _memory_busy() from exc
+    return {"success": True, "cleared_workspace_ids": cleared}
+
+
+@app.delete("/yuxi/memory/agent")
+async def clear_yuxi_memory_agent(
+    agent_slug: str = Query(...),
+    x_user_id: str = Header(...),
+) -> dict:
+    """清除一个 Agent 在所有用户下的长期记忆。"""
+    from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
+
+    async with pg_manager.get_async_session_context() as db:
+        records = await AgentMemoryScopeRepository(db).list_for_agent(agent_slug)
+    return await _clear_memory_records(records)
+
+
+@app.delete("/yuxi/memory/user")
+async def clear_yuxi_memory_user(
+    uid: str = Query(...),
+    x_user_id: str = Header(...),
+) -> dict:
+    """清除一个用户在所有 Agent 下的长期记忆。"""
+    from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
+
+    async with pg_manager.get_async_session_context() as db:
+        records = await AgentMemoryScopeRepository(db).list_for_user(uid)
+    return await _clear_memory_records(records)
 
 
 @app.post("/yuxi/workspace/file", status_code=status.HTTP_201_CREATED)

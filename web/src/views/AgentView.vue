@@ -82,6 +82,14 @@
                     <button
                       type="button"
                       class="config-dropdown-item action-item"
+                      @click="openAgentMemory"
+                    >
+                      <Brain :size="15" class="config-dropdown-item-icon" />
+                      <span class="config-dropdown-item-label">长期记忆</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="config-dropdown-item action-item"
                       @click="openAgentManagement"
                     >
                       <Settings2 :size="15" class="config-dropdown-item-icon" />
@@ -108,18 +116,20 @@
       :backend-options="agentBackendOptions"
       @saved="handleAgentSaved"
     />
+    <AgentMemoryModal ref="agentMemoryModalRef" />
   </div>
 </template>
 
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
-import { Settings2, ChevronDown, Check, Plus } from 'lucide-vue-next'
+import { Settings2, ChevronDown, Check, Plus, Brain } from 'lucide-vue-next'
 import { useRoute, useRouter } from 'vue-router'
 import { agentApi } from '@/apis/agent_api'
 import { useOutsidePointerdown } from '@/composables/useOutsidePointerdown'
 import AgentChatComponent from '@/components/AgentChatComponent.vue'
 import AgentEditModal from '@/components/model-management/AgentEditModal.vue'
+import AgentMemoryModal from '@/components/AgentMemoryModal.vue'
 import { isBuiltinAgent, useAgentStore } from '@/stores/agent'
 import { handleChatError } from '@/utils/errorHandler'
 import { generatePixelAvatar } from '@/utils/pixelAvatar'
@@ -130,6 +140,7 @@ import { storeToRefs } from 'pinia'
 // 组件引用
 const chatComponentRef = ref(null)
 const agentEditModalRef = ref(null)
+const agentMemoryModalRef = ref(null)
 
 // Stores
 const agentStore = useAgentStore()
@@ -313,6 +324,20 @@ const openAgentManagement = async () => {
   } catch (error) {
     message.error(error.message || '打开智能体配置失败')
   }
+}
+
+const openAgentMemory = () => {
+  agentDropdownOpen.value = false
+  const option = agentQuickSwitchOptions.value.find((item) => item.value === selectedAgentId.value)
+  if (!option) {
+    message.warning('请先选择智能体')
+    return
+  }
+  agentMemoryModalRef.value?.open({
+    slug: option.value,
+    id: option.value,
+    name: option.label
+  })
 }
 
 useOutsidePointerdown(agentDropdownOpen, [agentDropdownTriggerRef, agentDropdownPanelRef])

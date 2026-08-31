@@ -1,3 +1,4 @@
+import os
 import re
 from yuxi.utils import logger
 
@@ -33,6 +34,7 @@ from yuxi.services.auth_service import (
 from yuxi.storage.minio import upload_image_to_minio
 from yuxi.storage.minio.client import normalize_public_minio_url
 from yuxi.utils.datetime_utils import utc_now_naive
+from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError
 
 # OIDC 认证相关导入
 from yuxi.services.oidc_service import (
@@ -834,6 +836,15 @@ async def delete_user(
         )
 
     deletion_detail = f"删除用户: {user.username}, ID: {user.id}, 角色: {user.role}"
+
+    try:
+        await AgentScopeServiceClient(
+            os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"),
+        ).clear_memory_user(str(current_user.uid), str(user.uid))
+    except AgentScopeServiceError as exc:
+        if exc.status_code == 409:
+            raise HTTPException(status_code=409, detail="memory_scope_busy") from exc
+        raise HTTPException(status_code=502, detail="长期记忆清理失败，用户未删除") from exc
 
     user.is_deleted = 1
     user.deleted_at = utc_now_naive()

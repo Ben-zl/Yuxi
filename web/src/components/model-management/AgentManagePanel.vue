@@ -1,11 +1,12 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
-import { Plus, RefreshCw, Trash2, SquarePen, Bot, ChevronRight } from 'lucide-vue-next'
+import { Plus, RefreshCw, Trash2, SquarePen, Bot, ChevronRight, Brain } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 
 import { agentApi } from '@/apis/agent_api'
 import AgentEditModal from '@/components/model-management/AgentEditModal.vue'
+import AgentMemoryModal from '@/components/AgentMemoryModal.vue'
 import { isBuiltinAgent, useAgentStore } from '@/stores/agent'
 import PageShoulder from '@/components/shared/PageShoulder.vue'
 import InfoCard from '@/components/shared/InfoCard.vue'
@@ -22,6 +23,7 @@ const searchQuery = ref('')
 const agentBackendOptions = ref([])
 const managedAgents = ref([])
 const agentEditModalRef = ref(null)
+const agentMemoryModalRef = ref(null)
 
 const normalizeAgent = (agent) => {
   const agentId = agent?.agent_id || agent?.slug || agent?.id
@@ -115,6 +117,8 @@ const openAgentChat = (agent) => {
   router.push({ name: 'AgentComp', query: { agent_id: agent.id } })
 }
 
+const openAgentMemory = (agent) => agentMemoryModalRef.value?.open(agent)
+
 const refreshAgentLists = async () => {
   await Promise.all([loadAgents(), agentStore.fetchAgents()])
 }
@@ -202,15 +206,26 @@ defineExpose({
               />
             </template>
 
-            <template v-if="canManageAgent(agent)" #card-more-action-corner>
+            <template #card-more-action-corner>
               <a-menu>
-                <a-menu-item key="edit" @click.stop="openEditAgentModal(agent)">
+                <a-menu-item key="memory" @click.stop="openAgentMemory(agent)">
+                  <span class="lucide-menu-item">
+                    <Brain :size="14" />
+                    <span>长期记忆</span>
+                  </span>
+                </a-menu-item>
+                <a-menu-item
+                  v-if="canManageAgent(agent)"
+                  key="edit"
+                  @click.stop="openEditAgentModal(agent)"
+                >
                   <span class="lucide-menu-item">
                     <SquarePen :size="14" />
                     <span>编辑智能体</span>
                   </span>
                 </a-menu-item>
                 <a-menu-item
+                  v-if="canManageAgent(agent)"
                   key="delete"
                   :disabled="isBuiltinAgent(agent)"
                   :danger="!isBuiltinAgent(agent)"
@@ -245,6 +260,7 @@ defineExpose({
       :backend-options="agentBackendOptions"
       @saved="refreshAgentLists"
     />
+    <AgentMemoryModal ref="agentMemoryModalRef" />
   </div>
 </template>
 

@@ -104,6 +104,21 @@ export const agentApi = {
 
   deleteAgent: (agentId) => apiDelete(`/api/agent/${agentId}`),
 
+  listMemories: (agentSlug, filters = {}) => {
+    const params = new URLSearchParams()
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') params.set(key, String(value))
+    })
+    return apiGet(`/api/agent/${encodeURIComponent(agentSlug)}/memories?${params.toString()}`)
+  },
+
+  deleteMemory: (agentSlug, memoryId) =>
+    apiDelete(
+      `/api/agent/${encodeURIComponent(agentSlug)}/memories/${encodeURIComponent(memoryId)}`
+    ),
+
+  clearMemories: (agentSlug) => apiDelete(`/api/agent/${encodeURIComponent(agentSlug)}/memories`),
+
   /**
    * 创建异步运行任务（Run）
    * @param {Object} data - run 请求体

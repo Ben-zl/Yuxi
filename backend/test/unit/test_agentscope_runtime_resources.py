@@ -40,6 +40,7 @@ async def test_direct_session_uses_exact_mapping(monkeypatch):
         agent_slug="leader",
         model_spec="p:m",
         thread_id="thread-1",
+        is_team_worker=False,
     )
 
 
@@ -100,6 +101,7 @@ async def test_team_worker_uses_subagent_resources_with_parent_run_context(monke
         agent_slug="automation-analysis-agent",
         model_spec="p:m",
         thread_id="thread-1",
+        is_team_worker=True,
     )
 
 

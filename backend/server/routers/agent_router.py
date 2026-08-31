@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import os
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -36,6 +37,7 @@ from yuxi.services.input_message_service import build_chat_input_message
 from yuxi.services.run_submission_service import RunOrigin, RunSubmissionCommand, submit_run_command
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import User
+from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError
 
 from server.utils.auth_middleware import get_admin_user, get_db, get_required_user
 
@@ -79,6 +81,20 @@ class AgentRunCreate(BaseModel):
         "enqueue",
         description="排队策略：enqueue（默认排队）、reject（运行中拒绝）或 steer（优先接替）",
     )
+
+
+def _memory_client() -> AgentScopeServiceClient:
+    """返回内部 AgentScope Memory 管理客户端。"""
+    return AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
+
+
+def _raise_memory_service_error(exc: AgentScopeServiceError) -> None:
+    """把内部 Memory 错误映射为稳定公开协议。"""
+    if exc.status_code == 409:
+        raise HTTPException(status_code=409, detail="memory_scope_busy") from exc
+    if exc.status_code == 404:
+        raise HTTPException(status_code=404, detail="memory_not_found") from exc
+    raise HTTPException(status_code=502, detail="长期记忆服务暂不可用") from exc
 
 
 def _backend_info(info: dict) -> dict:
@@ -234,6 +250,68 @@ async def update_agent(
     return {"agent": await _serialize_agent(repo, updated, current_user, include_configurable_items=True)}
 
 
+@agent_router.get("/{agent_slug}/memories")
+async def list_agent_memories(
+    agent_slug: str,
+    kind: str = Query("all", pattern="^(all|daily|digest)$"),
+    category: str = Query("all", pattern="^(all|personal|procedure|wiki)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """列出当前用户在可见 Agent 下的长期记忆。"""
+    item = await AgentRepository(db).get_visible_by_slug(slug=agent_slug, user=current_user, kind="any")
+    if item is None:
+        raise HTTPException(status_code=404, detail="智能体不存在")
+    try:
+        return await _memory_client().list_memories(
+            str(current_user.uid),
+            agent_slug,
+            kind=kind,
+            category=category,
+            page=page,
+            page_size=page_size,
+        )
+    except AgentScopeServiceError as exc:
+        _raise_memory_service_error(exc)
+
+
+@agent_router.delete("/{agent_slug}/memories/{memory_id}")
+async def delete_agent_memory(
+    agent_slug: str,
+    memory_id: str,
+    current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """删除当前用户的一张 Agent 长期记忆。"""
+    item = await AgentRepository(db).get_visible_by_slug(slug=agent_slug, user=current_user, kind="any")
+    if item is None:
+        raise HTTPException(status_code=404, detail="智能体不存在")
+    try:
+        await _memory_client().delete_memory_item(str(current_user.uid), agent_slug, memory_id)
+    except AgentScopeServiceError as exc:
+        _raise_memory_service_error(exc)
+    return {"success": True}
+
+
+@agent_router.delete("/{agent_slug}/memories")
+async def clear_agent_memories(
+    agent_slug: str,
+    current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """清空当前用户在一个可见 Agent 下的全部长期记忆。"""
+    item = await AgentRepository(db).get_visible_by_slug(slug=agent_slug, user=current_user, kind="any")
+    if item is None:
+        raise HTTPException(status_code=404, detail="智能体不存在")
+    try:
+        await _memory_client().clear_memory_scope(str(current_user.uid), agent_slug)
+    except AgentScopeServiceError as exc:
+        _raise_memory_service_error(exc)
+    return {"success": True}
+
+
 @agent_router.delete("/{agent_id}")
 async def delete_agent(
     agent_id: str, current_user: User = Depends(get_required_user), db: AsyncSession = Depends(get_db)
@@ -264,6 +342,10 @@ async def delete_agent(
             status_code=409,
             detail=f"该智能体被 {len(referencing)} 个未归档任务引用，请先归档相关任务再删除",
         )
+    try:
+        await _memory_client().clear_memory_agent(str(current_user.uid), agent_slug)
+    except AgentScopeServiceError as exc:
+        _raise_memory_service_error(exc)
     # 归档后允许删除：置空引用，保留 slug 快照供历史展示
     await db.execute(
         AgentTask.__table__.update()

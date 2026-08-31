@@ -7,6 +7,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     Column,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -20,7 +21,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from yuxi.storage.minio.client import normalize_public_minio_url
-from yuxi.utils.datetime_utils import format_utc_datetime, utc_now_naive
+from yuxi.utils.datetime_utils import format_utc_datetime, utc_now, utc_now_naive
 
 Base = declarative_base()
 
@@ -182,6 +183,36 @@ class UserConfig(Base):
             "enable_memory": bool(self.enable_memory),
             "created_at": format_utc_datetime(self.created_at),
             "updated_at": format_utc_datetime(self.updated_at),
+        }
+
+
+class AgentMemoryScope(Base):
+    """用户与 Agent 共享的 ReMe Workspace 及 Dream 进度。"""
+
+    __tablename__ = "agent_memory_scopes"
+
+    uid = Column(String, ForeignKey("users.uid", ondelete="CASCADE"), primary_key=True)
+    agent_slug = Column(String(80), primary_key=True)
+    workspace_id = Column(String(64), nullable=False, unique=True, index=True)
+    last_memory_at = Column(DateTime(timezone=True), nullable=True)
+    last_dream_date = Column(Date, nullable=True)
+    dream_status = Column(String(16), nullable=True)
+    dream_attempted_at = Column(DateTime(timezone=True), nullable=True)
+    dream_error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        """返回管理 API 使用的 scope 状态。"""
+        return {
+            "uid": self.uid,
+            "agent_slug": self.agent_slug,
+            "workspace_id": self.workspace_id,
+            "last_memory_at": format_utc_datetime(self.last_memory_at),
+            "last_dream_date": self.last_dream_date.isoformat() if self.last_dream_date else None,
+            "dream_status": self.dream_status,
+            "dream_attempted_at": format_utc_datetime(self.dream_attempted_at),
+            "dream_error": self.dream_error,
         }
 
 

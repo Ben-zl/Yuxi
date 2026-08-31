@@ -7,11 +7,13 @@ import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from server.routers import auth_router as auth_router_module
 from server.routers.auth_router import delete_user
 from server.routers.user_router import APIKeyCreate, create_api_key
 from server.utils.auth_middleware import verify_api_key
 from yuxi.repositories import user_repository as user_repository_module
 from yuxi.repositories.user_repository import UserRepository
+from yuxi.agentscope.client import AgentScopeServiceError
 from yuxi.storage.postgres.models_business import APIKey, Base, Department, User
 from yuxi.utils.auth_utils import AuthUtils
 
@@ -156,8 +158,19 @@ async def test_create_api_key_allows_current_user_department(session):
     assert response.secret.startswith(response.api_key.key_prefix)
 
 
-async def test_delete_user_disables_owned_api_keys(session):
+async def test_delete_user_disables_owned_api_keys(session, monkeypatch):
     db = session["db"]
+    cleanup_calls = []
+
+    class FakeAgentScopeClient:
+        async def clear_memory_user(self, caller_uid, target_uid):
+            cleanup_calls.append((caller_uid, target_uid))
+
+    monkeypatch.setattr(
+        auth_router_module,
+        "AgentScopeServiceClient",
+        lambda _base_url: FakeAgentScopeClient(),
+    )
     _secret, key_hash, key_prefix = AuthUtils.generate_api_key()
     api_key = APIKey(
         key_hash=key_hash,
@@ -175,6 +188,28 @@ async def test_delete_user_disables_owned_api_keys(session):
 
     assert result["success"] is True
     assert api_key.is_enabled is False
+    assert cleanup_calls == [(session["superadmin"].uid, session["regular_user"].uid)]
+
+
+async def test_delete_user_stops_when_memory_cleanup_fails(session, monkeypatch):
+    """用户记忆清理失败时保持用户和 API Key 原状。"""
+    db = session["db"]
+
+    class FailingAgentScopeClient:
+        async def clear_memory_user(self, _caller_uid, _target_uid):
+            raise AgentScopeServiceError("cleanup failed", status_code=500)
+
+    monkeypatch.setattr(
+        auth_router_module,
+        "AgentScopeServiceClient",
+        lambda _base_url: FailingAgentScopeClient(),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await delete_user(session["regular_user"].id, None, session["superadmin"], db)
+
+    assert exc.value.status_code == 502
+    assert session["regular_user"].is_deleted == 0
 
 
 async def test_user_repository_soft_delete_disables_owned_api_keys(session, monkeypatch):

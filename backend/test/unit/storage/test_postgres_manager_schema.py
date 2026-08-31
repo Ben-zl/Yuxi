@@ -151,6 +151,30 @@ async def test_ensure_business_schema_creates_user_config_table():
 
 
 @pytest.mark.asyncio
+async def test_ensure_business_schema_creates_agent_memory_scope_catalog():
+    """长期记忆 scope catalog 必须可幂等创建并带查询索引。"""
+    manager = PostgresManager()
+    original_initialized = manager._initialized
+    original_engine = manager.async_engine
+    connection = _RecordingConnection()
+
+    manager._initialized = True
+    manager.async_engine = _RecordingEngine(connection)
+    try:
+        await manager.ensure_business_schema()
+    finally:
+        manager._initialized = original_initialized
+        manager.async_engine = original_engine
+
+    statements = "\n".join(connection.statements)
+
+    assert "CREATE TABLE IF NOT EXISTS agent_memory_scopes" in statements
+    assert "PRIMARY KEY (uid, agent_slug)" in statements
+    assert "workspace_id VARCHAR(64) NOT NULL UNIQUE" in statements
+    assert "ix_agent_memory_scopes_agent_slug" in statements
+
+
+@pytest.mark.asyncio
 async def test_ensure_business_schema_creates_generic_config_options_table():
     manager = PostgresManager()
     original_initialized = manager._initialized

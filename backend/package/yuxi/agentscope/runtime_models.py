@@ -17,6 +17,7 @@ from agentscope.model import (
     GeminiChatModel,
     OpenAIChatModel,
 )
+from agentscope.embedding import OpenAIEmbeddingModel
 from pydantic import Field
 
 
@@ -119,6 +120,45 @@ class YuxiGeminiChatModel(GeminiChatModel):
         )
 
 
+class YuxiOpenAIEmbeddingModel(OpenAIEmbeddingModel):
+    """适配 Yuxi 的 OpenAI-compatible Embedding 端点和自定义 Header。"""
+
+    def __init__(
+        self,
+        credential,
+        model: str,
+        dimensions: int,
+        *,
+        embedding_base_url: str | None = None,
+        parameters=None,
+        **kwargs,
+    ) -> None:
+        import openai
+
+        endpoint = str(embedding_base_url or credential.base_url or "").rstrip("/")
+        client_base_url = endpoint[: -len("/embeddings")] if endpoint.endswith("/embeddings") else endpoint
+        embedding_credential = credential.model_copy(
+            update={"base_url": client_base_url or None},
+        )
+        super().__init__(
+            credential=embedding_credential,
+            model=model,
+            dimensions=dimensions,
+            parameters=parameters,
+            pass_dimensions=False,
+            **kwargs,
+        )
+        client_kwargs: dict[str, Any] = {}
+        if client_base_url:
+            client_kwargs["base_url"] = client_base_url
+        if credential.default_headers:
+            client_kwargs["default_headers"] = credential.default_headers
+        self.client = openai.AsyncClient(
+            api_key=credential.api_key.get_secret_value(),
+            **client_kwargs,
+        )
+
+
 class YuxiOpenAICredential(OpenAICredential):
     """携带 Yuxi OpenAI-compatible 模型级运行参数的凭据。"""
 
@@ -131,6 +171,11 @@ class YuxiOpenAICredential(OpenAICredential):
     def get_chat_model_class(cls) -> type[ChatModelBase]:
         """返回消费 Yuxi 扩展字段的 OpenAI Adapter。"""
         return YuxiOpenAIChatModel
+
+    @classmethod
+    def get_embedding_model_class(cls):
+        """返回消费 Yuxi Header 与专用端点的 Embedding Adapter。"""
+        return YuxiOpenAIEmbeddingModel
 
 
 class YuxiAnthropicCredential(AnthropicCredential):

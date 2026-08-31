@@ -556,6 +556,23 @@ class PostgresManager(metaclass=SingletonMeta):
             "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS is_subagent BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE IF EXISTS user_config ADD COLUMN IF NOT EXISTS enable_memory BOOLEAN NOT NULL DEFAULT FALSE",
             """
+            CREATE TABLE IF NOT EXISTS agent_memory_scopes (
+                uid VARCHAR NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                agent_slug VARCHAR(80) NOT NULL,
+                workspace_id VARCHAR(64) NOT NULL UNIQUE,
+                last_memory_at TIMESTAMPTZ,
+                last_dream_date DATE,
+                dream_status VARCHAR(16),
+                dream_attempted_at TIMESTAMPTZ,
+                dream_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (uid, agent_slug)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_agent_memory_scopes_workspace_id ON agent_memory_scopes(workspace_id)",
+            "CREATE INDEX IF NOT EXISTS ix_agent_memory_scopes_agent_slug ON agent_memory_scopes(agent_slug)",
+            """
             UPDATE cli_auth_sessions
             SET api_key_id = NULL
             WHERE api_key_id IN (

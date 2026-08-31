@@ -145,6 +145,39 @@ def project_chat_model(provider: ModelProvider, model_id: str) -> tuple[dict, di
     return credential_data, chat_model_config
 
 
+def project_embedding_model(provider: ModelProvider, model_id: str) -> dict:
+    """投影 ReMe 使用的 OpenAI-compatible Embedding 模型。"""
+    if provider.provider_type != "openai":
+        raise ValueError(
+            f"Memory Embedding 暂仅支持 OpenAI-compatible provider，收到 {provider.provider_type}",
+        )
+    model = next(
+        (item for item in provider.enabled_models or [] if item.get("id") == model_id),
+        None,
+    )
+    if model is None or model.get("type") != "embedding":
+        raise ValueError(f"模型供应商 {provider.provider_id} 未启用 Embedding 模型 {model_id}")
+    dimensions = model.get("dimension")
+    if dimensions in (None, "") or int(dimensions) <= 0:
+        raise ValueError(f"Embedding 模型 {model_id} 未配置有效维度")
+
+    credential_data = {
+        "type": "yuxi_openai_credential",
+        "api_key": _resolve_api_key(provider),
+        "name": f"yuxi:{provider.provider_id}",
+    }
+    if provider.base_url:
+        credential_data["base_url"] = provider.base_url
+    if provider.headers_json:
+        credential_data["default_headers"] = dict(provider.headers_json)
+    return {
+        "credential_data": credential_data,
+        "model": model_id,
+        "dimensions": int(dimensions),
+        "base_url": model.get("base_url_override") or provider.embedding_base_url or provider.base_url,
+    }
+
+
 def permission_mode_for(tool_approval_mode: str | None) -> str:
     """yuxi 审批模式 → agentscope 会话权限模式。
 

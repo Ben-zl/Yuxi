@@ -165,6 +165,52 @@ class AgentScopeServiceClient:
             if not missing_ok or exc.status_code != 404:
                 raise
 
+    async def list_memories(self, uid: str, agent_slug: str, **params) -> dict:
+        """读取当前用户在指定 Agent scope 下的长期记忆卡片。"""
+        resp = await self._request(
+            "GET",
+            "/yuxi/memory",
+            uid,
+            params={"agent_slug": agent_slug, **params},
+        )
+        return resp.json()
+
+    async def delete_memory_item(self, uid: str, agent_slug: str, memory_id: str) -> None:
+        """删除一张长期记忆卡片并重建索引。"""
+        await self._request(
+            "DELETE",
+            "/yuxi/memory/item",
+            uid,
+            params={"agent_slug": agent_slug, "memory_id": memory_id},
+        )
+
+    async def clear_memory_scope(self, uid: str, agent_slug: str) -> None:
+        """清空当前用户在指定 Agent 下的长期记忆。"""
+        await self._request(
+            "DELETE",
+            "/yuxi/memory/scope",
+            uid,
+            params={"agent_slug": agent_slug},
+        )
+
+    async def clear_memory_agent(self, uid: str, agent_slug: str) -> None:
+        """删除指定 Agent 在全部用户下的长期记忆。"""
+        await self._request(
+            "DELETE",
+            "/yuxi/memory/agent",
+            uid,
+            params={"agent_slug": agent_slug},
+        )
+
+    async def clear_memory_user(self, caller_uid: str, target_uid: str) -> None:
+        """删除目标用户的全部长期记忆。"""
+        await self._request(
+            "DELETE",
+            "/yuxi/memory/user",
+            caller_uid,
+            params={"uid": target_uid},
+        )
+
     async def add_workspace_skill(self, uid: str, agent_id: str, session_id: str, skill_path: str) -> None:
         """把已授权 Skill 安装到指定会话 workspace。"""
         await self._request(

@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from yuxi.agentscope.projection import project_agent_request, project_subagent_template
+from yuxi.agentscope.projection import (
+    project_agent_request,
+    project_embedding_model,
+    project_subagent_template,
+)
 
 
 def test_project_agent_request_uses_native_context_config():
@@ -59,3 +63,32 @@ def test_project_agent_request_rejects_invalid_context_config(context, message):
 
     with pytest.raises(ValueError, match=message):
         project_agent_request(agent)
+
+
+def test_project_embedding_model_uses_embedding_endpoint_headers_and_dimension():
+    """Memory Embedding 必须消费 provider 的专用端点与模型维度。"""
+    provider = SimpleNamespace(
+        provider_id="openai-compatible",
+        provider_type="openai",
+        api_key="secret",
+        api_key_env=None,
+        embedding_base_url="https://example.test/v1/embeddings",
+        base_url="https://example.test/v1",
+        headers_json={"X-Tenant": "alpha"},
+        enabled_models=[{"id": "embed-v1", "type": "embedding", "dimension": 1024}],
+    )
+
+    projected = project_embedding_model(provider, "embed-v1")
+
+    assert projected == {
+        "credential_data": {
+            "type": "yuxi_openai_credential",
+            "api_key": "secret",
+            "name": "yuxi:openai-compatible",
+            "base_url": "https://example.test/v1",
+            "default_headers": {"X-Tenant": "alpha"},
+        },
+        "model": "embed-v1",
+        "dimensions": 1024,
+        "base_url": "https://example.test/v1/embeddings",
+    }

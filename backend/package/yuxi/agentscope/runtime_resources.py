@@ -111,6 +111,7 @@ async def resolve_runtime_projection(
                 agent_slug=mapping.agent_slug,
                 model_spec=mapping.model_spec,
                 thread_id=mapping.thread_id,
+                is_team_worker=False,
             )
 
         binding_repo = AgentScopeTeamWorkerRepository(db)
@@ -149,4 +150,5 @@ async def resolve_runtime_projection(
         agent_slug=runtime_agent_slug or mapping.agent_slug,
         model_spec=mapping.model_spec,
         thread_id=mapping.thread_id,
+        is_team_worker=runtime_agent_slug is not None,
     )

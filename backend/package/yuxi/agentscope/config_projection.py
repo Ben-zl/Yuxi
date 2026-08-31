@@ -19,6 +19,7 @@ from yuxi.agentscope.projection import (
     is_lite_mode,
     project_agent_request,
     project_chat_model,
+    project_embedding_model,
     project_subagent_template,
     split_model_spec,
 )
@@ -46,6 +47,10 @@ class RuntimeProjection:
     mcp_servers: list[dict] = field(default_factory=list)
     knowledge_slugs: list[str] | None = None
     subagent_templates: list[dict] = field(default_factory=list)
+    memory_enabled: bool = False
+    memory_chat_model_config: dict | None = None
+    memory_embedding_model_config: dict | None = None
+    is_team_worker: bool = False
 
 
 def adapt_prompt_paths_for_agentscope(prompt: str) -> str:
@@ -95,6 +100,8 @@ async def project_runtime(
     agent_slug: str,
     model_spec: str | None = None,
     thread_id: str | None = None,
+    is_team_worker: bool = False,
+    include_memory_models: bool = False,
 ) -> RuntimeProjection:
     """统一投影入口：读取 yuxi 配置并产出该线程运行的全部运行时对象。"""
     user = await _load_user(db, uid)
@@ -132,7 +139,28 @@ async def project_runtime(
         agent_request=agent_request,
         credential_data=credential_data,
         chat_model_config=chat_model_config,
+        is_team_worker=is_team_worker,
     )
+
+    from yuxi.config import UserConfig, config as sys_config
+
+    user_config = await UserConfig.load(db, uid)
+    projection.memory_enabled = bool(user_config.schema.enable_memory and not is_team_worker)
+    if projection.memory_enabled or (include_memory_models and not is_team_worker):
+        fast_provider_id, fast_model_id = split_model_spec(sys_config.fast_model)
+        fast_provider = await _load_provider(db, fast_provider_id)
+        memory_credential, memory_chat_config = project_chat_model(fast_provider, fast_model_id)
+        projection.memory_chat_model_config = {
+            "credential_data": memory_credential,
+            "model_config": memory_chat_config,
+        }
+
+        embed_provider_id, embed_model_id = split_model_spec(sys_config.embed_model)
+        embed_provider = await _load_provider(db, embed_provider_id)
+        projection.memory_embedding_model_config = project_embedding_model(
+            embed_provider,
+            embed_model_id,
+        )
 
     # 资源列表：None 表示全部可用（BaseContext 语义）
     accessible_skills = await list_accessible_skills(db, user)
