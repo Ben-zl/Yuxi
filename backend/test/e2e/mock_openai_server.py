@@ -125,6 +125,25 @@ def _team_next_call(body: dict):
     """团队编排：TeamCreate → AgentCreate → TeamDelete → 总结。"""
     called = _assistant_tool_names(body)
     context = json.dumps(body.get("messages") or [], ensure_ascii=False)
+    if "worker 缺参回报验证" in context:
+        subagent_types = _subagent_types(body)
+        if "TeamCreate" not in called:
+            return "TeamCreate", {"name": "e2e-missing-input-team", "description": "worker 缺参回报验证"}
+        if "AgentCreate" not in called:
+            return "AgentCreate", {
+                "name": "worker-1",
+                "description": "e2e 缺参子智能体",
+                "prompt": "执行 worker 缺参回报验证；缺少 AUTOMATION_PROJECT_ID，必须向 leader 回报。",
+                "subagent_type": subagent_types[0],
+            }
+        worker_reported = any(
+            '<team-message from="worker-1">' in _message_text(message)
+            for message in body.get("messages") or []
+            if message.get("role") == "user"
+        )
+        if worker_reported and "TeamDelete" not in called:
+            return "TeamDelete", {}
+        return None
     if "双 worker 回环验证" in context:
         created = {str(item.get("name") or "") for item in _assistant_tool_inputs(body, "AgentCreate")}
         subagent_types = _subagent_types(body)
@@ -234,9 +253,22 @@ def _matched_tool_trigger(body: dict):
         )
     if "<team-message" in joined and "TeamSay" in tool_names and "AgentCreate" not in tool_names:
         if "TeamSay" not in _assistant_tool_names(body):
+            if "worker 缺参回报验证" in joined:
+                if "ask_user_question" in tool_names:
+                    return TOOL_TRIGGERS["需要确认方案"]
+                return "TeamSay", {
+                    "content": "缺少 AUTOMATION_PROJECT_ID，无法继续执行。",
+                    "to": None,
+                }
             return "TeamSay", {"content": "worker 已完成调研并给出三点结论", "to": None}
+        return None
     # 团队编排是状态机（多轮工具调用），先于一次性触发的工具结果短路
-    if "组建团队" in joined or "简短调研" in joined or "双 worker 回环验证" in joined:
+    if (
+        "组建团队" in joined
+        or "简短调研" in joined
+        or "双 worker 回环验证" in joined
+        or "worker 缺参回报验证" in joined
+    ):
         return _team_next_call(body)
     if "调用技能依赖" in joined:
         return _skill_gateway_next_call(body)

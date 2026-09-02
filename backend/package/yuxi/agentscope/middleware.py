@@ -249,8 +249,27 @@ class TeamLifecycleMiddleware(MiddlewareBase):
         self._is_worker = is_worker
 
     async def on_acting(self, agent, input_kwargs, next_handler):
-        """观察 AgentCreate roster 差分，并把 TeamDelete 收口到父线程删除。"""
+        """幂等保留 Team，并观察 AgentCreate roster 差分。"""
         tool_call = input_kwargs["tool_call"]
+        if tool_call.name == "TeamCreate":
+            current = await self._lifecycle.snapshot()
+            if current.team_id:
+                from agentscope.message import TextBlock, ToolResultState
+                from agentscope.tool import ToolResponse
+
+                yield ToolResponse(
+                    content=[
+                        TextBlock(
+                            text=(
+                                f"Team {current.team_id} already exists and is retained for this parent thread. "
+                                "Use AgentCreate directly to add workers."
+                            )
+                        )
+                    ],
+                    state=ToolResultState.SUCCESS,
+                )
+                return
+
         if tool_call.name == "TeamDelete":
             from agentscope.message import TextBlock, ToolResultState
             from agentscope.tool import ToolResponse
@@ -291,7 +310,12 @@ class TeamLifecycleMiddleware(MiddlewareBase):
             async for item in next_handler(**input_kwargs):
                 yield item
             return
-        async for item in self._lifecycle.project_worker_reply(input_kwargs, next_handler):
+        cache_input_mode = cache_input_mode_for_model(agent.model)
+        async for item in self._lifecycle.project_worker_reply(
+            input_kwargs,
+            next_handler,
+            cache_input_mode=cache_input_mode,
+        ):
             yield item
 
     async def on_reasoning(self, agent, input_kwargs, next_handler):

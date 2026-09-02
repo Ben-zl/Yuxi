@@ -11,7 +11,7 @@ from typing import Any
 
 from yuxi.agentscope.protocol import ToolEventConverter, event_to_chunks, make_chunk, reply_end_to_terminal
 from yuxi.agentscope.team_protocol import resolve_worker_team_leader
-from yuxi.agentscope.usage import UsageAccumulator
+from yuxi.agentscope.usage import CacheInputMode, UsageAccumulator
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_repository import AgentRunRepository, TERMINAL_RUN_STATUSES
 from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerRepository
@@ -241,7 +241,13 @@ class TeamLifecycleModule:
             thread_id=child_thread_id,
         )
 
-    async def project_worker_reply(self, input_kwargs: dict, next_handler) -> AsyncIterator[Any]:
+    async def project_worker_reply(
+        self,
+        input_kwargs: dict,
+        next_handler,
+        *,
+        cache_input_mode: CacheInputMode = "unknown",
+    ) -> AsyncIterator[Any]:
         """透传 worker Reply，同时把事件、历史、用量和终态写入 child Run。"""
         binding = await self._wait_for_binding()
         if binding is None:
@@ -254,7 +260,10 @@ class TeamLifecycleModule:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_converter: ToolEventConverter | None = None
-        usage = UsageAccumulator(configured_model_spec=None)
+        usage = UsageAccumulator(
+            configured_model_spec=None,
+            native_cache_input_mode=cache_input_mode,
+        )
         reply_id: str | None = None
         prompt: str | None = None
         leader_name = await self.resolve_leader_name()

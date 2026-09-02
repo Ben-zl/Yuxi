@@ -54,6 +54,57 @@ async def test_failed_worker_reply_uses_native_notification_and_finishes_once(mo
     assert order == [("finish", "failed")]
 
 
+async def test_worker_reply_projects_native_anthropic_cache_usage(monkeypatch):
+    """worker 原生事件必须按实际 provider 口径写入缓存用量。"""
+    lifecycle = TeamLifecycleModule(
+        storage=_worker_storage(),
+        uid="u",
+        agent_id="worker-agent",
+        session_id="worker-session",
+    )
+    binding = SimpleNamespace(worker_session_id="worker-session", child_thread_id="child-thread")
+    monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
+    monkeypatch.setattr(lifecycle, "_open_worker_run", AsyncMock(return_value=("child-run", "child-request")))
+    finish_run = AsyncMock(return_value="completed")
+    monkeypatch.setattr(lifecycle, "_finish_worker_run", finish_run)
+    monkeypatch.setattr(team_lifecycle, "append_run_stream_event", AsyncMock())
+
+    async def _reply(**_kwargs):
+        yield {"type": "REPLY_START", "reply_id": "reply-1"}
+        yield {
+            "type": "MODEL_CALL_START",
+            "reply_id": "reply-1",
+            "model_name": "claude-test",
+        }
+        yield {
+            "type": "MODEL_CALL_END",
+            "reply_id": "reply-1",
+            "input_tokens": 39,
+            "output_tokens": 5,
+            "cache_input_tokens": 128,
+            "cache_creation_input_tokens": 3,
+        }
+        yield {"type": "REPLY_END", "reply_id": "reply-1", "finished_reason": "completed"}
+
+    assert [
+        item
+        async for item in lifecycle.project_worker_reply(
+            {},
+            _reply,
+            cache_input_mode="additive",
+        )
+    ]
+    usage = finish_run.await_args.kwargs["usage"]
+    assert usage["input_tokens"] == 170
+    assert usage["output_tokens"] == 5
+    model_usage = usage["run"]["models"]["claude-test"]
+    assert model_usage["cache_read_input_tokens"] == 128
+    assert model_usage["cache_creation_input_tokens"] == 3
+    assert model_usage["cache_observed_input_tokens"] == 170
+    assert model_usage["cache_observed_call_count"] == 1
+    assert model_usage["cache_hit_ratio"] == 128 / 170
+
+
 async def test_intermediate_reply_ends_are_candidates_until_generator_exhausts(monkeypatch):
     """原生纠正循环吞掉的中间 REPLY_END 不得提前结束 child Run。"""
     order = []

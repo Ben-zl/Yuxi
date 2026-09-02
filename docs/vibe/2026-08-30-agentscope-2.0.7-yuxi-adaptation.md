@@ -49,7 +49,9 @@ ID 仍为空时显式失败，不从目录名猜测。
 - `unknown`：保留 raw input，不展示缓存命中率。
 
 完整的 Yuxi `model_usage` 优先于同一 `reply_id` 的原生 `MODEL_CALL_END`。只有真实观察到
-缓存字段时才累计缓存分母，不回填历史缺失用量。
+缓存字段时才累计缓存分母，不回填历史缺失用量。Team worker 的 reply generator 不包含
+MessageBus 自定义用量事件，因此 child Run 从实际 `Agent.model` 适配器继承缓存输入口径，再归一
+原生 `MODEL_CALL_END` 的缓存字段；未知适配器仍保持 `unknown`，不得猜测或虚构命中率。
 
 ## Team worker 回报契约
 
@@ -61,6 +63,9 @@ Yuxi 在 worker 运行时用同名工具覆盖原生 `TeamSay`：从 AgentScope 
 工具结果以 `team_target` 记录实际目标；child Run 只接受 leader 派发消息，peer HintBlock 不进入
 模型上下文，也不创建新 Run。leader 的原生工具与 Team middleware 行为保持不变。
 
+Team 保留到 parent Thread 删除后，后续轮次重复调用 `TeamCreate` 时由 Yuxi 幂等返回当前
+`team_id`，并提示直接调用 `AgentCreate`；仅 Session 尚无 Team 时才透传 AgentScope 原生创建逻辑。
+
 ## 验收 Checklist
 
 - [x] `uv lock --check` 与 AgentScope 版本导入检查通过。
@@ -68,6 +73,7 @@ Yuxi 在 worker 运行时用同名工具覆盖原生 `TeamSay`：从 AgentScope 
 - [x] Schema、Workspace ID 创建/回填、路径安全和删除重试测试通过。
 - [x] Team 原生 middleware 真实顺序测试通过，每个 child Run 只有一个终态。
 - [x] Anthropic/OpenAI/Gemini 单来源、双来源和中断用量测试通过。
+- [x] Team worker 原生 Anthropic 缓存字段 additive 归一和重复 `TeamCreate` 幂等单测通过。
 - [x] 最大迭代同时保留文本和 `exceed_max_iters` 失败事实。
 - [x] 独立数据卷完成 2.0.6 -> 2.0.7 升级和 2.0.7 -> 2.0.6 回滚演练。
 - [x] 真实浏览器验证普通聊天、Team 单一 child 终态和 MiniMax 缓存展示。
@@ -86,6 +92,10 @@ Yuxi 在 worker 运行时用同名工具覆盖原生 `TeamSay`：从 AgentScope 
 - 双 worker 真实 API E2E 中两个 worker 均调用原始参数 `TeamSay(to=null)`；parent 和两个 child
   Run 均 completed，数据库最终只有 2 个 child Run 和 2 次 `TeamSay`，线程删除成功。单 worker
   与双 worker 用例在同一 pytest 进程连续通过。
+- 在原问题 Thread `93c32e06-0344-490c-bcc5-369adb5ffddc` 继续真实浏览器对话，强制再次调用
+  `TeamCreate` 后，`TeamCreate`、`AgentCreate`、`TeamDelete` 均一次成功，parent/child Run 均
+  completed。新 child Run 按 `additive` 记录输入 `28,761`、缓存读取 `19,101`、命中率
+  `66.41%`，Redis Stream 仅 1 个 `end`；页面线程累计缓存命中率显示 `90.3%`。
 - 原问题 Thread `42588b21-6f02-4caf-b373-65e240788f12` 保留故障期间 2 个 binding、
   41 个历史 child Run 和 40 次历史 `TeamSay`；修复后连续 10 秒观测均未增长。历史消息不自动
   删除，后续 worker 回报使用新的定向协议。

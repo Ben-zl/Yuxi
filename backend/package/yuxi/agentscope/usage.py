@@ -64,6 +64,7 @@ class UsageAccumulator:
     """按 AgentScope 模型调用事件累计一轮真实 token 用量。"""
 
     configured_model_spec: str | None = None
+    native_cache_input_mode: CacheInputMode = "unknown"
     current_model: str | None = None
     reply_models: dict[str, str] = field(default_factory=dict)
     reply_cache_modes: dict[str, CacheInputMode] = field(default_factory=dict)
@@ -173,7 +174,7 @@ class UsageAccumulator:
         if not call_key:
             call_key = f"native:{len(self.calls)}:{len(self.pending_native_usages)}"
             self.reply_models[call_key] = self.current_model or self.configured_model_spec or "unknown_model"
-        cache_input_mode = self.reply_cache_modes.get(call_key, "unknown")
+        cache_input_mode = self.reply_cache_modes.get(call_key, self.native_cache_input_mode)
         self.pending_native_usages[call_key] = self._normalize_usage(
             raw_input_tokens=event.get("input_tokens", 0),
             output_tokens=event.get("output_tokens", 0),

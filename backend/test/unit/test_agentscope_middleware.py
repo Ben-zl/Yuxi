@@ -302,6 +302,44 @@ async def test_team_delete_is_retained_without_calling_agentscope_delete():
     assert result[0].state == ToolResultState.SUCCESS
 
 
+async def test_existing_team_create_is_idempotent_without_calling_agentscope_create():
+    """长期 Team 已存在时，重复 TeamCreate 应直接返回当前 Team。"""
+    lifecycle = SimpleNamespace(
+        snapshot=AsyncMock(
+            return_value=SimpleNamespace(
+                team_id="team-existing",
+                members={"worker-session": ("worker-agent", "created")},
+            )
+        )
+    )
+    middleware = TeamLifecycleMiddleware(lifecycle, is_worker=False)
+    tool_call = SimpleNamespace(name="TeamCreate", input="{}", id="create-team-2")
+
+    async def next_handler(**_kwargs):
+        raise AssertionError("已有 Team 时不应执行 AgentScope TeamCreate")
+        yield
+
+    result = [item async for item in middleware.on_acting(None, {"tool_call": tool_call}, next_handler)]
+
+    assert len(result) == 1
+    assert isinstance(result[0], ToolResponse)
+    assert result[0].state == ToolResultState.SUCCESS
+    assert "team-existing" in result[0].content[0].text
+    assert "AgentCreate" in result[0].content[0].text
+
+
+async def test_team_create_without_existing_team_uses_agentscope_create():
+    """Session 尚无 Team 时必须保留 AgentScope 原生创建行为。"""
+    lifecycle = SimpleNamespace(
+        snapshot=AsyncMock(return_value=SimpleNamespace(team_id=None, members={})),
+    )
+    middleware = TeamLifecycleMiddleware(lifecycle, is_worker=False)
+    tool_call = SimpleNamespace(name="TeamCreate", input="{}", id="create-team-1")
+    response = ToolChunk(content=[TextBlock(text="created")])
+
+    assert await _collect_acting(middleware, tool_call, [response]) == [response]
+
+
 async def test_team_delete_emits_one_terminal_tool_result_event():
     """TeamDelete 必须完成 AgentScope 工具生命周期，且不执行原删除工具。"""
 
@@ -349,11 +387,12 @@ async def test_agent_create_projects_the_single_roster_delta_before_returning_re
     )
 
 
-async def test_only_worker_reply_enters_team_lifecycle_projection():
+async def test_only_worker_reply_enters_team_lifecycle_projection(monkeypatch):
     calls = []
+    monkeypatch.setattr("yuxi.agentscope.middleware.cache_input_mode_for_model", lambda _model: "additive")
 
-    async def project_worker_reply(input_kwargs, next_handler):
-        calls.append(input_kwargs)
+    async def project_worker_reply(input_kwargs, next_handler, *, cache_input_mode):
+        calls.append((input_kwargs, cache_input_mode))
         async for item in next_handler(**input_kwargs):
             yield item
 
@@ -366,8 +405,9 @@ async def test_only_worker_reply_enters_team_lifecycle_projection():
     worker = TeamLifecycleMiddleware(lifecycle, is_worker=True)
     assert [item async for item in leader.on_reply(None, {"inputs": "leader"}, next_handler)] == ["reply"]
     assert calls == []
-    assert [item async for item in worker.on_reply(None, {"inputs": "worker"}, next_handler)] == ["reply"]
-    assert calls == [{"inputs": "worker"}]
+    worker_agent = SimpleNamespace(model=object())
+    assert [item async for item in worker.on_reply(worker_agent, {"inputs": "worker"}, next_handler)] == ["reply"]
+    assert calls == [({"inputs": "worker"}, "additive")]
 
 
 @pytest.mark.parametrize(

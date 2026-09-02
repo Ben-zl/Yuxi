@@ -166,6 +166,7 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
     """每轮 chat 按会话注入 yuxi 工具（KB 工具按可见性，LITE 自动裁剪）。"""
     from yuxi.agentscope.tools import (
         build_extra_tools,
+        filter_runtime_tools_for_role,
         build_kb_tools,
         build_mcp_tools,
         build_shared_workspace_tools,
@@ -230,7 +231,10 @@ async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> li
             session_id=session_id,
         )
     )
-    return tools
+    return filter_runtime_tools_for_role(
+        tools,
+        is_team_worker=projection.is_team_worker,
+    )
 
 
 def _setup_otel_if_configured() -> None:

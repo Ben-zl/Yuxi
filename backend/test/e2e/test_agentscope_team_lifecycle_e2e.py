@@ -169,6 +169,123 @@ async def test_team_worker_projects_child_thread_run_history_and_binding(
         await _delete_agent(e2e_client, e2e_headers, subagent_slug)
 
 
+async def test_team_worker_reports_missing_input_without_direct_user_question(
+    e2e_client: httpx.AsyncClient,
+    e2e_headers: dict[str, str],
+    e2e_agent_context: dict[str, str],
+):
+    """worker 即使配置主动提问工具，也只能通过 TeamSay 向 leader 回报缺参。"""
+    uid = e2e_agent_context["uid"]
+    suffix = uuid.uuid4().hex[:8]
+    subagent_slug = f"e2e-team-missing-input-child-{suffix}"
+    leader_slug = f"e2e-team-missing-input-leader-{suffix}"
+    thread_id = None
+
+    pg_manager.initialize()
+    async with pg_manager.get_async_session_context() as db:
+        await upsert_mock_provider(db)
+    refresh = await e2e_client.post(
+        "/api/system/model-providers/models/cache/refresh",
+        headers=e2e_headers,
+    )
+    assert refresh.status_code == 200, refresh.text
+
+    base_context = {
+        "model": f"{PROVIDER_ID}:mock-chat-model",
+        "knowledges": [],
+        "mcps": [],
+        "skills": [],
+    }
+    try:
+        await _create_agent(
+            e2e_client,
+            e2e_headers,
+            uid=uid,
+            slug=subagent_slug,
+            subagent=True,
+            context={
+                **base_context,
+                "tools": ["ask_user_question"],
+                "subagents": [],
+                "system_prompt": "缺少执行参数时向 leader 回报，由 leader 决定是否询问用户。",
+            },
+        )
+        await _create_agent(
+            e2e_client,
+            e2e_headers,
+            uid=uid,
+            slug=leader_slug,
+            subagent=False,
+            context={
+                **base_context,
+                "tools": ["ask_user_question"],
+                "subagents": [subagent_slug],
+                "system_prompt": "创建 worker 执行任务，并处理 worker 回报的缺失参数。",
+            },
+        )
+        thread_id = await _create_thread(e2e_client, e2e_headers, leader_slug)
+        response = await e2e_client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请执行 worker 缺参回报验证并汇总结果。",
+                "agent_slug": leader_slug,
+                "thread_id": thread_id,
+                "meta": {"request_id": f"team-missing-input-{uuid.uuid4()}"},
+            },
+            headers=e2e_headers,
+        )
+        assert response.status_code == 200, response.text
+        parent_run_id = str(response.json()["run_id"])
+        parent_events = await asyncio.wait_for(
+            _consume_until_end(e2e_client, e2e_headers, parent_run_id),
+            timeout=120,
+        )
+        assert not any(item.get("status") == "ask_user_question_required" for item in parent_events)
+
+        parent_run = await _wait_for_run(e2e_client, e2e_headers, parent_run_id)
+        assert parent_run["status"] == "completed", parent_run
+
+        state = await e2e_client.get(
+            f"/api/chat/thread/{thread_id}/state",
+            headers=e2e_headers,
+        )
+        assert state.status_code == 200, state.text
+        child_runs = (state.json().get("agent_state") or {}).get("subagent_runs") or []
+        assert len(child_runs) == 1, state.json()
+        assert child_runs[0]["status"] == "completed", child_runs[0]
+
+        async with pg_manager.get_async_session_context() as db:
+            from sqlalchemy import select
+
+            from yuxi.storage.postgres.models_business import AgentRun, Message, ToolCall
+
+            child_tool_names = (
+                await db.scalars(
+                    select(ToolCall.tool_name)
+                    .join(Message, Message.id == ToolCall.message_id)
+                    .join(AgentRun, AgentRun.id == Message.run_id)
+                    .where(AgentRun.id == child_runs[0]["run_id"])
+                )
+            ).all()
+            assert child_tool_names.count("TeamSay") == 1, child_tool_names
+            assert "ask_user_question" not in child_tool_names
+
+        deleted = await e2e_client.delete(
+            f"/api/chat/thread/{thread_id}",
+            headers=e2e_headers,
+        )
+        assert deleted.status_code == 200, deleted.text
+        thread_id = None
+    finally:
+        if thread_id is not None:
+            await e2e_client.delete(
+                f"/api/chat/thread/{thread_id}",
+                headers=e2e_headers,
+            )
+        await _delete_agent(e2e_client, e2e_headers, leader_slug)
+        await _delete_agent(e2e_client, e2e_headers, subagent_slug)
+
+
 async def test_two_workers_do_not_create_broadcast_acknowledgement_loop(
     e2e_client: httpx.AsyncClient,
     e2e_headers: dict[str, str],

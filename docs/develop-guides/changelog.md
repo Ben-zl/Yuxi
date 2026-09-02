@@ -16,12 +16,13 @@
 
 - 完成 AgentScope 收口：统一投影逐轮装配 HTTP MCP、知识库与按用户/session 隔离的 Team worker 模板，凭据不进入 workspace；动态模板自动保留 `TeamSay` 回报协议，避免自定义系统提示覆盖团队协作约束；失败运行会继续派发 FIFO；线程状态改由 Yuxi 事实源聚合；移除 LangChain/LangGraph/DeepAgents 运行代码、依赖及无效摘要配置。
 - 消息渠道发起的会话继续持久化 Conversation、Message、AgentRun、ToolCall 与 Token 用量，但不再出现在用户会话列表、搜索结果和工作区历史中；超级管理员 Dashboard 仍保留完整审计数据。WPS 协作渠道移除模型覆盖配置，始终跟随绑定智能体的当前模型。
+- 平台中文名称由“语析”统一调整为“Agent智能体平台”，同步网页标题、默认品牌配置、智能体身份及项目文档，英文项目标识 Yuxi 保持不变。
 - 公共智能体系统提示词新增产出物交付约束：最终文件写入 outputs 后必须调用 `present_artifacts`，由主智能体统一登记并展示，临时文件不纳入交付。
-- 修复 Team worker 首轮默认 20 次迭代导致的 `exceed_max_iters`：子智能体模板继承 `max_execution_steps`；回报协议仅通知 leader；worker 完成后未主动 `TeamSay` 时由平台代发完整结果并触发 leader 续写；失败重试只保留最新 Team 指令；后续 TeamReply Run 写入稳定展示标识，历史缺失 `tool_call_id` 的 Run 不再导致线程状态接口 500；保留模式的 TeamDelete 返回终态响应。
+- 修复 Team worker 首轮默认 20 次迭代导致的 `exceed_max_iters`：子智能体模板继承 `max_execution_steps`；worker 不再暴露无法由子线程恢复的 `ask_user_question`，缺参改由 `TeamSay` 回报 leader；失败重试只保留最新 Team 指令；后续 TeamReply Run 写入稳定展示标识，历史缺失 `tool_call_id` 的 Run 不再导致线程状态接口 500；保留模式的 TeamDelete 返回终态响应。
 - 修复执行后取消的 AgentRun 对话内容为空：历史接口在已有助手输出时保留 cancelled/rejected 用户消息；Team worker 中断后即使缺少 `REPLY_END` 也会结束 child Run，父 Run 异常路径按取消信号归一为 cancelled；未执行的排队取消请求仍保持隐藏。
 - 修复 AgentScope 后台续写遗留提问挂起后普通消息无回复：Yuxi 无 pending 事实时先中断陈旧等待态再执行新消息；失败 Run 没有助手输出时，历史仍持续展示明确错误原因。
-- 升级 AgentScope 至 2.0.7.post1：持久化 parent/worker Workspace ID 并清理新旧目录与残留容器；Team worker 的空目标回报定向归一到 leader，避免 peer 互唤和重复 child Run；按 provider 归一缓存 Token 并按 reply 去重；最大迭代保留文本和失败事实。
-- 接入 AgentScope ReMe 长期记忆：按用户与 Agent 隔离并跨对话共享，使用 BM25/向量混合检索和每日 Dream，Team worker 不装配记忆；新增长期记忆管理接口与前端弹窗，支持筛选、分页、单项删除和清空，Agent、用户删除前同步清理相关 scope。
+- 升级 AgentScope 至 2.0.7.post1：持久化 parent/worker Workspace ID，清理新旧目录与残留容器；Team worker 空目标回报定向到 leader，避免 peer 互唤；长期 Team 重复 `TeamCreate` 幂等复用；worker 用量按实际模型适配器归一并去重；最大迭代保留文本和失败事实。
+- 接入 AgentScope ReMe 长期记忆：按用户与 Agent 隔离并跨对话共享，使用 BM25/向量混合检索和每日 Dream；新增高置信 Daily 归并、归档隐藏、Digest 优先召回与 Dream 后 reindex，避免跨 Session 近重复和 pending 状态污染；Team worker 不装配记忆，“编辑智能体”的“记忆”页签支持管理。
 - 修复开发环境 ARQ worker 异常后只留下 `watchfiles` 与 zombie 子进程、容器假存活：监督器自动重启 ARQ 并保留热重载，Compose 增加真实 healthcheck；启动恢复同时接管 `pending/running` Run，清理确定性 Job 的陈旧 retry/in-progress 状态后重新投递。
 - 补齐 AgentScope 功能对齐：Team worker 保留生命周期并按子智能体配置装配资源；Token 卡片与 Dashboard 使用真实 Run/线程累计用量，合并 Anthropic 兼容流在 `message_delta` 上报的输入与缓存用量；Summary 映射到上下文压缩；文件树提示 500 项截断；Steer 在工具批次后接力；主动提问支持刷新恢复与回答续接。
 - 新增 Agent 任务中心（工单 01-11）：以 NativeScheduleBlockMiddleware 在模型调用边界移除 AgentScope 原生 Schedule 工具；建立 AgentTask/TaskExecution 领域模型与 CRUD、手动/API/定时三入口触发收口、任务级 FIFO 串行队列与崩溃恢复；定时规则编译为 5 段 POSIX Cron 并按 IANA 时区计算下次运行，APScheduler DOW 约定差异在构造前统一转换；支持部门共享、执行身份审批隔离、Agent 删除阻断；前端新增任务中心页面（列表/创建/编辑/详情/执行历史/线程）与 SSE 事件流/产物只读接口。

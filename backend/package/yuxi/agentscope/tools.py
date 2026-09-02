@@ -328,6 +328,13 @@ def build_ask_user_question_tool():
     return AskUserQuestion()
 
 
+def filter_runtime_tools_for_role(tools: list, *, is_team_worker: bool) -> list:
+    """移除 Team worker 无法通过当前用户线程恢复的直接提问工具。"""
+    if not is_team_worker:
+        return tools
+    return [tool for tool in tools if getattr(tool, "name", None) != "ask_user_question"]
+
+
 def build_media_reader_tool(workspace):
     """构建独立图片/PDF读取工具，避免修改 AgentScope 内置 Read。"""
     if workspace is None:

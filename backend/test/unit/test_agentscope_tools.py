@@ -11,6 +11,20 @@ from yuxi.agentscope import tools
 pytestmark = pytest.mark.unit
 
 
+def test_team_worker_runtime_tools_exclude_direct_user_question():
+    """Team worker 不能进入只有顶层 Thread 才能恢复的用户问答等待态。"""
+    runtime_tools = [
+        SimpleNamespace(name="Bash"),
+        SimpleNamespace(name="ask_user_question"),
+        SimpleNamespace(name="TeamSay"),
+    ]
+
+    filtered = tools.filter_runtime_tools_for_role(runtime_tools, is_team_worker=True)
+
+    assert [tool.name for tool in filtered] == ["Bash", "TeamSay"]
+    assert tools.filter_runtime_tools_for_role(runtime_tools, is_team_worker=False) == runtime_tools
+
+
 def _summary(kb_id: str, name: str) -> SimpleNamespace:
     return SimpleNamespace(kb_id=kb_id, name=name, description=f"{name} 描述", kb_type="milvus")
 
