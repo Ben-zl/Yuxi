@@ -135,3 +135,9 @@ make format        # 格式化代码
 1. 参考 [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) 规范编写提交信息。
 2. 使用中文提交信息，标题简洁明了，描述具体改动内容和原因。
 3. 创建 PR 必须参考 [contributing.md](docs/develop-guides/contributing.md) 以及 PR 模板[PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md)，并在提交前完成其中的检查项。
+
+## GitHub 远端发布约束
+
+- 代码改动、文档、规格、方案和计划默认只生成本地产物。未经用户针对本次发布的明确授权，不得执行任何会修改 GitHub 远端状态的操作，包括 push、创建或更新 PR、Issue、Release、远端标签、评论及上传产物。
+- 用户要求生成、整理、评审或完善内容，不等同于授权发布。即使所调用的 Skill 默认包含 GitHub 发布步骤，也必须先获得用户对目标仓库、发布内容和发布方式的当次明确授权。
+- 完成工作后只汇报本地变更与验证结果；需要发布时，将其作为独立步骤等待用户确认，不得自行继续。
