@@ -331,11 +331,7 @@ async def delete_agent(
     from yuxi.storage.postgres.models_business import AgentTask, TaskExecution
 
     referencing = (
-        await db.execute(
-            _select(AgentTask.id).where(
-                AgentTask.agent_id == item.id, AgentTask.archived_at.is_(None)
-            )
-        )
+        await db.execute(_select(AgentTask.id).where(AgentTask.agent_id == item.id, AgentTask.archived_at.is_(None)))
     ).all()
     if referencing:
         raise HTTPException(
@@ -347,16 +343,8 @@ async def delete_agent(
     except AgentScopeServiceError as exc:
         _raise_memory_service_error(exc)
     # 归档后允许删除：置空引用，保留 slug 快照供历史展示
-    await db.execute(
-        AgentTask.__table__.update()
-        .where(AgentTask.agent_id == item.id)
-        .values(agent_id=None)
-    )
-    await db.execute(
-        TaskExecution.__table__.update()
-        .where(TaskExecution.agent_id == item.id)
-        .values(agent_id=None)
-    )
+    await db.execute(AgentTask.__table__.update().where(AgentTask.agent_id == item.id).values(agent_id=None))
+    await db.execute(TaskExecution.__table__.update().where(TaskExecution.agent_id == item.id).values(agent_id=None))
     await repo.delete(agent=item)
     return {"success": True}
 
