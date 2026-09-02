@@ -5,6 +5,10 @@ def test_chatbot_prompt_does_not_duplicate_html_preview_skill_instructions():
     assert "html:preview" not in PROMPT
 
 
+def test_chatbot_prompt_uses_current_platform_name():
+    assert '你是一个交互式智能体“Agent智能体平台”。' in PROMPT
+
+
 def test_chatbot_prompt_requires_registering_final_artifacts():
     assert "必须调用 `present_artifacts`" in PROMPT
     assert "仅写入 /home/gem/user-data/outputs 不等于完成交付" in PROMPT

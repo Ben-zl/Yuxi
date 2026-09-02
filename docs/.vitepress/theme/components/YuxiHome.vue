@@ -210,7 +210,7 @@ const vReveal = {
       </div>
       <div class="yx-container yx-hero__inner">
         <span class="yx-badge">v0.7.1 · MIT 开源 · LangGraph 驱动</span>
-        <h1 class="yx-hero__title">语析 <span class="yx-accent">Yuxi</span></h1>
+        <h1 class="yx-hero__title">Agent智能体平台 <span class="yx-accent">Yuxi</span></h1>
         <p class="yx-hero__subtitle">融合 RAG 与知识图谱的智能体 Harness 平台</p>
         <p class="yx-hero__desc">
           管理员配置知识库、模型与权限，用户在类 ChatGPT 的界面中，
@@ -226,7 +226,7 @@ const vReveal = {
           <img
             class="yx-hero__img"
             src="https://xerrors.oss-cn-shanghai.aliyuncs.com/github/image-20260608002434299.png"
-            alt="语析 Yuxi 产品界面预览"
+            alt="Agent智能体平台 Yuxi 产品界面预览"
             loading="lazy"
           />
         </div>

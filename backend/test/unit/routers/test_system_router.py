@@ -1,12 +1,25 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from server.routers.system_router import system
+from server.routers.system_router import load_info_config, system
 
 pytestmark = pytest.mark.unit
+
+
+async def test_default_info_config_uses_current_platform_name(monkeypatch):
+    template = Path(__file__).parents[3] / "package/yuxi/config/static/info.template.yaml"
+    monkeypatch.setenv("YUXI_BRAND_FILE_PATH", str(template))
+    monkeypatch.setattr("server.routers.system_router.get_version", lambda: "0.7.2")
+
+    config = await load_info_config()
+
+    assert config["organization"]["name"] == "Agent智能体平台"
+    assert config["footer"]["copyright"] == "© Agent智能体平台 2026 v0.7.2"
 
 
 def test_discovery_endpoint_is_public(monkeypatch):
