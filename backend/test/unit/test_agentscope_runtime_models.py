@@ -14,6 +14,7 @@ from yuxi.agentscope.projection import project_chat_model
 from yuxi.agentscope.runtime_models import (
     YuxiAnthropicChatModel,
     YuxiOpenAIChatModel,
+    YuxiOpenAIEmbeddingModel,
     register_yuxi_credentials,
 )
 
@@ -188,3 +189,33 @@ async def test_anthropic_stream_merges_usage_reported_in_message_delta(monkeypat
     assert responses[0].usage.output_tokens == 2
     assert responses[0].usage.cache_creation_input_tokens == 0
     assert responses[0].usage.cache_input_tokens == 1024
+
+
+@pytest.mark.asyncio
+async def test_xingliu_embedding_adapter_uses_string_and_preserves_batch_order():
+    """星流适配器逐条发送字符串输入并保持批次顺序。"""
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Embeddings:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            value = 0.1 if kwargs["input"] == "first" else 0.2
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[value] * 4096)],
+                usage=SimpleNamespace(total_tokens=3),
+            )
+
+    model = object.__new__(YuxiOpenAIEmbeddingModel)
+    model.model = "qwen3-embedding-8b"
+    model.credential = SimpleNamespace(base_url="https://kspmas.ksyun.com/v1")
+    model.client = SimpleNamespace(embeddings=Embeddings())
+
+    response = await model._call_api(["first", "second"])
+
+    assert [call["input"] for call in calls] == ["first", "second"]
+    assert len(response.embeddings) == 2
+    assert len(response.embeddings[0]) == 4096
+    assert response.embeddings[0][0] == 0.1
+    assert response.embeddings[1][0] == 0.2

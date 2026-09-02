@@ -339,3 +339,31 @@ def test_get_reranker_loads_model_from_cache(monkeypatch):
 
     assert isinstance(reranker, OpenAIReranker)
     assert reranker.model == "namespace/rerank-model"
+
+
+def test_xingliu_embedding_normalizes_single_item_array():
+    model = OtherEmbedding(
+        model="qwen3-embedding-8b",
+        base_url="https://kspmas.ksyun.com/v1/embeddings",
+        api_key="test-key",
+        dimension=4096,
+    )
+
+    assert model.build_payload(["hello"]) == {
+        "model": "qwen3-embedding-8b",
+        "input": "hello",
+    }
+    assert model.build_payload(["hello", "world"])["input"] == ["hello", "world"]
+
+
+def test_non_xingliu_embedding_keeps_array_payload():
+    model = OtherEmbedding(
+        model="text-embedding-3-small",
+        base_url="https://api.openai.com/v1/embeddings",
+        api_key="test-key",
+    )
+
+    assert model.build_payload(["hello"]) == {
+        "model": "text-embedding-3-small",
+        "input": ["hello"],
+    }

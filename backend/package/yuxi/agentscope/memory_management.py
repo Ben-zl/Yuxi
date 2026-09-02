@@ -19,6 +19,16 @@ def _memory_id(relative_path: str) -> str:
     return hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
 
 
+def _validated_root(root: str | Path) -> Path:
+    """拒绝 scope 或 uid 层符号链接，避免管理函数跟随到外部目录。"""
+    path = Path(root)
+    if path.is_symlink() or path.parent.is_symlink():
+        raise ValueError("Memory Workspace 路径不能包含符号链接")
+    if path.exists() and not path.is_dir():
+        raise ValueError("Memory Workspace 必须是真实目录")
+    return path
+
+
 def _safe_file(root: Path, path: Path) -> bool:
     """仅接受 root 下真实普通文件，拒绝符号链接和路径逃逸。"""
     try:
@@ -73,6 +83,9 @@ def _read_card(root: Path, item: tuple[Path, str, str, str | None]) -> dict[str,
         stat = path.stat()
     except (OSError, UnicodeError, ValueError):
         return None
+    status = str(metadata.get("yuxi_memory_status") or "").strip() or None
+    source_paths = metadata.get("yuxi_source_paths")
+    source_count = len(source_paths) if isinstance(source_paths, list) else 0
     return {
         "memory_id": _memory_id(relative),
         "kind": kind,
@@ -81,6 +94,8 @@ def _read_card(root: Path, item: tuple[Path, str, str, str | None]) -> dict[str,
         "summary": str(metadata.get("description") or body[:300]),
         "memory_date": memory_date or metadata.get("date"),
         "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+        "status": status,
+        "source_count": source_count,
     }
 
 
@@ -93,9 +108,10 @@ def list_memory_cards(
     page_size: int = 20,
 ) -> dict[str, Any]:
     """分页列出一个 scope 的 Daily/Digest 卡片。"""
-    root_path = Path(root)
+    root_path = _validated_root(root)
     candidates = [*_daily_paths(root_path), *_digest_paths(root_path)]
     cards = [card for item in candidates if (card := _read_card(root_path, item)) is not None]
+    cards = [item for item in cards if item["status"] != "archived_duplicate"]
     if kind != "all":
         cards = [item for item in cards if item["kind"] == kind]
     if category != "all":
@@ -111,7 +127,7 @@ def list_memory_cards(
 
 def latest_memory_at(root: str | Path) -> datetime | None:
     """返回可管理记忆卡片的最新文件时间；没有卡片时返回 None。"""
-    root_path = Path(root)
+    root_path = _validated_root(root)
     mtimes = [item[0].stat().st_mtime for item in [*_daily_paths(root_path), *_digest_paths(root_path)]]
     return datetime.fromtimestamp(max(mtimes), tz=UTC) if mtimes else None
 
@@ -141,7 +157,7 @@ async def delete_memory_card(
     maintain_index: Callable[[str | None], Awaitable[None] | None],
 ) -> None:
     """暂存删除一张卡片，完整重建索引后才最终提交文件删除。"""
-    root_path = Path(root).resolve()
+    root_path = _validated_root(root).resolve()
     item = _find_card(root_path, memory_id)
     if item is None:
         raise FileNotFoundError("memory_not_found")
@@ -187,20 +203,23 @@ async def delete_memory_card(
 
 def clear_memory_workspace(root: str | Path, *, base_dir: str | Path) -> bool:
     """安全删除一个精确 scope Workspace；不存在时返回 False。"""
-    path = Path(root)
-    if path.is_symlink():
-        raise ValueError("Memory Workspace 必须是真实目录")
+    path = _validated_root(root)
     if not path.exists():
         return False
-    if not path.is_dir():
-        raise ValueError("Memory Workspace 必须是真实目录")
     resolved = path.resolve()
-    base = Path(base_dir).resolve()
+    base_path = Path(base_dir)
+    if base_path.is_symlink() or not base_path.is_dir():
+        raise ValueError("Memory 根目录必须是真实目录")
+    base = base_path.resolve()
     try:
         relative = resolved.relative_to(base)
     except ValueError as exc:
         raise ValueError("Memory Workspace 不在配置根目录下") from exc
-    if len(relative.parts) != 2:
+    is_sha256_scope = len(relative.parts) == 2 and all(
+        len(segment) == 64 and all(character in "0123456789abcdef" for character in segment)
+        for segment in relative.parts
+    )
+    if not is_sha256_scope:
         raise ValueError("拒绝删除不安全的 Memory Workspace 路径")
     shutil.rmtree(resolved)
     return True

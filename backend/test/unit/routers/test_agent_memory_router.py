@@ -74,7 +74,7 @@ class _FakeMemoryClient:
         }
 
     async def delete_memory_item(self, uid, agent_slug, memory_id):
-        del uid, agent_slug, memory_id
+        self.events.append(f"delete:{uid}:{agent_slug}:{memory_id}")
         if self.error:
             raise self.error
 
@@ -90,7 +90,7 @@ class _FakeMemoryClient:
             raise self.error
 
 
-def _build_client(monkeypatch, memory_client: _FakeMemoryClient) -> TestClient:
+def _build_client(monkeypatch, memory_client: _FakeMemoryClient, *, uid: str = "user-1") -> TestClient:
     monkeypatch.setattr(agent_router_module, "AgentRepository", _FakeRepo)
     monkeypatch.setattr(agent_router_module, "_memory_client", lambda: memory_client)
     monkeypatch.setattr(agent_router_module, "user_can_manage_agent", lambda _user, _agent: True)
@@ -103,7 +103,9 @@ def _build_client(monkeypatch, memory_client: _FakeMemoryClient) -> TestClient:
         return _FakeDb()
 
     async def fake_user():
-        return _user()
+        user = _user()
+        user.uid = uid
+        return user
 
     app.dependency_overrides[get_db] = fake_db
     app.dependency_overrides[get_required_user] = fake_user
@@ -135,6 +137,22 @@ def test_invisible_agent_memory_is_not_exposed(monkeypatch):
     assert memory_client.events == []
 
 
+def test_same_visible_agent_forwards_each_authenticated_user_scope(monkeypatch):
+    """同一共享 Agent 的查询只能携带各自登录用户 UID，接口不能指定目标用户。"""
+    _FakeRepo.visible = True
+    memory_client = _FakeMemoryClient()
+
+    response_a = _build_client(monkeypatch, memory_client, uid="user-a").get("/api/agent/shared-agent/memories")
+    response_b = _build_client(monkeypatch, memory_client, uid="user-b").get("/api/agent/shared-agent/memories")
+
+    assert response_a.status_code == 200
+    assert response_b.status_code == 200
+    assert memory_client.events == [
+        "list:user-a:shared-agent:1",
+        "list:user-b:shared-agent:1",
+    ]
+
+
 def test_memory_busy_error_maps_to_stable_public_protocol(monkeypatch):
     """内部 409 在公开 API 中保持 memory_scope_busy。"""
     _FakeRepo.visible = True
@@ -146,6 +164,35 @@ def test_memory_busy_error_maps_to_stable_public_protocol(monkeypatch):
 
     assert response.status_code == 409
     assert response.json()["detail"] == "memory_scope_busy"
+
+
+def test_invalid_memory_id_is_rejected_before_internal_service_call(monkeypatch):
+    """公开 API 只接受 SHA-256 memory_id，非法值不能进入内部服务。"""
+    _FakeRepo.visible = True
+    memory_client = _FakeMemoryClient()
+    client = _build_client(monkeypatch, memory_client)
+
+    response = client.delete("/api/agent/shared-agent/memories/not-a-sha256")
+
+    assert response.status_code == 422
+    assert memory_client.events == []
+
+
+def test_invalid_memory_filters_and_pagination_are_rejected_locally(monkeypatch):
+    """枚举值和分页范围应由公开 API 拒绝，不能把非法查询转发到内部服务。"""
+    _FakeRepo.visible = True
+    memory_client = _FakeMemoryClient()
+    client = _build_client(monkeypatch, memory_client)
+
+    responses = [
+        client.get("/api/agent/shared-agent/memories?kind=transcript"),
+        client.get("/api/agent/shared-agent/memories?category=metadata"),
+        client.get("/api/agent/shared-agent/memories?page=0"),
+        client.get("/api/agent/shared-agent/memories?page_size=101"),
+    ]
+
+    assert [response.status_code for response in responses] == [422, 422, 422, 422]
+    assert memory_client.events == []
 
 
 def test_agent_delete_cleans_memory_before_business_record(monkeypatch):

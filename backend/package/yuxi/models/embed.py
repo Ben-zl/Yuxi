@@ -118,7 +118,16 @@ class OtherEmbedding(BaseEmbeddingModel):
         self.headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
     def build_payload(self, message: list[str] | str) -> dict:
+        # 星流 qwen3-embedding-8b 对单元素数组输入存在不稳定的上游兼容问题，
+        # 统一改用其稳定支持的字符串输入；多条输入在 encode/aencode 中逐条发送。
+        if self._is_xingliu_qwen3():
+            if isinstance(message, list) and len(message) == 1:
+                message = message[0]
         return {"model": self.model, "input": message}
+
+    def _is_xingliu_qwen3(self) -> bool:
+        """判断是否为金山云星流 qwen3 Embedding 模型。"""
+        return self.model == "qwen3-embedding-8b" and "kspmas.ksyun.com" in self.base_url
 
     @staticmethod
     def _retry_delay_seconds(retry_index: int, retry_after: str | None = None) -> float:
@@ -151,7 +160,9 @@ class OtherEmbedding(BaseEmbeddingModel):
         if status_code == 429:
             max_retries = EMBEDDING_RATE_LIMIT_MAX_RETRIES
         elif status_code in EMBEDDING_RETRYABLE_STATUS_CODES or status_code is None:
-            max_retries = EMBEDDING_TRANSIENT_MAX_RETRIES
+            # 星流 Embedding 上游偶发 500，给该模型更充分的瞬时重试窗口；
+            # 其他供应商保持原有重试语义。
+            max_retries = 5 if self._is_xingliu_qwen3() else EMBEDDING_TRANSIENT_MAX_RETRIES
         else:
             max_retries = 0
         if retry_index >= max_retries:
@@ -176,6 +187,8 @@ class OtherEmbedding(BaseEmbeddingModel):
         return [item["embedding"] for item in result["data"]]
 
     def encode(self, message: list[str] | str) -> list[list[float]]:
+        if self._is_xingliu_qwen3() and isinstance(message, list) and len(message) > 1:
+            return [embedding for item in message for embedding in self.encode(item)]
         payload = self.build_payload(message)
         retry_index = 0
         while True:
@@ -199,6 +212,11 @@ class OtherEmbedding(BaseEmbeddingModel):
                 raise ValueError(f"Embedding request failed: {e}")
 
     async def aencode(self, message: list[str] | str) -> list[list[float]]:
+        if self._is_xingliu_qwen3() and isinstance(message, list) and len(message) > 1:
+            result = []
+            for item in message:
+                result.extend(await self.aencode(item))
+            return result
         payload = self.build_payload(message)
         async with httpx.AsyncClient() as client:
             retry_index = 0

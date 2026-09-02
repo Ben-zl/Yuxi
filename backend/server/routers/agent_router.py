@@ -4,7 +4,7 @@ import uuid
 import os
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -280,7 +280,7 @@ async def list_agent_memories(
 @agent_router.delete("/{agent_slug}/memories/{memory_id}")
 async def delete_agent_memory(
     agent_slug: str,
-    memory_id: str,
+    memory_id: str = Path(..., pattern="^[0-9a-f]{64}$"),
     current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):

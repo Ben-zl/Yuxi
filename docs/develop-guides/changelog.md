@@ -1,5 +1,8 @@
 # 版本变更记录
 
+### 2026-09-02
+
+- 修复金山云星流 `qwen3-embedding-8b` 对单元素数组输入兼容不稳定的问题：Yuxi Embedding 与 AgentScope/ReMe 适配器统一使用字符串输入，多文本按条发送并保留顺序；其他 OpenAI-compatible provider 行为不变。
 本页用于记录各版本发布说明（新增、修复与破坏性变更）。
 
 同一版本的多次功能更新时，应以功能为单位进行更新，比如之前添加了 A 功能的更新，在后续的更新中修复了因 A 功能引入的 bug，那么这个修复说明应该和 A 功能描述放在一起（重新修改表达，而不仅仅是补充），而不是新增一条修复记录，功能更新同理。必须遵守：每一个修改不应超过 200 字，注意高度凝练。
@@ -444,6 +447,7 @@
 - 重写沙盒技术文档，明确 thread-local sandbox、viewer-oriented filesystem service、`/mnt` 命名空间、skills 可见性与当前实现边界，替换过时的 `/api/sandbox/*` 与 user-level 设计描述
 - 收紧沙盒遗留代码：修复未注册 `sandbox_router` 中残留的 user/thread 参数错位，改进宿主机挂载路径映射逻辑，并为 remote sandbox provisioner 增加基础 URL 校验与销毁失败日志
 - 修复 builtin skill 内容哈希计算对单文件使用 `read_bytes()` 的无上限内存读取问题，改为分块计算并补充回归测试
+- 修复 ReMe 长期记忆跨日期重复 Daily 未归并及 `memory_hint` 参数名错误：写入后治理同主题来源、硬清洗派发/等待状态并刷新完整索引；测试代号只保留用户明确事实
 
 ### 破坏性更新
 

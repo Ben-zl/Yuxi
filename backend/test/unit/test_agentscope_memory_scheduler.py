@@ -62,6 +62,23 @@ async def test_scheduler_failed_job_records_failure_once(tmp_path):
     scheduler._record_result.assert_not_awaited()
 
 
+async def test_scheduler_dream_passes_cross_session_deduplication_hint(tmp_path):
+    """Dream 必须显式合并跨 Session 证据并排除临时 pending 状态。"""
+    scheduler = MemoryDreamScheduler(registry=SimpleNamespace(), base_dir=tmp_path)
+    scheduler._record_result = AsyncMock()
+    maintenance = SimpleNamespace(run_job=AsyncMock(return_value=SimpleNamespace(success=True)))
+
+    await scheduler._run_date("u", "a", date(2026, 9, 1), maintenance)
+
+    dream_call, reindex_call = maintenance.run_job.await_args_list
+    assert dream_call.args == ("auto_dream",)
+    assert dream_call.kwargs["date"] == "2026-09-01"
+    assert "跨 Session" in dream_call.kwargs["hint"]
+    assert "pending" in dream_call.kwargs["hint"]
+    assert "合并" in dream_call.kwargs["hint"]
+    assert reindex_call.args == ("reindex",)
+
+
 async def test_scheduler_retry_window_accepts_aware_database_timestamp(tmp_path, monkeypatch):
     """TIMESTAMPTZ 返回 aware datetime 时，一小时失败退避不能发生时区类型错误。"""
     scheduler = MemoryDreamScheduler(registry=SimpleNamespace(), base_dir=tmp_path)
@@ -106,6 +123,52 @@ async def test_scheduler_retry_window_accepts_aware_database_timestamp(tmp_path,
     scheduler._process_scope.assert_not_awaited()
 
 
+async def test_scheduler_skips_disabled_scope_but_processes_enabled_scope(tmp_path, monkeypatch):
+    """同次扫描中关闭 Memory 的 scope 不调度，其他启用 scope 仍正常执行。"""
+    scheduler = MemoryDreamScheduler(registry=SimpleNamespace(), base_dir=tmp_path)
+    scheduler._process_scope = AsyncMock()
+    records = [
+        SimpleNamespace(
+            uid="disabled",
+            agent_slug="a",
+            last_dream_date=date(2026, 8, 30),
+            last_memory_at=None,
+            dream_status=None,
+            dream_attempted_at=None,
+        ),
+        SimpleNamespace(
+            uid="enabled",
+            agent_slug="a",
+            last_dream_date=date(2026, 8, 30),
+            last_memory_at=None,
+            dream_status=None,
+            dream_attempted_at=None,
+        ),
+    ]
+
+    @asynccontextmanager
+    async def fake_session_context():
+        yield object()
+
+    class FakeRepository:
+        def __init__(self, _db):
+            pass
+
+        async def list_all(self):
+            return records
+
+    async def load_config(_db, uid):
+        return SimpleNamespace(schema=SimpleNamespace(enable_memory=uid == "enabled"))
+
+    monkeypatch.setattr(scheduler_module.pg_manager, "get_async_session_context", fake_session_context)
+    monkeypatch.setattr(scheduler_module, "AgentMemoryScopeRepository", FakeRepository)
+    monkeypatch.setattr(scheduler_module.UserConfig, "load", load_config)
+
+    await scheduler.run_due_once(datetime(2026, 8, 31, 23, 30, tzinfo=ZoneInfo("Asia/Shanghai")))
+
+    scheduler._process_scope.assert_awaited_once_with("enabled", "a", [date(2026, 8, 31)])
+
+
 async def test_scheduler_skips_scope_with_active_reply(tmp_path):
     """活动 reply 存在时 Dream 本轮跳过且不尝试取得维护租约。"""
     registry = SimpleNamespace(
@@ -117,6 +180,35 @@ async def test_scheduler_skips_scope_with_active_reply(tmp_path):
     await scheduler._process_scope("u", "a", [date(2026, 8, 31)])
 
     registry.acquire_exclusive.assert_not_called()
+
+
+async def test_scheduler_missing_workspace_records_failure(tmp_path, monkeypatch):
+    """catalog 指向的 Workspace 不存在时应记录失败，不能创建空目录后误报 Dream 成功。"""
+
+    class FakeRegistry:
+        async def is_busy(self, _uid, _agent_slug):
+            return False
+
+        @asynccontextmanager
+        async def acquire_exclusive(self, _uid, _agent_slug):
+            yield None
+
+    @asynccontextmanager
+    async def fake_session_context():
+        yield object()
+
+    scheduler = MemoryDreamScheduler(registry=FakeRegistry(), base_dir=tmp_path)
+    scheduler._record_result = AsyncMock()
+    monkeypatch.setattr(scheduler_module.pg_manager, "get_async_session_context", fake_session_context)
+    monkeypatch.setattr(scheduler_module, "project_runtime", AsyncMock(return_value=object()))
+    monkeypatch.setattr(scheduler_module, "build_memory_models", lambda _projection: (object(), object(), "v1"))
+
+    await scheduler._process_scope("u", "a", [date(2026, 8, 31)])
+
+    scheduler._record_result.assert_awaited_once()
+    args, kwargs = scheduler._record_result.await_args
+    assert args == ("u", "a", "failed")
+    assert "Workspace 不存在" in kwargs["error"]
 
 
 async def test_scheduler_dream_job_times_out(tmp_path):
@@ -134,3 +226,56 @@ async def test_scheduler_dream_job_times_out(tmp_path):
 
     with pytest.raises(TimeoutError):
         await scheduler._run_date("u", "a", date(2026, 8, 31), maintenance)
+
+
+async def test_scheduler_partial_catch_up_keeps_last_success_before_failure(tmp_path, monkeypatch):
+    """多日补跑中途失败时，已成功日期应推进，后续日期留待下一轮重试。"""
+
+    class FakeRegistry:
+        async def is_busy(self, _uid, _agent_slug):
+            return False
+
+        @asynccontextmanager
+        async def acquire_exclusive(self, _uid, _agent_slug):
+            yield None
+
+    class Response:
+        success = True
+
+    maintenance = SimpleNamespace(
+        run_job=AsyncMock(side_effect=[Response(), Response(), RuntimeError("second day failed")]),
+    )
+
+    @asynccontextmanager
+    async def fake_session_context():
+        yield object()
+
+    @asynccontextmanager
+    async def fake_maintenance(**_kwargs):
+        yield maintenance
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scheduler = MemoryDreamScheduler(registry=FakeRegistry(), base_dir=tmp_path)
+    scheduler._record_result = AsyncMock()
+    monkeypatch.setattr(scheduler_module.pg_manager, "get_async_session_context", fake_session_context)
+    monkeypatch.setattr(scheduler_module, "project_runtime", AsyncMock(return_value=object()))
+    monkeypatch.setattr(scheduler_module, "build_memory_models", lambda _projection: (object(), object(), "v1"))
+    monkeypatch.setattr(scheduler_module, "validate_memory_workspace", lambda *_args, **_kwargs: workspace)
+    monkeypatch.setattr(scheduler_module, "reme_maintenance_app", fake_maintenance)
+
+    await scheduler._process_scope(
+        "u",
+        "a",
+        [date(2026, 8, 30), date(2026, 8, 31), date(2026, 9, 1)],
+    )
+
+    assert scheduler._record_result.await_args_list[0].args == (
+        "u",
+        "a",
+        "completed",
+    )
+    assert scheduler._record_result.await_args_list[0].kwargs["dream_date"] == date(2026, 8, 30)
+    assert scheduler._record_result.await_args_list[1].args == ("u", "a", "failed")
+    assert "second day failed" in scheduler._record_result.await_args_list[1].kwargs["error"]
+    assert maintenance.run_job.await_count == 3

@@ -15,6 +15,7 @@ E2E_THREAD_TEST_MARKERS = frozenset(
     {
         "agent-async-e2e",
         "agent-sync-e2e",
+        "memory-recall-e2e",
         "agent-steer-e2e",
         "attachment-state-e2e",
         "ocr-config-e2e",

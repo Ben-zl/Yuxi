@@ -11,14 +11,22 @@ from yuxi.agentscope.config_projection import project_runtime
 from yuxi.agentscope.memory import (
     MemoryScopeBusyError,
     build_memory_models,
-    memory_workspace_path,
     reme_maintenance_app,
+    validate_memory_workspace,
 )
 from yuxi.config import UserConfig
 from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.utils import logger
 from yuxi.utils.datetime_utils import utc_now
+
+
+DREAM_DEDUPLICATION_HINT = """整理长期 Digest 时遵循以下约束：
+1. 合并跨 Session 指向同一项目、任务、数据周期或用例的重复证据，不按会话分别生成近重复 Digest。
+2. pending、等待回报、刚派发、一次性时间戳等运行中状态不是稳定事实；除非已有最终结果，否则不要写入 Digest。
+3. 同一主题出现 completed、failed、running、pending 等多种状态时，以最新终态为准，并丢弃过时状态。
+4. 只保留可跨对话复用的用户事实、稳定流程、结论和已验证结果；不确定时优先合并或不生成。
+"""
 
 
 class MemoryDreamScheduler:
@@ -124,7 +132,9 @@ class MemoryDreamScheduler:
                             include_memory_models=True,
                         )
                     chat_model, embedding_model, _fingerprint = build_memory_models(projection)
-                    workspace = memory_workspace_path(self.base_dir, uid, agent_slug)
+                    workspace = validate_memory_workspace(self.base_dir, uid, agent_slug)
+                    if not workspace.is_dir():
+                        raise ValueError("Memory Workspace 不存在，无法执行 Dream")
                     async with reme_maintenance_app(
                         workspace_dir=workspace,
                         chat_model=chat_model,
@@ -140,11 +150,21 @@ class MemoryDreamScheduler:
     async def _run_date(self, uid: str, agent_slug: str, dream_date: date, maintenance) -> None:
         """执行一个日期，成功才推进 last_dream_date。"""
         response = await asyncio.wait_for(
-            maintenance.run_job("auto_dream", date=dream_date.isoformat()),
+            maintenance.run_job(
+                "auto_dream",
+                date=dream_date.isoformat(),
+                hint=DREAM_DEDUPLICATION_HINT,
+            ),
             timeout=self.job_timeout_seconds,
         )
         if getattr(response, "success", True) is False:
             raise RuntimeError(str(getattr(response, "answer", "Dream failed")))
+        reindex_response = await asyncio.wait_for(
+            maintenance.run_job("reindex"),
+            timeout=self.job_timeout_seconds,
+        )
+        if getattr(reindex_response, "success", True) is False:
+            raise RuntimeError(str(getattr(reindex_response, "answer", "Dream reindex failed")))
         await self._record_result(uid, agent_slug, "completed", dream_date=dream_date)
 
     @staticmethod

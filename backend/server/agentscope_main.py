@@ -9,7 +9,6 @@ Redis 作 message bus，workspace 按 AGENTSCOPE_WORKSPACE_BACKEND 选择
 import asyncio
 import os
 import threading
-from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import asyncpg
@@ -78,7 +77,7 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
         ScopedReMeMiddleware,
         build_memory_models,
         memory_scope_identity,
-        memory_workspace_path,
+        validate_memory_workspace,
     )
     from yuxi.agentscope.memory_management import latest_memory_at
     from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
@@ -111,7 +110,7 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
         async def mark_memory_updated() -> None:
             """仅在 ReMe 已实际生成卡片时推进 scope 最近记忆时间。"""
             memory_at = latest_memory_at(
-                memory_workspace_path(AGENTSCOPE_MEMORY_BASEDIR, user_id, projection.agent_slug),
+                validate_memory_workspace(AGENTSCOPE_MEMORY_BASEDIR, user_id, projection.agent_slug),
             )
             if memory_at is None:
                 return
@@ -325,12 +324,23 @@ def _create_service_app_sync():
         title="Yuxi AgentScope Service",
     )
     from yuxi.agentscope.memory import ReMeRegistry, ensure_memory_base_dir
+    from yuxi.agentscope.memory_compaction_scheduler import MemoryCompactionScheduler
+    from yuxi.agentscope.memory_service import AgentMemoryService
     from yuxi.agentscope.memory_scheduler import MemoryDreamScheduler
 
     memory_base_dir = ensure_memory_base_dir(AGENTSCOPE_MEMORY_BASEDIR)
     service_app.state.reme_registry = ReMeRegistry(base_dir=memory_base_dir)
+    service_app.state.agent_memory_service = AgentMemoryService(
+        registry=service_app.state.reme_registry,
+        base_dir=memory_base_dir,
+    )
     service_app.state.memory_dream_scheduler = MemoryDreamScheduler(
         registry=service_app.state.reme_registry,
+        base_dir=memory_base_dir,
+    )
+    service_app.state.memory_compaction_scheduler = MemoryCompactionScheduler(
+        registry=service_app.state.reme_registry,
+        memory_service=service_app.state.agent_memory_service,
         base_dir=memory_base_dir,
     )
     original_lifespan = service_app.router.lifespan_context
@@ -342,9 +352,11 @@ def _create_service_app_sync():
         """在 AgentScope 原生资源关闭前释放 Yuxi 长期记忆资源。"""
         async with original_lifespan(current_app):
             await current_app.state.memory_dream_scheduler.start()
+            await current_app.state.memory_compaction_scheduler.start()
             try:
                 yield
             finally:
+                await current_app.state.memory_compaction_scheduler.stop()
                 await current_app.state.memory_dream_scheduler.stop()
                 await current_app.state.reme_registry.close_all()
 
@@ -353,45 +365,6 @@ def _create_service_app_sync():
 
 
 app = _create_service_app_sync()
-
-
-async def _load_memory_projection(uid: str, agent_slug: str):
-    """为管理和 Dream 解析模型，即使用户当前已关闭 Memory。"""
-    from yuxi.agentscope.config_projection import project_runtime
-
-    async with pg_manager.get_async_session_context() as db:
-        return await project_runtime(
-            db,
-            uid=uid,
-            agent_slug=agent_slug,
-            include_memory_models=True,
-        )
-
-
-async def _reindex_memory(
-    uid: str,
-    agent_slug: str,
-    workspace: Path,
-    *,
-    daily_date: str | None = None,
-) -> None:
-    """使用短生命周期 ReMe 应用完整重建一个 scope 的混合索引。"""
-    from yuxi.agentscope.memory import build_memory_models, reme_maintenance_app
-
-    projection = await _load_memory_projection(uid, agent_slug)
-    chat_model, embedding_model, _fingerprint = build_memory_models(projection)
-    async with reme_maintenance_app(
-        workspace_dir=workspace,
-        chat_model=chat_model,
-        embedding_model=embedding_model,
-    ) as maintenance:
-        if daily_date is not None:
-            daily_response = await maintenance.run_job("daily_reindex", date=daily_date)
-            if getattr(daily_response, "success", True) is False:
-                raise RuntimeError(f"ReMe daily reindex failed: {getattr(daily_response, 'answer', '')}")
-        response = await maintenance.run_job("reindex")
-        if getattr(response, "success", True) is False:
-            raise RuntimeError(f"ReMe reindex failed: {getattr(response, 'answer', '')}")
 
 
 def _memory_busy() -> HTTPException:
@@ -411,82 +384,41 @@ async def list_yuxi_memories(
     """列出当前用户在一个 Agent scope 下可管理的记忆卡片。"""
     from urllib.parse import unquote
 
-    from yuxi.agentscope.memory import memory_workspace_path
-    from yuxi.agentscope.memory_management import list_memory_cards
-    from yuxi.config import UserConfig
-    from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
+    from yuxi.agentscope.memory import MemoryScopeBusyError
 
     uid = unquote(x_user_id)
-    async with pg_manager.get_async_session_context() as db:
-        record = await AgentMemoryScopeRepository(db).get(uid, agent_slug)
-        enabled = (await UserConfig.load(db, uid)).schema.enable_memory
-    workspace = memory_workspace_path(AGENTSCOPE_MEMORY_BASEDIR, uid, agent_slug)
-    result = list_memory_cards(workspace, kind=kind, category=category, page=page, page_size=page_size)
-    result["scope"] = {
-        "enabled": bool(enabled),
-        "last_memory_at": record.to_dict()["last_memory_at"] if record else None,
-        "last_dream_date": record.to_dict()["last_dream_date"] if record else None,
-        "dream_status": record.dream_status if record else None,
-    }
-    return result
+    try:
+        return await app.state.agent_memory_service.list_memories(
+            uid,
+            agent_slug,
+            kind=kind,
+            category=category,
+            page=page,
+            page_size=page_size,
+        )
+    except MemoryScopeBusyError as exc:
+        raise _memory_busy() from exc
 
 
 @app.delete("/yuxi/memory/item")
 async def delete_yuxi_memory_item(
     agent_slug: str = Query(...),
-    memory_id: str = Query(..., min_length=64, max_length=64),
+    memory_id: str = Query(..., pattern="^[0-9a-f]{64}$"),
     x_user_id: str = Header(...),
 ) -> dict:
     """删除一张记忆卡片，并在提交文件删除前完成完整 reindex。"""
     from urllib.parse import unquote
 
-    from yuxi.agentscope.memory import MemoryScopeBusyError, memory_workspace_path
-    from yuxi.agentscope.memory_management import delete_memory_card
+    from yuxi.agentscope.memory import MemoryScopeBusyError
 
     uid = unquote(x_user_id)
-    workspace = memory_workspace_path(AGENTSCOPE_MEMORY_BASEDIR, uid, agent_slug)
     try:
-        async with app.state.reme_registry.acquire_exclusive(uid, agent_slug):
-            await delete_memory_card(
-                workspace,
-                memory_id,
-                maintain_index=lambda daily_date: _reindex_memory(
-                    uid,
-                    agent_slug,
-                    workspace,
-                    daily_date=daily_date,
-                ),
-            )
+        await app.state.agent_memory_service.delete_item(uid, agent_slug, memory_id)
     except MemoryScopeBusyError as exc:
         raise _memory_busy() from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="memory_not_found") from exc
     return {"success": True}
-
-
-async def _clear_memory_scope(uid: str, agent_slug: str) -> bool:
-    """清理一个 scope 的 Registry、目录和 catalog。"""
-    from yuxi.agentscope.memory import MemoryScopeBusyError
-
-    try:
-        async with app.state.reme_registry.acquire_exclusive(uid, agent_slug):
-            return await _delete_memory_scope_data(uid, agent_slug)
-    except MemoryScopeBusyError:
-        raise
-
-
-async def _delete_memory_scope_data(uid: str, agent_slug: str) -> bool:
-    """在调用方已持有独占 lease 时删除一个 scope 的目录和 catalog。"""
-    from yuxi.agentscope.memory import memory_workspace_path
-    from yuxi.agentscope.memory_management import clear_memory_workspace
-    from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
-
-    workspace = memory_workspace_path(AGENTSCOPE_MEMORY_BASEDIR, uid, agent_slug)
-    removed = clear_memory_workspace(workspace, base_dir=AGENTSCOPE_MEMORY_BASEDIR)
-    async with pg_manager.get_async_session_context() as db:
-        await AgentMemoryScopeRepository(db).delete(uid, agent_slug)
-        await db.commit()
-    return removed
 
 
 @app.delete("/yuxi/memory/scope")
@@ -499,26 +431,10 @@ async def clear_yuxi_memory_scope(
     from yuxi.agentscope.memory import MemoryScopeBusyError
 
     try:
-        removed = await _clear_memory_scope(unquote(x_user_id), agent_slug)
+        removed = await app.state.agent_memory_service.clear_scope(unquote(x_user_id), agent_slug)
     except MemoryScopeBusyError as exc:
         raise _memory_busy() from exc
     return {"success": True, "already_absent": not removed}
-
-
-async def _clear_memory_records(records: list) -> dict:
-    """原子占用全部 scope 后执行批量幂等清理。"""
-    from yuxi.agentscope.memory import MemoryScopeBusyError
-
-    scopes = [(record.uid, record.agent_slug) for record in records]
-    cleared = []
-    try:
-        async with app.state.reme_registry.acquire_exclusive_many(scopes):
-            for record in records:
-                await _delete_memory_scope_data(record.uid, record.agent_slug)
-                cleared.append(record.workspace_id)
-    except MemoryScopeBusyError as exc:
-        raise _memory_busy() from exc
-    return {"success": True, "cleared_workspace_ids": cleared}
 
 
 @app.delete("/yuxi/memory/agent")
@@ -527,11 +443,12 @@ async def clear_yuxi_memory_agent(
     x_user_id: str = Header(...),
 ) -> dict:
     """清除一个 Agent 在所有用户下的长期记忆。"""
-    from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
+    from yuxi.agentscope.memory import MemoryScopeBusyError
 
-    async with pg_manager.get_async_session_context() as db:
-        records = await AgentMemoryScopeRepository(db).list_for_agent(agent_slug)
-    return await _clear_memory_records(records)
+    try:
+        return await app.state.agent_memory_service.clear_agent(agent_slug)
+    except MemoryScopeBusyError as exc:
+        raise _memory_busy() from exc
 
 
 @app.delete("/yuxi/memory/user")
@@ -540,11 +457,12 @@ async def clear_yuxi_memory_user(
     x_user_id: str = Header(...),
 ) -> dict:
     """清除一个用户在所有 Agent 下的长期记忆。"""
-    from yuxi.repositories.agent_memory_scope_repository import AgentMemoryScopeRepository
+    from yuxi.agentscope.memory import MemoryScopeBusyError
 
-    async with pg_manager.get_async_session_context() as db:
-        records = await AgentMemoryScopeRepository(db).list_for_user(uid)
-    return await _clear_memory_records(records)
+    try:
+        return await app.state.agent_memory_service.clear_user(uid)
+    except MemoryScopeBusyError as exc:
+        raise _memory_busy() from exc
 
 
 @app.post("/yuxi/workspace/file", status_code=status.HTTP_201_CREATED)

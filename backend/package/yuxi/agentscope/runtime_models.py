@@ -17,7 +17,7 @@ from agentscope.model import (
     GeminiChatModel,
     OpenAIChatModel,
 )
-from agentscope.embedding import OpenAIEmbeddingModel
+from agentscope.embedding import EmbeddingResponse, EmbeddingUsage, OpenAIEmbeddingModel
 from pydantic import Field
 
 
@@ -157,6 +157,37 @@ class YuxiOpenAIEmbeddingModel(OpenAIEmbeddingModel):
             api_key=credential.api_key.get_secret_value(),
             **client_kwargs,
         )
+
+    def _is_xingliu_qwen3(self) -> bool:
+        """判断是否需要规避星流 Embedding 的数组输入兼容问题。"""
+        return self.model == "qwen3-embedding-8b" and "kspmas.ksyun.com" in str(
+            getattr(self.credential, "base_url", ""),
+        )
+
+    async def _call_api(self, inputs: list[str], **kwargs: Any) -> EmbeddingResponse:
+        """为星流 qwen3 逐条发送字符串输入，其余模型沿用 AgentScope 实现。"""
+        if not self._is_xingliu_qwen3() or len(inputs) <= 1:
+            if self._is_xingliu_qwen3() and inputs:
+                # 星流稳定支持字符串，不支持单元素数组。
+                response = await self.client.embeddings.create(
+                    input=inputs[0],
+                    model=self.model,
+                    encoding_format="float",
+                    **kwargs,
+                )
+                item = response.data[0]
+                embedding = item.embedding or getattr(item, "dense_embedding", None)
+                return EmbeddingResponse(
+                    embeddings=[embedding],
+                    usage=EmbeddingUsage(
+                        tokens=getattr(response.usage, "total_tokens", None),
+                        time=0,
+                    ),
+                )
+            return await super()._call_api(inputs, **kwargs)
+
+        results = [await self._call_api([item], **kwargs) for item in inputs]
+        return self._merge_responses(results)
 
 
 class YuxiOpenAICredential(OpenAICredential):

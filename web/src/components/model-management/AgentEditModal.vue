@@ -3,6 +3,7 @@ import { computed, nextTick, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import {
   Bot,
+  Brain,
   Info,
   MessageSquare,
   Microscope,
@@ -15,6 +16,7 @@ import {
 
 import { userApi } from '@/apis/user_api'
 import AgentRuntimeConfigForm from '@/components/AgentRuntimeConfigForm.vue'
+import AgentMemoryPanel from '@/components/AgentMemoryPanel.vue'
 import WPSChannelManagePanel from '@/components/model-management/WPSChannelManagePanel.vue'
 import ShareConfigForm from '@/components/ShareConfigForm.vue'
 import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
@@ -157,6 +159,7 @@ const agentModalMenuItems = computed(() => {
       { key: 'tools', label: '工具配置', icon: Wrench },
       { key: 'other', label: '其他配置', icon: Settings2 }
     )
+    items.push({ key: 'memory', label: '记忆', icon: Brain })
     if (userStore.isAdmin) {
       items.push({ key: 'channels', label: '协作渠道', icon: MessageSquare })
     }
@@ -568,6 +571,17 @@ defineExpose({
             ref="runtimeConfigFormRef"
             :segment="runtimeConfigSegment"
             :show-segmented="false"
+          />
+        </section>
+
+        <section
+          v-if="editingAgentId"
+          v-show="agentModalActiveTab === 'memory'"
+          class="agent-modal-section memory-section"
+        >
+          <AgentMemoryPanel
+            :agent="{ id: editingAgentId, slug: agentForm.slug, name: agentForm.name }"
+            :active="agentModalActiveTab === 'memory'"
           />
         </section>
 

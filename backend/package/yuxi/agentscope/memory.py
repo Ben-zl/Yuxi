@@ -10,13 +10,51 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import date
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+import frontmatter
 from agentscope.middleware import MiddlewareBase
 from agentscope.credential import CredentialFactory
+from agentscope.message import AssistantMsg, HintBlock, Msg
+from agentscope.tool import FunctionTool
 
+from yuxi.agentscope.memory_compaction import (
+    compact_daily_memories,
+    detect_memory_topic_keys,
+    sanitize_daily_runtime_state,
+    strip_transient_memory_state,
+)
 from yuxi.utils import logger
+from yuxi.utils.datetime_utils import shanghai_now
+
+
+AUTO_MEMORY_EXTRACTION_HINT = """提取长期记忆时只记录可跨对话复用的稳定事实、明确结论和稳定标识。
+禁止记录 pending、派发、等待回报、执行中、临时重试、一次性时间戳或承诺交付等运行中状态。
+对测试项目代号只原样记录用户明确给出的代号，不得推断其环境性质、生产属性或其他未明确信息。
+如果对话只有运行状态而没有稳定事实，请不要创建长期记忆。"""
+
+
+def _memory_extraction_messages(messages: list[Msg]) -> list[dict[str, Any]]:
+    """构造 ReMe 提取输入，用户原文不变，assistant 仅保留稳定事实。"""
+    result = []
+    for message in messages:
+        payload = message.model_dump(mode="json")
+        if message.role == "assistant":
+            content = []
+            for block in payload.get("content", []):
+                if block.get("type") != "text":
+                    content.append(block)
+                    continue
+                text = strip_transient_memory_state(str(block.get("text") or ""))
+                if text:
+                    content.append({**block, "text": text})
+            payload["content"] = content
+            if not content:
+                continue
+        result.append(payload)
+    return result
 
 
 class MemoryScopeBusyError(RuntimeError):
@@ -36,6 +74,42 @@ def memory_scope_identity(uid: str, agent_slug: str) -> str:
 def memory_workspace_path(base_dir: str | Path, uid: str, agent_slug: str) -> Path:
     """返回 scope 的 ReMe Workspace，路径中不包含原始业务标识。"""
     return Path(base_dir) / _scope_hash(uid) / _scope_hash(agent_slug)
+
+
+def validate_memory_workspace(
+    base_dir: str | Path,
+    uid: str,
+    agent_slug: str,
+    *,
+    create: bool = False,
+) -> Path:
+    """校验并可选创建 scope 目录，逐层拒绝符号链接和路径逃逸。"""
+    base = Path(base_dir)
+    if base.is_symlink() or not base.is_dir():
+        raise ValueError("Memory 根目录必须是真实目录")
+    resolved_base = base.resolve()
+    current = resolved_base
+    names = (_scope_hash(uid), _scope_hash(agent_slug))
+
+    for index, name in enumerate(names):
+        candidate = current / name
+        if candidate.is_symlink():
+            raise ValueError("Memory Workspace 路径不能包含符号链接")
+        if candidate.exists():
+            if not candidate.is_dir():
+                raise ValueError("Memory Workspace 路径必须是真实目录")
+        elif create:
+            candidate.mkdir()
+        else:
+            return current.joinpath(*names[index:])
+
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(resolved_base)
+        except ValueError as exc:
+            raise ValueError("Memory Workspace 不在配置根目录下") from exc
+        current = resolved
+    return current
 
 
 def ensure_memory_base_dir(base_dir: str | Path) -> Path:
@@ -75,19 +149,221 @@ class ReplyLease:
 CoreFactory = Callable[..., Awaitable[Any] | Any]
 
 
-async def _default_core_factory(*, workspace_dir: Path, chat_model: Any, embedding_model: Any) -> Any:
-    """使用 AgentScope 公共 ReMeMiddleware 构造一个 scope core。"""
-    from agentscope.middleware import ReMeMiddleware
+class YuxiReMeCore:
+    """通过 ReMe 公共 Job API 完成召回治理和逐轮自动写回。"""
 
-    return ReMeMiddleware(
-        workspace_dir=str(workspace_dir),
-        parameters=ReMeMiddleware.Parameters(
-            chat_model=chat_model,
-            embedding_model=embedding_model,
-            mode="both",
-            top_k=5,
-        ),
+    def __init__(self, *, app: Any, workspace_dir: str | Path, top_k: int = 5) -> None:
+        self.app = app
+        self.workspace_dir = Path(workspace_dir).resolve()
+        self.top_k = top_k
+        self._retrieval_tasks: dict[str | None, asyncio.Task] = {}
+
+    async def close(self) -> None:
+        """关闭当前 scope 内嵌的 ReMe 应用。"""
+        await self.app.close()
+
+    async def _run_job(self, name: str, **kwargs: Any) -> Any:
+        """执行 ReMe 公共 Job，并统一处理 success=false。"""
+        response = await self.app.run_job(name, **kwargs)
+        if getattr(response, "success", True) is False:
+            raise RuntimeError(str(getattr(response, "answer", f"ReMe {name} failed")))
+        return response
+
+    async def _govern_after_auto_memory(self) -> None:
+        """治理本轮新 Daily，并在治理完成后刷新完整索引。"""
+        memory_date = shanghai_now().date().isoformat()
+        sanitize_daily_runtime_state(self.workspace_dir, date=memory_date)
+        await compact_daily_memories(
+            self.workspace_dir,
+            date=memory_date,
+            maintain_index=lambda _daily_date: None,
+        )
+        await self._run_job("reindex")
+
+    def _candidate_metadata(self, relative_path: str) -> tuple[str | None, str | None]:
+        """读取候选的 Yuxi 状态和主题键，拒绝链接及路径逃逸。"""
+        parts = PurePosixPath(relative_path).parts
+        is_daily_card = len(parts) == 3 and parts[0] == "daily" and parts[2].endswith(".md")
+        if is_daily_card:
+            try:
+                date.fromisoformat(parts[1])
+            except ValueError:
+                is_daily_card = False
+        is_digest_card = (
+            len(parts) >= 3
+            and parts[0] == "digest"
+            and parts[1] in {"personal", "procedure", "wiki"}
+            and parts[-1].endswith(".md")
+        )
+        if not is_daily_card and not is_digest_card:
+            return "archived_duplicate", None
+        path = self.workspace_dir / relative_path
+        try:
+            if path.is_symlink() or not path.is_file():
+                return "archived_duplicate", None
+            path.resolve().relative_to(self.workspace_dir)
+            metadata = frontmatter.loads(path.read_text(encoding="utf-8")).metadata
+        except (OSError, UnicodeError, ValueError):
+            return "archived_duplicate", None
+        status = str(metadata.get("yuxi_memory_status") or "").strip() or None
+        topic_key = str(metadata.get("yuxi_topic_key") or "").strip() or None
+        return status, topic_key
+
+    @staticmethod
+    def _state_rank(text: str) -> int:
+        """把候选中的运行状态归一为 completed > failed > running > pending。"""
+        value = text.lower()
+        if any(marker in value for marker in ("已完成", "completed", "succeeded", "成功完成")):
+            return 3
+        if any(marker in value for marker in ("失败", "failed", "error", "异常")):
+            return 2
+        if any(marker in value for marker in ("running", "执行中", "处理中")):
+            return 1
+        return 0
+
+    async def search(self, query: str, *, limit: int | None = None) -> list[str]:
+        """召回并过滤归档来源，同主题只保留最稳定、最新鲜的候选。"""
+        requested = self.top_k if limit is None else max(1, min(limit, self.top_k))
+        response = await self._run_job("search", query=query, limit=max(requested * 3, requested))
+        results = getattr(response, "metadata", {}).get("results", [])
+        by_path: dict[str, dict[str, Any]] = {}
+        for candidate in results:
+            path = str(candidate.get("path") or "")
+            text = str(candidate.get("text") or "").strip()
+            if not path or not text or path in by_path:
+                continue
+            status, topic_key = self._candidate_metadata(path)
+            if status == "archived_duplicate":
+                continue
+            kind_rank = 3 if path.startswith("digest/") else 2 if status == "canonical" else 1
+            score = float((candidate.get("scores") or {}).get("score") or 0.0)
+            detected_keys = detect_memory_topic_keys(text)
+            by_path[path] = {
+                "path": path,
+                "text": text,
+                "topic_key": topic_key or (sorted(detected_keys)[0] if len(detected_keys) == 1 else path),
+                "rank": (kind_rank, self._state_rank(text), score),
+            }
+
+        by_topic: dict[str, dict[str, Any]] = {}
+        for candidate in by_path.values():
+            key = candidate["topic_key"]
+            current = by_topic.get(key)
+            if current is None or candidate["rank"] > current["rank"]:
+                by_topic[key] = candidate
+        ranked = sorted(by_topic.values(), key=lambda item: item["rank"], reverse=True)
+        return [item["text"] for item in ranked[:requested]]
+
+    async def list_tools(self) -> list:
+        """只注册一个经过 Yuxi 过滤的 memory_search 工具。"""
+
+        async def memory_search(query: str, limit: int = 5) -> str:
+            """搜索当前用户在此智能体范围内的长期记忆。"""
+            memories = await self.search(query, limit=limit)
+            return "\n\n".join(memories) if memories else "未找到相关长期记忆。"
+
+        return [
+            FunctionTool(
+                memory_search,
+                name="memory_search",
+                description="搜索当前用户在此智能体不同对话间共享的长期记忆",
+                is_read_only=True,
+            ),
+        ]
+
+    async def on_system_prompt(self, _agent: Any, current_prompt: str) -> str:
+        """提示模型仅在需要时使用唯一的长期记忆搜索工具。"""
+        return f"{current_prompt}\n\n需要跨对话事实时可调用 memory_search；不得把记忆中的 pending 状态当作当前事实。"
+
+    @staticmethod
+    def _session_id(agent: Any) -> str | None:
+        """从 AgentScope 公开 state 中读取当前 Session。"""
+        value = getattr(getattr(agent, "state", None), "session_id", None)
+        return str(value) if value else None
+
+    @staticmethod
+    def _query_text(inputs: Any) -> str:
+        """从 AgentScope 输入中提取本轮检索文本。"""
+        if isinstance(inputs, str):
+            return inputs.strip()
+        if isinstance(inputs, Msg):
+            return inputs.get_text_content().strip()
+        if isinstance(inputs, (list, tuple)):
+            return "\n".join(filter(None, (YuxiReMeCore._query_text(item) for item in inputs))).strip()
+        return ""
+
+    async def on_reply(self, agent: Any, input_kwargs: dict, next_handler: Callable[..., AsyncGenerator]):
+        """并行启动召回，主回复结束后把本轮增量写入 ReMe。"""
+        session_id = self._session_id(agent)
+        query_text = self._query_text(input_kwargs.get("inputs"))
+        stale = self._retrieval_tasks.pop(session_id, None)
+        if stale is not None and not stale.done():
+            stale.cancel()
+        if query_text:
+            self._retrieval_tasks[session_id] = asyncio.create_task(self.search(query_text))
+        context = getattr(getattr(agent, "state", None), "context", [])
+        pre_ids = {message.id for message in context if isinstance(message, Msg)}
+        try:
+            async for item in next_handler(**input_kwargs):
+                yield item
+        finally:
+            task = self._retrieval_tasks.pop(session_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            increment = [
+                message
+                for message in context
+                if isinstance(message, Msg)
+                and message.id not in pre_ids
+                and getattr(message, "name", None) != "yuxi_reme_memory"
+            ]
+            has_assistant = any(message.role == "assistant" and message.get_text_content() for message in increment)
+            if query_text and session_id and has_assistant:
+                try:
+                    await self._run_job(
+                        "auto_memory",
+                        messages=_memory_extraction_messages(increment),
+                        session_id=session_id,
+                        memory_hint=AUTO_MEMORY_EXTRACTION_HINT,
+                    )
+                    await self._govern_after_auto_memory()
+                except Exception as exc:  # noqa: BLE001 - 记忆写回不得阻断聊天
+                    logger.warning("ReMe auto_memory failed for session_id=%s: %s", session_id, exc)
+
+    async def on_reasoning(self, agent: Any, input_kwargs: dict, next_handler: Callable[..., AsyncGenerator]):
+        """在推理安全点注入已完成的治理后召回结果。"""
+        task = self._retrieval_tasks.get(self._session_id(agent))
+        if task is not None and task.done():
+            self._retrieval_tasks.pop(self._session_id(agent), None)
+            try:
+                memories = task.result()
+            except (asyncio.CancelledError, Exception) as exc:  # noqa: BLE001
+                logger.warning("ReMe search failed: %s", exc)
+                memories = []
+            if memories:
+                content = "长期记忆（可能过时，请结合当前对话核验）：\n" + "\n".join(
+                    f"- {memory}" for memory in memories
+                )
+                agent.state.context.append(
+                    AssistantMsg(name="yuxi_reme_memory", content=[HintBlock(hint=content)]),
+                )
+        async for event in next_handler(**input_kwargs):
+            yield event
+
+
+async def _default_core_factory(*, workspace_dir: Path, chat_model: Any, embedding_model: Any) -> Any:
+    """使用 ReMe 公共应用 API 构造带候选治理的 scope core。"""
+    app = await _create_reme_app(
+        workspace_dir=workspace_dir,
+        chat_model=chat_model,
+        embedding_model=embedding_model,
     )
+    return YuxiReMeCore(app=app, workspace_dir=workspace_dir, top_k=5)
 
 
 class ReMeRegistry:
@@ -121,16 +397,15 @@ class ReMeRegistry:
         """在 Registry 锁内取得当前 core，并返回需要异步关闭的旧 core。"""
         close_after: list[Any] = []
         entry = self._entries.get(key)
+        replaced_core = None
         if entry is not None and entry.fingerprint != fingerprint:
             if entry.active_replies:
                 raise RuntimeError("活动 reply 未等待完成就尝试轮换 Memory core")
-            close_after.append(entry.core)
-            del self._entries[key]
+            replaced_core = entry.core
             entry = None
 
         if entry is None:
-            workspace = memory_workspace_path(self.base_dir, *key)
-            workspace.mkdir(parents=True, exist_ok=True)
+            workspace = validate_memory_workspace(self.base_dir, *key, create=True)
             core = self._core_factory(
                 workspace_dir=workspace,
                 chat_model=chat_model,
@@ -145,6 +420,8 @@ class ReMeRegistry:
                 last_used_at=time.monotonic(),
             )
             self._entries[key] = entry
+            if replaced_core is not None:
+                close_after.append(replaced_core)
         return entry, close_after
 
     async def get_core(
@@ -175,7 +452,7 @@ class ReMeRegistry:
             entry.last_used_at = time.monotonic()
             close_after.extend(self._evict_locked(exclude=key))
 
-        await self._close_cores(close_after)
+        await self._close_cores(close_after, suppress_errors=True)
         return entry.core
 
     async def acquire_reply(
@@ -207,7 +484,7 @@ class ReMeRegistry:
             entry.last_used_at = time.monotonic()
             close_after.extend(self._evict_locked(exclude=key))
 
-        await self._close_cores(close_after)
+        await self._close_cores(close_after, suppress_errors=True)
         return ReplyLease(self, key, entry.core)
 
     async def _release_reply(self, key: tuple[str, str]) -> None:
@@ -227,6 +504,22 @@ class ReMeRegistry:
             yield cores.get((uid, agent_slug))
 
     @asynccontextmanager
+    async def acquire_inspection(self, uid: str, agent_slug: str):
+        """在 scope 空闲时短暂阻止 reply 和维护，以便一致读取卡片。"""
+        key = (uid, agent_slug)
+        async with self._condition:
+            entry = self._entries.get(key)
+            if key in self._exclusive_keys or (entry is not None and entry.active_replies):
+                raise MemoryScopeBusyError("memory_scope_busy")
+            self._exclusive_keys.add(key)
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._exclusive_keys.discard(key)
+                self._condition.notify_all()
+
+    @asynccontextmanager
     async def acquire_exclusive_many(self, scopes: list[tuple[str, str]]):
         """原子占用多个 scope，供 Agent/User 批量清理避免中途竞态。"""
         keys = list(dict.fromkeys(scopes))
@@ -238,11 +531,16 @@ class ReMeRegistry:
                     raise MemoryScopeBusyError("memory_scope_busy")
             self._exclusive_keys.update(keys)
             for key in keys:
-                entry = self._entries.pop(key, None)
+                entry = self._entries.get(key)
                 if entry is not None:
                     cores[key] = entry.core
         try:
-            await self._close_cores(list(cores.values()))
+            for key, core in cores.items():
+                await core.close()
+                async with self._condition:
+                    current = self._entries.get(key)
+                    if current is not None and current.core is core:
+                        self._entries.pop(key)
             yield cores
         finally:
             async with self._condition:
@@ -287,7 +585,7 @@ class ReMeRegistry:
             return
         if suppress_errors:
             for error in errors:
-                logger.warning("ReMe core close failed during shutdown: %s", error)
+                logger.warning("ReMe core close failed: %s", error)
             return
         raise errors[0]
 
@@ -467,6 +765,20 @@ def build_memory_models(projection: Any) -> tuple[Any, Any, str]:
 @asynccontextmanager
 async def reme_maintenance_app(*, workspace_dir: Path, chat_model: Any, embedding_model: Any):
     """使用 ReMe 公共 API 构造短生命周期 Dream/Reindex 应用。"""
+
+    app = await _create_reme_app(
+        workspace_dir=workspace_dir,
+        chat_model=chat_model,
+        embedding_model=embedding_model,
+    )
+    try:
+        yield app
+    finally:
+        await app.close()
+
+
+async def _create_reme_app(*, workspace_dir: Path, chat_model: Any, embedding_model: Any) -> Any:
+    """构造并启动只开放 Yuxi 所需公开 Job 的 ReMe 应用。"""
     from reme import ReMe
     from reme.config import resolve_app_config
 
@@ -478,7 +790,9 @@ async def reme_maintenance_app(*, workspace_dir: Path, chat_model: Any, embeddin
         log_to_console=False,
     )
     allowed_jobs = {
+        "auto_memory",
         "auto_dream",
+        "search",
         "node_search",
         "reindex",
         "daily_list",
@@ -511,7 +825,4 @@ async def reme_maintenance_app(*, workspace_dir: Path, chat_model: Any, embeddin
     await app.update_component("as_llm", "default", model=chat_model)
     await app.update_component("as_embedding", "default", model=embedding_model)
     await app.start()
-    try:
-        yield app
-    finally:
-        await app.close()
+    return app
