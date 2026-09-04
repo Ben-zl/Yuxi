@@ -85,10 +85,12 @@ class SkillRepository:
         self,
         item: Skill,
         *,
+        dir_path: str,
         version: str,
         content_hash: str,
         updated_by: str | None,
     ) -> Skill:
+        item.dir_path = dir_path
         item.version = version
         item.content_hash = content_hash
         item.source_type = "builtin"

@@ -1252,7 +1252,7 @@ async def test_init_builtin_skills_updates_existing_record_and_preserves_disable
         slug="reporter",
         name="reporter",
         description="old description",
-        dir_path="skills/reporter",
+        dir_path="shared/reporter",
         source_type="builtin",
         tool_dependencies=[],
         mcp_dependencies=[],
@@ -1309,16 +1309,23 @@ async def test_init_builtin_skills_updates_existing_record_and_preserves_disable
             self,
             item: Skill,
             *,
+            dir_path: str,
             version: str,
             content_hash: str,
             updated_by: str | None,
         ) -> Skill:
+            item.dir_path = dir_path
             item.version = version
             item.content_hash = content_hash
             item.source_type = "builtin"
             item.share_config = svc.BUILTIN_SKILL_SHARE_CONFIG.copy()
             item.updated_by = updated_by
-            captured["install"] = {"version": version, "content_hash": content_hash, "updated_by": updated_by}
+            captured["install"] = {
+                "dir_path": dir_path,
+                "version": version,
+                "content_hash": content_hash,
+                "updated_by": updated_by,
+            }
             return item
 
     monkeypatch.setattr(svc, "SkillRepository", FakeRepo)
@@ -1327,6 +1334,7 @@ async def test_init_builtin_skills_updates_existing_record_and_preserves_disable
 
     assert len(items) == 1
     assert items[0].enabled is False
+    assert items[0].dir_path == "skills/reporter"
     assert items[0].version == "1.0.1"
     assert (target_dir / "prompt.md").read_text(encoding="utf-8") == "new builtin content"
     assert captured["metadata"] == {
@@ -1341,6 +1349,7 @@ async def test_init_builtin_skills_updates_existing_record_and_preserves_disable
         "updated_by": "release-bot",
     }
     assert captured["install"]["updated_by"] == "release-bot"
+    assert captured["install"]["dir_path"] == "skills/reporter"
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 """AgentScope Team worker 生命周期投影测试。"""
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -36,8 +37,9 @@ async def test_failed_worker_reply_uses_native_notification_and_finishes_once(mo
     monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
     monkeypatch.setattr(lifecycle, "_open_worker_run", AsyncMock(return_value=("child-run", "child-request")))
 
-    async def _finish_worker_run(**kwargs) -> None:
+    async def _finish_worker_run(**kwargs) -> str:
         order.append(("finish", kwargs["terminal_status"]))
+        return kwargs["terminal_status"]
 
     monkeypatch.setattr(lifecycle, "_finish_worker_run", _finish_worker_run)
     monkeypatch.setattr(team_lifecycle, "append_run_stream_event", AsyncMock())
@@ -52,6 +54,109 @@ async def test_failed_worker_reply_uses_native_notification_and_finishes_once(mo
 
     assert [item async for item in lifecycle.project_worker_reply({}, _reply)]
     assert order == [("finish", "failed")]
+
+
+async def test_worker_setup_failure_finishes_projected_child_run(monkeypatch):
+    """Agent 尚未装配完成时，也必须结束 AgentCreate 已投影的 child Run。"""
+    lifecycle = TeamLifecycleModule(
+        storage=_worker_storage(),
+        uid="u",
+        agent_id="worker-agent",
+        session_id="worker-session",
+    )
+    binding = SimpleNamespace(
+        active_run_id="child-run",
+        child_thread_id="child-thread",
+    )
+    monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
+
+    @asynccontextmanager
+    async def _db_context():
+        yield object()
+
+    class FakeRunRepository:
+        def __init__(self, _db):
+            pass
+
+        async def get_run(self, run_id: str):
+            assert run_id == "child-run"
+            return SimpleNamespace(status="running", request_id="child-request")
+
+    monkeypatch.setattr(team_lifecycle.pg_manager, "get_async_session_context", _db_context)
+    monkeypatch.setattr(team_lifecycle, "AgentRunRepository", FakeRunRepository)
+    finish_run = AsyncMock(return_value="failed")
+    monkeypatch.setattr(lifecycle, "_finish_worker_run", finish_run)
+    append_event = AsyncMock()
+    monkeypatch.setattr(team_lifecycle, "append_run_stream_event", append_event)
+
+    assert await lifecycle.fail_setup() is True
+    finish_run.assert_awaited_once_with(
+        run_id="child-run",
+        terminal_status="failed",
+        error_type="agentscope_team_setup",
+        error_message="Team worker 会话准备失败，请检查模型、工具、Skill 和知识库配置",
+        text="",
+        reasoning="",
+        usage={},
+        tool_calls=[],
+    )
+    append_event.assert_awaited_once()
+    assert append_event.await_args.args[:2] == ("child-run", "end")
+    assert append_event.await_args.args[2]["status"] == "failed"
+
+
+async def test_top_level_setup_failure_does_not_wait_for_worker_binding(monkeypatch):
+    """普通或 leader Session 装配失败时不得等待不存在的 worker binding。"""
+    storage = _worker_storage()
+    storage.get_session.return_value = SimpleNamespace(team_id=None)
+    lifecycle = TeamLifecycleModule(
+        storage=storage,
+        uid="u",
+        agent_id="leader-agent",
+        session_id="leader-session",
+    )
+    wait_for_binding = AsyncMock()
+    monkeypatch.setattr(lifecycle, "_wait_for_binding", wait_for_binding)
+
+    assert await lifecycle.fail_setup() is False
+    wait_for_binding.assert_not_awaited()
+
+
+async def test_worker_finish_loser_does_not_persist_duplicate_output(monkeypatch):
+    """并发终态竞争失败者不得再写重复消息或终态事件。"""
+    lifecycle = TeamLifecycleModule(
+        storage=_worker_storage(),
+        uid="u",
+        agent_id="worker-agent",
+        session_id="worker-session",
+    )
+    db = SimpleNamespace(add=AsyncMock(), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def _db_context():
+        yield db
+
+    run = SimpleNamespace(status="completed")
+    repository = SimpleNamespace(
+        set_terminal_status=AsyncMock(return_value=(run, False)),
+    )
+    monkeypatch.setattr(team_lifecycle.pg_manager, "get_async_session_context", _db_context)
+    monkeypatch.setattr(team_lifecycle, "AgentRunRepository", lambda _db: repository)
+
+    result = await lifecycle._finish_worker_run(
+        run_id="child-run",
+        terminal_status="completed",
+        error_type=None,
+        error_message=None,
+        text="duplicate",
+        reasoning="",
+        usage={},
+        tool_calls=[],
+    )
+
+    assert result is None
+    db.add.assert_not_awaited()
+    db.commit.assert_not_awaited()
 
 
 async def test_worker_reply_projects_native_anthropic_cache_usage(monkeypatch):
@@ -119,8 +224,9 @@ async def test_intermediate_reply_ends_are_candidates_until_generator_exhausts(m
     monkeypatch.setattr(lifecycle, "_wait_for_binding", AsyncMock(return_value=binding))
     monkeypatch.setattr(lifecycle, "_open_worker_run", AsyncMock(return_value=("child-run", "child-request")))
 
-    async def _finish_worker_run(**kwargs) -> None:
+    async def _finish_worker_run(**kwargs) -> str:
         order.append(("finish", kwargs["terminal_status"]))
+        return kwargs["terminal_status"]
 
     monkeypatch.setattr(lifecycle, "_finish_worker_run", _finish_worker_run)
     monkeypatch.setattr(team_lifecycle, "append_run_stream_event", AsyncMock())

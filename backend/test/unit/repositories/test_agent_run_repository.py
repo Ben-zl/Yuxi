@@ -247,3 +247,30 @@ async def test_set_terminal_status_persists_token_usage_only_for_winner(session)
     assert persisted.token_usage == usage
     assert loser_changed is False
     assert loser.token_usage == usage
+
+
+async def test_set_terminal_status_normalizes_cancel_request_under_lock(session):
+    """Team 收尾竞争终态时必须在同一行锁内保留取消语义。"""
+    repo = AgentRunRepository(session)
+    run = await repo.create_run(
+        run_id="cancelled-team-run",
+        conversation_thread_id="thread-1",
+        agent_slug="worker",
+        uid="user-1",
+        request_id="cancelled-team-request",
+        input_payload={},
+    )
+    await repo.request_cancel(run.id)
+
+    persisted, changed = await repo.set_terminal_status(
+        run.id,
+        status="completed",
+        error_type="unexpected",
+        error_message="should be cleared",
+        cancel_requested_as_cancelled=True,
+    )
+
+    assert changed is True
+    assert persisted.status == "cancelled"
+    assert persisted.error_type is None
+    assert persisted.error_message is None

@@ -1802,6 +1802,7 @@ async def init_builtin_skills(db: AsyncSession, *, created_by: str = "system") -
             synced_items.append(
                 await repo.update_builtin_install(
                     existing,
+                    dir_path=_build_builtin_skill_dir_path(slug),
                     version=spec["version"],
                     content_hash=spec["content_hash"],
                     updated_by=created_by,

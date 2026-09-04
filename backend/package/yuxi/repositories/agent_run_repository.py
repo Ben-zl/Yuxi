@@ -309,12 +309,17 @@ class AgentRunRepository:
         error_type: str | None = None,
         error_message: str | None = None,
         token_usage: dict | None = None,
+        cancel_requested_as_cancelled: bool = False,
     ) -> tuple[AgentRun | None, bool]:
         run = await self._lock_run(run_id)
         if not run:
             return None, False
         if run.status in TERMINAL_RUN_STATUSES:
             return run, False
+        if cancel_requested_as_cancelled and run.status == "cancel_requested":
+            status = "cancelled"
+            error_type = None
+            error_message = None
         run.status = status
         run.error_type = error_type
         run.error_message = error_message

@@ -58,7 +58,47 @@ async def _ensure_database_exists(database_url: str) -> None:
         await conn.close()
 
 
+async def _finalize_team_worker_setup_failure(
+    user_id: str,
+    agent_id: str,
+    session_id: str,
+    error: Exception,
+) -> None:
+    """尽力结束 AgentScope 准备阶段失败的 Team child Run。"""
+    from yuxi.agentscope.team_lifecycle import TeamLifecycleModule
+    from yuxi.utils.logging_config import logger
+
+    try:
+        finalized = await TeamLifecycleModule(
+            storage=app.state.storage,
+            uid=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+        ).fail_setup()
+    except Exception:
+        logger.exception(
+            "Team worker 准备失败后的 child Run 收口失败 session=%s",
+            session_id,
+        )
+        return
+    if finalized:
+        logger.warning(
+            "Team worker 会话准备失败，已结束 child Run session=%s cause=%s",
+            session_id,
+            type(error).__name__,
+        )
+
+
 async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str) -> list:
+    """装配额外 middleware，并收口准备阶段失败的 Team child Run。"""
+    try:
+        return await _build_extra_agent_middlewares(user_id, agent_id, session_id)
+    except Exception as error:
+        await _finalize_team_worker_setup_failure(user_id, agent_id, session_id, error)
+        raise
+
+
+async def _build_extra_agent_middlewares(user_id: str, agent_id: str, session_id: str) -> list:
     """每轮 chat 注入当前提示词、观测和运行控制中间件。
 
     Langfuse 对接：设置 OTEL_EXPORTER_OTLP_ENDPOINT 等 OTel 环境变量即可
@@ -158,6 +198,15 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
 
 
 async def _extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> list:
+    """装配额外工具，并收口准备阶段失败的 Team child Run。"""
+    try:
+        return await _build_extra_agent_tools(user_id, agent_id, session_id)
+    except Exception as error:
+        await _finalize_team_worker_setup_failure(user_id, agent_id, session_id, error)
+        raise
+
+
+async def _build_extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> list:
     """每轮 chat 按会话注入 yuxi 工具（KB 工具按可见性，LITE 自动裁剪）。"""
     from yuxi.agentscope.tools import (
         build_extra_tools,

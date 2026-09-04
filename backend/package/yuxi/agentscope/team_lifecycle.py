@@ -332,7 +332,7 @@ class TeamLifecycleModule:
                             "error_message"
                         )
                         if final_reply_end:
-                            await self._finish_worker_run(
+                            persisted_status = await self._finish_worker_run(
                                 run_id=run_id,
                                 terminal_status=terminal.run_status,
                                 error_type=terminal.chunk.get("error_type"),
@@ -342,12 +342,13 @@ class TeamLifecycleModule:
                                 usage=usage.snapshot(complete=True),
                                 tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
                             )
-                            await append_run_stream_event(
-                                run_id,
-                                "end",
-                                {"status": terminal.run_status, "chunk": terminal.chunk},
-                                thread_id=binding.child_thread_id,
-                            )
+                            if persisted_status is not None:
+                                await append_run_stream_event(
+                                    run_id,
+                                    "end",
+                                    {"status": persisted_status, "chunk": terminal.chunk},
+                                    thread_id=binding.child_thread_id,
+                                )
                             finalized = True
                     else:
                         chunks = event_to_chunks(event, request_id=request_id)
@@ -363,7 +364,7 @@ class TeamLifecycleModule:
                 yield item
 
             if run_id and request_id and terminal is not None and not finalized:
-                await self._finish_worker_run(
+                persisted_status = await self._finish_worker_run(
                     run_id=run_id,
                     terminal_status=terminal.run_status,
                     error_type=terminal.chunk.get("error_type"),
@@ -373,12 +374,13 @@ class TeamLifecycleModule:
                     usage=usage.snapshot(complete=True),
                     tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
                 )
-                await append_run_stream_event(
-                    run_id,
-                    "end",
-                    {"status": terminal.run_status, "chunk": terminal.chunk},
-                    thread_id=binding.child_thread_id,
-                )
+                if persisted_status is not None:
+                    await append_run_stream_event(
+                        run_id,
+                        "end",
+                        {"status": persisted_status, "chunk": terminal.chunk},
+                        thread_id=binding.child_thread_id,
+                    )
             elif run_id and request_id and not finalized:
                 error_message = "AgentScope worker reply stream ended without REPLY_END"
                 terminal_status = await self._finish_worker_run(
@@ -421,22 +423,23 @@ class TeamLifecycleModule:
                     usage=usage.snapshot(complete=False),
                     tool_calls=tool_converter.history_tool_calls() if tool_converter else [],
                 )
-                chunk = (
-                    make_chunk(request_id, status="interrupted", message="对话已取消")
-                    if terminal_status == "cancelled"
-                    else make_chunk(
-                        request_id,
-                        status="error",
-                        error_type="agentscope_team",
-                        error_message=str(exc),
+                if terminal_status is not None:
+                    chunk = (
+                        make_chunk(request_id, status="interrupted", message="对话已取消")
+                        if terminal_status == "cancelled"
+                        else make_chunk(
+                            request_id,
+                            status="error",
+                            error_type="agentscope_team",
+                            error_message=str(exc),
+                        )
                     )
-                )
-                await append_run_stream_event(
-                    run_id,
-                    "end",
-                    {"status": terminal_status, "chunk": chunk},
-                    thread_id=binding.child_thread_id,
-                )
+                    await append_run_stream_event(
+                        run_id,
+                        "end",
+                        {"status": terminal_status, "chunk": chunk},
+                        thread_id=binding.child_thread_id,
+                    )
             raise
 
     async def _wait_for_binding(self):
@@ -452,6 +455,59 @@ class TeamLifecycleModule:
             await asyncio.sleep(0.1)
         logger.debug("Team worker 没有 Yuxi 生命周期绑定 session=%s", self.session_id)
         return None
+
+    async def fail_setup(self) -> bool:
+        """结束尚未进入 Reply middleware 的 worker child Run。"""
+        session = await self.storage.get_session(
+            self.uid,
+            self.agent_id,
+            self.session_id,
+        )
+        if session is None or session.team_id is None:
+            return False
+        team = await self.storage.get_team(self.uid, session.team_id)
+        if team is None or team.session_id == self.session_id:
+            return False
+
+        binding = await self._wait_for_binding()
+        if binding is None or not binding.active_run_id:
+            return False
+
+        async with pg_manager.get_async_session_context() as db:
+            run = await AgentRunRepository(db).get_run(binding.active_run_id)
+            if run is None or run.status in TERMINAL_RUN_STATUSES:
+                return False
+            request_id = run.request_id
+
+        error_type = "agentscope_team_setup"
+        error_message = "Team worker 会话准备失败，请检查模型、工具、Skill 和知识库配置"
+        terminal_status = await self._finish_worker_run(
+            run_id=binding.active_run_id,
+            terminal_status="failed",
+            error_type=error_type,
+            error_message=error_message,
+            text="",
+            reasoning="",
+            usage={},
+            tool_calls=[],
+        )
+        if terminal_status is None:
+            return False
+        await append_run_stream_event(
+            binding.active_run_id,
+            "end",
+            {
+                "status": terminal_status,
+                "chunk": make_chunk(
+                    request_id,
+                    status="error",
+                    error_type=error_type,
+                    error_message=error_message,
+                ),
+            },
+            thread_id=binding.child_thread_id,
+        )
+        return True
 
     async def _open_worker_run(
         self,
@@ -544,14 +600,17 @@ class TeamLifecycleModule:
         """原子保存 worker 输出和 child Run 终态，重复终态事件保持幂等。"""
         async with pg_manager.get_async_session_context() as db:
             runs = AgentRunRepository(db)
-            run = await runs.get_run(run_id)
-            if run is None:
+            run, changed = await runs.set_terminal_status(
+                run_id,
+                status=terminal_status,
+                error_type=error_type if terminal_status == "failed" else None,
+                error_message=error_message,
+                token_usage=usage,
+                cancel_requested_as_cancelled=True,
+            )
+            if run is None or not changed:
                 return None
-            if run.status in TERMINAL_RUN_STATUSES:
-                return run.status
-            if run.status == "cancel_requested":
-                terminal_status = "cancelled"
-                error_message = None
+            terminal_status = run.status
             output_message = None
             if text or reasoning or tool_calls:
                 output_message = Message(
@@ -584,13 +643,6 @@ class TeamLifecycleModule:
                         )
                     )
                 await runs.set_output_message(run.id, output_message.id)
-            await runs.set_terminal_status(
-                run.id,
-                status=terminal_status,
-                error_type=error_type if terminal_status == "failed" else None,
-                error_message=error_message,
-                token_usage=usage,
-            )
             await db.commit()
             return terminal_status
 
