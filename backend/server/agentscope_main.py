@@ -74,8 +74,7 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
     )
     from yuxi.agentscope.runtime_resources import resolve_runtime_projection
     from yuxi.agentscope.memory import (
-        ScopedReMeMiddleware,
-        build_memory_models,
+        build_scoped_reme_middleware,
         memory_scope_identity,
         validate_memory_workspace,
     )
@@ -105,7 +104,6 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
         build_context_observability_middleware(app.state.message_bus, session_id),
     ]
     if projection.memory_enabled:
-        chat_model, embedding_model, fingerprint = build_memory_models(projection)
 
         async def mark_memory_updated() -> None:
             """仅在 ReMe 已实际生成卡片时推进 scope 最近记忆时间。"""
@@ -121,17 +119,14 @@ async def _extra_agent_middlewares(user_id: str, agent_id: str, session_id: str)
                     await repo.mark_memory_at(record, memory_at)
                     await update_db.commit()
 
-        middlewares.append(
-            ScopedReMeMiddleware(
-                registry=app.state.reme_registry,
-                uid=user_id,
-                agent_slug=projection.agent_slug,
-                fingerprint=fingerprint,
-                chat_model=chat_model,
-                embedding_model=embedding_model,
-                on_memory_updated=mark_memory_updated,
-            ),
+        memory_middleware = build_scoped_reme_middleware(
+            projection,
+            registry=app.state.reme_registry,
+            uid=user_id,
+            on_memory_updated=mark_memory_updated,
         )
+        if memory_middleware is not None:
+            middlewares.append(memory_middleware)
     session = await app.state.storage.get_session(user_id, agent_id, session_id)
     source = getattr(session, "source", None) if session is not None else None
     if getattr(source, "value", source) == "channel":
@@ -355,6 +350,9 @@ def _create_service_app_sync():
     async def yuxi_lifespan(current_app):
         """在 AgentScope 原生资源关闭前释放 Yuxi 长期记忆资源。"""
         async with original_lifespan(current_app):
+            from yuxi.config import config
+
+            config.start_runtime_sync()
             await current_app.state.memory_dream_scheduler.start()
             await current_app.state.memory_compaction_scheduler.start()
             try:

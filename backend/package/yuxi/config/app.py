@@ -100,7 +100,8 @@ class Config(BaseModel):
             logger.error(f"Failed to load config from {self._config_file}: {e}")
 
     def start_runtime_sync(self, interval: float = runtime_cache.RUNTIME_CONFIG_SYNC_INTERVAL_SECONDS) -> None:
-        """启动后台线程周期性从 Redis 同步运行时配置。多次调用仅启动一次。"""
+        """立即刷新运行时配置，再启动幂等的后台同步线程。"""
+        self.refresh()
         self._runtime_sync_thread = runtime_cache.start_runtime_sync(
             self,
             self._runtime_sync_thread,

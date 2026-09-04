@@ -762,6 +762,32 @@ def build_memory_models(projection: Any) -> tuple[Any, Any, str]:
     return chat_model, embedding_model, fingerprint
 
 
+def build_scoped_reme_middleware(
+    projection: Any,
+    *,
+    registry: Any,
+    uid: str,
+    on_memory_updated: Callable[[], Awaitable[None]] | None,
+) -> ScopedReMeMiddleware | None:
+    """构造 scope 记忆中间件；可选记忆不可用时保持普通对话可执行。"""
+    try:
+        chat_model, embedding_model, fingerprint = build_memory_models(projection)
+        return ScopedReMeMiddleware(
+            registry=registry,
+            uid=uid,
+            agent_slug=projection.agent_slug,
+            fingerprint=fingerprint,
+            chat_model=chat_model,
+            embedding_model=embedding_model,
+            on_memory_updated=on_memory_updated,
+        )
+    except Exception as exc:  # noqa: BLE001 - 长期记忆是可选能力
+        logger.warning(
+            f"ReMe middleware disabled for {uid}/{projection.agent_slug}: {type(exc).__name__}",
+        )
+        return None
+
+
 @asynccontextmanager
 async def reme_maintenance_app(*, workspace_dir: Path, chat_model: Any, embedding_model: Any):
     """使用 ReMe 公共 API 构造短生命周期 Dream/Reindex 应用。"""

@@ -235,6 +235,20 @@ def test_start_runtime_sync_is_idempotent(tmp_path):
     assert thread.daemon is True
 
 
+def test_start_runtime_sync_refreshes_before_starting_background_thread(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    payload = {
+        "fast_model": "runtime-provider:fast-chat",
+        "embed_model": "runtime-provider:embedding",
+    }
+    _patch_runtime_redis(monkeypatch, _FakeRedis(raw=json.dumps(payload)))
+    cfg = Config(save_dir=str(tmp_path))
+
+    cfg.start_runtime_sync(interval=3600)
+
+    assert cfg.fast_model == "runtime-provider:fast-chat"
+    assert cfg.embed_model == "runtime-provider:embedding"
+
+
 def test_update_ignores_readonly_save_dir(tmp_path, monkeypatch: pytest.MonkeyPatch):
     _patch_runtime_redis(monkeypatch, _FakeRedis())
     cfg = Config(save_dir=str(tmp_path))
