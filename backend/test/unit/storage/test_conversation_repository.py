@@ -179,6 +179,50 @@ async def test_add_tool_call_updates_existing_lifecycle(conversation_session):
 
 
 @pytest.mark.asyncio
+async def test_pending_tool_call_lookup_is_scoped_to_conversation(conversation_session):
+    """相同工具 ID 只能命中目标对话中的 pending 记录。"""
+    first = Conversation(
+        thread_id="thread-first",
+        uid="user-a",
+        agent_id="agent-a",
+        title="First",
+        status="active",
+    )
+    second = Conversation(
+        thread_id="thread-second",
+        uid="user-b",
+        agent_id="agent-a",
+        title="Second",
+        status="active",
+    )
+    first_message = Message(conversation=first, role="assistant", content="", message_type="text")
+    second_message = Message(conversation=second, role="assistant", content="", message_type="text")
+    conversation_session.add_all([first, second, first_message, second_message])
+    await conversation_session.flush()
+    first_call = ToolCall(
+        message_id=first_message.id,
+        langgraph_tool_call_id="shared-id",
+        tool_name="ask_user_question",
+        status="pending",
+    )
+    second_call = ToolCall(
+        message_id=second_message.id,
+        langgraph_tool_call_id="shared-id",
+        tool_name="ask_user_question",
+        status="pending",
+    )
+    conversation_session.add_all([first_call, second_call])
+    await conversation_session.commit()
+
+    result = await ConversationRepository(conversation_session).get_pending_tool_call_for_conversation(
+        "shared-id",
+        first.id,
+    )
+
+    assert result.id == first_call.id
+
+
+@pytest.mark.asyncio
 async def test_search_conversations_by_message_content_filters_user_status_and_tool_messages(conversation_session):
     now = utc_now_naive()
     active = Conversation(

@@ -6,6 +6,7 @@ yuxi 消息表与 Run 事件流。旧栈管理面（Skills/MCP/agent_state 视�
 清退计划见迁移工单 14。
 """
 
+import asyncio
 import os
 
 from yuxi.agents.mcp.service import ensure_builtin_mcp_servers_in_db
@@ -38,9 +39,16 @@ async def process_agent_run(ctx, run_id: str):
     从 run 列与输入消息恢复参数，经 yuxi.agentscope.worker_job 执行：
     映射保障 → 网关协议转换写入 Run 事件流 → yuxi 消息落库 → 终态回写。
     """
-    from yuxi.agentscope.worker_job import execute_agent_run_job
+    from yuxi.agentscope.worker_job import execute_agent_run_job, fail_agent_run_by_id
 
-    await execute_agent_run_job(run_id)
+    try:
+        async with asyncio.timeout(PROCESS_AGENT_RUN_TIMEOUT_SECONDS):
+            await execute_agent_run_job(run_id)
+    except TimeoutError:
+        await fail_agent_run_by_id(
+            run_id,
+            "执行超过最长运行时间",
+        )
 
 
 async def _worker_startup(ctx):
@@ -55,6 +63,14 @@ async def _worker_startup(ctx):
 
         await ensure_options_in_db(session)
     sys_config.start_runtime_sync()
+    from yuxi.agentscope.client import AgentScopeServiceClient
+    from yuxi.agentscope.recovery import reconcile_stale_running_runs
+
+    recovered = await reconcile_stale_running_runs(
+        AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
+    )
+    if recovered:
+        logger.warning("Recovered %s stale AgentScope run(s) from persisted replies", recovered)
     await recover_pending_dispatches()
 
 
@@ -66,6 +82,9 @@ async def _worker_shutdown(ctx):
     await pg_manager.close()
 
 
+PROCESS_AGENT_RUN_TIMEOUT_SECONDS = int(os.getenv("YUXI_JOB_TIMEOUT_SECONDS", "3600"))
+
+
 class WorkerSettings:
     functions = [process_agent_run]
     cron_jobs = [_agent_task_scan_job()]
@@ -74,7 +93,7 @@ class WorkerSettings:
     health_check_interval = 15
     # 单任务最长执行时间（秒），可配置：超长图谱构建/深度检索场景需调大，
     # 避免长任务被 arq 取消并误标为 cancelled。
-    job_timeout = int(os.getenv("YUXI_JOB_TIMEOUT_SECONDS", "3600"))
+    job_timeout = PROCESS_AGENT_RUN_TIMEOUT_SECONDS + 30
     keep_result = 60
     on_startup = _worker_startup
     on_shutdown = _worker_shutdown

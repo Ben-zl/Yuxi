@@ -140,6 +140,49 @@ def test_tool_event_converter_streams_call_and_result():
     assert converter.feed({"type": "MODEL_CALL_START", "reply_id": "r1"}) == []
 
 
+def test_tool_history_sanitizes_postgres_invalid_nul_bytes():
+    """工具历史中的 NUL 不得让 Run 终态持久化失败。"""
+    from yuxi.agentscope.protocol import ToolEventConverter
+
+    converter = ToolEventConverter(REQUEST_ID)
+    converter.feed(
+        {
+            "type": "TOOL_CALL_START",
+            "reply_id": "reply-1",
+            "tool_call_id": "tool-1",
+            "tool_call_name": "Read",
+        }
+    )
+    converter.feed(
+        {
+            "type": "TOOL_CALL_DELTA",
+            "tool_call_id": "tool-1",
+            "delta": '{"path":"a\\u0000b"}',
+        }
+    )
+    converter.feed(
+        {
+            "type": "TOOL_RESULT_TEXT_DELTA",
+            "tool_call_id": "tool-1",
+            "delta": "before\x00after",
+        }
+    )
+    converter.feed(
+        {
+            "type": "TOOL_RESULT_END",
+            "tool_call_id": "tool-1",
+            "state": "error",
+            "metadata": {"error_message": "bad\x00output"},
+        }
+    )
+
+    [call] = converter.history_tool_calls()
+    assert call["args"] == {"path": "a�b"}
+    assert call["output"] == "before�after"
+    assert call["error_message"] == "bad�output"
+    assert "\x00" not in str(call)
+
+
 def test_require_user_confirm_maps_to_approval_chunk():
     """审批 chunk 需符合前端 useApproval 契约：approval 包装 + review_configs 等长。
 
@@ -200,11 +243,7 @@ def test_external_gateway_unwraps_question_payload_and_source():
                         "skill": "research",
                         "tool_name": "ask_user_question",
                         "activation_token": "token",
-                        "arguments": {
-                            "questions": [
-                                {"question_id": "q1", "question": "范围？", "options": []}
-                            ]
-                        },
+                        "arguments": {"questions": [{"question_id": "q1", "question": "范围？", "options": []}]},
                     }
                 ),
             }

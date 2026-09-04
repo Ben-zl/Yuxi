@@ -96,7 +96,9 @@ async def env(monkeypatch):
             db.add(provider)
         provider.display_name = "e2e mock provider"
         provider.provider_type = "openai"
-        provider.base_url = os.getenv("OPENAI_MOCK_BASE_URL", os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1"))
+        provider.base_url = os.getenv(
+            "OPENAI_MOCK_BASE_URL", os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1")
+        )
         provider.api_key = "e2e-mock-key"
         provider.capabilities = ["chat"]
         provider.enabled_models = [{"id": "mock-chat-model", "type": "chat"}]
@@ -239,7 +241,17 @@ async def test_steer_interrupted_run_dispatches_queue_head(env, monkeypatch):
     async def _capture_dispatch(**kwargs):
         dispatched.append(kwargs.get("thread_id"))
 
-    async def _interrupted_run(db, client, *, run, text, read_timeout=180.0, model_spec=None, image_content=None):
+    async def _interrupted_run(
+        db,
+        client,
+        *,
+        run,
+        text,
+        read_timeout=180.0,
+        model_spec=None,
+        image_content=None,
+        mapping=None,
+    ):
         return GatewayRoundResult(run_status="interrupted", text="", reasoning="", event_count=1)
 
     monkeypatch.setattr(worker_job, "dispatch_next_request", _capture_dispatch)
@@ -296,7 +308,17 @@ async def test_approval_parked_interrupted_run_holds_queue(env, monkeypatch):
     async def _capture_dispatch(**kwargs):
         dispatched.append(kwargs.get("thread_id"))
 
-    async def _parked_run(db, client, *, run, text, read_timeout=180.0, model_spec=None, image_content=None):
+    async def _parked_run(
+        db,
+        client,
+        *,
+        run,
+        text,
+        read_timeout=180.0,
+        model_spec=None,
+        image_content=None,
+        mapping=None,
+    ):
         return GatewayRoundResult(
             run_status="interrupted",
             text="",

@@ -13,6 +13,19 @@ from dataclasses import dataclass
 ASSISTANT_MSG_TYPE = "AIMessageChunk"
 
 
+def sanitize_persisted_value(value):
+    """递归替换 PostgreSQL text/jsonb 不接受的 NUL 字符。"""
+    if isinstance(value, str):
+        return value.replace("\x00", "\N{REPLACEMENT CHARACTER}")
+    if isinstance(value, dict):
+        return {sanitize_persisted_value(key): sanitize_persisted_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_persisted_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_persisted_value(item) for item in value)
+    return value
+
+
 def make_chunk(request_id: str, **kwargs) -> dict:
     """构造与现有 chat_service.make_chunk 等价的 chunk dict。"""
     return {"request_id": request_id, "response": None, "thread_id": None, **kwargs}
@@ -243,15 +256,17 @@ class ToolEventConverter:
             if state != "success":
                 error_message = metadata.get("error_message") or metadata.get("message")
             calls.append(
-                {
-                    "id": tool_call_id,
-                    "name": self._tool_names.get(tool_call_id, "") or "unknown",
-                    "args": parsed_args,
-                    "output": "".join(self._result_fragments.get(tool_call_id, [])),
-                    "status": state,
-                    "error_message": error_message,
-                    "metadata": metadata,
-                }
+                sanitize_persisted_value(
+                    {
+                        "id": tool_call_id,
+                        "name": self._tool_names.get(tool_call_id, "") or "unknown",
+                        "args": parsed_args,
+                        "output": "".join(self._result_fragments.get(tool_call_id, [])),
+                        "status": state,
+                        "error_message": error_message,
+                        "metadata": metadata,
+                    }
+                )
             )
         return calls
 

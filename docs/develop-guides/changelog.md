@@ -1,5 +1,14 @@
 # 版本变更记录
 
+### 2026-09-04
+
+- 修复 AgentScope Team 工具输出含 NUL 时 child/parent Run 永久停在运行中的问题：持久化前清洗非法字符，从 idle Session 已完成 reply 恢复终态，并在超时后先中断远端执行再收束本地 Run。
+
+### 2026-09-03
+
+- 修复 AgentScope 未同步管理员运行时模型配置导致 ReMe 使用启动默认模型、并在凭证无效时阻断普通对话的问题；服务启动时立即读取 Redis 配置并持续同步，ReMe 模型构造失败时仅禁用本轮长期记忆。
+- 修复旧数据中的内置 Skill 目录仍指向 `shared/` 导致 Team worker 会话准备失败的问题；启动同步会归一为 `skills/`，准备阶段异常也会结束已投影的 child Run，避免子智能体长期停在运行中。
+
 ### 2026-09-02
 
 - 修复金山云星流 `qwen3-embedding-8b` 对单元素数组输入兼容不稳定的问题：Yuxi Embedding 与 AgentScope/ReMe 适配器统一使用字符串输入，多文本按条发送并保留顺序；其他 OpenAI-compatible provider 行为不变。

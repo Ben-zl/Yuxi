@@ -389,13 +389,14 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
     run_repo = SimpleNamespace(
         get_run=AsyncMock(return_value=run),
         mark_running=AsyncMock(),
-        set_terminal_status=AsyncMock(),
+        set_terminal_status=AsyncMock(return_value=(SimpleNamespace(status="failed"), True)),
     )
     db = SimpleNamespace(
         execute=AsyncMock(
             return_value=SimpleNamespace(scalar_one_or_none=lambda: SimpleNamespace(content="hello", extra_metadata={}))
         ),
         commit=AsyncMock(),
+        rollback=AsyncMock(),
     )
 
     class _SessionContext:

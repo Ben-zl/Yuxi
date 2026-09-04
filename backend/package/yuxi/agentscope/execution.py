@@ -17,13 +17,11 @@ from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.storage.postgres.models_business import AgentRun
 
 
-async def has_active_child_runs(run_id: str, uid: str) -> bool:
-    """查询父 Run 是否仍有未结束的 Team child Run。"""
-    from yuxi.storage.postgres.manager import pg_manager
+async def has_active_child_runs(client: AgentScopeServiceClient, run_id: str, uid: str) -> bool:
+    """查询活动 child，并收束已 idle 但本地终态丢失的 Team worker。"""
+    from yuxi.agentscope.recovery import reconcile_active_team_child_runs
 
-    async with pg_manager.get_async_session_context() as db:
-        children = await AgentRunRepository(db).list_active_child_runs_for_user(run_id, uid)
-        return bool(children)
+    return await reconcile_active_team_child_runs(client, parent_run_id=run_id, uid=uid)
 
 
 async def execute_run(
@@ -66,7 +64,7 @@ async def execute_run(
         read_timeout=read_timeout,
         image_content=image_content,
         configured_model_spec=mapping.model_spec,
-        has_active_child_runs=lambda: has_active_child_runs(run.id, run.uid),
+        has_active_child_runs=lambda: has_active_child_runs(client, run.id, run.uid),
     )
     await finalize_run(db, run, result)
     return result

@@ -444,7 +444,10 @@ async def recover_pending_dispatches() -> None:
                 AgentRun.uid,
                 AgentRun.agent_slug,
                 AgentRun.conversation_thread_id,
-            ).where(AgentRun.status.in_(("pending", "running")))
+            ).where(
+                AgentRun.status.in_(("pending", "running")),
+                AgentRun.run_type.in_(("chat", "resume")),
+            )
         )
         scopes_result = await db.execute(
             select(

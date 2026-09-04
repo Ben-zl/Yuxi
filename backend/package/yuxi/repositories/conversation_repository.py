@@ -406,9 +406,7 @@ class ConversationRepository:
             Conversation.status == "active",
             *self._exclude_source_conditions(exclude_sources),
         ]
-        result = await self.db.execute(
-            select(Conversation).where(*conditions).order_by(Conversation.updated_at.desc())
-        )
+        result = await self.db.execute(select(Conversation).where(*conditions).order_by(Conversation.updated_at.desc()))
         return list(result.scalars().all())
 
     async def search_conversations_by_message_content(
@@ -570,6 +568,25 @@ class ConversationRepository:
             select(ToolCall)
             .where(ToolCall.langgraph_tool_call_id == langgraph_tool_call_id)
             .order_by(ToolCall.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_pending_tool_call_for_conversation(
+        self,
+        langgraph_tool_call_id: str,
+        conversation_id: int,
+    ) -> ToolCall | None:
+        """按对话边界读取待恢复工具调用，避免跨用户或线程误更新。"""
+        result = await self.db.execute(
+            select(ToolCall)
+            .join(Message, ToolCall.message_id == Message.id)
+            .where(
+                ToolCall.langgraph_tool_call_id == langgraph_tool_call_id,
+                ToolCall.status == "pending",
+                Message.conversation_id == conversation_id,
+            )
+            .order_by(ToolCall.created_at.desc(), ToolCall.id.desc())
             .limit(1)
         )
         return result.scalar_one_or_none()

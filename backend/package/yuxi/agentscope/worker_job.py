@@ -132,6 +132,7 @@ async def execute_agent_run_job(run_id: str) -> None:
             await _sync_input_delivery_status(db, run, result.run_status)
             await db.commit()
         except ValueError as exc:
+            await db.rollback()
             message = str(exc)
             await _fail_run(
                 db,
@@ -142,6 +143,7 @@ async def execute_agent_run_job(run_id: str) -> None:
             return
         except Exception as exc:  # noqa: BLE001 - 任务级失败统一终态
             logger.exception(f"agentscope 执行失败 run={run_id}: {exc}")
+            await db.rollback()
             await _fail_run(db, run_repo, run, f"执行失败: {exc}")
             return
 
@@ -196,7 +198,7 @@ async def _sync_input_delivery_status(db, run, run_status: str) -> None:
         await ConversationRepository(db).set_message_delivery_status(run.input_message_id, delivery)
 
 
-async def _fail_run(db, run_repo, run, message: str) -> None:
+async def _fail_run(db, run_repo, run, message: str) -> bool:
     """失败终态提交后续派 FIFO 队头。"""
     from yuxi.services.run_queue_service import clear_cancel_signal, has_cancel_signal
 
@@ -205,14 +207,21 @@ async def _fail_run(db, run_repo, run, message: str) -> None:
     error_message = None if cancelled else message
     end_payload = {"status": "cancelled"} if cancelled else {"status": "error", "error_message": message}
 
-    await run_repo.set_terminal_status(run.id, status=terminal_status, error_message=error_message)
+    persisted, changed = await run_repo.set_terminal_status(
+        run.id,
+        status=terminal_status,
+        error_message=error_message,
+    )
+    if persisted is None or not changed:
+        return False
+    terminal_status = persisted.status
+    await _sync_input_delivery_status(db, run, terminal_status)
+    await db.commit()
     await _emit_end_event(
         run.id,
         run.conversation_thread_id,
         end_payload,
     )
-    await _sync_input_delivery_status(db, run, terminal_status)
-    await db.commit()
     if cancelled:
         await clear_cancel_signal(run.id)
     await dispatch_next_request(
@@ -221,6 +230,122 @@ async def _fail_run(db, run_repo, run, message: str) -> None:
         thread_id=run.conversation_thread_id,
     )
     await _notify_agent_task(run.id, terminal_status)
+    return True
+
+
+async def fail_agent_run_by_id(run_id: str, message: str) -> None:
+    """中断并确认远端执行停止后，使用独立事务收束超时 Run。"""
+    from yuxi.agentscope.client import AgentScopeServiceError
+    from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerRepository
+    from yuxi.repositories.agentscope_thread_sessions import get_thread_session
+
+    async with pg_manager.get_async_session_context() as db:
+        run_repo = AgentRunRepository(db)
+        run = await run_repo.get_run(run_id)
+        if run is None or run.status in TERMINAL_RUN_STATUSES:
+            return
+        mapping = await get_thread_session(
+            db,
+            uid=run.uid,
+            thread_id=run.conversation_thread_id,
+        )
+        child_runs = await run_repo.list_active_child_runs_for_user(run.id, run.uid)
+        child_bindings = await AgentScopeTeamWorkerRepository(db).list_for_active_runs(
+            uid=run.uid,
+            run_ids=[child.id for child in child_runs],
+        )
+        uid = run.uid
+
+    client = AgentScopeServiceClient(
+        os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"),
+        timeout=5,
+    )
+    sessions = []
+    if mapping is not None:
+        sessions.append((mapping.agentscope_agent_id, mapping.agentscope_session_id))
+    sessions.extend((binding.worker_agent_id, binding.worker_session_id) for binding in child_bindings)
+
+    async with asyncio.timeout(25):
+
+        async def interrupt(agent_id: str, session_id: str) -> None:
+            try:
+                await client.interrupt_session(uid, agent_id, session_id)
+            except AgentScopeServiceError as exc:
+                if exc.status_code != 404:
+                    raise
+
+        await asyncio.gather(*(interrupt(agent_id, session_id) for agent_id, session_id in sessions))
+
+        pending_sessions = list(sessions)
+        for _ in range(40):
+            statuses = await asyncio.gather(
+                *(_session_is_stopped(client, uid, agent_id, session_id) for agent_id, session_id in pending_sessions)
+            )
+            pending_sessions = [
+                session for session, stopped in zip(pending_sessions, statuses, strict=True) if not stopped
+            ]
+            if not pending_sessions:
+                break
+            await asyncio.sleep(0.25)
+        if pending_sessions:
+            raise RuntimeError("AgentScope Session 未在超时后停止")
+
+        from yuxi.agentscope.recovery import reconcile_active_team_child_runs
+
+        await reconcile_active_team_child_runs(
+            client,
+            parent_run_id=run_id,
+            uid=uid,
+        )
+        await _fail_remaining_timeout_children(
+            parent_run_id=run_id,
+            uid=uid,
+        )
+        async with pg_manager.get_async_session_context() as db:
+            run_repo = AgentRunRepository(db)
+            run = await run_repo.get_run(run_id)
+            if run is None or run.status in TERMINAL_RUN_STATUSES:
+                return
+            await _fail_run(db, run_repo, run, message)
+
+
+async def _session_is_stopped(
+    client: AgentScopeServiceClient,
+    uid: str,
+    agent_id: str,
+    session_id: str,
+) -> bool:
+    """确认 AgentScope Session 已空闲或不存在。"""
+    from yuxi.agentscope.client import AgentScopeServiceError
+
+    try:
+        return await client.get_session_status(uid, agent_id, session_id) == "idle"
+    except AgentScopeServiceError as exc:
+        if exc.status_code == 404:
+            return True
+        raise
+
+
+async def _fail_remaining_timeout_children(*, parent_run_id: str, uid: str) -> None:
+    """收束没有可恢复 reply 的超时 child Run，并确认全部进入终态。"""
+    async with pg_manager.get_async_session_context() as db:
+        runs = AgentRunRepository(db)
+        children = await runs.list_active_child_runs_for_user(parent_run_id, uid)
+        for child in children:
+            await _fail_run(
+                db,
+                runs,
+                child,
+                "执行因父运行超时而终止",
+            )
+
+    async with pg_manager.get_async_session_context() as db:
+        remaining = await AgentRunRepository(db).list_active_child_runs_for_user(
+            parent_run_id,
+            uid,
+        )
+        if remaining:
+            raise RuntimeError("父运行超时后仍存在未结束的 child Run")
 
 
 async def _materialize_run_attachments(
@@ -448,7 +573,7 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
             idle_poll_seconds=stall_poll_seconds,
             total_timeout=READ_TIMEOUT_SECONDS,
             emit_parked_end=False,
-            has_active_child_runs=lambda: has_active_child_runs(run.id, run.uid),
+            has_active_child_runs=lambda: has_active_child_runs(client, run.id, run.uid),
         )
     finally:
         await cancel_tasks(pump, cancel_task)
@@ -497,7 +622,7 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
             tool_converter=tool_converter,
             team_tool_seen=any(str(call.get("name") or "") in TEAM_TOOL_NAMES for call in pending_calls),
             emit_parked_end=False,
-            has_active_child_runs=lambda: has_active_child_runs(run.id, run.uid),
+            has_active_child_runs=lambda: has_active_child_runs(client, run.id, run.uid),
         )
     finally:
         await cancel_tasks(pump, cancel_task)
