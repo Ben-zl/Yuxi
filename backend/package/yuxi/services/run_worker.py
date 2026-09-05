@@ -18,6 +18,13 @@ from yuxi.config.runtime import lite_mode_enabled
 from yuxi.services.agent_request_queue_service import recover_pending_dispatches
 from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.storage.postgres.manager import pg_manager
+from yuxi.services.run_queue_service import (
+    WORKER_HEALTH_INTERVAL_SECONDS,
+    WORKER_HEALTH_KEY,
+    WORKER_RECONCILIATION_HEALTH_KEY,
+    WORKER_RECONCILIATION_HEALTH_TTL_SECONDS,
+    get_redis_client,
+)
 from yuxi.storage.redis import get_arq_redis_settings
 from yuxi.utils.logging_config import logger
 
@@ -161,10 +168,22 @@ async def _reconcile_forever() -> None:
             recovered = await reconcile_expired_run_leases()
             if recovered:
                 logger.warning("Reconciled expired AgentScope Run lease(s): %s", ",".join(recovered))
+            await _publish_reconciliation_health()
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("AgentScope Run lease reconciliation failed")
+
+
+async def _publish_reconciliation_health() -> None:
+    """发布 lease reconciliation 的短 TTL 健康事实。"""
+
+    redis = await get_redis_client()
+    await redis.set(
+        WORKER_RECONCILIATION_HEALTH_KEY,
+        "healthy",
+        ex=WORKER_RECONCILIATION_HEALTH_TTL_SECONDS,
+    )
 
 
 async def _worker_startup(ctx):
@@ -187,6 +206,7 @@ async def _worker_startup(ctx):
     if recovered:
         logger.warning("Recovered %s stale AgentScope run(s) from persisted replies", recovered)
     await recover_pending_dispatches()
+    await _publish_reconciliation_health()
     global _reconciliation_task
     _reconciliation_task = asyncio.create_task(_reconcile_forever())
 
@@ -209,7 +229,8 @@ class WorkerSettings:
     cron_jobs = [_agent_task_scan_job()]
     max_tries = 2
     retry_jobs = True
-    health_check_interval = 15
+    health_check_interval = WORKER_HEALTH_INTERVAL_SECONDS
+    health_check_key = WORKER_HEALTH_KEY
     # 单任务最长执行时间（秒），可配置：超长图谱构建/深度检索场景需调大，
     # 避免长任务被 arq 取消并误标为 cancelled。
     job_timeout = PROCESS_AGENT_RUN_TIMEOUT_SECONDS + 30

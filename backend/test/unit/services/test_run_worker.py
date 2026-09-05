@@ -46,3 +46,27 @@ async def test_process_agent_run_cancellation_is_left_for_arq_retry(monkeypatch)
         raise AssertionError("CancelledError must propagate to ARQ")
 
     finish.assert_not_awaited()
+
+
+async def test_reconciliation_health_publishes_bounded_lease(monkeypatch):
+    """worker 启动和周期收敛必须发布 readiness 所需的续租事实。"""
+    redis = AsyncMock()
+
+    async def get_redis():
+        return redis
+
+    monkeypatch.setattr(run_worker, "get_redis_client", get_redis)
+
+    await run_worker._publish_reconciliation_health()
+
+    redis.set.assert_awaited_once_with(
+        run_worker.WORKER_RECONCILIATION_HEALTH_KEY,
+        "healthy",
+        ex=run_worker.WORKER_RECONCILIATION_HEALTH_TTL_SECONDS,
+    )
+
+
+def test_worker_settings_publish_arq_health_lease():
+    """ARQ health lease 的刷新周期必须匹配 readiness 的 TTL 上限。"""
+    assert run_worker.WorkerSettings.health_check_interval == run_worker.WORKER_HEALTH_INTERVAL_SECONDS
+    assert run_worker.WorkerSettings.health_check_key == run_worker.WORKER_HEALTH_KEY
