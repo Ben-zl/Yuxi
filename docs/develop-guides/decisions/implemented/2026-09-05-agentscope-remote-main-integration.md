@@ -75,3 +75,20 @@ docker compose exec api uv run ruff format package --check
 ```
 
 当前独立 compose 配置缺少 `AGENTSCOPE_LEGACY_CUTOFF` 等 `.env` 变量，且预构建镜像没有可执行的 ruff entrypoint；主机 ruff 对全包检查得到 477 个历史/merge-wide 问题，不能把它们归因于本次 Workspace 适配。独立 Reviewer 调度未得到可用回报，因此完整独立 Review 记为 `Not run`/`Blocked`；当前 Agent 只完成了不继承上下文的范围收敛静态检查。`uv run` 在容器中尝试更新或替换 root-owned `/app/uv.lock`/site-packages，故本次真实 E2E 使用容器内已安装依赖直接执行 `python -m pytest`；该命令已通过。真实页面和完整 integration suite 仍未执行。
+
+## 追加边界与并发验证（2026-09-05）
+
+为覆盖合并后 Schema、lease、队列和 Docker Workspace 的真实边界，使用独立 Docker Compose 槽位重新执行了以下验证：
+
+```text
+Docker PostgreSQL/Redis/MinIO/AgentScope/worker/api 槽位：启动成功
+相关 unit：158 passed
+AgentRun lease + 请求队列并发 + manifest/attempt + Docker Workspace integration：27 passed
+Docker Workspace 真实文件写入、读取、编辑、附件越界与大小限制：2 passed
+```
+
+并发测试夹具同步到当前 AgentScope 事实模型：Conversation 必须绑定 Project/User，非终态 Run 必须填写 `runtime_scope_id`，resume/subagent Run 必须填写当前关系字段；恢复扫描明确只重投 chat/resume 根 Run，不把 subagent child 当成独立队列头。旧 `chat_service.save_messages_from_langgraph_state` lease 测试迁移到 `AgentRunRepository` 的 `lock_output_persistence`、`set_output_message` 和 `set_terminal_status`，未恢复旧 LangGraph 执行入口。
+
+Docker Workspace 首次失败原因为验证槽位内 AgentScope 进程以非 root 用户访问 `/run/docker.sock`，不是业务路径错误；通过仅用于验证的 Compose override 以 root 运行 AgentScope 后，真实 Workspace 测试通过。shipping Compose 未修改。
+
+真实 MiniMax-M3 已完成独立并发会话和长 Agent 任务验证；真实多 Agent Team 协作仍有一次 `interrupted`，日志显示 `AgentCreate`/`Skill` 重复工具注册警告，尚未把该次结果宣称为通过。确定性 mock Team E2E 因缺少 API E2E 登录凭据被测试框架跳过；因此多 Agent 的真实 provider 完整闭环仍是剩余风险。

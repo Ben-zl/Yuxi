@@ -7,19 +7,16 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from langchain.messages import AIMessage
 from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.repositories.agent_run_repository import AgentRunRepository
-from yuxi.repositories.conversation_repository import ConversationRepository
-from yuxi.services import chat_service, run_worker
+from yuxi.services import run_queue_service, run_worker
 from yuxi.storage.postgres.manager import AGENT_RUN_LEASE_SCHEMA_STATEMENTS, RUNTIME_SCOPE_SCHEMA_STATEMENTS
 from yuxi.storage.postgres.models_business import AgentRun, Conversation, Message, Project, SubagentThread, User
 from yuxi.utils.datetime_utils import utc_now_naive
@@ -202,7 +199,7 @@ async def test_root_terminal_atomically_cancels_live_child_and_clears_lease(
             run_worker.pg_manager, "get_async_session_context", lambda: _session_context(session_factory)
         )
         publish_cancel = AsyncMock()
-        monkeypatch.setattr(run_worker, "publish_cancel_signal", publish_cancel)
+        monkeypatch.setattr(run_queue_service, "publish_cancel_signal", publish_cancel)
 
         transition = await run_worker.mark_run_terminal(
             parent_id,
@@ -326,7 +323,7 @@ async def test_expired_root_reconciliation_cancels_live_child_before_runtime_rel
     lease_database,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """失联根 Run 必须先持久收敛执行树，再释放共享 runtime。"""
+    """失联根 Run 必须先持久收敛执行树，再发布子 Run 取消信号。"""
 
     _, session_factory = lease_database
     now = utc_now_naive()
@@ -355,9 +352,7 @@ async def test_expired_root_reconciliation_cancels_live_child_before_runtime_rel
             run_worker.pg_manager, "get_async_session_context", lambda: _session_context(session_factory)
         )
         publish_cancel = AsyncMock()
-        release_runtime = AsyncMock(return_value=False)
-        monkeypatch.setattr(run_worker, "publish_cancel_signal", publish_cancel)
-        monkeypatch.setattr(run_worker, "_release_runtime_if_idle", release_runtime)
+        monkeypatch.setattr(run_queue_service, "publish_cancel_signal", publish_cancel)
 
         reconciled_ids = await run_worker.reconcile_expired_run_leases(now=now + timedelta(seconds=11))
 
@@ -373,8 +368,6 @@ async def test_expired_root_reconciliation_cancels_live_child_before_runtime_rel
         assert child.lease_expires_at is not None
         assert child_message.delivery_status == "dispatched"
         publish_cancel.assert_awaited_once_with(child_id)
-        release_runtime.assert_awaited_once()
-        assert release_runtime.await_args.args[0].id == parent_id
     finally:
         await _cleanup_runs(session_factory, [parent_thread_id, child_thread_id])
 
@@ -480,7 +473,7 @@ async def test_heartbeat_and_terminal_transition_require_exact_attempt_owner(
             exact_output_id = exact_output.id
             await db.commit()
 
-        missing_owner = await run_worker.mark_run_terminal(run_id, "failed")
+        missing_owner = await run_worker.mark_run_terminal(run_id, "failed", worker_id="missing-owner")
         other_owner_result = await run_worker.mark_run_terminal(run_id, "failed", worker_id=other_owner)
         owner_result = await run_worker.mark_run_terminal(run_id, "completed", worker_id=owner)
 
@@ -524,30 +517,15 @@ async def test_invalid_attempt_cannot_leave_assistant_message(
         lease_expires_at=now + timedelta(seconds=lease_offset),
     )
 
-    class FakeGraph:
-        async def aget_state(self, _config):
-            return SimpleNamespace(values={"messages": [AIMessage(id=f"output-{run_id}", content="must rollback")]})
-
-    class FakeAgent:
-        async def get_graph(self, *, context):
-            assert context is fake_context
-            return FakeGraph()
-
-    fake_context = object()
     try:
         async with session_factory() as db:
             run = await db.get(AgentRun, run_id)
             with pytest.raises(ValueError, match="有效 AgentRun lease owner"):
-                await chat_service.save_messages_from_langgraph_state(
-                    agent_instance=FakeAgent(),
-                    thread_id=thread_id,
-                    conv_repo=ConversationRepository(db),
-                    config_dict={"configurable": {"thread_id": thread_id, "uid": run.uid}},
-                    context=fake_context,
+                await AgentRunRepository(db).lock_output_persistence(
                     run_id=run_id,
-                    request_id=run.request_id,
                     worker_id=owner,
-                    complete_run=True,
+                    conversation_thread_id=thread_id,
+                    request_id=run.request_id,
                 )
 
         async with session_factory() as db:
@@ -569,14 +547,6 @@ async def test_interrupt_message_and_run_terminal_commit_together(lease_database
     owner = "worker-interrupt:attempt-owner"
     run_id, thread_id, _ = await _create_run(session_factory)
 
-    class FakeGraph:
-        async def aget_state(self, _config):
-            return SimpleNamespace(values={"messages": [AIMessage(id=f"output-{run_id}", content="waiting")]})
-
-    class FakeAgent:
-        async def get_graph(self, *, context):
-            return FakeGraph()
-
     try:
         async with session_factory() as db:
             run, acquired = await AgentRunRepository(db).mark_running(
@@ -586,23 +556,34 @@ async def test_interrupt_message_and_run_terminal_commit_together(lease_database
             )
             await db.commit()
             request_id = run.request_id
-            uid = run.uid
         assert acquired is True
 
         async with session_factory() as db:
-            committed = await chat_service.save_messages_from_langgraph_state(
-                agent_instance=FakeAgent(),
-                thread_id=thread_id,
-                conv_repo=ConversationRepository(db),
-                config_dict={"configurable": {"thread_id": thread_id, "uid": uid}},
-                context=object(),
-                run_id=run_id,
+            run = await db.get(AgentRun, run_id)
+            conversation = await db.get(Conversation, run.conversation_id)
+            output_message = Message(
+                conversation_id=conversation.id,
+                role="assistant",
+                content="waiting",
                 request_id=request_id,
-                worker_id=owner,
-                interrupt_run=True,
-                interrupt_error_type="ask_user_question_required",
-                interrupt_error_message="请选择",
+                run_id=run_id,
+                delivery_status="complete",
             )
+            db.add(output_message)
+            await db.flush()
+            await AgentRunRepository(db).set_output_message(
+                run_id,
+                output_message.id,
+                worker_id=owner,
+            )
+            _, committed = await AgentRunRepository(db).set_terminal_status(
+                run_id,
+                status="interrupted",
+                error_type="ask_user_question_required",
+                error_message="请选择",
+                worker_id=owner,
+            )
+            await db.commit()
         assert committed is True
 
         async with session_factory() as db:

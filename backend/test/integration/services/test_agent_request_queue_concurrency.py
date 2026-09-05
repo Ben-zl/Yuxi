@@ -13,10 +13,19 @@ from fastapi import HTTPException
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.repositories.agent_run_request_repository import AgentRunRequestRepository
 from yuxi.services import agent_request_queue_service
 from yuxi.services.input_message_service import build_chat_input_message
-from yuxi.storage.postgres.models_business import AgentRun, AgentRunRequest, Conversation, Message
+from yuxi.storage.postgres.models_business import (
+    AgentRun,
+    AgentRunRequest,
+    Conversation,
+    Message,
+    Project,
+    SubagentThread,
+    User,
+)
 from yuxi.utils.datetime_utils import utc_now_naive
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -24,14 +33,45 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 async def _cleanup_queue_test_thread(session_factory, engine, thread_id: str) -> None:
     async with session_factory() as db:
-        conversation_id = await db.scalar(select(Conversation.id).where(Conversation.thread_id == thread_id))
+        conversation = await db.scalar(
+            select(Conversation).where(Conversation.thread_id == thread_id)
+        )
+        conversation_id = conversation.id if conversation is not None else None
+        project_id = conversation.project_id if conversation is not None else None
+        uid = conversation.uid if conversation is not None else None
         await db.execute(delete(AgentRunRequest).where(AgentRunRequest.conversation_thread_id == thread_id))
         if conversation_id is not None:
             await db.execute(delete(Message).where(Message.conversation_id == conversation_id))
         await db.execute(delete(AgentRun).where(AgentRun.conversation_thread_id == thread_id))
         await db.execute(delete(Conversation).where(Conversation.thread_id == thread_id))
+        if project_id is not None:
+            await db.execute(delete(Project).where(Project.id == project_id))
+        if uid is not None:
+            await db.execute(delete(User).where(User.uid == uid))
         await db.commit()
     await engine.dispose()
+
+
+async def _add_project_and_user(db, uid: str) -> str:
+    project_id = str(uuid.uuid4())
+    db.add(User(username=uid, uid=uid, password_hash="test"))
+    await db.flush()
+    return await _add_project(db, uid, project_id)
+
+
+async def _add_project(db, uid: str, project_id: str | None = None) -> str:
+    project_id = project_id or str(uuid.uuid4())
+    db.add(
+        Project(
+            id=project_id,
+            uid=uid,
+            selection_status="implicit",
+            workdir_path=f"projects/{project_id}",
+            directory_mode="managed",
+        )
+    )
+    await db.flush()
+    return project_id
 
 
 async def test_concurrent_reject_requests_never_enter_queue(monkeypatch: pytest.MonkeyPatch):
@@ -44,7 +84,14 @@ async def test_concurrent_reject_requests_never_enter_queue(monkeypatch: pytest.
     monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
 
     async with session_factory() as db:
-        conversation = Conversation(thread_id=thread_id, uid=uid, agent_id="main", status="active")
+        project_id = await _add_project_and_user(db, uid)
+        conversation = Conversation(
+            thread_id=thread_id,
+            uid=uid,
+            project_id=project_id,
+            agent_id="main",
+            status="active",
+        )
         db.add(conversation)
         await db.commit()
 
@@ -115,7 +162,14 @@ async def test_concurrent_steer_requests_keep_one_pending(monkeypatch: pytest.Mo
     monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
 
     async with session_factory() as db:
-        conversation = Conversation(thread_id=thread_id, uid=uid, agent_id="main", status="active")
+        project_id = await _add_project_and_user(db, uid)
+        conversation = Conversation(
+            thread_id=thread_id,
+            uid=uid,
+            project_id=project_id,
+            agent_id="main",
+            status="active",
+        )
         db.add(conversation)
         await db.flush()
         active_message = Message(
@@ -144,6 +198,7 @@ async def test_concurrent_steer_requests_keep_one_pending(monkeypatch: pytest.Mo
             AgentRun(
                 id=active_run_id,
                 conversation_thread_id=thread_id,
+                runtime_scope_id=thread_id,
                 agent_slug="main",
                 uid=uid,
                 status="running",
@@ -225,7 +280,16 @@ async def test_concurrent_enqueue_dispatches_fifo_head(monkeypatch: pytest.Monke
     monkeypatch.setattr(AgentRunRequestRepository, "create", controlled_create)
 
     async with session_factory() as db:
-        db.add(Conversation(thread_id=thread_id, uid=uid, agent_id="main", status="active"))
+        project_id = await _add_project_and_user(db, uid)
+        db.add(
+            Conversation(
+                thread_id=thread_id,
+                uid=uid,
+                project_id=project_id,
+                agent_id="main",
+                status="active",
+            )
+        )
         await db.commit()
 
     async def submit(request_id: str):
@@ -304,7 +368,14 @@ async def test_dispatch_retry_reenqueues_existing_pending_run(monkeypatch: pytes
     monkeypatch.setattr(agent_request_queue_service.pg_manager, "get_async_session_context", session_context)
 
     async with session_factory() as db:
-        conversation = Conversation(thread_id=thread_id, uid=uid, agent_id="main", status="active")
+        project_id = await _add_project_and_user(db, uid)
+        conversation = Conversation(
+            thread_id=thread_id,
+            uid=uid,
+            project_id=project_id,
+            agent_id="main",
+            status="active",
+        )
         db.add(conversation)
         await db.flush()
         message = Message(
@@ -380,21 +451,43 @@ async def test_startup_recovery_reenqueues_pending_runs_without_queue_requests(m
     monkeypatch.setattr(agent_request_queue_service.pg_manager, "get_async_session_context", session_context)
 
     async with session_factory() as db:
+        db.add(User(username=uid, uid=uid, password_hash="test"))
+        await db.flush()
+        project_ids = [await _add_project(db, uid) for _ in run_specs]
         conversations = [
-            Conversation(thread_id=thread_id, uid=uid, agent_id=agent_slug, status="active")
-            for thread_id, agent_slug, _, _ in run_specs
+            Conversation(
+                thread_id=thread_id,
+                uid=uid,
+                project_id=project_id,
+                agent_id=agent_slug,
+                status="active",
+            )
+            for project_id, (thread_id, agent_slug, _, _) in zip(project_ids, run_specs, strict=True)
         ]
         db.add_all(conversations)
+        await db.flush()
+        relation = SubagentThread(
+            uid=uid,
+            parent_conversation_id=conversations[0].id,
+            child_conversation_id=conversations[1].id,
+            child_thread_id=run_specs[1][0],
+            subagent_slug=run_specs[1][1],
+            created_by_run_id=run_ids[0],
+        )
+        db.add(relation)
         await db.flush()
         db.add_all(
             [
                 AgentRun(
                     id=run_id,
                     conversation_thread_id=thread_id,
+                    runtime_scope_id=run_specs[0][0] if run_type == "subagent" else thread_id,
                     agent_slug=agent_slug,
                     uid=uid,
                     request_id=f"startup-{run_type}-{uuid.uuid4()}",
                     conversation_id=conversation.id,
+                    created_by_run_id=run_ids[0],
+                    subagent_thread_relation_id=relation.id if run_type == "subagent" else None,
                     input_payload={"model_spec": "model"},
                     status=status,
                     run_type=run_type,
@@ -420,12 +513,26 @@ async def test_startup_recovery_reenqueues_pending_runs_without_queue_requests(m
                 ).all()
             )
 
-        assert set(run_ids).issubset(enqueue_calls)
+        assert run_ids[0] in enqueue_calls
+        # Subagent Run 由父 Run 的 AgentScope runtime 统一恢复，不作为独立队列头重投。
+        assert run_ids[1] not in enqueue_calls
         assert request_count == 0
     finally:
         async with session_factory() as db:
+            project_ids = list(
+                (
+                    await db.scalars(
+                        select(Conversation.project_id).where(
+                            Conversation.thread_id.in_([spec[0] for spec in run_specs])
+                        )
+                    )
+                ).all()
+            )
             await db.execute(delete(AgentRun).where(AgentRun.id.in_(run_ids)))
+            await db.execute(delete(SubagentThread).where(SubagentThread.child_thread_id == run_specs[1][0]))
             await db.execute(delete(Conversation).where(Conversation.thread_id.in_([spec[0] for spec in run_specs])))
+            await db.execute(delete(Project).where(Project.id.in_(project_ids)))
+            await db.execute(delete(User).where(User.uid == uid))
             await db.commit()
         await engine.dispose()
 
@@ -449,7 +556,14 @@ async def test_terminal_status_loser_does_not_change_message_delivery_status(mon
                 raise
 
     async with session_factory() as db:
-        conversation = Conversation(thread_id=thread_id, uid=uid, agent_id="main", status="active")
+        project_id = await _add_project_and_user(db, uid)
+        conversation = Conversation(
+            thread_id=thread_id,
+            uid=uid,
+            project_id=project_id,
+            agent_id="main",
+            status="active",
+        )
         db.add(conversation)
         await db.flush()
         message = Message(
@@ -465,25 +579,42 @@ async def test_terminal_status_loser_does_not_change_message_delivery_status(mon
             AgentRun(
                 id=run_id,
                 conversation_thread_id=thread_id,
+                runtime_scope_id=thread_id,
                 agent_slug="main",
                 uid=uid,
                 request_id=request_id,
                 conversation_id=conversation.id,
                 input_message_id=message.id,
                 input_payload={},
-                status="running",
+                status="pending",
                 run_type="chat",
             )
         )
+        await db.flush()
+        output_message = Message(
+            conversation_id=conversation.id,
+            role="assistant",
+            content="completed output",
+            request_id=request_id,
+            run_id=run_id,
+            delivery_status="complete",
+        )
+        db.add(output_message)
+        await db.flush()
+        run = await db.get(AgentRun, run_id)
+        run.output_message_id = output_message.id
+        await AgentRunRepository(db).mark_running(run_id, worker_id="queue-test-worker", lease_seconds=60)
         await db.commit()
 
     try:
         # 网关翻转后终态回写走 AgentRunRepository.set_terminal_status
-        from yuxi.repositories.agent_run_repository import AgentRunRepository
-
         async with session_factory() as db:
             repo = AgentRunRepository(db)
-            run1, changed1 = await repo.set_terminal_status(run_id, status="completed")
+            run1, changed1 = await repo.set_terminal_status(
+                run_id,
+                status="completed",
+                worker_id="queue-test-worker",
+            )
             await db.commit()
         async with session_factory() as db:
             repo = AgentRunRepository(db)
@@ -492,6 +623,7 @@ async def test_terminal_status_loser_does_not_change_message_delivery_status(mon
                 status="cancelled",
                 error_type="cancelled",
                 error_message="late cancel",
+                worker_id="queue-test-worker",
             )
             await db.commit()
 
@@ -505,10 +637,15 @@ async def test_terminal_status_loser_does_not_change_message_delivery_status(mon
     finally:
         async with session_factory() as db:
             conversation_id = await db.scalar(select(Conversation.id).where(Conversation.thread_id == thread_id))
+            project_id = await db.scalar(select(Conversation.project_id).where(Conversation.thread_id == thread_id))
+            await db.execute(delete(Message).where(Message.run_id == run_id))
             await db.execute(delete(AgentRun).where(AgentRun.id == run_id))
             if conversation_id is not None:
                 await db.execute(delete(Message).where(Message.conversation_id == conversation_id))
             await db.execute(delete(Conversation).where(Conversation.thread_id == thread_id))
+            if project_id is not None:
+                await db.execute(delete(Project).where(Project.id == project_id))
+            await db.execute(delete(User).where(User.uid == uid))
             await db.commit()
         await engine.dispose()
 
@@ -523,8 +660,20 @@ async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict
     monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
 
     async with session_factory() as db:
+        db.add(User(username=uid, uid=uid, password_hash="test"))
+        await db.flush()
+        project_ids = [await _add_project(db, uid) for _ in thread_ids]
         db.add_all(
-            [Conversation(thread_id=thread_id, uid=uid, agent_id="main", status="active") for thread_id in thread_ids]
+            [
+                Conversation(
+                    thread_id=thread_id,
+                    uid=uid,
+                    project_id=project_id,
+                    agent_id="main",
+                    status="active",
+                )
+                for thread_id, project_id in zip(thread_ids, project_ids, strict=True)
+            ]
         )
         await db.commit()
 
@@ -571,6 +720,13 @@ async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict
         assert len(runs) == 1
     finally:
         async with session_factory() as db:
+            project_ids = list(
+                (
+                    await db.scalars(
+                        select(Conversation.project_id).where(Conversation.thread_id.in_(thread_ids))
+                    )
+                ).all()
+            )
             now = utc_now_naive()
             await db.execute(
                 update(AgentRun)
@@ -587,5 +743,7 @@ async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict
         async with session_factory() as db:
             await db.execute(delete(AgentRun).where(AgentRun.conversation_thread_id.in_(thread_ids)))
             await db.execute(delete(Conversation).where(Conversation.thread_id.in_(thread_ids)))
+            await db.execute(delete(Project).where(Project.id.in_(project_ids)))
+            await db.execute(delete(User).where(User.uid == uid))
             await db.commit()
         await engine.dispose()
