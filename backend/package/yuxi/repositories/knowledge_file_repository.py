@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+import uuid
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,6 +23,147 @@ KB_FILE_STATS_CACHE_TTL = 10
 
 
 class KnowledgeFileRepository:
+    @asynccontextmanager
+    async def lock_file_tree(self, kb_id: str) -> AsyncIterator[None]:
+        """按知识库串行化目录树结构修改。"""
+        async with pg_manager.get_async_session_context() as session:
+            await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(kb_id))))
+            yield
+
+    async def detect_virtual_folder_data(self, kb_id: str) -> dict[str, int | bool]:
+        """检测仍以相对路径保存的历史文件记录。"""
+        path_record = KnowledgeFile.filename.contains("/")
+        async with pg_manager.get_async_session_context() as session:
+            result = await session.execute(
+                select(
+                    func.count(KnowledgeFile.file_id),
+                    func.coalesce(
+                        func.sum(
+                            func.length(KnowledgeFile.filename)
+                            - func.length(func.replace(KnowledgeFile.filename, "/", ""))
+                        ),
+                        0,
+                    ),
+                ).where(
+                    KnowledgeFile.kb_id == kb_id,
+                    or_(KnowledgeFile.is_folder.is_(False), KnowledgeFile.is_folder.is_(None)),
+                    path_record,
+                )
+            )
+            file_count, remaining_steps = result.one()
+        count = int(file_count or 0)
+        return {
+            "has_virtual_folders": count > 0,
+            "file_count": count,
+            "remaining_steps": int(remaining_steps or 0),
+        }
+
+    async def migrate_virtual_folder_batch(
+        self,
+        *,
+        kb_id: str,
+        operator_id: str,
+        after_file_id: str | None,
+        batch_size: int = 500,
+    ) -> dict[str, Any]:
+        """原子迁移一批文件的首个路径段。"""
+        filters = [
+            KnowledgeFile.kb_id == kb_id,
+            or_(KnowledgeFile.is_folder.is_(False), KnowledgeFile.is_folder.is_(None)),
+            KnowledgeFile.filename.contains("/"),
+        ]
+        if after_file_id:
+            filters.append(KnowledgeFile.file_id > after_file_id)
+
+        async with pg_manager.get_async_session_context() as session:
+            await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(kb_id))))
+            records = list(
+                (
+                    await session.execute(
+                        select(KnowledgeFile).where(*filters).order_by(KnowledgeFile.file_id).limit(batch_size)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not records:
+                return {"scanned": 0, "processed": 0, "created_folders": 0, "conflict_file_ids": []}
+
+            groups: dict[tuple[str | None, str], list[KnowledgeFile]] = {}
+            conflict_file_ids: list[str] = []
+            for record in records:
+                segment, remainder = record.filename.split("/", 1)
+                if not segment or segment in {".", ".."} or not remainder:
+                    conflict_file_ids.append(record.file_id)
+                    continue
+                groups.setdefault((record.parent_id, segment), []).append(record)
+
+            processed = 0
+            created_folders = 0
+            for (parent_id, segment), group in groups.items():
+                sibling_result = await session.execute(
+                    select(KnowledgeFile).where(
+                        KnowledgeFile.kb_id == kb_id,
+                        self._parent_condition(parent_id),
+                        KnowledgeFile.filename == segment,
+                    )
+                )
+                siblings = list(sibling_result.scalars().all())
+                if len(siblings) == 1 and siblings[0].is_folder:
+                    folder = siblings[0]
+                elif siblings:
+                    conflict_file_ids.extend(record.file_id for record in group)
+                    continue
+                else:
+                    folder = KnowledgeFile(
+                        file_id=f"folder-{uuid.uuid4()}",
+                        kb_id=kb_id,
+                        parent_id=parent_id,
+                        filename=segment,
+                        path=segment,
+                        file_type="folder",
+                        status="done",
+                        is_folder=True,
+                        file_size=0,
+                        chunk_count=0,
+                        token_count=0,
+                        created_by=operator_id,
+                    )
+                    session.add(folder)
+                    await session.flush()
+                    created_folders += 1
+
+                for record in group:
+                    record.parent_id = folder.file_id
+                    record.filename = record.filename.split("/", 1)[1]
+                    processed += 1
+
+            return {
+                "scanned": len(records),
+                "processed": processed,
+                "created_folders": created_folders,
+                "conflict_file_ids": conflict_file_ids,
+                "last_file_id": records[-1].file_id,
+            }
+
+    async def aggregate_dashboard_stats(self) -> list[tuple[str, int, int, int]]:
+        """按文件类型聚合真实文件数、大小与 Chunk 数。"""
+        async with pg_manager.get_async_session_context() as session:
+            result = await session.execute(
+                select(
+                    KnowledgeFile.file_type,
+                    func.count(KnowledgeFile.file_id),
+                    func.coalesce(func.sum(KnowledgeFile.file_size), 0),
+                    func.coalesce(func.sum(KnowledgeFile.chunk_count), 0),
+                )
+                .where(or_(KnowledgeFile.is_folder.is_(False), KnowledgeFile.is_folder.is_(None)))
+                .group_by(KnowledgeFile.file_type)
+            )
+            return [
+                (str(file_type or "unknown"), int(count or 0), int(size or 0), int(nodes or 0))
+                for file_type, count, size, nodes in result.all()
+            ]
+
     _writable_fields = {
         "kb_id",
         "parent_id",

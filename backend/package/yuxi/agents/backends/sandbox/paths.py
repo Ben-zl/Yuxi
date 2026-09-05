@@ -4,17 +4,19 @@ import hashlib
 import re
 from pathlib import Path
 
-from yuxi import config as conf
-from yuxi.utils.logging_config import logger
-from yuxi.utils.paths import (
+from yuxi.config.app import config as conf
+from yuxi.config import get_user_data_dir
+from yuxi.agents.backends.paths import (
     OUTPUTS_DIR_NAME,
     UPLOADS_DIR_NAME,
     VIRTUAL_PATH_PREFIX,
-    WORKSPACE_AGENT_CONTEXT_FILES,
-    WORKSPACE_AGENTS_DIR_NAME,
     WORKSPACE_DIR_NAME,
+)
+from yuxi.utils.logging_config import logger
+from yuxi.utils.paths import (
     ensure_within_root,
 )
+from yuxi.workspace.paths import WORKSPACE_AGENT_CONTEXT_FILES, WORKSPACE_AGENTS_DIR_NAME
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -34,7 +36,7 @@ def validate_thread_id(thread_id: str) -> str:
 
 def _thread_root_dir(thread_id: str) -> Path:
     safe_thread_id = validate_thread_id(thread_id)
-    return Path(conf.save_dir) / "threads" / safe_thread_id / "user-data"
+    return _threads_root_dir() / safe_thread_id / "user-data"
 
 
 def workspace_uid_dirname(uid: str) -> str:
@@ -56,7 +58,7 @@ def workspace_uid_dirname(uid: str) -> str:
 def global_user_data_dir(uid: str) -> Path:
     """Return the shared host-side directory used for one user's workspace files."""
     safe_uid = workspace_uid_dirname(uid)
-    return Path(conf.save_dir) / "threads" / "shared" / safe_uid
+    return _threads_root_dir() / "shared" / safe_uid
 
 
 def sandbox_user_data_dir(thread_id: str) -> Path:
@@ -73,6 +75,10 @@ def sandbox_workspace_agent_context_file(thread_id: str, uid: str, filename: str
 
 
 def _threads_root_dir() -> Path:
+    """返回当前显式 UserWorkspace 存储域，兼容宿主机单测的旧配置注入。"""
+    configured = str(get_user_data_dir()).strip()
+    if configured != "user-data":
+        return Path(configured).resolve(strict=False)
     return (Path(conf.save_dir) / "threads").resolve(strict=False)
 
 
@@ -82,22 +88,12 @@ def _resolve_threads_child_path(path: Path) -> Path:
     return ensure_within_root(resolved, root, error_message="path resolved outside threads root")
 
 
-def _chmod_writable(path: Path, *, dir: bool = False) -> None:
-    safe_path = _resolve_threads_child_path(path)
-    mode = 0o777 if dir else 0o666
-    try:
-        safe_path.chmod(mode)
-    except OSError:
-        pass
-
-
 def ensure_workspace_default_files(workspace_dir: Path) -> None:
     workspace_dir = _resolve_threads_child_path(workspace_dir)
     agents_dir = workspace_dir / WORKSPACE_AGENTS_DIR_NAME
 
     try:
         agents_dir.mkdir(parents=True, exist_ok=True)
-        _chmod_writable(agents_dir, dir=True)
     except FileExistsError:
         logger.warning("工作区默认 Agents 目录创建失败：路径已被文件占用")
         return
@@ -110,7 +106,6 @@ def ensure_workspace_default_files(workspace_dir: Path) -> None:
         try:
             with context_file.open("x", encoding="utf-8") as buffer:
                 buffer.write(default_content)
-            _chmod_writable(context_file)
         except FileExistsError:
             if context_file.is_dir():
                 logger.warning(f"工作区默认 {filename} 创建失败：路径已被目录占用")

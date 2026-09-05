@@ -5,7 +5,7 @@
         <div class="disabled-content">
           <h4>知识图谱不可用</h4>
           <p>当前知识库类型 "{{ kbTypeLabel }}" 不支持知识图谱功能。</p>
-          <p>只有 Milvus 类型的知识库支持知识图谱。</p>
+          <p>只有 Yuxi 类型的知识库支持知识图谱。</p>
         </div>
       </div>
       <div v-else class="graph-wrapper">
@@ -420,7 +420,7 @@ import {
   Network,
   BrainCircuit,
   ScanText
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import GraphDetailPanel from '@/components/GraphDetailPanel.vue'
 import ResourceEmptyState from '@/components/shared/ResourceEmptyState.vue'

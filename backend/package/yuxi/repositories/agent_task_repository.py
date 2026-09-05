@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.storage.postgres.models_business import (
@@ -44,6 +44,26 @@ class AgentTaskRepository:
             select(AgentTask).order_by(AgentTask.created_at.desc()).limit(limit)
         )
         return list(result.scalars().all())
+
+    async def count_active_references(self, agent_id: int) -> int:
+        """统计仍引用指定 Agent 的未归档任务。"""
+        result = await self.db.scalar(
+            select(func.count(AgentTask.id)).where(
+                AgentTask.agent_id == agent_id,
+                AgentTask.archived_at.is_(None),
+            )
+        )
+        return int(result or 0)
+
+    async def detach_agent_references(self, agent_id: int) -> None:
+        """清理已归档任务与执行记录中的 Agent 引用。"""
+        await self.db.execute(
+            AgentTask.__table__.update().where(AgentTask.agent_id == agent_id).values(agent_id=None)
+        )
+        await self.db.execute(
+            TaskExecution.__table__.update().where(TaskExecution.agent_id == agent_id).values(agent_id=None)
+        )
+        await self.db.flush()
 
 
 class TaskExecutionRepository:

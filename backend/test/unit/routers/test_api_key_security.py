@@ -136,7 +136,11 @@ async def test_create_api_key_rejects_mismatched_department(session):
 
     with pytest.raises(HTTPException) as exc:
         await create_api_key(
-            APIKeyCreate(name="wrong department", department_id=session["dept_b"].id),
+            APIKeyCreate(
+                request_id="wrong-department",
+                name="wrong department",
+                department_id=session["dept_b"].id,
+            ),
             current_user=session["regular_user"],
             db=db,
         )
@@ -148,7 +152,11 @@ async def test_create_api_key_allows_current_user_department(session):
     db = session["db"]
 
     response = await create_api_key(
-        APIKeyCreate(name="own department", department_id=session["dept_a"].id),
+        APIKeyCreate(
+            request_id="own-department",
+            name="own department",
+            department_id=session["dept_a"].id,
+        ),
         current_user=session["regular_user"],
         db=db,
     )

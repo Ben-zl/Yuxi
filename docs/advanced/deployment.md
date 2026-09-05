@@ -32,13 +32,15 @@ NEO4J_PASSWORD=
 MINIO_ACCESS_KEY=
 MINIO_SECRET_KEY=
 JWT_SECRET_KEY=
+API_KEY_DERIVATION_SECRET=
 YUXI_INSTANCE_ID=
 SANDBOX_PROVISIONER_TOKEN=
+AGENTSCOPE_CHANNEL_CREDENTIAL_KEY=
 AGENTSCOPE_LEGACY_CUTOFF=
 SILICONFLOW_API_KEY=
 ```
 
-生产 Compose 会在上述基础设施配置缺失或为空时拒绝启动，并提示具体变量名。`JWT_SECRET_KEY` 和 `SANDBOX_PROVISIONER_TOKEN` 均应至少使用 32 字节随机值并持久保存，可分别使用 `openssl rand -hex 32` 生成；两者不能复用。`YUXI_INSTANCE_ID` 应是每套部署稳定且唯一的实例标识。模型 API 密钥按实际使用的供应商配置。
+生产 Compose 会在上述基础设施配置缺失或为空时拒绝启动，并提示具体变量名。`JWT_SECRET_KEY`、`API_KEY_DERIVATION_SECRET` 和 `SANDBOX_PROVISIONER_TOKEN` 均应至少使用 32 字节随机值并持久保存，三者不能复用。`AGENTSCOPE_CHANNEL_CREDENTIAL_KEY` 应使用 Fernet 密钥，用于加密 AgentScope Channel 凭据；可按初始化脚本生成安全值。`YUXI_INSTANCE_ID` 应是每套部署稳定且唯一的实例标识。模型 API 密钥按实际使用的供应商配置。
 
 `AGENTSCOPE_LEGACY_CUTOFF` 必须是 ISO 8601 时间，例如 `2026-08-17T00:00:00Z`。无 AgentScope 映射且在该时间之前已有消息的线程会归档为只读；升级部署应把它设为实际切换时刻，新安装可使用首次启动时刻。该值确定后不要随重启变化。
 

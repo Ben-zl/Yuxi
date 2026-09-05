@@ -10,7 +10,7 @@ set -euo pipefail
 #
 # 该脚本从 backend/package/pyproject.toml 读取当前版本，
 # 自动同步所有需要硬编码版本号的位置。
-# --dev 模式不会更新 README.md、docs/intro/quick-start.md 和文档首页中 git clone --branch 的版本号。
+# --dev 模式不会更新 README、快速开始、部署指南和文档首页中的发布版本引用。
 #
 # 更新 tag 标准流程（给人工和 agent 使用）:
 #
@@ -31,12 +31,12 @@ set -euo pipefail
 # 3. 脚本运行后必须检查:
 #    - git diff，确认只有预期版本文件变化。
 #    - backend/package/pyproject.toml、backend/pyproject.toml、web/package.json、
-#      docker-compose*.yml、backend/*uv.lock 中的 Yuxi 版本一致。
+#      docker-compose*.yml、backend/uv.lock 中的 Yuxi 版本一致。
 #    - dev 模式下 README.md、README.en.md、docs/intro/quick-start.md 和文档首页
 #      不应被更新。
 #
 # 4. 必须先提交版本更新，再创建 tag。tag 要指向包含版本更新的提交:
-#    git add backend/package/pyproject.toml backend/package/uv.lock backend/pyproject.toml backend/uv.lock docker-compose.yml docker-compose.prod.yml web/package.json
+#    git add backend/package/pyproject.toml backend/pyproject.toml backend/uv.lock docker-compose.yml docker-compose.prod.yml web/package.json
 #    git commit -m 'chore(release): 升级版本到 0.7.1.dev2'
 #    git tag v0.7.1.dev2
 #
@@ -103,11 +103,11 @@ echo "  - web/package.json"
 echo "  - docker-compose.yml"
 echo "  - docker-compose.prod.yml"
 echo "  - backend/uv.lock"
-echo "  - backend/package/uv.lock"
 if [ "$DEV_MODE" = false ]; then
     echo "  - README.md"
     echo "  - README.en.md"
     echo "  - docs/intro/quick-start.md"
+    echo "  - docs/advanced/deployment.md"
     echo "  - docs/.vitepress/theme/components/YuxiHome.vue"
 fi
 echo ""
@@ -160,10 +160,6 @@ perl -0pi -e "s/(^name = \"yuxi\"\nversion = \")[^\"]+/\${1}${NEW_VERSION}/m" \
 perl -0pi -e "s/(^name = \"yuxi-workspace\"\nversion = \")[^\"]+/\${1}${NEW_VERSION}/m" \
     "${PROJECT_ROOT}/backend/uv.lock"
 
-echo "→ 更新 backend/package/uv.lock"
-perl -0pi -e "s/(^name = \"yuxi\"\nversion = \")[^\"]+/\${1}${NEW_VERSION}/m" \
-    "${PROJECT_ROOT}/backend/package/uv.lock"
-
 # -----------------------------------------------------------------------------
 # 6. 更新文档中的版本引用
 # -----------------------------------------------------------------------------
@@ -171,7 +167,7 @@ perl -0pi -e "s/(^name = \"yuxi\"\nversion = \")[^\"]+/\${1}${NEW_VERSION}/m" \
 # 发布历史记录（如 [2026/04/01] v0.6.1 版本发布）不修改，保持为历史版本记录
 if [ "$DEV_MODE" = false ]; then
     echo "→ 更新 README.md"
-    perl -pi -e "s/(git clone --branch v)[0-9]+\\.[0-9]+\\.[0-9]+(\\.[a-zA-Z0-9]+)?/\${1}${NEW_VERSION}/g" \
+    perl -pi -e "s/(git clone --branch v)[0-9]+\\.[0-9]+\\.[0-9]+(\\.[a-zA-Z0-9]+)?/\${1}${NEW_VERSION}/g; s/(当前仓库默认配置对应 \`v)[0-9]+\\.[0-9]+\\.[0-9]+(\\.[a-zA-Z0-9]+)?/\${1}${NEW_VERSION}/g" \
         "${PROJECT_ROOT}/README.md"
 
     echo "→ 更新 README.en.md"
@@ -179,14 +175,18 @@ if [ "$DEV_MODE" = false ]; then
         "${PROJECT_ROOT}/README.en.md"
 
     echo "→ 更新 docs/intro/quick-start.md"
-    perl -pi -e "s/(git clone --branch v)[0-9]+\\.[0-9]+\\.[0-9]+(\\.[a-zA-Z0-9]+)?/\${1}${NEW_VERSION}/g" \
+    perl -pi -e "s/(git clone --branch v)[0-9]+\\.[0-9]+\\.[0-9]+(\\.[a-zA-Z0-9]+)?/\${1}${NEW_VERSION}/g; s/(仓库当前默认配置对应 \`v)[0-9]+\\.[0-9]+\\.[0-9]+(\\.[a-zA-Z0-9]+)?/\${1}${NEW_VERSION}/g" \
         "${PROJECT_ROOT}/docs/intro/quick-start.md"
+
+    echo "→ 更新 docs/advanced/deployment.md"
+    perl -pi -e "s/(升级到当前 \`v)[0-9]+\\.[0-9]+\\.[0-9]+(\\.[a-zA-Z0-9]+)?/\${1}${NEW_VERSION}/g; s/(git checkout v)[0-9]+\\.[0-9]+\\.[0-9]+(\\.[a-zA-Z0-9]+)?/\${1}${NEW_VERSION}/g" \
+        "${PROJECT_ROOT}/docs/advanced/deployment.md"
 
     echo "→ 更新 docs/.vitepress/theme/components/YuxiHome.vue"
     perl -pi -e "s/(git clone --branch v)[0-9]+\\.[0-9]+\\.[0-9]+(\\.[a-zA-Z0-9]+)?/\${1}${NEW_VERSION}/g" \
         "${PROJECT_ROOT}/docs/.vitepress/theme/components/YuxiHome.vue"
 else
-    echo "→ dev 模式，跳过 README.md、README.en.md、docs/intro/quick-start.md 和文档首页的分支版本更新"
+    echo "→ dev 模式，跳过 README、快速开始、部署指南和文档首页的发布版本更新"
 fi
 
 # -----------------------------------------------------------------------------
@@ -206,7 +206,7 @@ echo "  web/package.json:"
 grep -E '"version"' "${PROJECT_ROOT}/web/package.json" | head -1 | sed 's/^/    /'
 
 echo "  docker-compose.yml (api):"
-grep -E "image: yuxi-api:" "${PROJECT_ROOT}/docker-compose.yml" | head -1 | sed 's/^/    /'
+grep -E "image: .*api:.*YUXI_VERSION" "${PROJECT_ROOT}/docker-compose.yml" | head -1 | sed 's/^/    /'
 
 echo "  docker-compose.prod.yml (web):"
 grep -E "image: yuxi-web:" "${PROJECT_ROOT}/docker-compose.prod.yml" | head -1 | sed 's/^/    /'

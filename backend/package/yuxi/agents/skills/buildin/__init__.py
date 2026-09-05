@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from yuxi.config.runtime import knowledge_capability_enabled
+
 
 @dataclass(frozen=True)
 class BuiltinSkillSpec:
@@ -43,21 +45,6 @@ BUILTIN_SKILLS: list[BuiltinSkillSpec] = [
         skill_dependencies=("html-preview",),
     ),
     BuiltinSkillSpec(
-        slug="knowledge-base",
-        source_dir=_SKILLS_ROOT / "knowledge-base",
-        description="使用 Yuxi 知识库进行检索、打开文档、文档内定位和查看思维导图。",
-        version="2026.06.24",
-        tool_dependencies=(
-            "list_kbs",
-            "query_kb",
-            "find_kb_document",
-            "open_kb_document",
-            "get_mindmap",
-            "search_file",
-            "download_kb_file",
-        ),
-    ),
-    BuiltinSkillSpec(
         slug="mysql-reporter",
         source_dir=_SKILLS_ROOT / "mysql-reporter",
         description="基于 MySQL 数据库生成查询报表和静态可视化，适合分析业务指标与统计趋势。",
@@ -77,3 +64,23 @@ BUILTIN_SKILLS: list[BuiltinSkillSpec] = [
         source_dir=_SKILLS_ROOT / "unity-profiler-analyzer",
     ),
 ]
+
+if knowledge_capability_enabled():
+    BUILTIN_SKILLS.insert(
+        3,
+        BuiltinSkillSpec(
+            slug="knowledge-base",
+            source_dir=_SKILLS_ROOT / "knowledge-base",
+            description="使用 Yuxi 知识库进行检索、打开文档、文档内定位和查看思维导图。",
+            version="2026.06.24",
+            tool_dependencies=(
+                "list_kbs",
+                "query_kb",
+                "find_kb_document",
+                "open_kb_document",
+                "get_mindmap",
+                "search_file",
+                "download_kb_file",
+            ),
+        ),
+    )

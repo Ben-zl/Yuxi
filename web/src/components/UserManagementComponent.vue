@@ -62,100 +62,101 @@
           <a-alert type="error" :message="userManagement.error" show-icon />
         </div>
 
-        <div class="cards-container">
-          <div v-if="filteredUsers.length === 0" class="empty-state">
-            <a-empty
-              :description="userManagement.users.length === 0 ? '暂无用户数据' : '没有匹配的用户'"
-            />
-          </div>
-          <div v-else class="user-cards-grid">
-            <InfoCard
-              v-for="user in paginatedUsers"
-              :key="user.id"
-              :title="user.username"
-              :subtitle="`ID: ${user.uid || '-'}`"
-              class="user-card"
+        <template v-if="userManagement.users.length > 0">
+          <div class="settings-table-wrapper">
+            <a-table
+              :dataSource="userManagement.users"
+              :columns="columns"
+              :rowKey="(record) => record.id"
+              :pagination="false"
+              class="settings-table"
             >
-              <template #icon>
-                <FallbackAvatar
-                  :src="user.avatar"
-                  :default-src="getUserDefaultAvatarSrc(user)"
-                  :name="user.username"
-                  :seed="user.uid || user.username"
-                  kind="user"
-                  :size="40"
-                  shape="circle"
-                  :alt="user.username"
-                  class="avatar-img"
-                />
-              </template>
-
-              <template #status>
-                <div
-                  v-if="user.role === 'admin' || user.role === 'superadmin' || user.department_name"
-                  class="role-dept-badge"
-                >
-                  <span class="role-icon-wrapper" :class="getRoleClass(user.role)">
-                    <UserLock v-if="user.role === 'superadmin'" :size="14" />
-                    <UserStar v-else-if="user.role === 'admin'" :size="14" />
-                    <User v-else :size="14" />
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'user'">
+                  <div class="user-table-cell">
+                    <FallbackAvatar
+                      :src="record.avatar"
+                      :default-src="getUserDefaultAvatarSrc(record)"
+                      :name="record.username"
+                      :seed="record.uid || record.username"
+                      kind="user"
+                      :size="28"
+                      shape="circle"
+                      :alt="record.username"
+                      class="user-avatar"
+                    />
+                    <div class="user-meta">
+                      <span class="user-name" :title="record.username">{{ record.username }}</span>
+                      <span v-if="record.uid" class="user-uid">ID: {{ record.uid }}</span>
+                    </div>
+                  </div>
+                </template>
+                <template v-if="column.key === 'role'">
+                  <span class="role-badge" :class="record.role">
+                    <UserLock v-if="record.role === 'superadmin'" :size="12" />
+                    <UserStar v-else-if="record.role === 'admin'" :size="12" />
+                    <User v-else :size="12" />
+                    <span>{{ getRoleDisplayName(record.role) }}</span>
                   </span>
-                  <span v-if="user.department_name" class="dept-text">
-                    {{ user.department_name }}
-                  </span>
-                </div>
+                </template>
+                <template v-if="column.key === 'department'">
+                  <span class="dept-text">{{ record.department_name || '-' }}</span>
+                </template>
+                <template v-if="column.key === 'phone'">
+                  <span class="phone-text">{{ record.phone_number || '-' }}</span>
+                </template>
+                <template v-if="column.key === 'lastLogin'">
+                  <span class="time-text">{{ formatTime(record.last_login) }}</span>
+                </template>
+                <template v-if="column.key === 'action'">
+                  <a-space :size="4">
+                    <a-tooltip title="编辑用户">
+                      <a-button
+                        type="text"
+                        size="small"
+                        class="action-btn lucide-icon-btn"
+                        @click="showEditUserModal(record)"
+                      >
+                        <SquarePen :size="14" />
+                      </a-button>
+                    </a-tooltip>
+                    <a-tooltip
+                      :title="
+                        isUserDeleteDisabled(record) ? '不能删除当前用户或超级管理员' : '删除用户'
+                      "
+                    >
+                      <a-button
+                        type="text"
+                        size="small"
+                        danger
+                        :disabled="isUserDeleteDisabled(record)"
+                        class="action-btn lucide-icon-btn"
+                        @click="confirmDeleteUser(record)"
+                      >
+                        <Trash2 :size="14" />
+                      </a-button>
+                    </a-tooltip>
+                  </a-space>
+                </template>
               </template>
-
-              <template #card-more-action-corner>
-                <a-menu>
-                  <a-menu-item key="edit" @click.stop="showEditUserModal(user)">
-                    <span class="lucide-menu-item">
-                      <SquarePen :size="14" />
-                      <span>编辑用户</span>
-                    </span>
-                  </a-menu-item>
-                  <a-menu-item
-                    key="delete"
-                    :disabled="isUserDeleteDisabled(user)"
-                    :danger="!isUserDeleteDisabled(user)"
-                    @click.stop="confirmDeleteUser(user)"
-                  >
-                    <span class="lucide-menu-item">
-                      <Trash2 :size="14" />
-                      <span>删除用户</span>
-                    </span>
-                  </a-menu-item>
-                </a-menu>
-              </template>
-
-              <template #info>
-                <div class="card-content">
-                  <div class="info-item">
-                    <span class="info-label">手机号:</span>
-                    <span class="info-value phone-text">{{ user.phone_number || '-' }}</span>
-                  </div>
-                  <div class="info-item">
-                    <span class="info-label">创建时间:</span>
-                    <span class="info-value time-text">{{ formatTime(user.created_at) }}</span>
-                  </div>
-                  <div class="info-item">
-                    <span class="info-label">最后登录:</span>
-                    <span class="info-value time-text">{{ formatTime(user.last_login) }}</span>
-                  </div>
-                </div>
-              </template>
-            </InfoCard>
+            </a-table>
           </div>
-          <div v-if="filteredUsers.length > userManagement.pageSize" class="pagination-section">
+
+          <div v-if="userManagement.total > userManagement.pageSize" class="pagination-section">
             <a-pagination
-              v-model:current="userManagement.currentPage"
-              v-model:page-size="userManagement.pageSize"
-              :total="filteredUsers.length"
+              :current="userManagement.currentPage"
+              :page-size="userManagement.pageSize"
+              :total="userManagement.total"
               :page-size-options="['20', '50', '100']"
               show-size-changer
               size="small"
+              @change="handlePageChange"
             />
           </div>
+        </template>
+
+        <div v-else class="empty-state">
+          <a-empty :description="hasActiveFilters ? '没有匹配的用户' : '暂无用户数据'" />
         </div>
       </a-spin>
     </div>
@@ -252,38 +253,47 @@
 </template>
 
 <script setup>
-import { reactive, onMounted, watch, computed } from 'vue'
+import { reactive, onMounted, onUnmounted, watch, computed } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { useUserStore } from '@/stores/user'
-import { departmentApi } from '@/apis'
-import {
-  Plus,
-  SquarePen,
-  Trash2,
-  User,
-  UserLock,
-  UserStar,
-  RefreshCw,
-  Search
-} from 'lucide-vue-next'
+import { authApi, departmentApi } from '@/apis'
+import { Plus, SquarePen, Trash2, User, UserLock, UserStar, RefreshCw, Search } from '@lucide/vue'
 import { formatDateTime } from '@/utils/time'
 import { isPasswordLongEnough, MIN_PASSWORD_LENGTH } from '@/utils/passwordValidation'
 import { generatePixelAvatar } from '@/utils/pixelAvatar'
 import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
-import InfoCard from '@/components/shared/InfoCard.vue'
 
 const userStore = useUserStore()
+
+const columns = [
+  { title: '用户', key: 'user', width: '26%' },
+  { title: '角色', dataIndex: 'role', key: 'role', width: '16%' },
+  { title: '所属部门', dataIndex: 'department_name', key: 'department', width: '18%' },
+  { title: '手机号', dataIndex: 'phone_number', key: 'phone', width: '16%' },
+  { title: '最后登录', dataIndex: 'last_login', key: 'lastLogin', width: '14%' },
+  { title: '操作', key: 'action', width: '10%', align: 'center' }
+]
+
+const getRoleDisplayName = (role) => {
+  const map = {
+    superadmin: '超级管理员',
+    admin: '管理员',
+    user: '普通用户'
+  }
+  return map[role] || role || '普通用户'
+}
 
 // 用户管理相关状态
 const userManagement = reactive({
   loading: false,
   refreshing: false,
   users: [],
+  total: 0,
   searchKeyword: '',
   departmentFilter: '',
   roleFilter: '',
   currentPage: 1,
-  pageSize: 50,
+  pageSize: 20,
   error: null,
   modalVisible: false,
   modalTitle: '添加用户',
@@ -307,6 +317,13 @@ const userManagement = reactive({
 const departmentManagement = reactive({
   departments: []
 })
+
+const hasActiveFilters = computed(
+  () =>
+    Boolean(userManagement.searchKeyword.trim()) ||
+    Boolean(userManagement.departmentFilter) ||
+    Boolean(userManagement.roleFilter)
+)
 
 const departmentFilterOptions = computed(() => {
   const options = new Map()
@@ -335,32 +352,6 @@ const departmentFilterOptions = computed(() => {
   })
 
   return [...options.values()]
-})
-
-const filteredUsers = computed(() => {
-  const keyword = userManagement.searchKeyword.trim().toLowerCase()
-
-  return userManagement.users.filter((user) => {
-    const matchesKeyword =
-      !keyword ||
-      [user.username, user.uid, user.phone_number].some((value) =>
-        String(value || '')
-          .toLowerCase()
-          .includes(keyword)
-      )
-    const matchesDepartment =
-      !userManagement.departmentFilter ||
-      String(user.department_id ?? user.department_name ?? '') === userManagement.departmentFilter
-    const matchesRole = !userManagement.roleFilter || user.role === userManagement.roleFilter
-
-    return matchesKeyword && matchesDepartment && matchesRole
-  })
-})
-
-const paginatedUsers = computed(() => {
-  const pageSize = Number(userManagement.pageSize)
-  const start = (userManagement.currentPage - 1) * pageSize
-  return filteredUsers.value.slice(start, start + pageSize)
 })
 
 // 获取部门列表
@@ -434,20 +425,13 @@ watch(
   }
 )
 
+let filterRequestTimer = null
 watch(
   () => [userManagement.searchKeyword, userManagement.departmentFilter, userManagement.roleFilter],
   () => {
     userManagement.currentPage = 1
-  }
-)
-
-watch(
-  () => filteredUsers.value.length,
-  (total) => {
-    const maxPage = Math.max(1, Math.ceil(total / Number(userManagement.pageSize)))
-    if (userManagement.currentPage > maxPage) {
-      userManagement.currentPage = maxPage
-    }
+    if (filterRequestTimer) clearTimeout(filterRequestTimer)
+    filterRequestTimer = setTimeout(() => fetchUsers(), 250)
   }
 )
 
@@ -460,19 +444,45 @@ const isUserDeleteDisabled = (user) =>
   user.id === userStore.userId ||
   (user.role === 'superadmin' && userStore.userRole !== 'superadmin')
 
-// 获取用户列表
+let latestUserRequest = 0
 const fetchUsers = async () => {
+  const requestId = ++latestUserRequest
   try {
     userManagement.loading = true
-    const users = await userStore.getUsers()
-    userManagement.users = users
+    const pageSize = Number(userManagement.pageSize)
+    const response = await authApi.getUsersPage({
+      offset: (userManagement.currentPage - 1) * pageSize,
+      limit: pageSize,
+      search: userManagement.searchKeyword.trim(),
+      departmentId: userManagement.departmentFilter,
+      role: userManagement.roleFilter
+    })
+    if (requestId !== latestUserRequest) return
+
+    const maxPage = Math.max(1, Math.ceil(response.total / pageSize))
+    if (userManagement.currentPage > maxPage) {
+      userManagement.currentPage = maxPage
+      await fetchUsers()
+      return
+    }
+
+    userManagement.users = response.items
+    userManagement.total = response.total
     userManagement.error = null
   } catch (error) {
+    if (requestId !== latestUserRequest) return
     console.error('获取用户列表失败:', error)
     userManagement.error = '获取用户列表失败'
   } finally {
-    userManagement.loading = false
+    if (requestId === latestUserRequest) userManagement.loading = false
   }
+}
+
+const handlePageChange = (page, pageSize) => {
+  if (filterRequestTimer) clearTimeout(filterRequestTimer)
+  userManagement.currentPage = pageSize === userManagement.pageSize ? page : 1
+  userManagement.pageSize = pageSize
+  fetchUsers()
 }
 
 // 刷新用户和部门信息
@@ -661,23 +671,15 @@ const confirmDeleteUser = (user) => {
   })
 }
 
-const getRoleClass = (role) => {
-  switch (role) {
-    case 'superadmin':
-      return 'role-superadmin'
-    case 'admin':
-      return 'role-admin'
-    case 'user':
-      return 'role-user'
-    default:
-      return 'role-default'
-  }
-}
-
 // 在组件挂载时获取用户列表
 onMounted(async () => {
   await fetchUsers()
   await fetchDepartments()
+})
+
+onUnmounted(() => {
+  if (filterRequestTimer) clearTimeout(filterRequestTimer)
+  latestUserRequest += 1
 })
 </script>
 
@@ -797,126 +799,148 @@ onMounted(async () => {
       padding: 16px 24px;
     }
 
-    .cards-container {
-      .empty-state {
-        padding: 60px 20px;
-        text-align: center;
+    .empty-state {
+      padding: 60px 20px;
+      text-align: center;
+    }
+
+    .settings-table-wrapper {
+      border: 1px solid var(--gray-150);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--gray-0);
+
+      :deep(.ant-table) {
+        background: transparent;
+        font-size: 13px;
       }
 
-      .user-cards-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-        gap: 16px;
-        // padding: 16px;
+      :deep(.ant-table-thead > tr > th) {
+        background: var(--gray-50);
+        color: var(--gray-500);
+        font-weight: 500;
+        font-size: 12px;
+        padding: 9px 14px;
+        border-bottom: 1px solid var(--gray-150);
+        white-space: nowrap;
 
-        .user-card {
-          cursor: default;
+        &::before {
+          display: none !important;
+        }
+      }
 
-          :deep(.info-card-icon) {
-            border-radius: 50%;
+      :deep(.ant-table-tbody > tr > td) {
+        padding: 10px 14px;
+        color: var(--gray-800);
+        border-bottom: 1px solid var(--gray-100);
+        transition: background 0.15s ease;
+      }
+
+      :deep(.ant-table-tbody > tr:last-child > td) {
+        border-bottom: none;
+      }
+
+      :deep(.ant-table-tbody > tr:hover > td) {
+        background: var(--gray-25) !important;
+      }
+
+      .user-table-cell {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+        max-width: 100%;
+
+        .user-avatar {
+          flex-shrink: 0;
+        }
+
+        .user-meta {
+          display: flex;
+          flex-direction: column;
+          min-width: 0;
+
+          .user-name {
+            font-weight: 500;
+            color: var(--gray-900);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 13px;
+            line-height: 18px;
           }
 
-          :deep(.info-card-body) {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-          }
-
-          .avatar-img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-          }
-
-          .role-dept-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-            padding: 2px 8px 2px 4px;
-            background: var(--gray-50);
-            border-radius: 4px;
-
-            .role-icon-wrapper {
-              display: flex;
-              align-items: center;
-              justify-content: center;
-              width: 16px;
-              height: 16px;
-
-              &.role-superadmin {
-                color: var(--color-error-700);
-              }
-              &.role-admin {
-                color: var(--color-info-700);
-              }
-              &.role-user {
-                color: var(--color-success-700);
-              }
-            }
-
-            .dept-text {
-              font-size: 12px;
-              color: var(--gray-700);
-              font-weight: 500;
-            }
-          }
-
-          .card-content {
-            .info-item {
-              display: flex;
-              justify-content: space-between;
-              align-items: center;
-              padding: 2px 0;
-              border-bottom: 1px solid var(--gray-25);
-
-              &:last-child {
-                border-bottom: none;
-              }
-
-              .info-label {
-                font-size: 12px;
-                color: var(--gray-600);
-                font-weight: 500;
-                min-width: 70px;
-              }
-
-              .info-value {
-                font-size: 12px;
-                color: var(--gray-900);
-                text-align: right;
-                flex: 1;
-
-                &.time-text {
-                  color: var(--gray-700);
-                }
-
-                &.phone-text {
-                  font-family: 'Monaco', 'Consolas', monospace;
-                }
-              }
-            }
+          .user-uid {
+            font-size: 11px;
+            color: var(--gray-400);
+            line-height: 14px;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Menlo', monospace;
           }
         }
       }
 
-      .pagination-section {
-        display: flex;
-        justify-content: flex-end;
-        margin-top: 16px;
+      .role-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 500;
+        line-height: 16px;
+        background: var(--gray-100);
+        color: var(--gray-600);
+
+        &.superadmin {
+          background: rgba(217, 119, 6, 0.08);
+          color: #d97706;
+        }
+
+        &.admin {
+          background: var(--main-30);
+          color: var(--main-color);
+        }
+      }
+
+      .dept-text,
+      .time-text {
+        color: var(--gray-600);
+        font-size: 12px;
+      }
+
+      .phone-text {
+        font-size: 12px;
+        color: var(--gray-700);
+        font-family: 'JetBrains Mono', 'Fira Code', 'Menlo', monospace;
+      }
+
+      .action-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        border-radius: 6px;
+        color: var(--gray-400);
+        transition: all 0.15s ease;
+
+        &:hover:not(:disabled) {
+          background: var(--gray-100);
+          color: var(--gray-800);
+        }
+
+        &.ant-btn-dangerous:hover:not(:disabled) {
+          background: var(--color-error-50, #fff2f0);
+          color: var(--color-error-500, #ff4d4f);
+        }
       }
     }
-  }
 
-  .time-text {
-    font-size: 13px;
-    color: var(--gray-700);
-  }
-
-  .phone-text,
-  .user-id-text {
-    font-size: 13px;
-    color: var(--gray-900);
-    font-family: 'Monaco', 'Consolas', monospace;
+    .pagination-section {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 16px;
+    }
   }
 }
 

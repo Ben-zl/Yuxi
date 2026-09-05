@@ -17,6 +17,7 @@ from yuxi.services.viewer_filesystem_service import (
     download_viewer_file,
     list_viewer_filesystem_tree,
     read_viewer_file_content,
+    search_viewer_files,
     upload_viewer_files,
 )
 from yuxi.storage.postgres.models_business import User
@@ -102,6 +103,21 @@ async def upload_viewer_files_route(
         thread_id=thread_id,
         parent_path=parent_path,
         files=files,
+        current_user=current_user,
+        db=db,
+    )
+
+
+@filesystem_router.get("/search", response_model=dict)
+async def search_viewer_files_route(
+    thread_id: str = Query(..., description="线程 ID"),
+    query: str = Query(..., description="搜索关键词"),
+    current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await search_viewer_files(
+        thread_id=thread_id,
+        query=query,
         current_user=current_user,
         db=db,
     )

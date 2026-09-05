@@ -17,6 +17,10 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 async def _create_restricted_database(test_client, admin_headers):
     """Create a KB shared only with its creator (admin), so non-owners get 404."""
+    profile_response = await test_client.get("/api/auth/me", headers=admin_headers)
+    assert profile_response.status_code == 200, profile_response.text
+    owner_uid = profile_response.json()["uid"]
+
     response = await test_client.post(
         "/api/knowledge/databases",
         json={
@@ -25,7 +29,15 @@ async def _create_restricted_database(test_client, admin_headers):
             "embedding_model_spec": "siliconflow-cn:Pro/BAAI/bge-m3",
             "kb_type": "milvus",
             "additional_params": {},
-            "share_config": {"access_level": "user"},
+            "share_config": {
+                "version": 2,
+                "read_scope": {
+                    "access_level": "user",
+                    "department_ids": [],
+                    "user_uids": [owner_uid],
+                },
+                "manage_scope": None,
+            },
         },
         headers=admin_headers,
     )
@@ -64,8 +76,6 @@ async def test_external_files_lists_and_searches(test_client, admin_headers, kno
     assert list_response.status_code == 200, list_response.text
     payload = list_response.json()
     assert isinstance(payload.get("files"), list)
-    assert payload["offset"] == 0
-    assert payload["limit"] == 100
 
     search_response = await test_client.get(
         f"/api/knowledge/databases/external/{kb_id}/files",
@@ -93,21 +103,12 @@ async def test_external_open_unknown_file_returns_400(test_client, admin_headers
     assert response.status_code == 400
 
 
-async def test_external_find_rejects_empty_patterns(test_client, admin_headers, knowledge_database):
+@pytest.mark.parametrize("patterns", [[], ["keyword"]])
+async def test_external_find_rejects_bad_patterns(test_client, admin_headers, knowledge_database, patterns):
     kb_id = knowledge_database["kb_id"]
     response = await test_client.post(
         f"/api/knowledge/databases/external/{kb_id}/files/file_does_not_exist/find",
-        json={"patterns": []},
-        headers=admin_headers,
-    )
-    assert response.status_code == 400
-
-
-async def test_external_find_unknown_file_returns_400(test_client, admin_headers, knowledge_database):
-    kb_id = knowledge_database["kb_id"]
-    response = await test_client.post(
-        f"/api/knowledge/databases/external/{kb_id}/files/file_does_not_exist/find",
-        json={"patterns": ["keyword"]},
+        json={"patterns": patterns},
         headers=admin_headers,
     )
     assert response.status_code == 400

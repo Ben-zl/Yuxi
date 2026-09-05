@@ -3,16 +3,21 @@ from pathlib import Path
 
 import aiofiles
 import yaml
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from yuxi import config, get_version
+from yuxi import get_version
+from yuxi.config.options import invalidate_option_cache, system_options, update_option_value
+from yuxi.config.runtime import knowledge_capability_enabled
+from yuxi.services.readiness_service import get_readiness
 from yuxi.storage.postgres.models_business import User
-from yuxi.utils.logging_config import logger
+from yuxi.utils.logging_config import LOG_FILE, logger
 
 from server.utils.auth_middleware import get_admin_user, get_db, get_required_user
 
 system = APIRouter(prefix="/system", tags=["system"])
+
 
 # =============================================================================
 # === 健康检查分组 ===
@@ -21,33 +26,50 @@ system = APIRouter(prefix="/system", tags=["system"])
 
 @system.get("/health")
 async def health_check():
-    """系统健康检查接口（公开接口）"""
-    return {"status": "ok", "message": "服务正常运行", "version": get_version()}
+    """返回 API 进程 liveness，不代表依赖或业务链路就绪。"""
+    return {"status": "ok", "message": "进程正常运行", "version": get_version()}
+
+
+@system.get("/ready")
+async def readiness_check(request: Request):
+    """验证 API 接流量所需的启动状态与核心依赖。"""
+
+    result = await get_readiness(
+        startup_complete=bool(getattr(request.app.state, "startup_complete", False)),
+        startup_components=getattr(request.app.state, "startup_components", None),
+    )
+    result["version"] = get_version()
+    return JSONResponse(status_code=200 if result["status"] == "ready" else 503, content=result)
 
 
 @system.get("/discovery")
 async def discovery():
     """系统能力发现接口（公开接口）"""
+    knowledge_enabled = knowledge_capability_enabled()
     return {
         "name": "Yuxi",
         "version": get_version(),
         "api_prefix": "/api",
         "capabilities": {
+            "features": {"knowledge": knowledge_enabled},
             "cli": {
                 "min_cli_version": "0.1.0",
                 "browser_login": True,
                 "api_key_auth": True,
                 "remote_config": True,
-                "kb_upload": True,
-                "kb_list": True,
-                "kb_files": True,
-                "kb_query": True,
-                "kb_open": True,
-                "kb_find": True,
-            }
+                "agent_list": True,
+                "agent_show": True,
+                "kb_upload": knowledge_enabled,
+                "kb_list": knowledge_enabled,
+                "kb_files": knowledge_enabled,
+                "kb_query": knowledge_enabled,
+                "kb_open": knowledge_enabled,
+                "kb_find": knowledge_enabled,
+            },
         },
         "endpoints": {
             "health": "/api/system/health",
+            "readiness": "/api/system/ready",
             "auth_me": "/api/auth/me",
             "cli_auth_sessions": "/api/auth/cli/sessions",
             "cli_auth_authorize": "/auth/cli/authorize",
@@ -60,48 +82,71 @@ async def discovery():
 # =============================================================================
 
 
+def _serialize_system_config(values: dict) -> dict:
+    fields = {
+        field["key"]: {
+            "des": field["label"],
+            "default": field.get("default"),
+            "type": field.get("type", "string"),
+            "exclude": False,
+        }
+        for field in system_options.fields
+    }
+    return {**values, "_config_items": fields}
+
+
 @system.get("/config")
-async def get_config(current_user: User = Depends(get_required_user)):
+async def get_config(
+    current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
+):
     """获取系统配置"""
-    return config.dump_config()
+    return _serialize_system_config(await system_options.get(db))
 
 
 @system.post("/config")
-async def update_config_single(key=Body(...), value=Body(...), current_user: User = Depends(get_admin_user)) -> dict:
+async def update_config_single(
+    key=Body(...),
+    value=Body(...),
+    current_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     """更新单个配置项"""
-    if not isinstance(key, str) or key not in type(config).model_fields:
+    if not isinstance(key, str) or key not in {field["key"] for field in system_options.fields}:
         raise HTTPException(status_code=400, detail=f"未知配置项: {key}")
-    if not config.can_update(key):
-        raise HTTPException(status_code=400, detail=f"配置项不可修改: {key}")
     try:
-        config.set_value(key, value)
+        await update_option_value(db, system_options.key, {key: value}, current_user.username)
+        await db.commit()
+        await invalidate_option_cache(system_options.key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    config.save()
-    return config.dump_config()
+    return _serialize_system_config(await system_options.get(db))
 
 
 @system.post("/config/update")
-async def update_config_batch(items: dict = Body(...), current_user: User = Depends(get_admin_user)) -> dict:
+async def update_config_batch(
+    items: dict = Body(...),
+    current_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     """批量更新配置项"""
     try:
-        config.update(items)
+        await update_option_value(db, system_options.key, items, current_user.username)
+        await db.commit()
+        await invalidate_option_cache(system_options.key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    config.save()
-    return config.dump_config()
+    return _serialize_system_config(await system_options.get(db))
 
 
 @system.get("/logs")
 async def get_system_logs(levels: str | None = None, current_user: User = Depends(get_admin_user)):
-    """获取系统日志
+    """获取当前 API 进程日志。
 
     Args:
         levels: 可选的日志级别过滤，多个级别用逗号分隔，如 "INFO,ERROR,DEBUG,WARNING"
     """
     try:
-        from yuxi.utils.logging_config import LOG_FILE
-
         # 解析日志级别过滤条件
         level_filter = None
         if levels:
@@ -129,7 +174,7 @@ async def get_system_logs(levels: str | None = None, current_user: User = Depend
                         lines.pop(0)
 
         log = "".join(lines)
-        return {"log": log, "message": "success", "log_file": LOG_FILE}
+        return {"log": log, "message": "success", "log_file": LOG_FILE, "scope": "api"}
     except Exception as e:
         logger.error(f"获取系统日志失败: {e}")
         raise HTTPException(status_code=500, detail=f"获取系统日志失败: {str(e)}")
@@ -229,6 +274,7 @@ async def put_config_option(
         if record is None:
             raise HTTPException(status_code=404, detail=f"配置项不存在: {key}")
         await db.commit()
+        await invalidate_option_cache(key)
         await db.refresh(record)
         return {"option": serialize_option(record)}
     except HTTPException:
@@ -240,12 +286,13 @@ async def put_config_option(
 @system.get("/ocr/options")
 async def get_ocr_engine_options(
     current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """返回所有代码支持的 OCR 方法和默认项。"""
 
     from yuxi.services.ocr_service import get_ocr_options
 
-    return get_ocr_options()
+    return await get_ocr_options(db)
 
 
 @system.get("/ocr/health")

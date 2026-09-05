@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agents.skills.service import list_accessible_skills
 from yuxi.agents.toolkits.service import get_tool_metadata
-from yuxi.utils.paths import VIRTUAL_PATH_PREFIX
+from yuxi.agents.backends.paths import VIRTUAL_PATH_PREFIX
 from yuxi.agentscope.projection import (
     agent_context,
     is_lite_mode,

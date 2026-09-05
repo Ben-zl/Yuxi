@@ -5,14 +5,19 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.utils.auth_middleware import get_current_user, get_db, get_required_user
 from yuxi.config import UserConfig, UserConfigSchema
+from yuxi.repositories.agent_env_repository import AgentEnvRepository
+from yuxi.repositories.api_key_repository import (
+    APIKeyDepartmentConflict,
+    APIKeyIdempotencyConflict,
+    APIKeyRepository,
+    APIKeySubjectUnavailable,
+)
 from yuxi.storage.minio import upload_image_to_minio
-from yuxi.storage.postgres.models_business import APIKey, AgentEnv, User
+from yuxi.storage.postgres.models_business import User
 from yuxi.utils.auth_utils import AuthUtils
 from yuxi.utils.datetime_utils import coerce_any_to_utc_datetime, format_utc_datetime, utc_now_naive
 
@@ -26,6 +31,7 @@ MAX_USER_IMAGE_SIZE_BYTES = 5 * 1024 * 1024
 
 
 class APIKeyCreate(BaseModel):
+    request_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$")
     name: str
     user_id: int | None = None
     department_id: int | None = None
@@ -134,18 +140,18 @@ def validate_agent_env(env: dict[str, Any]) -> dict[str, str]:
     return normalized
 
 
-def ensure_api_key_owner(api_key: APIKey, current_user: User) -> None:
-    if api_key.user_id != current_user.id and current_user.role != "superadmin":
-        raise HTTPException(status_code=403, detail="无权操作此 API Key")
-
-
-async def get_accessible_api_key(db: AsyncSession, api_key_id: int, current_user: User) -> APIKey:
-    result = await db.execute(select(APIKey).filter(APIKey.id == api_key_id))
-    api_key = result.scalar_one_or_none()
-    if not api_key:
+async def get_accessible_api_key(repository: APIKeyRepository, api_key_id: int, current_user: User):
+    """读取当前用户可见的 API Key，并保持既有错误状态码。"""
+    access = await repository.get_accessible(
+        api_key_id=api_key_id,
+        requester_user_id=current_user.id,
+        is_superadmin=current_user.role == "superadmin",
+    )
+    if access.api_key is not None:
+        return access.api_key
+    if not access.exists:
         raise HTTPException(status_code=404, detail="API Key 不存在")
-    ensure_api_key_owner(api_key, current_user)
-    return api_key
+    raise HTTPException(status_code=403, detail="无权操作此 API Key")
 
 
 @user_router.get("/apikey/", response_model=dict)
@@ -155,19 +161,16 @@ async def list_api_keys(
     current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(APIKey).order_by(APIKey.created_at.desc()).offset(skip).limit(limit)
-    count_query = select(func.count(APIKey.id))
-    if current_user.role != "superadmin":
-        query = query.filter(APIKey.user_id == current_user.id)
-        count_query = count_query.filter(APIKey.user_id == current_user.id)
-
-    result = await db.execute(query)
-    api_keys = result.scalars().all()
-    total_result = await db.execute(count_query)
+    api_keys, total = await APIKeyRepository(db).list_visible(
+        requester_user_id=current_user.id,
+        is_superadmin=current_user.role == "superadmin",
+        skip=skip,
+        limit=limit,
+    )
 
     return {
         "api_keys": [key.to_dict() for key in api_keys],
-        "total": total_result.scalar(),
+        "total": total,
     }
 
 
@@ -180,37 +183,39 @@ async def create_api_key(
     if data.user_id and data.user_id != current_user.id and current_user.role != "superadmin":
         raise HTTPException(status_code=403, detail="无权为其他用户创建 API Key")
 
-    target_user = current_user
-    if data.user_id:
-        result = await db.execute(select(User).filter(User.id == data.user_id))
-        user = result.scalar_one_or_none()
-        if not user or user.is_deleted:
-            raise HTTPException(status_code=404, detail="关联的用户不存在")
-        target_user = user
+    target_user_id = data.user_id or current_user.id
 
-    if data.department_id is not None and data.department_id != target_user.department_id:
-        raise HTTPException(status_code=403, detail="API Key 部门必须与关联用户部门一致")
-
-    full_key, key_hash, key_prefix = AuthUtils.generate_api_key()
+    full_key, key_hash, key_prefix = AuthUtils.derive_api_key(
+        f"user-request:{data.request_id}",
+        target_user_id,
+    )
     expires_at = None
     if data.expires_at:
         aware_dt = coerce_any_to_utc_datetime(data.expires_at)
         if aware_dt:
             expires_at = aware_dt.replace(tzinfo=None)
 
-    api_key = APIKey(
-        key_hash=key_hash,
-        key_prefix=key_prefix,
-        name=data.name,
-        user_id=target_user.id,
-        department_id=data.department_id,
-        expires_at=expires_at,
-        created_by=str(current_user.id),
-    )
-
-    db.add(api_key)
-    await db.commit()
-    await db.refresh(api_key)
+    try:
+        api_key = await APIKeyRepository(db).create(
+            key_hash=key_hash,
+            key_prefix=key_prefix,
+            request_id=data.request_id,
+            name=data.name,
+            user_id=target_user_id,
+            department_id=data.department_id,
+            expires_at=expires_at,
+            created_by=str(current_user.id),
+        )
+        await db.commit()
+    except APIKeyIdempotencyConflict as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except APIKeySubjectUnavailable as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except APIKeyDepartmentConflict as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
     return APIKeyCreateResponse(
         api_key=APIKeyResponse(**api_key.to_dict()),
@@ -224,7 +229,7 @@ async def get_api_key(
     current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
-    api_key = await get_accessible_api_key(db, api_key_id, current_user)
+    api_key = await get_accessible_api_key(APIKeyRepository(db), api_key_id, current_user)
     return {"api_key": api_key.to_dict()}
 
 
@@ -235,18 +240,19 @@ async def update_api_key(
     current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
-    api_key = await get_accessible_api_key(db, api_key_id, current_user)
+    repository = APIKeyRepository(db)
+    api_key = await get_accessible_api_key(repository, api_key_id, current_user)
 
+    updates = {}
     if data.name is not None:
-        api_key.name = data.name
+        updates["name"] = data.name
     if data.expires_at is not None:
         aware_dt = coerce_any_to_utc_datetime(data.expires_at)
-        api_key.expires_at = aware_dt.replace(tzinfo=None) if aware_dt else None
+        updates["expires_at"] = aware_dt.replace(tzinfo=None) if aware_dt else None
     if data.is_enabled is not None:
-        api_key.is_enabled = data.is_enabled
+        updates["is_enabled"] = data.is_enabled
 
-    await db.commit()
-    await db.refresh(api_key)
+    api_key = await repository.update(api_key, updates)
     return {"api_key": api_key.to_dict()}
 
 
@@ -256,10 +262,10 @@ async def delete_api_key(
     current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
-    api_key = await get_accessible_api_key(db, api_key_id, current_user)
+    repository = APIKeyRepository(db)
+    api_key = await get_accessible_api_key(repository, api_key_id, current_user)
 
-    await db.delete(api_key)
-    await db.commit()
+    await repository.delete(api_key)
     return {"success": True}
 
 
@@ -268,8 +274,7 @@ async def get_agent_env(
     current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(AgentEnv).filter(AgentEnv.uid == current_user.uid))
-    agent_env = result.scalar_one_or_none()
+    agent_env = await AgentEnvRepository(db).get_by_uid(current_user.uid)
     if agent_env is None:
         return AgentEnvResponse(env={})
     return AgentEnvResponse(env=agent_env.env or {}, updated_at=format_utc_datetime(agent_env.updated_at))
@@ -282,25 +287,6 @@ async def update_agent_env(
     db: AsyncSession = Depends(get_db),
 ):
     env = validate_agent_env(data.env)
-    result = await db.execute(select(AgentEnv).filter(AgentEnv.uid == current_user.uid))
-    current_agent_env = result.scalar_one_or_none()
-    if current_agent_env is not None and (current_agent_env.env or {}) == env:
-        return AgentEnvResponse(
-            env=current_agent_env.env or {},
-            updated_at=format_utc_datetime(current_agent_env.updated_at),
-        )
-
     now = utc_now_naive()
-    stmt = (
-        pg_insert(AgentEnv)
-        .values(uid=current_user.uid, env=env, updated_at=now)
-        .on_conflict_do_update(
-            index_elements=[AgentEnv.uid],
-            set_={"env": env, "updated_at": now},
-        )
-        .returning(AgentEnv)
-    )
-    await db.execute(stmt)
-    await db.commit()
-    # 直接返回刚写入的 env/now，避免身份映射中的旧实例属性导致返回陈旧值
-    return AgentEnvResponse(env=env, updated_at=format_utc_datetime(now))
+    result = await AgentEnvRepository(db).upsert(uid=current_user.uid, env=env, updated_at=now)
+    return AgentEnvResponse(env=result.env, updated_at=format_utc_datetime(result.updated_at))

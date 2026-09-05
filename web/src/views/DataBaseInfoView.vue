@@ -1,5 +1,233 @@
 <template>
-  <div class="database-info-container extension-detail-page">
+  <div class="database-info-container">
+    <ExtensionDetailLayout
+      :active-key="activeTab"
+      :tabs="visibleTabs"
+      @update:active-key="handleActiveTabChange"
+      :loading="detailLoading"
+      :ready="isCurrentDatabaseLoaded && !isConnector"
+      empty-description="未找到知识库"
+      class="knowledge-detail-layout"
+    >
+      <template #breadcrumb>
+        <nav class="extension-detail-breadcrumb" aria-label="知识库详情导航">
+          <button type="button" class="extension-detail-back" @click="backToDatabase">
+            知识库
+          </button>
+          <ChevronRight :size="15" aria-hidden="true" />
+          <span class="extension-detail-current" :title="database.name || kbId">
+            {{ database.name || kbId }}
+          </span>
+        </nav>
+      </template>
+
+      <template #actions>
+        <div class="extension-detail-actions">
+          <a-space :size="8">
+            <button
+              type="button"
+              aria-label="复制知识库 ID"
+              class="lucide-icon-btn extension-panel-action extension-panel-action-secondary"
+              @click="copyDatabaseId"
+            >
+              <Copy :size="14" />
+              <span>复制 ID</span>
+            </button>
+            <button
+              v-if="canManageDatabase"
+              type="button"
+              aria-label="配置知识库"
+              class="lucide-icon-btn extension-panel-action extension-panel-action-primary"
+              @click="showEditModal"
+            >
+              <Pencil :size="14" />
+              <span>配置</span>
+            </button>
+          </a-space>
+        </div>
+      </template>
+
+      <template #panel-filetable>
+        <div v-if="isMilvus" v-show="activeTab === 'filetable'" class="tab-panel file-panel">
+          <div class="file-management-info">
+            <div class="file-info-title">
+              <div class="file-info-title-row">
+                <div
+                  v-if="canManageDatabase"
+                  ref="uploadActionMenuRef"
+                  class="file-action-dropdown"
+                >
+                  <button
+                    type="button"
+                    class="lucide-icon-btn extension-panel-action extension-panel-action-primary"
+                    @click="uploadActionMenuOpen = !uploadActionMenuOpen"
+                  >
+                    <Upload :size="14" />
+                    <span>上传</span>
+                    <ChevronDown
+                      :size="12"
+                      class="file-action-chevron"
+                      :class="{ 'is-open': uploadActionMenuOpen }"
+                    />
+                  </button>
+                  <Transition name="file-action-menu">
+                    <div v-if="uploadActionMenuOpen" class="file-action-menu">
+                      <button type="button" class="file-action-menu-item" @click="onUploadAction">
+                        <Upload :size="14" />
+                        <span>上传文件</span>
+                      </button>
+                      <button
+                        type="button"
+                        class="file-action-menu-item"
+                        @click="onUploadFolderAction"
+                      >
+                        <FolderUp :size="14" />
+                        <span>上传文件夹</span>
+                      </button>
+                      <button
+                        type="button"
+                        class="file-action-menu-item"
+                        @click="onCreateFolderAction"
+                      >
+                        <FolderPlus :size="14" />
+                        <span>新建文件夹</span>
+                      </button>
+                    </div>
+                  </Transition>
+                </div>
+              </div>
+            </div>
+            <div class="file-panel-status">
+              <button
+                v-if="canManageDatabase && pendingParseCount > 0"
+                type="button"
+                class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-warning file-stat-summary"
+                :disabled="store.state.chunkLoading"
+                @click="confirmBatchParse"
+              >
+                <FileText :size="16" />
+                <div class="file-stat-inline">
+                  <span class="file-stat-value">{{ pendingParseCount }}</span>
+                  <span class="file-stat-label">待解析</span>
+                </div>
+              </button>
+              <button
+                v-if="canManageDatabase && pendingIndexCount > 0"
+                type="button"
+                class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-warning file-stat-summary"
+                :disabled="store.state.chunkLoading"
+                @click="confirmBatchIndex"
+              >
+                <DatabaseIcon :size="16" />
+                <div class="file-stat-inline">
+                  <span class="file-stat-value">{{ pendingIndexCount }}</span>
+                  <span class="file-stat-label">待入库</span>
+                </div>
+              </button>
+              <button
+                type="button"
+                class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-summary"
+                :class="{ 'file-stat-warning': virtualFolderStatus.has_virtual_folders }"
+                :disabled="!virtualFolderStatus.has_virtual_folders || !canManageDatabase"
+                :title="
+                  virtualFolderStatus.has_virtual_folders ? '存在历史虚拟文件夹，点击转换' : ''
+                "
+                @click="virtualFolderModalVisible = true"
+              >
+                <CircleAlert v-if="virtualFolderStatus.has_virtual_folders" :size="16" />
+                <FileText v-else :size="16" />
+                <div class="file-stat-inline">
+                  <span class="file-stat-value">{{ fileStats.count }}</span>
+                  <span class="file-stat-label">文件</span>
+                </div>
+              </button>
+              <div
+                v-if="fileStats.sizeText"
+                class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-summary"
+                :title="`文件大小 ${fileStats.sizeText}`"
+              >
+                <DatabaseIcon :size="16" aria-hidden="true" />
+                <div class="file-stat-inline">
+                  <span class="file-stat-value">{{ fileStats.sizeText }}</span>
+                </div>
+              </div>
+              <button
+                v-if="canManageDatabase"
+                type="button"
+                class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-summary file-stat-repair"
+                :disabled="statsRepairing"
+                :aria-busy="statsRepairing"
+                aria-label="修复缺失的 Chunk/Token 统计"
+                title="修复缺失的 Chunk/Token 统计"
+                @click="repairDatabaseStats"
+              >
+                <LoaderCircle v-if="statsRepairing" :size="16" class="file-stat-spinner" />
+                <DatabaseIcon v-else :size="16" />
+                <div class="file-stat-inline">
+                  <span class="file-stat-value">{{ fileStats.chunkText }}</span>
+                  <span class="file-stat-label">Chunks</span>
+                </div>
+              </button>
+              <button
+                v-if="canManageDatabase"
+                type="button"
+                class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-summary file-stat-repair"
+                :disabled="statsRepairing"
+                :aria-busy="statsRepairing"
+                aria-label="修复缺失的 Chunk/Token 统计"
+                title="修复缺失的 Chunk/Token 统计"
+                @click="repairDatabaseStats"
+              >
+                <LoaderCircle v-if="statsRepairing" :size="16" class="file-stat-spinner" />
+                <Hash v-else :size="16" />
+                <div class="file-stat-inline">
+                  <span class="file-stat-value">{{ fileStats.tokenText }}</span>
+                  <span class="file-stat-label">Tokens</span>
+                </div>
+              </button>
+            </div>
+          </div>
+          <FileTable
+            ref="fileTableRef"
+            :readonly="!canManageDatabase"
+            @mindmap="mindmapModalVisible = true"
+            @search="fileSearchModalVisible = true"
+          />
+        </div>
+      </template>
+
+      <template #panel-query>
+        <div
+          v-if="!isConnector"
+          v-show="activeTab === 'query'"
+          class="tab-panel query-config-panel"
+        >
+          <QuerySection ref="querySectionRef" :visible="true" @toggle-visible="() => {}" />
+        </div>
+      </template>
+
+      <template #panel-graph>
+        <div v-if="isMilvus && activeTab === 'graph'" class="tab-panel">
+          <KnowledgeGraphSection
+            :visible="true"
+            :active="activeTab === 'graph'"
+            :readonly="!canManageDatabase"
+            @toggle-visible="() => {}"
+          />
+        </div>
+      </template>
+
+      <template #panel-evaluation>
+        <div v-if="isMilvus && activeTab === 'evaluation'" class="tab-panel evaluation-panel">
+          <KnowledgeEvaluationWorkspace
+            v-if="kbId"
+            :kb-id="kbId"
+            :can-manage="canManageDatabase"
+          />
+        </div>
+      </template>
+    </ExtensionDetailLayout>
+
     <FileDetailModal
       v-model:open="store.state.fileDetailModalVisible"
       :kb-id="kbId"
@@ -22,224 +250,50 @@
       @select="onFileSearchSelect"
     />
 
-    <div v-if="detailLoading" class="database-detail-loading">
-      <a-spin tip="加载知识库信息..." />
-    </div>
+    <a-modal v-model:open="virtualFolderModalVisible" title="转换历史虚拟文件夹">
+      <p>该知识库存在历史兼容数据创建的虚拟文件夹，需要转换为真实目录结构。</p>
+      <p>
+        转换按批次提交；关闭弹窗或进度连接中断不会撤销已经完成的部分，再次执行会从剩余数据继续。
+      </p>
+      <a-progress
+        v-if="virtualFolderTask"
+        :percent="Math.round(virtualFolderTask.progress || 0)"
+        :status="
+          virtualFolderTask.status === 'failed'
+            ? 'exception'
+            : virtualFolderTask.status === 'success'
+              ? 'success'
+              : 'active'
+        "
+      />
+      <p v-if="virtualFolderTask?.message" class="virtual-folder-migration-message">
+        {{ virtualFolderTask.message }}
+      </p>
+      <template #footer>
+        <a-button @click="virtualFolderModalVisible = false">关闭</a-button>
+        <a-button
+          type="primary"
+          :loading="virtualFolderStarting"
+          :disabled="virtualFolderRunning"
+          @click="startVirtualFolderMigration"
+        >
+          开始转换
+        </a-button>
+      </template>
+    </a-modal>
 
-    <template v-else>
-      <div class="detail-top-bar">
-        <button class="detail-back-btn" type="button" @click="backToDatabase">
-          <ArrowLeft :size="16" />
-          <span>返回</span>
-        </button>
-        <div class="detail-title-area">
-          <div class="detail-icon">
-            <component :is="kbTypeIcon" :size="18" />
-          </div>
-          <div class="detail-title-text">
-            <h2>{{ database.name || '知识库加载中' }}</h2>
-            <span class="detail-subtitle">{{ databaseSubtitle }}</span>
-          </div>
-        </div>
-        <div class="detail-actions">
-          <a-space :size="8">
-            <button
-              type="button"
-              class="lucide-icon-btn extension-panel-action extension-panel-action-secondary"
-              @click="copyDatabaseId"
-            >
-              <Copy :size="14" />
-              <span>复制 ID</span>
-            </button>
-            <button
-              v-if="canManageDatabase"
-              type="button"
-              class="lucide-icon-btn extension-panel-action extension-panel-action-primary"
-              @click="showEditModal"
-            >
-              <Pencil :size="14" />
-              <span>配置</span>
-            </button>
-          </a-space>
-        </div>
+    <a-modal
+      v-model:open="mindmapModalVisible"
+      title="思维导图"
+      width="1200px"
+      :footer="null"
+      destroy-on-close
+      wrap-class-name="knowledge-mindmap-modal"
+    >
+      <div class="knowledge-mindmap-modal-content">
+        <MindMapSection v-if="kbId" :kb-id="kbId" :readonly="!canManageDatabase" />
       </div>
-
-      <div class="database-detail-body">
-        <div class="database-tab-bar" aria-label="知识库功能导航">
-          <nav class="database-tab-list" aria-label="知识库功能标签" role="tablist">
-            <button
-              v-for="tab in visibleTabs"
-              :key="tab.key"
-              type="button"
-              class="database-tab-item"
-              :class="{ active: activeTab === tab.key }"
-              role="tab"
-              :aria-selected="activeTab === tab.key"
-              @click="activeTab = tab.key"
-            >
-              <component :is="tab.icon" :size="17" />
-              <span>{{ tab.label }}</span>
-            </button>
-          </nav>
-        </div>
-
-        <main class="database-tab-content">
-          <div v-if="isMilvus" v-show="activeTab === 'filetable'" class="tab-panel file-panel">
-            <div class="file-management-info">
-              <div class="file-info-title">
-                <div class="file-info-title-row">
-                  <button
-                    v-if="canManageDatabase"
-                    type="button"
-                    class="lucide-icon-btn extension-panel-action extension-panel-action-primary"
-                    @click="showAddFilesModal()"
-                  >
-                    <FileUp :size="14" />
-                    <span>上传</span>
-                  </button>
-                  <button
-                    v-if="canManageDatabase"
-                    type="button"
-                    class="lucide-icon-btn extension-panel-action extension-panel-action-secondary"
-                    @click="showCreateFolderModal"
-                  >
-                    <FolderPlus :size="14" />
-                    <span>新建文件夹</span>
-                  </button>
-                  <button
-                    type="button"
-                    class="lucide-icon-btn extension-panel-action extension-panel-action-secondary"
-                    @click="fileSearchModalVisible = true"
-                  >
-                    <Search :size="14" />
-                    <span>搜索文件</span>
-                  </button>
-                </div>
-              </div>
-              <div class="file-panel-status">
-                <button
-                  v-if="canManageDatabase && pendingParseCount > 0"
-                  type="button"
-                  class="file-stat-card file-stat-action file-stat-summary"
-                  :disabled="store.state.chunkLoading"
-                  @click="confirmBatchParse"
-                >
-                  <FileText :size="16" />
-                  <div class="file-stat-inline">
-                    <strong>{{ pendingParseCount }}</strong>
-                    <span>待解析</span>
-                  </div>
-                </button>
-                <button
-                  v-if="canManageDatabase && pendingIndexCount > 0"
-                  type="button"
-                  class="file-stat-card file-stat-action file-stat-summary"
-                  :disabled="store.state.chunkLoading"
-                  @click="confirmBatchIndex"
-                >
-                  <DatabaseIcon :size="16" />
-                  <div class="file-stat-inline">
-                    <strong>{{ pendingIndexCount }}</strong>
-                    <span>待入库</span>
-                  </div>
-                </button>
-                <div class="file-stat-card file-stat-summary">
-                  <FileText :size="16" />
-                  <div class="file-stat-inline">
-                    <strong>{{ fileStats.count }}</strong>
-                    <span>文件</span>
-                  </div>
-                </div>
-                <div v-if="fileStats.sizeText" class="file-stat-card file-stat-summary">
-                  <DatabaseIcon :size="16" />
-                  <div class="file-stat-inline">
-                    <strong>{{ fileStats.sizeText }}</strong>
-                    <span>总大小</span>
-                  </div>
-                </div>
-                <button
-                  v-if="canManageDatabase"
-                  type="button"
-                  class="file-stat-card file-stat-summary file-stat-repair"
-                  :disabled="statsRepairing"
-                  :aria-busy="statsRepairing"
-                  aria-label="修复缺失的 Chunk/Token 统计"
-                  title="修复缺失的 Chunk/Token 统计"
-                  @click="repairDatabaseStats"
-                >
-                  <LoaderCircle v-if="statsRepairing" :size="16" class="file-stat-spinner" />
-                  <DatabaseIcon v-else :size="16" />
-                  <div class="file-stat-inline">
-                    <strong>{{ fileStats.chunkText }}</strong>
-                    <span>Chunks</span>
-                  </div>
-                </button>
-                <button
-                  v-if="canManageDatabase"
-                  type="button"
-                  class="file-stat-card file-stat-summary file-stat-repair"
-                  :disabled="statsRepairing"
-                  :aria-busy="statsRepairing"
-                  aria-label="修复缺失的 Chunk/Token 统计"
-                  title="修复缺失的 Chunk/Token 统计"
-                  @click="repairDatabaseStats"
-                >
-                  <LoaderCircle v-if="statsRepairing" :size="16" class="file-stat-spinner" />
-                  <Hash v-else :size="16" />
-                  <div class="file-stat-inline">
-                    <strong>{{ fileStats.tokenText }}</strong>
-                    <span>Tokens</span>
-                  </div>
-                </button>
-              </div>
-            </div>
-            <FileTable ref="fileTableRef" :readonly="!canManageDatabase" />
-          </div>
-
-          <div v-show="activeTab === 'query'" class="tab-panel query-config-panel">
-            <QuerySection ref="querySectionRef" :visible="true" @toggle-visible="() => {}" />
-          </div>
-
-          <div v-if="isMilvus && activeTab === 'graph'" class="tab-panel">
-            <KnowledgeGraphSection
-              :visible="true"
-              :active="activeTab === 'graph'"
-              :readonly="!canManageDatabase"
-              @toggle-visible="() => {}"
-            />
-          </div>
-
-          <div v-if="isMilvus && activeTab === 'mindmap'" class="tab-panel">
-            <MindMapSection
-              v-if="kbId"
-              :kb-id="kbId"
-              :readonly="!canManageDatabase"
-              ref="mindmapSectionRef"
-            />
-          </div>
-
-          <div v-if="isMilvus && activeTab === 'evaluation'" class="tab-panel">
-            <RAGEvaluationTab
-              v-if="kbId"
-              :kb-id="kbId"
-              @switch-to-benchmarks="activeTab = 'benchmarks'"
-            />
-          </div>
-
-          <div v-if="isMilvus && activeTab === 'benchmarks'" class="tab-panel">
-            <div class="benchmark-management-container">
-              <div class="benchmark-content">
-                <EvaluationBenchmarks
-                  v-if="kbId && isEvaluationSupported"
-                  :kb-id="kbId"
-                  @benchmark-selected="activeTab = 'evaluation'"
-                />
-              </div>
-            </div>
-          </div>
-        </main>
-      </div>
-    </template>
+    </a-modal>
 
     <a-modal
       v-model:open="editModalVisible"
@@ -247,6 +301,7 @@
       width="720px"
       :mask-closable="false"
       wrap-class-name="database-edit-modal"
+      @after-close="handleEditModalAfterClose"
     >
       <template #footer>
         <a-button key="close" @click="editModalVisible = false">关闭</a-button>
@@ -270,6 +325,15 @@
                   action-placement="header"
                   :rows="4"
                 />
+              </a-form-item>
+
+              <a-form-item v-if="database?.embedding_model_spec" label="Embedding 模型">
+                <div class="readonly-model-field">
+                  <span class="readonly-model-value" :title="database.embedding_model_spec">
+                    {{ database.embedding_model_spec }}
+                  </span>
+                  <span class="readonly-model-hint">创建后不可修改</span>
+                </div>
               </a-form-item>
 
               <a-form-item v-if="!isConnector" name="chunk_preset_id">
@@ -337,11 +401,7 @@
                     v-model="editShareConfig"
                     :auto-select-user-dept="true"
                     :require-read-scope="true"
-                  >
-                    <template #manage-description>
-                      知识库<strong>仅管理员</strong>可以管理知识库；普通用户无法管理。
-                    </template>
-                  </ShareConfigForm>
+                  />
                 </a-form-item-rest>
               </a-form-item>
               <div v-else-if="database.share_config" class="share-config-readonly">
@@ -371,23 +431,25 @@ import { useRoute, useRouter } from 'vue-router'
 import { useDatabaseStore } from '@/stores/database'
 import { useTaskerStore } from '@/stores/tasker'
 import {
-  ArrowLeft,
   BarChart3,
-  ClipboardList,
+  ChevronDown,
+  ChevronRight,
+  CircleAlert,
   Copy,
   Database as DatabaseIcon,
-  FileUp,
   FileText,
   FolderPlus,
+  FolderUp,
   Hash,
   LoaderCircle,
-  Map as MapIcon,
   Network,
   Pencil,
-  Search
-} from 'lucide-vue-next'
+  Search,
+  Upload
+} from '@lucide/vue'
 import { QuestionCircleOutlined } from '@ant-design/icons-vue'
-import { message, Modal } from 'ant-design-vue'
+import { message } from 'ant-design-vue'
+import ExtensionDetailLayout from '@/components/shared/ExtensionDetailLayout.vue'
 import FileTable from '@/components/FileTable.vue'
 import FileDetailModal from '@/components/FileDetailModal.vue'
 import FileUploadModal from '@/components/FileUploadModal.vue'
@@ -395,8 +457,7 @@ import FileSearchModal from '@/components/modals/FileSearchModal.vue'
 import KnowledgeGraphSection from '@/components/KnowledgeGraphSection.vue'
 import QuerySection from '@/components/QuerySection.vue'
 import MindMapSection from '@/components/MindMapSection.vue'
-import RAGEvaluationTab from '@/components/RAGEvaluationTab.vue'
-import EvaluationBenchmarks from '@/components/EvaluationBenchmarks.vue'
+import KnowledgeEvaluationWorkspace from '@/components/evaluation/KnowledgeEvaluationWorkspace.vue'
 import SearchConfigPanel from '@/components/SearchConfigPanel.vue'
 import AiTextarea from '@/components/AiTextarea.vue'
 import ShareConfigForm from '@/components/ShareConfigForm.vue'
@@ -405,8 +466,7 @@ import { departmentApi } from '@/apis/department_api'
 import { authApi } from '@/apis/auth_api'
 import { useChunkPresetOptions } from '@/composables/useChunkPresetOptions'
 import { DEFAULT_CHUNK_PRESET_ID } from '@/utils/chunkUtils'
-import { formatFileSize } from '@/utils/file_utils'
-import { getKbTypeIcon, getKbTypeLabel, kbUtils } from '@/utils/kb_utils'
+import { kbUtils } from '@/utils/kb_utils'
 
 const route = useRoute()
 const router = useRouter()
@@ -432,56 +492,49 @@ const isNotionKb = computed(() => kbType.value === 'notion')
 const isConnector = computed(
   () => isCurrentDatabaseLoaded.value && kbUtils.isReadOnlyDatabase(database.value)
 )
-const isEvaluationSupported = computed(() => isMilvus.value)
-const kbTypeIcon = computed(() => getKbTypeIcon(kbType.value || 'milvus'))
-
-const databaseSubtitle = computed(() => {
-  const typeLabel = getKbTypeLabel(kbType.value || 'milvus')
-  if (!isCurrentDatabaseLoaded.value) return '正在加载知识库信息'
-
-  const description = database.value.description?.trim()
-  if (description) return description
-
-  if (isConnector.value) return `${typeLabel} 连接器`
-  return `${typeLabel} 知识库 · ${database.value.row_count || 0} 文件`
-})
-
 const tabs = computed(() => {
   if (isMilvus.value) {
     return [
       { key: 'filetable', label: '文件管理', icon: FileText },
-      { key: 'query', label: '检索测试', icon: Search },
+      { key: 'query', label: '检索测试', icon: Search, forceRender: true },
       { key: 'graph', label: '知识图谱', icon: Network },
-      { key: 'mindmap', label: '知识导图', icon: MapIcon },
-      { key: 'evaluation', label: 'RAG 评估', icon: BarChart3 },
-      { key: 'benchmarks', label: '评估基准', icon: ClipboardList }
+      { key: 'evaluation', label: '评估', icon: BarChart3 }
     ]
   }
 
-  return [{ key: 'query', label: '检索测试', icon: Search }]
+  return [{ key: 'query', label: '检索测试', icon: Search, forceRender: true }]
 })
 
 const visibleTabs = computed(() =>
   canManageDatabase.value
     ? tabs.value
-    : tabs.value.filter((tab) => ['filetable', 'query', 'graph', 'mindmap'].includes(tab.key))
+    : tabs.value.filter((tab) => ['filetable', 'query', 'graph'].includes(tab.key))
 )
 const activeTab = ref('filetable')
 
 watch(
-  () => [kbId.value, isMilvus.value],
-  ([newDbId, isMilvusType]) => {
+  () => [kbId.value, route.query.section, visibleTabs.value, isCurrentDatabaseLoaded.value],
+  ([newDbId, requestedTab, availableTabs, loaded]) => {
     if (!newDbId) return
-    activeTab.value = isMilvusType ? 'filetable' : 'query'
+    const fallbackTab = availableTabs[0]?.key || 'query'
+    activeTab.value = availableTabs.some((tab) => tab.key === requestedTab)
+      ? requestedTab
+      : fallbackTab
+
+    if (loaded && requestedTab && requestedTab !== activeTab.value) {
+      router.replace({ query: { ...route.query, section: activeTab.value } })
+    }
   },
   { immediate: true }
 )
 
-watch(visibleTabs, (nextTabs) => {
-  if (!nextTabs.some((tab) => tab.key === activeTab.value)) {
-    activeTab.value = nextTabs[0]?.key || 'query'
+const handleActiveTabChange = (tab) => {
+  if (!visibleTabs.value.some((item) => item.key === tab)) return
+  activeTab.value = tab
+  if (route.query.section !== tab) {
+    router.replace({ query: { ...route.query, section: tab } })
   }
-})
+}
 
 const pendingParseCount = computed(() => {
   return Number(store.database.stats?.pending_parse_count || 0)
@@ -490,6 +543,22 @@ const pendingParseCount = computed(() => {
 const formatStatNumber = (value) => {
   const number = Number(value ?? 0)
   return Number.isFinite(number) ? number.toLocaleString('zh-CN') : '0'
+}
+
+const formatCompactFileSize = (bytes) => {
+  const number = Number(bytes)
+  if (!Number.isFinite(number) || number <= 0) return ''
+
+  const units = ['b', 'kb', 'mb', 'gb', 'tb', 'pb']
+  let unitIndex = 0
+  let value = number
+  while (value >= 1000 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+
+  const decimals = value >= 100 ? 0 : value >= 10 ? 1 : 2
+  return `${Number(value.toFixed(decimals))}${units[unitIndex]}`
 }
 
 const formatTokenStatNumber = (value) => {
@@ -502,6 +571,14 @@ const formatTokenStatNumber = (value) => {
 }
 
 const statsRepairing = ref(false)
+const virtualFolderStatus = ref({ has_virtual_folders: false, file_count: 0, remaining_steps: 0 })
+const virtualFolderModalVisible = ref(false)
+const virtualFolderStarting = ref(false)
+const virtualFolderTask = ref(null)
+const virtualFolderStreamController = ref(null)
+const virtualFolderRunning = computed(() =>
+  ['pending', 'running'].includes(virtualFolderTask.value?.status)
+)
 
 const fileStats = computed(() => {
   const stats = store.database.stats || {}
@@ -510,11 +587,72 @@ const fileStats = computed(() => {
 
   return {
     count: Number.isFinite(statsFileCount) ? statsFileCount : 0,
-    sizeText: totalSize > 0 ? formatFileSize(totalSize) : '',
+    sizeText: totalSize > 0 ? formatCompactFileSize(totalSize) : '',
     chunkText: formatStatNumber(stats.chunk_count),
     tokenText: formatTokenStatNumber(stats.token_count)
   }
 })
+
+const detectVirtualFolders = async () => {
+  if (!kbId.value || !canManageDatabase.value) return
+  try {
+    virtualFolderStatus.value = await databaseApi.detectVirtualFolders(kbId.value)
+  } catch (error) {
+    console.error(error)
+  }
+}
+
+const consumeVirtualFolderEvents = async (taskId) => {
+  virtualFolderStreamController.value?.abort()
+  const controller = new AbortController()
+  virtualFolderStreamController.value = controller
+  try {
+    const response = await databaseApi.streamVirtualFolderMigration(
+      kbId.value,
+      taskId,
+      controller.signal
+    )
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const events = buffer.split('\n\n')
+      buffer = events.pop() || ''
+      for (const event of events) {
+        const data = event
+          .split('\n')
+          .find((line) => line.startsWith('data: '))
+          ?.slice(6)
+        if (data) virtualFolderTask.value = JSON.parse(data)
+      }
+    }
+    await detectVirtualFolders()
+    await store.getDatabaseInfo(undefined, true, true)
+  } catch (error) {
+    if (error.name !== 'AbortError') {
+      console.error(error)
+      message.warning('进度连接已中断，转换任务会继续执行')
+    }
+  }
+}
+
+const startVirtualFolderMigration = async () => {
+  if (!kbId.value || virtualFolderStarting.value || virtualFolderRunning.value) return
+  virtualFolderStarting.value = true
+  try {
+    const result = await databaseApi.startVirtualFolderMigration(kbId.value)
+    virtualFolderTask.value = { status: 'pending', progress: 0, message: '等待任务执行' }
+    consumeVirtualFolderEvents(result.task_id)
+  } catch (error) {
+    console.error(error)
+    message.error(error.message || '启动转换失败')
+  } finally {
+    virtualFolderStarting.value = false
+  }
+}
 
 const repairDatabaseStats = async () => {
   if (!kbId.value || statsRepairing.value) return
@@ -552,13 +690,10 @@ const confirmBatchParse = () => {
     return
   }
 
-  Modal.confirm({
-    title: '解析待解析文件',
-    content: `将提交 ${formatStatNumber(count)} 个待解析文件，任务会在后台按批处理，可在任务中心查看进度。`,
-    okText: '提交解析',
-    cancelText: '取消',
-    onOk: () => store.parsePendingFiles(count)
-  })
+  const opened = fileTableRef.value?.startPendingParse?.(count)
+  if (!opened) {
+    message.error('文件列表尚未加载完成，请稍后再试')
+  }
 }
 
 const confirmBatchIndex = () => {
@@ -574,7 +709,7 @@ const confirmBatchIndex = () => {
   }
 }
 
-const mindmapSectionRef = ref(null)
+const mindmapModalVisible = ref(false)
 const querySectionRef = ref(null)
 const searchConfigPanelRef = ref(null)
 
@@ -604,6 +739,30 @@ const showAddFilesModal = (options = {}) => {
 
 const showCreateFolderModal = () => {
   fileTableRef.value?.showCreateFolderModal()
+}
+
+const uploadActionMenuRef = ref(null)
+const uploadActionMenuOpen = ref(false)
+
+const onUploadAction = () => {
+  uploadActionMenuOpen.value = false
+  showAddFilesModal()
+}
+
+const onUploadFolderAction = () => {
+  uploadActionMenuOpen.value = false
+  showAddFilesModal({ isFolder: true, mode: 'folder' })
+}
+
+const onCreateFolderAction = () => {
+  uploadActionMenuOpen.value = false
+  showCreateFolderModal()
+}
+
+const onUploadMenuOutsideClick = (event) => {
+  if (uploadActionMenuRef.value && !uploadActionMenuRef.value.contains(event.target)) {
+    uploadActionMenuOpen.value = false
+  }
 }
 
 const folderTree = computed(() => {
@@ -637,6 +796,9 @@ const resetFileSelectionState = () => {
 watch(
   () => route.params.kbId,
   async (nextKbId) => {
+    virtualFolderStreamController.value?.abort()
+    virtualFolderTask.value = null
+    virtualFolderStatus.value = { has_virtual_folders: false, file_count: 0, remaining_steps: 0 }
     isInitialLoad.value = true
     detailLoading.value = true
     store.kbId = nextKbId
@@ -644,6 +806,15 @@ watch(
     store.stopAutoRefresh()
     try {
       await store.getDatabaseInfo(nextKbId, false)
+      if (store.database?.kb_id === nextKbId && kbUtils.isReadOnlyDatabase(store.database)) {
+        if (route.query.action === 'edit' && canManageDatabase.value) {
+          showEditModal()
+          return
+        }
+        await router.replace({ path: '/extensions', query: { tab: 'knowledge' } })
+        return
+      }
+      await detectVirtualFolders()
       store.startAutoRefresh()
     } finally {
       detailLoading.value = false
@@ -811,6 +982,10 @@ const loadUsers = async () => {
   }
 }
 
+const handleEditModalAfterClose = () => {
+  if (isConnector.value) backToDatabase()
+}
+
 const showEditModal = () => {
   editModalTab.value = 'basic'
   editForm.name = database.value.name || ''
@@ -834,7 +1009,7 @@ const showEditModal = () => {
 watch(
   () => [route.query.action, detailLoading.value, isCurrentDatabaseLoaded.value],
   ([action, loading, loaded]) => {
-    if (action !== 'edit' || loading || !loaded) return
+    if (action !== 'edit' || loading || !loaded || !canManageDatabase.value) return
     showEditModal()
     router.replace({ path: route.path, query: { ...route.query, action: undefined } })
   },
@@ -922,124 +1097,24 @@ onMounted(() => {
   loadChunkPresetOptions()
   loadDepartments()
   loadUsers()
+  document.addEventListener('click', onUploadMenuOutsideClick)
 })
 
 onUnmounted(() => {
   store.stopAutoRefresh()
+  virtualFolderStreamController.value?.abort()
+  document.removeEventListener('click', onUploadMenuOutsideClick)
 })
 </script>
 
 <style lang="less" scoped>
 @import '@/assets/css/extensions.less';
-@import '@/assets/css/extension-detail.less';
 
-.database-info-container {
-  .detail-content-wrapper {
-    flex: 1;
-    min-height: 0;
-  }
-
-  .detail-subtitle {
-    display: block;
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-}
-
-.database-detail-body {
-  flex: 1;
+.database-info-container,
+.knowledge-detail-layout {
+  width: 100%;
+  height: 100%;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
-  background: var(--gray-10);
-  overflow: hidden;
-}
-
-.database-detail-loading {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--gray-10);
-}
-
-.database-tab-bar {
-  flex-shrink: 0;
-  border-bottom: 1px solid var(--gray-150);
-  background: var(--gray-0);
-  padding: 8px 12px 0;
-  overflow-x: auto;
-  overflow-y: hidden;
-}
-
-.database-tab-list {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: max-content;
-}
-
-.database-tab-item {
-  position: relative;
-  min-height: 40px;
-  border: none;
-  border-radius: 8px 8px 0 0;
-  background: transparent;
-  color: var(--gray-600);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 0 14px 8px;
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  white-space: nowrap;
-  transition:
-    background 0.15s,
-    color 0.15s;
-
-  svg {
-    flex-shrink: 0;
-  }
-
-  &:hover {
-    color: var(--gray-900);
-    background: var(--gray-50);
-  }
-
-  &:focus-visible {
-    outline: 2px solid var(--main-200);
-    outline-offset: 2px;
-  }
-
-  &.active {
-    color: var(--main-color);
-    background: var(--main-20);
-
-    &::before {
-      content: '';
-      position: absolute;
-      left: 12px;
-      right: 12px;
-      bottom: 0;
-      height: 3px;
-      border-radius: 3px 3px 0 0;
-      background: var(--main-color);
-    }
-  }
-}
-
-.database-tab-content {
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
 }
 
 .tab-panel {
@@ -1063,6 +1138,10 @@ onUnmounted(() => {
     flex: 1;
     min-width: 0;
   }
+}
+
+.evaluation-panel {
+  padding: 0;
 }
 
 .file-panel-toolbar {
@@ -1120,6 +1199,80 @@ onUnmounted(() => {
   flex-wrap: wrap;
 }
 
+.file-action-dropdown {
+  position: relative;
+
+  .extension-panel-action {
+    font-size: 12px;
+  }
+}
+
+.file-action-chevron {
+  transition: transform 0.15s ease;
+
+  &.is-open {
+    transform: rotate(180deg);
+  }
+}
+
+.file-action-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  min-width: 130px;
+  padding: 4px;
+  background: var(--gray-0);
+  border: 1px solid var(--gray-200);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+}
+
+.file-action-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--gray-700);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+
+  &:hover {
+    background: var(--gray-100);
+    color: var(--gray-900);
+  }
+
+  &:active {
+    transform: scale(0.97);
+  }
+}
+
+.file-action-menu-enter-active {
+  transition:
+    opacity 0.16s ease,
+    transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.file-action-menu-leave-active {
+  transition:
+    opacity 0.12s ease,
+    transform 0.16s ease;
+}
+
+.file-action-menu-enter-from,
+.file-action-menu-leave-to {
+  opacity: 0;
+  transform: translateY(-6px) scale(0.96);
+}
+
 .file-panel-desc {
   font-size: 12px;
   color: var(--gray-500);
@@ -1135,17 +1288,28 @@ onUnmounted(() => {
 
 .file-stat-card {
   min-width: 60px;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 16px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: var(--main-0);
-  border: 1px solid var(--gray-100);
-  color: var(--main-color);
-  font: inherit;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 12px;
+  border-radius: 6px;
+  background: var(--gray-0);
+  border: 1px solid var(--gray-200);
+  box-shadow: none;
+  color: var(--gray-700);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1;
   appearance: none;
-  text-align: left;
+  text-align: center;
+  cursor: default;
+  justify-content: center;
+  transition:
+    background-color 0.18s ease,
+    border-color 0.18s ease,
+    color 0.18s ease;
 
   div {
     display: flex;
@@ -1153,25 +1317,40 @@ onUnmounted(() => {
     gap: 1px;
   }
 
-  strong {
-    font-size: 14px;
-    line-height: 1.2;
-    color: var(--gray-900);
+  svg {
+    flex: 0 0 auto;
+  }
+
+  .file-stat-value,
+  .file-stat-label {
     white-space: nowrap;
   }
 
-  span {
-    font-size: 11px;
+  .file-stat-value {
+    font-size: 13px;
+    font-weight: 400;
+    line-height: 1.2;
+    color: var(--gray-900);
+  }
+
+  .file-stat-label {
+    font-size: 10px;
+    font-weight: 400;
     color: var(--gray-500);
-    white-space: nowrap;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible:not(:disabled) {
+    border-color: var(--gray-300);
+    background: var(--gray-0);
+    color: var(--gray-900);
+    outline: none;
   }
 }
 
 .file-stat-summary {
   min-width: 87px;
-  min-height: 36px;
-  gap: 8px;
-  padding: 5px 10px;
+  min-height: 30px;
 
   .file-stat-inline {
     flex-direction: row;
@@ -1180,23 +1359,32 @@ onUnmounted(() => {
   }
 }
 
-.file-stat-action {
+.file-stat-warning {
   cursor: pointer;
-  color: var(--color-warning-500);
-  border: 1px solid var(--color-warning-100);
-  background-color: var(--color-warning-50);
-  transition:
-    background 0.15s,
-    border-color 0.15s;
+  color: var(--color-warning-700);
+  border-color: var(--color-warning-100);
+  background: var(--color-warning-50);
 
-  &:hover {
-    border-color: var(--color-warning-700);
+  .file-stat-value {
+    color: var(--color-warning-900);
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible:not(:disabled) {
+    border-color: var(--color-warning-500);
+    background: var(--color-warning-50);
+    color: var(--color-warning-900);
   }
 
   &:disabled {
     cursor: not-allowed;
     opacity: 0.6;
   }
+}
+
+.virtual-folder-migration-message {
+  margin-top: 8px;
+  color: var(--gray-600);
 }
 
 .file-stat-repair {
@@ -1242,7 +1430,9 @@ onUnmounted(() => {
 }
 
 .retrieval-config-content {
-  padding: 0 2px;
+  min-width: 0;
+  padding: 0;
+  overflow-x: hidden;
 }
 
 :global(.database-edit-modal .ant-modal-body) {
@@ -1278,6 +1468,34 @@ onUnmounted(() => {
   gap: 6px;
 }
 
+.readonly-model-field {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 7px 11px;
+  border: 1px solid var(--gray-200);
+  border-radius: 6px;
+  background: var(--gray-25);
+}
+
+.readonly-model-value {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--gray-800);
+  font-family: var(--mono-font, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.readonly-model-hint {
+  flex: 0 0 auto;
+  color: var(--gray-500);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .chunk-preset-help-icon {
   color: var(--gray-500);
   cursor: help;
@@ -1297,20 +1515,8 @@ onUnmounted(() => {
 }
 
 @media (max-width: 767px) {
-  .detail-top-bar {
-    gap: 10px;
-  }
-
-  .detail-actions :deep(.extension-panel-action span) {
+  .extension-detail-actions :deep(.extension-panel-action span) {
     display: none;
-  }
-
-  .database-tab-bar {
-    padding: 8px 8px 0;
-  }
-
-  .database-tab-item {
-    min-width: 104px;
   }
 
   .retrieval-config-content :deep(.ant-col) {
@@ -1330,6 +1536,30 @@ onUnmounted(() => {
   .app-layout:has(.database-info-container) {
     min-width: 0;
   }
+}
+
+.knowledge-mindmap-modal .ant-modal {
+  top: 32px;
+  max-width: calc(100vw - 32px);
+  padding-bottom: 0;
+}
+
+.knowledge-mindmap-modal .ant-modal-content {
+  height: min(760px, calc(100vh - 64px));
+  display: flex;
+  flex-direction: column;
+}
+
+.knowledge-mindmap-modal .ant-modal-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.knowledge-mindmap-modal-content {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
 }
 
 /* 全局样式作为备用方案 */
@@ -1425,15 +1655,4 @@ onUnmounted(() => {
   border-radius: 12px;
 }
 
-.benchmark-management-container {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-}
-
-.benchmark-content {
-  flex: 1;
-  overflow: hidden;
-  min-height: 0;
-}
 </style>

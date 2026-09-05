@@ -16,6 +16,7 @@ from yuxi.repositories.agent_repository import (
     user_can_access_agent,
     user_can_manage_agent,
 )
+from yuxi.repositories.agent_task_repository import AgentTaskRepository
 from yuxi.services.agent_request_queue_service import (
     cancel_queued_request as cancel_queued_request_svc,
     continue_thread_queue,
@@ -29,6 +30,7 @@ from yuxi.services.agent_run_service import (
     cancel_agent_run_view,
     create_agent_run_view,
     get_active_run_by_thread,
+    get_agent_run_langfuse_link,
     get_agent_run_result,
     get_agent_run_view,
     stream_agent_run_events,
@@ -39,7 +41,7 @@ from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import User
 from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError
 
-from server.utils.auth_middleware import get_admin_user, get_db, get_required_user
+from server.utils.auth_middleware import get_admin_user, get_db, get_required_user, get_superadmin_user
 
 agent_router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -325,26 +327,20 @@ async def delete_agent(
         raise HTTPException(status_code=403, detail="不能删除非自己创建的智能体")
     if is_builtin_agent(item):
         raise HTTPException(status_code=409, detail="内置智能体不能删除")
-    # 任务中心工单 10：未归档任务引用时阻断删除；允许删除时置空引用保留快照
-    from sqlalchemy import select as _select
-
-    from yuxi.storage.postgres.models_business import AgentTask, TaskExecution
-
-    referencing = (
-        await db.execute(_select(AgentTask.id).where(AgentTask.agent_id == item.id, AgentTask.archived_at.is_(None)))
-    ).all()
-    if referencing:
+    # 任务中心工单 10：未归档任务引用时阻断删除；允许删除时置空引用保留快照。
+    task_repo = AgentTaskRepository(db)
+    referencing_count = await task_repo.count_active_references(item.id)
+    if referencing_count:
         raise HTTPException(
             status_code=409,
-            detail=f"该智能体被 {len(referencing)} 个未归档任务引用，请先归档相关任务再删除",
+            detail=f"该智能体被 {referencing_count} 个未归档任务引用，请先归档相关任务再删除",
         )
     try:
         await _memory_client().clear_memory_agent(str(current_user.uid), agent_slug)
     except AgentScopeServiceError as exc:
         _raise_memory_service_error(exc)
-    # 归档后允许删除：置空引用，保留 slug 快照供历史展示
-    await db.execute(AgentTask.__table__.update().where(AgentTask.agent_id == item.id).values(agent_id=None))
-    await db.execute(TaskExecution.__table__.update().where(TaskExecution.agent_id == item.id).values(agent_id=None))
+    # 归档后允许删除：置空引用，保留 slug 快照供历史展示。
+    await task_repo.detach_agent_references(item.id)
     await repo.delete(agent=item)
     return {"success": True}
 
@@ -520,6 +516,13 @@ async def get_agent_run_result_route(
     run_id: str, current_user: User = Depends(get_required_user), db: AsyncSession = Depends(get_db)
 ):
     return await get_agent_run_result(run_id=run_id, current_uid=str(current_user.uid), db=db)
+
+
+@agent_router.get("/runs/{run_id}/langfuse")
+async def get_agent_run_langfuse_link_route(
+    run_id: str, current_user: User = Depends(get_superadmin_user), db: AsyncSession = Depends(get_db)
+):
+    return await get_agent_run_langfuse_link(run_id=run_id, current_uid=str(current_user.uid), db=db)
 
 
 @agent_router.post("/runs/{run_id}/cancel")

@@ -88,7 +88,9 @@
                 @click="handleSelectV2Model(model.spec)"
               >
                 <div class="model-option">
-                  <span class="model-option-name">{{ model.display_name }}</span>
+                  <span class="model-option-name" :title="model.display_name">{{
+                    model.display_name
+                  }}</span>
                   <div class="model-option-signals">
                     <a-tooltip v-if="getModelInfo(model).vision" title="支持图像输入">
                       <span class="model-signal-icon" role="img" aria-label="支持图像输入">
@@ -146,7 +148,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { modelProviderApi } from '@/apis/system_api'
-import { Eye, RefreshCw, X } from 'lucide-vue-next'
+import { Eye, RefreshCw, X } from '@lucide/vue'
 import { useModelStatus } from '@/composables/useModelStatus'
 import { useUserStore } from '@/stores/user'
 import { loadModelMetadataCatalog, resolveModelDisplayMetadata } from '@/utils/modelMetadata'
@@ -507,7 +509,7 @@ const handleClear = () => {
 }
 
 .model-dropdown {
-  width: min(360px, calc(100vw - 24px));
+  width: min(300px, calc(100vw - 24px));
   padding: 8px 0;
   overflow: hidden;
   background: var(--gray-0);
@@ -568,7 +570,7 @@ const handleClear = () => {
 }
 
 .model-option-name {
-  display: block;
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   color: var(--gray-1000);

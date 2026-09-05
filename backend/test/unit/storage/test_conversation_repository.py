@@ -53,6 +53,7 @@ async def test_list_conversations_excludes_hidden_user_sources(conversation_sess
     now = utc_now_naive()
     normal = Conversation(
         thread_id="thread-normal",
+        project_id="project-thread-normal",
         uid="user-a",
         agent_id="agent-a",
         title="Normal",
@@ -63,6 +64,7 @@ async def test_list_conversations_excludes_hidden_user_sources(conversation_sess
     )
     agent_call = Conversation(
         thread_id="thread-call",
+        project_id="project-thread-call",
         uid="user-a",
         agent_id="agent-a",
         title="Agent Call Run",
@@ -74,6 +76,7 @@ async def test_list_conversations_excludes_hidden_user_sources(conversation_sess
     )
     agent_eval = Conversation(
         thread_id="thread-eval",
+        project_id="project-thread-eval",
         uid="user-a",
         agent_id="agent-a",
         title="Agent Evaluation Run",
@@ -84,6 +87,7 @@ async def test_list_conversations_excludes_hidden_user_sources(conversation_sess
     )
     channel = Conversation(
         thread_id="thread-channel",
+        project_id="project-thread-channel",
         uid="user-a",
         agent_id="agent-a",
         title="WPS Channel Run",
@@ -111,6 +115,7 @@ async def test_list_conversations_excludes_hidden_user_sources(conversation_sess
 async def test_list_active_conversations_for_user_excludes_hidden_user_sources(conversation_session):
     normal = Conversation(
         thread_id="thread-active-normal",
+        project_id="project-thread-active-normal",
         uid="user-a",
         agent_id="agent-a",
         title="Normal",
@@ -119,6 +124,7 @@ async def test_list_active_conversations_for_user_excludes_hidden_user_sources(c
     )
     channel = Conversation(
         thread_id="thread-active-channel",
+        project_id="project-thread-active-channel",
         uid="user-a",
         agent_id="agent-a",
         title="WPS Channel Run",
@@ -143,6 +149,7 @@ async def test_add_tool_call_updates_existing_lifecycle(conversation_session):
     """同一工具在审批恢复后应更新原记录，而不是保留 pending 或重复插入。"""
     conversation = Conversation(
         thread_id="thread-tools",
+        project_id="project-thread-tools",
         uid="user-a",
         agent_id="agent-a",
         title="Tools",
@@ -183,6 +190,7 @@ async def test_pending_tool_call_lookup_is_scoped_to_conversation(conversation_s
     """相同工具 ID 只能命中目标对话中的 pending 记录。"""
     first = Conversation(
         thread_id="thread-first",
+        project_id="project-thread-first",
         uid="user-a",
         agent_id="agent-a",
         title="First",
@@ -190,6 +198,7 @@ async def test_pending_tool_call_lookup_is_scoped_to_conversation(conversation_s
     )
     second = Conversation(
         thread_id="thread-second",
+        project_id="project-thread-second",
         uid="user-b",
         agent_id="agent-a",
         title="Second",
@@ -227,6 +236,7 @@ async def test_search_conversations_by_message_content_filters_user_status_and_t
     now = utc_now_naive()
     active = Conversation(
         thread_id="thread-active",
+        project_id="project-thread-active",
         uid="user-a",
         agent_id="agent-a",
         title="Active Thread",
@@ -236,6 +246,7 @@ async def test_search_conversations_by_message_content_filters_user_status_and_t
     )
     deleted = Conversation(
         thread_id="thread-deleted",
+        project_id="project-thread-deleted",
         uid="user-a",
         agent_id="agent-a",
         title="Deleted Thread",
@@ -245,6 +256,7 @@ async def test_search_conversations_by_message_content_filters_user_status_and_t
     )
     other_user = Conversation(
         thread_id="thread-other-user",
+        project_id="project-thread-other-user",
         uid="user-b",
         agent_id="agent-a",
         title="Other User Thread",
@@ -254,6 +266,7 @@ async def test_search_conversations_by_message_content_filters_user_status_and_t
     )
     tool_only = Conversation(
         thread_id="thread-tool-only",
+        project_id="project-thread-tool-only",
         uid="user-a",
         agent_id="agent-a",
         title="Tool Only Thread",
@@ -317,6 +330,7 @@ async def test_search_conversations_by_message_content_excludes_hidden_user_sour
     now = utc_now_naive()
     normal = Conversation(
         thread_id="thread-normal",
+        project_id="project-thread-normal",
         uid="user-a",
         agent_id="agent-a",
         title="Normal",
@@ -327,6 +341,7 @@ async def test_search_conversations_by_message_content_excludes_hidden_user_sour
     )
     agent_call = Conversation(
         thread_id="thread-call",
+        project_id="project-thread-call",
         uid="user-a",
         agent_id="agent-a",
         title="Agent Call Run",
@@ -337,6 +352,7 @@ async def test_search_conversations_by_message_content_excludes_hidden_user_sour
     )
     agent_eval = Conversation(
         thread_id="thread-eval",
+        project_id="project-thread-eval",
         uid="user-a",
         agent_id="agent-a",
         title="Agent Evaluation Run",
@@ -347,6 +363,7 @@ async def test_search_conversations_by_message_content_excludes_hidden_user_sour
     )
     channel = Conversation(
         thread_id="thread-channel",
+        project_id="project-thread-channel",
         uid="user-a",
         agent_id="agent-a",
         title="WPS Channel Run",
@@ -404,6 +421,7 @@ async def test_search_conversations_by_message_content_filters_agent_and_paginat
     old = now - timedelta(days=1)
     first = Conversation(
         thread_id="thread-first",
+        project_id="project-thread-first",
         uid="user-a",
         agent_id="agent-a",
         title="First",
@@ -413,6 +431,7 @@ async def test_search_conversations_by_message_content_filters_agent_and_paginat
     )
     second = Conversation(
         thread_id="thread-second",
+        project_id="project-thread-second",
         uid="user-a",
         agent_id="agent-a",
         title="Second",
@@ -422,6 +441,7 @@ async def test_search_conversations_by_message_content_filters_agent_and_paginat
     )
     other_agent = Conversation(
         thread_id="thread-other-agent",
+        project_id="project-thread-other-agent",
         uid="user-a",
         agent_id="agent-b",
         title="Other Agent",

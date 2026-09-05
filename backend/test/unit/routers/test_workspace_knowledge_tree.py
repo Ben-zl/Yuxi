@@ -4,8 +4,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from server.routers import workspace_router
-from server.routers.workspace_router import workspace
+from server.routers.workspace_router import workspace_knowledge
 from server.utils.auth_middleware import get_required_user
+from yuxi.knowledge import preview
 from yuxi.knowledge.read_models import KnowledgeBaseDetail
 from yuxi.storage.postgres.models_business import User
 
@@ -76,13 +77,13 @@ class FakeKnowledgeBase:
 
 def _build_client(monkeypatch, fake_kb: FakeKnowledgeBase) -> TestClient:
     app = FastAPI()
-    app.include_router(workspace, prefix="/api")
+    app.include_router(workspace_knowledge, prefix="/api")
 
     async def fake_required_user():
         return User(username="user", uid="user", password_hash="x", role="user", department_id=1)
 
     app.dependency_overrides[get_required_user] = fake_required_user
-    monkeypatch.setattr(workspace_router, "knowledge_base", fake_kb)
+    monkeypatch.setattr(workspace_router, "_get_knowledge_base", lambda: fake_kb)
     return TestClient(app)
 
 
@@ -132,3 +133,30 @@ def test_workspace_knowledge_tree_rejects_non_document_kb(monkeypatch):
 
     assert response.status_code == 501
     assert "不支持文件浏览" in response.json()["detail"]
+
+
+def test_workspace_knowledge_file_calls_knowledge_preview_directly(monkeypatch):
+    client = _build_client(monkeypatch, FakeKnowledgeBase())
+    calls = []
+
+    async def read_preview(*, kb_id: str, file_id: str) -> dict:
+        calls.append((kb_id, file_id))
+        return {
+            "source": "knowledge",
+            "kb_id": kb_id,
+            "file_id": file_id,
+            "content": "preview",
+            "preview_type": "text",
+            "supported": True,
+        }
+
+    monkeypatch.setattr(preview, "read_knowledge_file_preview", read_preview)
+
+    response = client.get(
+        "/api/workspace/knowledge/file",
+        params={"kb_id": "kb_1", "file_id": "file_1"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["content"] == "preview"
+    assert calls == [("kb_1", "file_1")]

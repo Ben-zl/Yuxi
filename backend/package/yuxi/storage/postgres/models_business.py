@@ -6,16 +6,19 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Column,
     Date,
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
@@ -30,9 +33,80 @@ JSON_VALUE = JSON().with_variant(JSONB, "postgresql")
 MAX_LOGIN_FAILED_ATTEMPTS = 5
 LOGIN_LOCK_DURATION_SECONDS = 300
 AGENT_RUN_TERMINAL_STATUSES = ("completed", "failed", "cancelled", "interrupted")
+AGENT_RUN_SHAPE_CONSTRAINT_NAME = "ck_agent_runs_nonterminal_shape"
+AGENT_RUN_SHAPE_CONSTRAINT_SQL = """
+status IN ('completed', 'failed', 'cancelled', 'interrupted')
+OR (
+    runtime_scope_id <> ''
+ AND conversation_thread_id <> ''
+ AND ((run_type = 'chat'
+     AND runtime_scope_id = conversation_thread_id
+     AND created_by_run_id IS NULL
+     AND subagent_thread_relation_id IS NULL)
+ OR (run_type = 'resume'
+     AND runtime_scope_id = conversation_thread_id
+     AND created_by_run_id IS NOT NULL
+     AND subagent_thread_relation_id IS NULL)
+ OR (run_type = 'subagent'
+     AND created_by_run_id IS NOT NULL
+     AND subagent_thread_relation_id IS NOT NULL))
+)
+"""
+PROJECT_STATUS_CONSTRAINT_NAME = "ck_projects_status"
+PROJECT_STATUS_CONSTRAINT_SQL = "status IN ('active', 'deleted')"
 # 新建线程的初始已查看标记，用于区分"尚无任何 Run"与"上线前的历史会话"，
 # 避免 startup 回填把后续新产生的未读状态误清为已读。不会与真实 Run id 冲突。
 UNVIEWED_RUN_MARKER = "__unviewed__"
+
+
+class Project(Base):
+    """用户项目及其 Workdir 绑定。"""
+
+    __tablename__ = "projects"
+    __table_args__ = (
+        UniqueConstraint("id", "uid", name="uq_projects_id_uid"),
+        UniqueConstraint("uid", "idempotency_key", name="uq_projects_uid_idempotency_key"),
+        CheckConstraint("selection_status IN ('implicit', 'selectable')", name="ck_projects_selection_status"),
+        CheckConstraint("directory_mode IN ('managed', 'linked')", name="ck_projects_directory_mode"),
+        CheckConstraint(PROJECT_STATUS_CONSTRAINT_SQL, name=PROJECT_STATUS_CONSTRAINT_NAME),
+    )
+
+    id = Column(String(64), primary_key=True, comment="Project UUID")
+    uid = Column(
+        String(64),
+        ForeignKey("users.uid", ondelete="CASCADE", name="fk_projects_uid_users"),
+        nullable=False,
+        index=True,
+        comment="UID",
+    )
+    name = Column(String(255), nullable=True, comment="项目名称；implicit Project 可为空")
+    selection_status = Column(String(20), nullable=False, index=True, comment="implicit/selectable")
+    workdir_path = Column(String(512), nullable=False, comment="UserWorkspace-relative Workdir path")
+    directory_mode = Column(String(20), nullable=False, comment="managed/linked")
+    status = Column(String(20), nullable=False, default="active", server_default="active", index=True)
+    deleted_at = Column(DateTime, nullable=True, comment="软删除时间")
+    idempotency_key = Column(String(128), nullable=True, comment="幂等创建键")
+    created_at = Column(DateTime, default=utc_now_naive, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime, default=utc_now_naive, onupdate=utc_now_naive, server_default=func.now(), nullable=False
+    )
+
+    conversations = relationship("Conversation", back_populates="project")
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化项目公开字段。"""
+        return {
+            "id": self.id,
+            "uid": self.uid,
+            "name": self.name,
+            "selection_status": self.selection_status,
+            "workdir_path": self.workdir_path,
+            "directory_mode": self.directory_mode,
+            "status": self.status,
+            "deleted_at": format_utc_datetime(self.deleted_at),
+            "created_at": format_utc_datetime(self.created_at),
+            "updated_at": format_utc_datetime(self.updated_at),
+        }
 
 
 class Department(Base):
@@ -241,7 +315,15 @@ class Agent(Base):
     created_at = Column(DateTime, default=utc_now_naive)
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
 
-    __table_args__ = (Index("uq_agents_default", "is_default", unique=True, postgresql_where=is_default.is_(True)),)
+    __table_args__ = (
+        Index(
+            "uq_agents_default",
+            "is_default",
+            unique=True,
+            postgresql_where=is_default.is_(True),
+            sqlite_where=is_default.is_(True),
+        ),
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -318,6 +400,7 @@ class Conversation(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
     thread_id = Column(String(64), unique=True, index=True, nullable=False, comment="Thread ID (UUID)")
+    creation_request_id = Column(String(64), nullable=True, comment="新建 Conversation 幂等请求 ID")
     uid = Column(String(64), index=True, nullable=False, comment="UID")
     # 历史字段名，实际保存的是 Agent.slug。
     agent_id = Column(String(64), index=True, nullable=False, comment="Agent slug (legacy column name: agent_id)")
@@ -325,6 +408,7 @@ class Conversation(Base):
     status = Column(String(20), default="active", comment="Status: active/archived/deleted")
     is_pinned = Column(Boolean, default=False, nullable=False, index=True, comment="Is pinned to top")
     last_viewed_run_id = Column(String(64), nullable=True, comment="Latest top-level run id viewed by user")
+    project_id = Column(String(64), nullable=False, index=True, comment="Conversation 绑定的 Project ID")
     created_at = Column(DateTime, default=utc_now_naive, comment="Creation time")
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive, comment="Update time")
     extra_metadata = Column(JSON, nullable=True, comment="Additional metadata")
@@ -334,17 +418,29 @@ class Conversation(Base):
     stats = relationship(
         "ConversationStats", back_populates="conversation", uselist=False, cascade="all, delete-orphan"
     )
+    project = relationship("Project", back_populates="conversations")
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "uid"],
+            ["projects.id", "projects.uid"],
+            name="fk_conversations_project_uid",
+        ),
+        UniqueConstraint("uid", "creation_request_id", name="uq_conversations_uid_creation_request_id"),
+    )
 
     def to_dict(self) -> dict[str, Any]:
         metadata = self.extra_metadata or {}
         return {
             "id": self.id,
             "thread_id": self.thread_id,
+            "creation_request_id": self.creation_request_id,
             "uid": self.uid,
             "agent_id": self.agent_id,
             "title": self.title,
             "status": self.status,
             "is_pinned": bool(self.is_pinned),
+            "project_id": self.project_id,
             "created_at": format_utc_datetime(self.created_at),
             "updated_at": format_utc_datetime(self.updated_at),
             "metadata": metadata,
@@ -888,6 +984,8 @@ class APIKey(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     key_hash = Column(String(64), nullable=False, unique=True, index=True)
     key_prefix = Column(String(16), nullable=False)
+    request_id = Column(String(64), nullable=True, unique=True, index=True)
+    intent_hash = Column(String(64), nullable=True)
     name = Column(String(100), nullable=False)
 
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
@@ -895,6 +993,7 @@ class APIKey(Base):
 
     expires_at = Column(DateTime, nullable=True)
     is_enabled = Column(Boolean, nullable=False, default=True)
+    revoked_at = Column(DateTime, nullable=True, index=True)
     last_used_at = Column(DateTime, nullable=True)
 
     created_by = Column(String(64), nullable=False)
@@ -921,6 +1020,8 @@ class APIKey(Base):
     def is_valid(self) -> bool:
         """检查 Key 是否有效"""
         if not self.is_enabled:
+            return False
+        if self.revoked_at is not None:
             return False
         if self.expires_at and utc_now_naive() > self.expires_at:
             return False
@@ -971,6 +1072,11 @@ class AgentRun(Base):
 
     id = Column(String(64), primary_key=True, comment="Run ID (UUID)")
     conversation_thread_id = Column(String(64), index=True, nullable=False, comment="Conversation thread ID snapshot")
+    runtime_scope_id = Column(String(64), index=True, nullable=False, comment="Root conversation runtime scope")
+    runtime_cleanup_pending = Column(
+        Boolean, nullable=False, default=False, server_default="false", index=True,
+        comment="Root terminal Run still owns execution runtime cleanup",
+    )
     agent_slug = Column(String(64), index=True, nullable=False, comment="Agent slug")
     uid = Column(String(64), index=True, nullable=False, comment="UID")
     status = Column(
@@ -1009,15 +1115,27 @@ class AgentRun(Base):
     token_usage = Column(JSON_VALUE, nullable=False, default=dict, comment="Run token usage grouped by model")
     error_type = Column(String(64), nullable=True, comment="Error type")
     error_message = Column(Text, nullable=True, comment="Error message")
+    worker_id = Column(String(128), nullable=True, comment="当前执行 ownership token")
+    heartbeat_at = Column(DateTime, nullable=True, comment="当前 owner 最近一次续租时间")
+    lease_expires_at = Column(DateTime, nullable=True, comment="当前执行 ownership 的到期时间")
+    manifest = Column(JSON_VALUE, nullable=True, comment="首次执行前固化的运行清单（脱敏）")
+    manifest_fingerprint = Column(String(64), nullable=True, comment="运行清单规范化 JSON 的 SHA-256 指纹")
+    manifest_recorded_at = Column(DateTime, nullable=True, comment="运行清单固化时间")
     started_at = Column(DateTime, nullable=True, comment="Start time")
     finished_at = Column(DateTime, nullable=True, comment="Finish time")
     created_at = Column(DateTime, default=utc_now_naive, comment="Creation time")
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive, comment="Update time")
 
+    __table_args__ = (
+        CheckConstraint(AGENT_RUN_SHAPE_CONSTRAINT_SQL, name=AGENT_RUN_SHAPE_CONSTRAINT_NAME),
+    )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "conversation_thread_id": self.conversation_thread_id,
+            "runtime_scope_id": self.runtime_scope_id,
+            "runtime_cleanup_pending": bool(self.runtime_cleanup_pending),
             "agent_slug": self.agent_slug,
             "uid": self.uid,
             "status": self.status,
@@ -1037,6 +1155,8 @@ class AgentRun(Base):
             "token_usage": self.token_usage or {},
             "error_type": self.error_type,
             "error_message": self.error_message,
+            "manifest": self.manifest,
+            "manifest_fingerprint": self.manifest_fingerprint,
             "started_at": format_utc_datetime(self.started_at),
             "finished_at": format_utc_datetime(self.finished_at),
             "created_at": format_utc_datetime(self.created_at),
@@ -1053,6 +1173,31 @@ Index(
     postgresql_where=AgentRun.status.notin_(AGENT_RUN_TERMINAL_STATUSES),
     sqlite_where=AgentRun.status.notin_(AGENT_RUN_TERMINAL_STATUSES),
 )
+Index("ix_agent_runs_status_lease_expires", AgentRun.status, AgentRun.lease_expires_at)
+
+
+class AgentRunAttempt(Base):
+    """AgentRun 单次执行占有的不可变事实记录。"""
+
+    __tablename__ = "agent_run_attempts"
+    __table_args__ = (
+        UniqueConstraint("run_id", "attempt_no", name="uq_agent_run_attempts_run_attempt_no"),
+        Index("ix_agent_run_attempts_open", "run_id", "finished_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False)
+    attempt_no = Column(Integer, nullable=False)
+    worker_id = Column(String(128), nullable=False)
+    started_at = Column(DateTime, nullable=False)
+    heartbeat_at = Column(DateTime, nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    outcome = Column(String(32), nullable=True)
+    error_type = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now_naive)
+    updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
 
 
 class AgentRunRequest(Base):

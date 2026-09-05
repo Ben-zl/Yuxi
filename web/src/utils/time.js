@@ -1,8 +1,8 @@
 import dayjs from 'dayjs'
-import 'dayjs/locale/zh-cn'
-import utc from 'dayjs/plugin/utc'
-import timezone from 'dayjs/plugin/timezone'
-import relativeTime from 'dayjs/plugin/relativeTime'
+import 'dayjs/locale/zh-cn.js'
+import utc from 'dayjs/plugin/utc.js'
+import timezone from 'dayjs/plugin/timezone.js'
+import relativeTime from 'dayjs/plugin/relativeTime.js'
 
 dayjs.extend(utc)
 dayjs.extend(timezone)
@@ -65,6 +65,20 @@ export const formatRelative = (value) => {
   const parsed = coerceDayjs(value)
   if (!parsed) return '-'
   return parsed.fromNow()
+}
+
+// 对话时间展示：今天仅时间，昨天带"昨天"前缀，一周内显示周几，
+// 一周前显示月-日与时间，跨年补全年份；nowValue 供测试注入当前时间
+export const formatChatTime = (value, nowValue = undefined) => {
+  const parsed = coerceDayjs(value)
+  if (!parsed) return ''
+  const now = coerceDayjs(nowValue ?? Date.now())
+
+  if (parsed.isSame(now, 'day')) return parsed.format('HH:mm')
+  if (parsed.isSame(now.subtract(1, 'day'), 'day')) return parsed.format('昨天 HH:mm')
+  if (parsed.isAfter(now.subtract(7, 'day'))) return parsed.format('ddd HH:mm')
+  if (parsed.isSame(now, 'year')) return parsed.format('MM-DD HH:mm')
+  return parsed.format('YYYY-MM-DD')
 }
 
 export const sortByDatetimeDesc = (items, accessor) => {

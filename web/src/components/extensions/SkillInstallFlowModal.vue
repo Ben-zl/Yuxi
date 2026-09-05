@@ -3,7 +3,7 @@
     :open="open"
     class="skill-install-flow-modal"
     :width="840"
-    :closable="canClose"
+    :closable="false"
     :mask-closable="canClose"
     :keyboard="canClose"
     :footer="null"
@@ -12,24 +12,32 @@
   >
     <div class="install-flow-shell">
       <header class="install-flow-header">
-        <div class="install-flow-icon"><PackageOpen :size="19" /></div>
-        <div>
-          <h2>{{ modalTitle }}</h2>
-          <p>{{ modalDescription }}</p>
+        <div class="header-left">
+          <div class="install-flow-icon"><PackageOpen :size="18" /></div>
+          <div class="header-titles">
+            <h2>{{ modalTitle }}</h2>
+            <p v-if="props.flow?.kind === 'suite' && modalDescription" class="header-sub">
+              {{ modalDescription }}
+            </p>
+          </div>
+        </div>
+        <div class="header-right">
+          <div class="step-indicator-pill">
+            <span class="step-indicator-num">{{ currentStep + 1 }}/{{ stepLabels.length }}</span>
+            <span class="step-divider">·</span>
+            <span class="step-indicator-label">{{ stepLabels[currentStep] }}</span>
+          </div>
+          <button
+            type="button"
+            class="modal-close-btn"
+            :disabled="!canClose"
+            aria-label="关闭"
+            @click="handleClose"
+          >
+            <XIcon :size="16" />
+          </button>
         </div>
       </header>
-
-      <ol class="install-flow-steps" aria-label="安装进度">
-        <li
-          v-for="(label, index) in stepLabels"
-          :key="label"
-          :class="{ active: currentStep === index, completed: currentStep > index }"
-          :aria-current="currentStep === index ? 'step' : undefined"
-        >
-          <span class="step-dot">{{ currentStep > index ? '✓' : index + 1 }}</span>
-          <span class="step-label">{{ label }}</span>
-        </li>
-      </ol>
 
       <main
         class="install-flow-body"
@@ -126,8 +134,8 @@
                 :aria-pressed="installTarget === 'personal'"
                 @click="installTarget = 'personal'"
               >
-                <span class="install-target-title">个人工作区 <b>推荐</b></span>
-                <span>仅自己可用，保存在个人 workspace，不进入平台数据库。</span>
+                <span class="install-target-title">个人 Skill <b>推荐</b></span>
+                <span>仅自己可用，保存在个人 Skill 持久源，不进入平台数据库。</span>
               </button>
               <button
                 v-if="userStore.isAdmin"
@@ -217,14 +225,7 @@
 
 <script setup>
 import { computed, defineComponent, h, nextTick, ref, watch } from 'vue'
-import {
-  CheckCircle2,
-  Circle,
-  LoaderCircle,
-  PackageOpen,
-  X as XIcon,
-  XCircle
-} from 'lucide-vue-next'
+import { CheckCircle2, Circle, LoaderCircle, PackageOpen, X as XIcon, XCircle } from '@lucide/vue'
 import ShareConfigForm from '@/components/ShareConfigForm.vue'
 import { skillApi } from '@/apis/skill_api'
 import { useUserStore } from '@/stores/user'
@@ -308,7 +309,7 @@ const shareScopeLabel = computed(() => {
   )
 })
 const installTargetLabel = computed(() =>
-  installTarget.value === 'personal' ? '个人工作区' : shareScopeLabel.value
+  installTarget.value === 'personal' ? '个人 Skill' : shareScopeLabel.value
 )
 const failedInstallItems = computed(() =>
   installItems.value.filter((item) => item.status === 'failed')
@@ -437,9 +438,18 @@ const openReview = (draftPayloads) => {
 
 const prepareSuite = () => {
   const details = suiteSkills.value.filter((skill) => selectedSlugs.value.includes(skill.slug))
-  prepareRequests([
-    { source: props.flow.suite.source, skills: selectedSlugs.value, skillDetails: details }
-  ])
+  const requestsBySource = new Map()
+  for (const skill of details) {
+    const source = skill.source || props.flow.suite?.source
+    if (!source) continue
+    if (!requestsBySource.has(source)) {
+      requestsBySource.set(source, { source, skills: [], skillDetails: [] })
+    }
+    const req = requestsBySource.get(source)
+    req.skills.push(skill.slug)
+    req.skillDetails.push(skill)
+  }
+  prepareRequests(Array.from(requestsBySource.values()))
 }
 
 const installDrafts = async () => {
@@ -583,27 +593,39 @@ watch(
 
 .install-flow-header {
   display: flex;
-  align-items: flex-start;
-  gap: 11px;
-  padding-right: 28px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--gray-150);
+  margin-bottom: 14px;
+}
 
-  > div:last-child {
-    min-width: 0;
-  }
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.header-titles {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 
   h2 {
     margin: 0;
     color: var(--gray-900);
-    font-size: 18px;
-    font-weight: 650;
-    line-height: 25px;
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 22px;
   }
 
-  p {
-    margin: 3px 0 0;
+  .header-sub {
+    margin: 2px 0 0;
     color: var(--gray-500);
     font-size: 12px;
-    line-height: 18px;
+    line-height: 16px;
   }
 }
 
@@ -611,70 +633,68 @@ watch(
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  flex: 0 0 36px;
-  height: 36px;
+  flex: 0 0 32px;
+  height: 32px;
   border-radius: 8px;
   background: var(--gray-100);
   color: var(--gray-700);
 }
 
-.install-flow-steps {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  margin: 20px 0 16px;
-  padding: 0;
-  list-style: none;
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 
-  li {
-    position: relative;
-    display: grid;
-    grid-template-rows: 22px 18px;
-    justify-items: center;
-    gap: 4px;
-    color: var(--gray-400);
-    font-size: 12px;
+.step-indicator-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--gray-100);
+  font-size: 12px;
+  line-height: 18px;
+  user-select: none;
+}
 
-    &::before {
-      position: absolute;
-      top: 11px;
-      right: 50%;
-      left: -50%;
-      z-index: 0;
-      height: 1px;
-      background: var(--gray-150);
-      content: '';
-    }
+.step-indicator-num {
+  font-weight: 600;
+  color: var(--gray-800);
+  font-variant-numeric: tabular-nums;
+}
 
-    &:first-child::before {
-      display: none;
-    }
+.step-divider {
+  color: var(--gray-350, #b4b8be);
+  font-size: 10px;
+}
 
-    .step-dot {
-      z-index: 1;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 22px;
-      height: 22px;
-      border: 1px solid var(--gray-200);
-      border-radius: 50%;
-      background: var(--gray-0);
-    }
+.step-indicator-label {
+  color: var(--gray-600);
+  font-weight: 500;
+}
 
-    &.active,
-    &.completed {
-      color: var(--gray-800);
-      font-weight: 600;
+.modal-close-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--gray-400);
+  cursor: pointer;
+  transition: all 0.15s ease;
 
-      .step-dot {
-        border-color: var(--gray-500);
-        background: var(--gray-50);
-      }
-    }
+  &:hover:not(:disabled) {
+    background: var(--gray-100);
+    color: var(--gray-700);
+  }
 
-    &.completed::before {
-      background: var(--gray-300);
-    }
+  &:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 }
 
@@ -1041,6 +1061,7 @@ watch(
 }
 
 .personal-install-note {
+  margin-top: 10px;
   padding: 9px 11px;
   border: 1px solid var(--main-100);
   border-radius: 6px;

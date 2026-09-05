@@ -33,6 +33,24 @@
         <Copy v-else size="12" />
       </span>
 
+      <!-- 对话结束时间 / 执行耗时：纯文本，紧挨复制按钮展示 -->
+      <span
+        v-if="messageFinishedAt"
+        class="time-entry"
+        :class="{ toggleable: messageDurationMs }"
+        @click="toggleTimeDisplay"
+        :title="
+          messageDurationMs
+            ? showingDuration
+              ? '点击显示结束时间'
+              : '点击显示执行耗时'
+            : '结束时间'
+        "
+      >
+        <span v-if="showingDuration && messageDurationLabel">{{ messageDurationLabel }}</span>
+        <span v-else>{{ messageFinishedAt }}</span>
+      </span>
+
       <!-- 重试 -->
       <span
         v-if="showKey('regenerate')"
@@ -102,8 +120,9 @@ import {
   RotateCcw,
   BookOpen,
   ChevronDown
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { agentApi } from '@/apis'
+import { formatChatTime, parseToShanghai } from '@/utils/time'
 import KnowledgeSourceSection from '@/components/KnowledgeSourceSection.vue'
 import WebSearchSourceSection from '@/components/WebSearchSourceSection.vue'
 
@@ -151,6 +170,33 @@ const feedbackState = reactive({
   reason: null
 })
 
+// 对话结束时间 / 执行耗时切换
+const showingDuration = ref(false)
+const messageFinishedAt = computed(() => {
+  const finishedAt = msg.value?.run_finished_at || msg.value?.created_at
+  return finishedAt ? formatChatTime(finishedAt) : ''
+})
+const messageDurationMs = computed(() => {
+  const started = parseToShanghai(msg.value?.run_started_at)
+  const finished = parseToShanghai(msg.value?.run_finished_at || msg.value?.created_at)
+  if (!started || !finished) return 0
+  const duration = finished.valueOf() - started.valueOf()
+  return Number.isFinite(duration) && duration > 0 ? duration : 0
+})
+const messageDurationLabel = computed(() => {
+  const ms = messageDurationMs.value
+  if (!ms) return ''
+  const seconds = Math.round(ms / 1000)
+  if (seconds < 60) return `耗时 ${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const restSeconds = seconds % 60
+  return `耗时 ${minutes}分${restSeconds}s`
+})
+const toggleTimeDisplay = () => {
+  if (!messageDurationMs.value) return
+  showingDuration.value = !showingDuration.value
+}
+
 // 初始化反馈状态 - 从 antMessage.feedback 读取历史反馈
 const initFeedbackState = () => {
   if (msg.value?.feedback) {
@@ -170,6 +216,7 @@ watch(
   () => {
     msg.value = props.message
     initFeedbackState()
+    showingDuration.value = false
   },
   { immediate: true }
 )
@@ -402,6 +449,20 @@ const cancelDislike = () => {
 
         &.rotated {
           transform: rotate(180deg);
+        }
+      }
+    }
+
+    .time-entry {
+      color: var(--gray-400);
+      font-variant-numeric: tabular-nums;
+      user-select: none;
+
+      &.toggleable {
+        cursor: pointer;
+
+        &:hover {
+          color: var(--gray-700);
         }
       }
     }

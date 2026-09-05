@@ -1,6 +1,7 @@
 # Yuxi Initialization Script for PowerShell
 # This script helps set up the environment for the Yuxi project
-# Note: API keys will be visible during input - use with care
+
+param([switch]$ValidateSecurityEnv)
 
 function New-RandomHex($ByteCount) {
     $bytes = [byte[]]::new($ByteCount)
@@ -14,7 +15,7 @@ function New-RandomHex($ByteCount) {
 }
 
 function Test-EnvValue($Name) {
-    return [bool](Select-String -Path ".env" -Pattern "^$Name=.+" -Quiet)
+    return -not [string]::IsNullOrWhiteSpace((Get-EnvValue $Name))
 }
 
 function Set-EnvValue($Name, $Value) {
@@ -37,6 +38,81 @@ function Set-EnvValue($Name, $Value) {
     }
 }
 
+function Get-EnvValue($Name) {
+    $escapedName = [regex]::Escape($Name)
+    $line = Get-Content -Path ".env" | Where-Object { $_ -match "^$escapedName=" } | Select-Object -First 1
+    if ($null -eq $line) {
+        return ""
+    }
+    return $line.Substring($line.IndexOf("=") + 1)
+}
+
+function Read-HiddenValue($Prompt) {
+    $secureValue = Read-Host $Prompt -AsSecureString
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureValue)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+    }
+}
+
+function Test-SecuritySecretValue($Value, [string[]]$OtherValues = @()) {
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value.Trim().Length -lt 32 -or $Value -ne $Value.Trim()) {
+        return $false
+    }
+    if ($Value.StartsWith('"') -or $Value.EndsWith('"') -or $Value.StartsWith("'") -or $Value.EndsWith("'")) {
+        return $false
+    }
+    foreach ($other in $OtherValues) {
+        if (-not [string]::IsNullOrEmpty($other) -and $Value -eq $other) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Read-SecuritySecret($Name, [string[]]$OtherValues = @()) {
+    while ($true) {
+        $value = Read-HiddenValue "Please enter your $Name (press Enter to auto-generate)"
+        if ([string]::IsNullOrEmpty($value)) {
+            $value = New-RandomHex 32
+            Write-Host "Generated $Name and saved it to .env." -ForegroundColor Green
+        }
+        if (Test-SecuritySecretValue $value $OtherValues) {
+            return $value
+        }
+        Write-Host "❌ $Name must contain at least 32 non-whitespace characters and must not reuse another security secret." -ForegroundColor Red
+    }
+}
+
+function Ensure-SecuritySecret($Name, [string[]]$OtherNames = @()) {
+    $current = Get-EnvValue $Name
+    $otherValues = @($OtherNames | ForEach-Object { Get-EnvValue $_ })
+    if (Test-SecuritySecretValue $current $otherValues) {
+        return
+    }
+
+    Write-Host "$Name is missing, too short, or reuses another security secret in .env." -ForegroundColor Yellow
+    $value = Read-SecuritySecret $Name $otherValues
+    Set-EnvValue $Name $value
+}
+
+function Assert-SecuritySecrets {
+    $jwtSecret = Get-EnvValue "JWT_SECRET_KEY"
+    $apiKeySecret = Get-EnvValue "API_KEY_DERIVATION_SECRET"
+    $sandboxSecret = Get-EnvValue "SANDBOX_PROVISIONER_TOKEN"
+    if (-not (Test-SecuritySecretValue $jwtSecret)) {
+        throw "JWT_SECRET_KEY must contain at least 32 non-whitespace characters."
+    }
+    if (-not (Test-SecuritySecretValue $apiKeySecret @($jwtSecret))) {
+        throw "API_KEY_DERIVATION_SECRET must be at least 32 characters and independent from JWT_SECRET_KEY."
+    }
+    if (-not (Test-SecuritySecretValue $sandboxSecret @($jwtSecret, $apiKeySecret))) {
+        throw "SANDBOX_PROVISIONER_TOKEN must be at least 32 characters and independent from other security secrets."
+    }
+}
+
 function Ensure-RequiredApiEnv {
     if (Test-EnvValue "SILICONFLOW_API_KEY") {
         return
@@ -53,16 +129,8 @@ function Ensure-RequiredApiEnv {
 }
 
 function Ensure-JwtEnv {
-    if (-not (Test-EnvValue "JWT_SECRET_KEY")) {
-        Write-Host "JWT_SECRET_KEY is missing in .env." -ForegroundColor Yellow
-        $JWT_SECRET_KEY = Read-Host "Please enter your JWT_SECRET_KEY (press Enter to auto-generate)"
-        if ([string]::IsNullOrEmpty($JWT_SECRET_KEY)) {
-            $JWT_SECRET_KEY = New-RandomHex 32
-            Write-Host "Generated JWT_SECRET_KEY and saved it to .env." -ForegroundColor Green
-        }
-
-        Set-EnvValue "JWT_SECRET_KEY" $JWT_SECRET_KEY
-    }
+    Ensure-SecuritySecret "JWT_SECRET_KEY"
+    Ensure-SecuritySecret "API_KEY_DERIVATION_SECRET" @("JWT_SECRET_KEY")
 
     if (-not (Test-EnvValue "YUXI_INSTANCE_ID")) {
         Write-Host "YUXI_INSTANCE_ID is missing in .env." -ForegroundColor Yellow
@@ -77,18 +145,7 @@ function Ensure-JwtEnv {
 }
 
 function Ensure-SandboxEnv {
-    if (Test-EnvValue "SANDBOX_PROVISIONER_TOKEN") {
-        return
-    }
-
-    Write-Host "SANDBOX_PROVISIONER_TOKEN is missing in .env." -ForegroundColor Yellow
-    $SANDBOX_PROVISIONER_TOKEN = Read-Host "Please enter your SANDBOX_PROVISIONER_TOKEN (press Enter to auto-generate)"
-    if ([string]::IsNullOrEmpty($SANDBOX_PROVISIONER_TOKEN)) {
-        $SANDBOX_PROVISIONER_TOKEN = New-RandomHex 32
-        Write-Host "Generated SANDBOX_PROVISIONER_TOKEN and saved it to .env." -ForegroundColor Green
-    }
-
-    Set-EnvValue "SANDBOX_PROVISIONER_TOKEN" $SANDBOX_PROVISIONER_TOKEN
+    Ensure-SecuritySecret "SANDBOX_PROVISIONER_TOKEN" @("JWT_SECRET_KEY", "API_KEY_DERIVATION_SECRET")
 }
 
 function Ensure-AgentScopeEnv {
@@ -104,6 +161,14 @@ function Ensure-AgentScopeEnv {
     }
 
     Set-EnvValue "AGENTSCOPE_LEGACY_CUTOFF" $AGENTSCOPE_LEGACY_CUTOFF
+}
+
+if ($ValidateSecurityEnv) {
+    if (-not (Test-Path ".env")) {
+        throw ".env does not exist"
+    }
+    Assert-SecuritySecrets
+    exit 0
 }
 
 function Test-SkipExistingImage($ImageTag) {
@@ -126,6 +191,7 @@ if (Test-Path ".env") {
     Ensure-JwtEnv
     Ensure-SandboxEnv
     Ensure-AgentScopeEnv
+    Assert-SecuritySecrets
 } else {
     Write-Host "📝 .env file not found. Let's set up your environment variables." -ForegroundColor Yellow
     Write-Host ""
@@ -167,11 +233,8 @@ if (Test-Path ".env") {
 
     Write-Host ""
     Write-Host "JWT security settings" -ForegroundColor Yellow
-    $JWT_SECRET_KEY = Read-Host "Please enter your JWT_SECRET_KEY (press Enter to auto-generate)"
-    if ([string]::IsNullOrEmpty($JWT_SECRET_KEY)) {
-        $JWT_SECRET_KEY = New-RandomHex 32
-        Write-Host "Generated JWT_SECRET_KEY and saved it to .env." -ForegroundColor Green
-    }
+    $JWT_SECRET_KEY = Read-SecuritySecret "JWT_SECRET_KEY"
+    $API_KEY_DERIVATION_SECRET = Read-SecuritySecret "API_KEY_DERIVATION_SECRET" @($JWT_SECRET_KEY)
 
     $YUXI_INSTANCE_ID = Read-Host "Please enter your YUXI_INSTANCE_ID (press Enter to auto-generate)"
     if ([string]::IsNullOrEmpty($YUXI_INSTANCE_ID)) {
@@ -179,11 +242,10 @@ if (Test-Path ".env") {
         Write-Host "Generated YUXI_INSTANCE_ID and saved it to .env." -ForegroundColor Green
     }
 
-    $SANDBOX_PROVISIONER_TOKEN = Read-Host "Please enter your SANDBOX_PROVISIONER_TOKEN (press Enter to auto-generate)"
-    if ([string]::IsNullOrEmpty($SANDBOX_PROVISIONER_TOKEN)) {
-        $SANDBOX_PROVISIONER_TOKEN = New-RandomHex 32
-        Write-Host "Generated SANDBOX_PROVISIONER_TOKEN and saved it to .env." -ForegroundColor Green
-    }
+    $SANDBOX_PROVISIONER_TOKEN = Read-SecuritySecret "SANDBOX_PROVISIONER_TOKEN" @(
+        $JWT_SECRET_KEY,
+        $API_KEY_DERIVATION_SECRET
+    )
     $AGENTSCOPE_LEGACY_CUTOFF = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
 
     # Create .env file
@@ -208,12 +270,14 @@ SILICONFLOW_API_KEY=$apiKey
 
 # JWT security settings
 JWT_SECRET_KEY=$JWT_SECRET_KEY
+API_KEY_DERIVATION_SECRET=$API_KEY_DERIVATION_SECRET
 YUXI_INSTANCE_ID=$YUXI_INSTANCE_ID
 SANDBOX_PROVISIONER_TOKEN=$SANDBOX_PROVISIONER_TOKEN
 AGENTSCOPE_LEGACY_CUTOFF=$AGENTSCOPE_LEGACY_CUTOFF
 "@
 
     $envContent | Out-File -FilePath ".env" -Encoding UTF8
+    Assert-SecuritySecrets
     Write-Host "✅ .env file created successfully!" -ForegroundColor Green
 
     # Clear the variables from memory
@@ -222,9 +286,9 @@ AGENTSCOPE_LEGACY_CUTOFF=$AGENTSCOPE_LEGACY_CUTOFF
     Remove-Variable -Name "DOUBAO_SEARCH_API_KEY" -ErrorAction SilentlyContinue
     Remove-Variable -Name "TAVILY_API_KEY" -ErrorAction SilentlyContinue
     Remove-Variable -Name "JWT_SECRET_KEY" -ErrorAction SilentlyContinue
+    Remove-Variable -Name "API_KEY_DERIVATION_SECRET" -ErrorAction SilentlyContinue
     Remove-Variable -Name "YUXI_INSTANCE_ID" -ErrorAction SilentlyContinue
     Remove-Variable -Name "SANDBOX_PROVISIONER_TOKEN" -ErrorAction SilentlyContinue
-    Remove-Variable -Name "AGENTSCOPE_LEGACY_CUTOFF" -ErrorAction SilentlyContinue
 }
 
 Write-Host ""
@@ -237,13 +301,13 @@ $images = @(
     "node:24-slim",
     "node:24-alpine",
     "milvusdb/milvus:v2.5.6",
-    "neo4j:5.26",
+    "neo4j:5.26.29",
     "minio/minio:RELEASE.2023-03-20T20-16-18Z",
-    "ghcr.io/astral-sh/uv:0.11.26",
+    "ghcr.io/astral-sh/uv:0.12.6",
     "nginx:alpine",
     "quay.io/coreos/etcd:v3.5.5",
     "postgres:16",
-    "redis:7-alpine"
+    "redis:7.4.10-alpine"
 )
 
 # Pull each image

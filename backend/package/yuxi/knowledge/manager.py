@@ -67,16 +67,19 @@ class KnowledgeBaseManager:
         rows = await kb_repo.get_all()
 
         kb_types_in_use = set()
+        unsupported_types = set()
         for row in rows:
             kb_type = row.kb_type or "milvus"
             if KnowledgeBaseFactory.is_type_supported(kb_type):
                 kb_types_in_use.add(kb_type)
             else:
                 logger.warning(f"Skip unsupported knowledge base type during initialization: {kb_type}")
+                unsupported_types.add(kb_type)
 
         logger.info(f"[InitializeKB] 发现 {len(kb_types_in_use)} 种知识库类型: {kb_types_in_use}")
 
         # 为每种使用中的知识库类型创建共享执行器。
+        failures = [f"{kb_type}:unsupported" for kb_type in unsupported_types]
         for kb_type in kb_types_in_use:
             if not KnowledgeBaseFactory.is_type_supported(kb_type):
                 logger.warning(f"[InitializeKB] Skip initialization for unsupported knowledge base type: {kb_type}")
@@ -89,6 +92,9 @@ class KnowledgeBaseManager:
                 import traceback
 
                 logger.error(traceback.format_exc())
+                failures.append(f"{kb_type}:{type(e).__name__}")
+        if failures:
+            raise RuntimeError(f"Used knowledge backends failed to initialize: {', '.join(sorted(failures))}")
 
     def _get_or_create_kb_instance(self, kb_type: str) -> KnowledgeBase:
         """
@@ -112,11 +118,14 @@ class KnowledgeBaseManager:
         return kb_instance
 
     async def move_file(self, kb_id: str, file_id: str, new_parent_id: str | None) -> dict:
-        """
-        移动文件/文件夹
-        """
+        """移动文件或文件夹。"""
         kb_instance = await self.get_kb_executor(kb_id)
         return await kb_instance.move_file(kb_id, file_id, new_parent_id)
+
+    async def rename_folder(self, kb_id: str, folder_id: str, folder_name: str) -> dict:
+        """重命名真实文件夹。"""
+        kb_instance = await self.get_kb_executor(kb_id)
+        return await kb_instance.rename_folder(kb_id, folder_id, folder_name)
 
     async def get_kb_config(self, kb_id: str) -> KnowledgeBaseConfig:
         """读取知识库运行配置，Redis 未命中时回源 PostgreSQL。
@@ -436,12 +445,18 @@ class KnowledgeBaseManager:
                 return True
         return False
 
-    async def create_folder(self, kb_id: str, folder_name: str, parent_id: str = None) -> dict:
-        """Create a folder in the database."""
+    async def create_folder(
+        self,
+        kb_id: str,
+        folder_name: str,
+        parent_id: str | None = None,
+        operator_id: str | None = None,
+    ) -> dict:
+        """创建文件夹并刷新统计。"""
         kb_instance = await self.get_kb_executor(kb_id)
         return await self._run_with_stats_refresh(
             kb_id,
-            kb_instance.create_folder(kb_id, folder_name, parent_id),
+            kb_instance.create_folder(kb_id, folder_name, parent_id, operator_id),
         )
 
     async def create_database(
@@ -1040,10 +1055,6 @@ class KnowledgeBaseManager:
     ) -> dict:
         kb_instance = await self.get_kb_executor(kb_id)
         return await kb_instance.list_file_tree(kb_id, parent_id, recursive, files_only)
-
-    async def read_file_preview(self, kb_id: str, file_id: str) -> dict:
-        kb_instance = await self.get_kb_executor(kb_id)
-        return await kb_instance.read_file_preview(kb_id, file_id)
 
     async def get_file_download(self, kb_id: str, file_id: str, variant: str = "original") -> dict:
         await self._require_kb_supports_documents(kb_id, "download")

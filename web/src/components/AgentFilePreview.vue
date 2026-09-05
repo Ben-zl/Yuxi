@@ -13,13 +13,13 @@
     <div v-if="showHeader" class="preview-header">
       <div class="file-title">
         <FileTypeIcon v-if="showFileIcon" :name="filePath" :size="16" />
-        <span class="file-path-title">{{ filePath }}</span>
+        <span class="file-path-title">{{ displayFilePath }}</span>
       </div>
       <div class="modal-actions">
         <button
           v-if="canEdit && editMode !== 'edit'"
           class="modal-action-btn"
-          @click="editMode = 'edit'"
+          @click="startEditing"
           title="编辑"
           aria-label="编辑"
         >
@@ -42,6 +42,32 @@
             title="源码"
           >
             <Code2 :size="16" />
+          </button>
+        </div>
+        <div
+          v-if="isHtmlFile && htmlPreviewMode === 'render' && !(canEdit && editMode === 'edit')"
+          class="html-preview-zoom-control"
+        >
+          <button
+            class="preview-mode-btn"
+            :disabled="zoomOutDisabled"
+            @click="zoomHtmlPreview(-HTML_PREVIEW_SCALE_STEP)"
+            title="缩小"
+            aria-label="缩小"
+          >
+            <ZoomOut :size="14" />
+          </button>
+          <span class="html-preview-zoom-value" title="缩放比例"
+            >{{ htmlPreviewScalePercent }}%</span
+          >
+          <button
+            class="preview-mode-btn"
+            :disabled="zoomInDisabled"
+            @click="zoomHtmlPreview(HTML_PREVIEW_SCALE_STEP)"
+            title="放大"
+            aria-label="放大"
+          >
+            <ZoomIn :size="14" />
           </button>
         </div>
         <button
@@ -73,7 +99,9 @@
     </div>
 
     <div
-      v-if="showInlineHtmlControls && !showHeader && isHtmlFile"
+      v-if="
+        showInlineHtmlControls && !showHeader && isHtmlFile && !(canEdit && editMode === 'edit')
+      "
       class="preview-mode-switch inline-html-preview-switch"
     >
       <button
@@ -92,6 +120,28 @@
       >
         <Code2 :size="16" />
       </button>
+      <template v-if="htmlPreviewMode === 'render' && !(canEdit && editMode === 'edit')">
+        <span class="preview-mode-divider"></span>
+        <button
+          class="preview-mode-btn"
+          :disabled="zoomOutDisabled"
+          @click="zoomHtmlPreview(-HTML_PREVIEW_SCALE_STEP)"
+          title="缩小"
+          aria-label="缩小"
+        >
+          <ZoomOut :size="14" />
+        </button>
+        <span class="html-preview-zoom-value" title="缩放比例">{{ htmlPreviewScalePercent }}%</span>
+        <button
+          class="preview-mode-btn"
+          :disabled="zoomInDisabled"
+          @click="zoomHtmlPreview(HTML_PREVIEW_SCALE_STEP)"
+          title="放大"
+          aria-label="放大"
+        >
+          <ZoomIn :size="14" />
+        </button>
+      </template>
     </div>
 
     <div v-if="canEdit && editMode === 'edit'" class="edit-floating-actions">
@@ -124,8 +174,7 @@
         contentClass,
         {
           'is-editing': canEdit && editMode === 'edit',
-          'is-iframe-preview':
-            file?.previewType === 'pdf' || (isHtmlFile && htmlPreviewMode === 'render')
+          'is-iframe-preview': isHtmlFile && htmlPreviewMode === 'render'
         }
       ]"
     >
@@ -137,13 +186,30 @@
           spellcheck="false"
         />
       </template>
+      <template v-else-if="currentStatus === 'loading'">
+        <div class="unsupported-preview loading-preview">
+          <LoaderCircle class="preview-spinner" :size="20" />
+          <span>{{ currentLoadingMessage }}</span>
+        </div>
+      </template>
+      <template v-else-if="currentStatus === 'error'">
+        <div class="unsupported-preview error-preview">
+          <CircleAlert :size="22" class="preview-error-icon" />
+          <span class="preview-error-text">{{ currentErrorMessage }}</span>
+        </div>
+      </template>
+      <template v-else-if="currentStatus === 'unsupported' || file?.supported === false">
+        <div class="unsupported-preview">
+          {{ file?.message || '当前文件暂不支持预览，请下载后查看' }}
+        </div>
+      </template>
       <template v-else-if="file?.previewType === 'image' && file?.previewUrl">
         <div class="image-preview-wrapper">
           <img :src="file.previewUrl" :alt="filePath" class="image-preview" />
         </div>
       </template>
       <template v-else-if="file?.previewType === 'pdf' && file?.previewUrl">
-        <iframe :src="file.previewUrl" class="pdf-preview" :title="filePath" />
+        <PdfPreview :url="file.previewUrl" class="pdf-preview" />
       </template>
       <template v-else-if="isHtmlFile && htmlPreviewMode === 'render'">
         <iframe
@@ -156,11 +222,6 @@
       </template>
       <template v-else-if="isMarkdown">
         <MarkdownPreview :content="formatContent(file?.content)" />
-      </template>
-      <template v-else-if="file?.supported === false">
-        <div class="unsupported-preview">
-          {{ file?.message || '当前文件暂不支持预览，请下载后查看' }}
-        </div>
       </template>
       <template v-else>
         <pre v-if="Array.isArray(file?.content)" class="file-content-pre">{{
@@ -197,6 +258,30 @@
             >
               <Code2 :size="16" />
             </button>
+            <template v-if="htmlPreviewMode === 'render'">
+              <span class="preview-mode-divider"></span>
+              <button
+                class="preview-mode-btn"
+                :disabled="zoomOutDisabled"
+                @click="zoomHtmlPreview(-HTML_PREVIEW_SCALE_STEP)"
+                title="缩小"
+                aria-label="缩小"
+              >
+                <ZoomOut :size="14" />
+              </button>
+              <span class="html-preview-zoom-value" title="缩放比例"
+                >{{ htmlPreviewScalePercent }}%</span
+              >
+              <button
+                class="preview-mode-btn"
+                :disabled="zoomInDisabled"
+                @click="zoomHtmlPreview(HTML_PREVIEW_SCALE_STEP)"
+                title="放大"
+                aria-label="放大"
+              >
+                <ZoomIn :size="14" />
+              </button>
+            </template>
           </div>
           <button
             v-if="showDownload && file"
@@ -216,34 +301,42 @@
         </div>
         <div class="fullscreen-preview-content">
           <div class="file-content fullscreen-file-content">
-            <template v-if="file?.previewType === 'image' && file?.previewUrl">
+            <template v-if="currentStatus === 'loading'">
+              <div class="unsupported-preview loading-preview fullscreen-unsupported-preview">
+                <LoaderCircle class="preview-spinner" :size="20" />
+                <span>{{ currentLoadingMessage }}</span>
+              </div>
+            </template>
+            <template v-else-if="currentStatus === 'error'">
+              <div class="unsupported-preview error-preview fullscreen-unsupported-preview">
+                <CircleAlert :size="22" class="preview-error-icon" />
+                <span class="preview-error-text">{{ currentErrorMessage }}</span>
+              </div>
+            </template>
+            <template v-else-if="currentStatus === 'unsupported' || file?.supported === false">
+              <div class="unsupported-preview fullscreen-unsupported-preview">
+                {{ file?.message || '当前文件暂不支持预览，请下载后查看' }}
+              </div>
+            </template>
+            <template v-else-if="file?.previewType === 'image' && file?.previewUrl">
               <div class="image-preview-wrapper fullscreen-image-preview-wrapper">
                 <img :src="file.previewUrl" :alt="filePath" class="image-preview" />
               </div>
             </template>
             <template v-else-if="file?.previewType === 'pdf' && file?.previewUrl">
-              <iframe
-                :src="file.previewUrl"
-                class="pdf-preview fullscreen-embed-preview"
-                :title="filePath"
-              />
+              <PdfPreview :url="file.previewUrl" class="pdf-preview fullscreen-embed-preview" />
             </template>
             <template v-else-if="isHtmlFile && htmlPreviewMode === 'render'">
               <iframe
                 :key="`fullscreen-${htmlPreviewRenderKey}`"
                 class="html-preview fullscreen-embed-preview"
-                :srcdoc="htmlPreviewFullscreenSrcdoc"
+                :srcdoc="htmlPreviewSrcdoc"
                 :title="filePath"
                 sandbox="allow-scripts"
               />
             </template>
             <template v-else-if="isMarkdown">
               <MarkdownPreview :content="formatContent(file?.content)" />
-            </template>
-            <template v-else-if="file?.supported === false">
-              <div class="unsupported-preview fullscreen-unsupported-preview">
-                {{ file?.message || '当前文件暂不支持预览，请下载后查看' }}
-              </div>
             </template>
             <template v-else>
               <pre v-if="Array.isArray(file?.content)" class="file-content-pre">{{
@@ -268,17 +361,22 @@
 <script setup>
 import { computed, onUnmounted, ref, watch } from 'vue'
 import {
+  CircleAlert,
   Code2,
   Download,
   Globe,
+  LoaderCircle,
   Maximize,
   PanelRight,
   FilePen,
   Save,
-  X
-} from 'lucide-vue-next'
+  X,
+  ZoomIn,
+  ZoomOut
+} from '@lucide/vue'
 import hljs from 'highlight.js/lib/common'
 import MarkdownPreview from '@/components/common/MarkdownPreview.vue'
+import PdfPreview from '@/components/common/PdfPreview.vue'
 import FileTypeIcon from '@/components/common/FileTypeIcon.vue'
 import { useThemeStore } from '@/stores/theme'
 import { escapeHtml } from '@/utils/html'
@@ -290,8 +388,10 @@ import {
 } from '@/utils/file_preview'
 
 const EDITABLE_EXTENSIONS = new Set(['.md', '.markdown', '.mdx', '.txt'])
-const HTML_PREVIEW_SCALE = 0.75
-const HTML_PREVIEW_FULLSCREEN_SCALE = 1
+const HTML_PREVIEW_DEFAULT_SCALE = 0.9
+const HTML_PREVIEW_SCALE_STEP = 0.1
+const HTML_PREVIEW_SCALE_MIN = 0.6
+const HTML_PREVIEW_SCALE_MAX = 1.5
 
 const props = defineProps({
   file: {
@@ -299,6 +399,19 @@ const props = defineProps({
     default: null
   },
   filePath: {
+    type: String,
+    default: ''
+  },
+  status: {
+    type: String,
+    default: '',
+    validator: (value) => ['', 'idle', 'loading', 'error', 'unsupported', 'ready'].includes(value)
+  },
+  loadingMessage: {
+    type: String,
+    default: ''
+  },
+  errorMessage: {
     type: String,
     default: ''
   },
@@ -370,11 +483,38 @@ const closeTitle = computed(() =>
 const closeIconComponent = computed(() =>
   props.closeVariant === 'collapse-right' ? PanelRight : X
 )
+const currentStatus = computed(() => {
+  if (props.status) return props.status
+  if (props.file?.status) return props.file.status
+  if (props.file?.loading === true) return 'loading'
+  if (props.file?.error || props.file?.isError) return 'error'
+  if (props.file?.supported === false) return 'unsupported'
+  return 'ready'
+})
+const currentLoadingMessage = computed(() => {
+  return props.loadingMessage || props.file?.loadingMessage || '正在加载文件内容...'
+})
+const currentErrorMessage = computed(() => {
+  return (
+    props.errorMessage ||
+    props.file?.errorMessage ||
+    (typeof props.file?.error === 'string' ? props.file.error : '') ||
+    props.file?.message ||
+    '加载文件预览失败'
+  )
+})
 const htmlPreviewMode = ref('render')
 const editMode = ref('preview')
 const draftContent = ref('')
 const fullscreenPreviewVisible = ref(false)
 const htmlPreviewRenderKey = ref(0)
+const htmlPreviewScale = ref(HTML_PREVIEW_DEFAULT_SCALE)
+const zoomInDisabled = computed(() => htmlPreviewScale.value >= HTML_PREVIEW_SCALE_MAX)
+const zoomOutDisabled = computed(() => htmlPreviewScale.value <= HTML_PREVIEW_SCALE_MIN)
+const htmlPreviewScalePercent = computed(() => Math.round(htmlPreviewScale.value * 100))
+const displayFilePath = computed(() =>
+  String(props.filePath || '').replace(/^\/home\/gem\/user-data(?=\/|$)/, '~')
+)
 
 const isMarkdown = computed(() => isMarkdownPreview(props.filePath, props.file?.previewType))
 const canEdit = computed(() => {
@@ -396,10 +536,7 @@ const isHtmlFile = computed(
     isHtmlPreview(props.filePath)
 )
 const htmlPreviewSrcdoc = computed(() =>
-  buildHtmlPreviewSrcdoc(props.file?.content, HTML_PREVIEW_SCALE)
-)
-const htmlPreviewFullscreenSrcdoc = computed(() =>
-  buildHtmlPreviewSrcdoc(props.file?.content, HTML_PREVIEW_FULLSCREEN_SCALE)
+  buildHtmlPreviewSrcdoc(props.file?.content, htmlPreviewScale.value)
 )
 const codeThemeClass = computed(() => (themeStore.isDark ? 'hljs-theme-dark' : 'hljs-theme-light'))
 const codeLanguage = computed(() => getCodeLanguageByPath(props.filePath))
@@ -441,7 +578,7 @@ const serializeDoctype = (doctype) => {
   return `<!DOCTYPE ${doctype.name}${publicId}${systemId}>`
 }
 
-const buildHtmlPreviewSrcdoc = (content, scale = HTML_PREVIEW_SCALE) => {
+const buildHtmlPreviewSrcdoc = (content, scale = HTML_PREVIEW_DEFAULT_SCALE) => {
   const html = formatContent(content)
   if (!html.trim() || typeof DOMParser === 'undefined') return html
 
@@ -460,6 +597,23 @@ const syncDraftContent = () => {
   draftContent.value = savedContent.value
   editMode.value = 'preview'
 }
+
+const zoomHtmlPreview = (delta) => {
+  const next = Math.round((htmlPreviewScale.value + delta) * 10) / 10
+  htmlPreviewScale.value = Math.min(Math.max(next, HTML_PREVIEW_SCALE_MIN), HTML_PREVIEW_SCALE_MAX)
+  htmlPreviewRenderKey.value += 1
+}
+
+const resetHtmlPreviewZoom = () => {
+  htmlPreviewScale.value = HTML_PREVIEW_DEFAULT_SCALE
+}
+
+const startEditing = () => {
+  if (!canEdit.value || props.saving) return
+  editMode.value = 'edit'
+}
+
+defineExpose({ startEditing })
 
 const requestSave = () => {
   if (!canEdit.value || props.saving) return
@@ -483,6 +637,7 @@ watch(
   () => props.filePath,
   () => {
     htmlPreviewMode.value = 'render'
+    resetHtmlPreviewZoom()
   }
 )
 
@@ -518,10 +673,14 @@ onUnmounted(() => {
 }
 
 .agent-file-preview.is-full-height {
-  max-height: 100vh;
+  width: 100%;
+  height: 100%;
+  max-height: none;
 }
 
 .agent-file-preview.is-full-height .file-content {
+  flex: 1 1 0;
+  height: auto;
   min-height: 0;
 }
 
@@ -573,8 +732,8 @@ onUnmounted(() => {
 
 .file-path-title {
   font-weight: 400;
-  font-size: 14px;
-  color: var(--gray-700);
+  font-size: 12px;
+  color: var(--gray-600);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -625,6 +784,31 @@ onUnmounted(() => {
   min-width: 48px;
   padding: 0 8px;
   font-size: 12px;
+}
+
+.preview-mode-divider {
+  width: 1px;
+  height: 14px;
+  margin: 0 2px;
+  background: var(--gray-300);
+}
+
+.html-preview-zoom-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--gray-100);
+}
+
+.html-preview-zoom-value {
+  min-width: 34px;
+  color: var(--gray-700);
+  font-size: 12px;
+  line-height: 1;
+  text-align: center;
+  user-select: none;
 }
 
 .file-content {
@@ -830,9 +1014,9 @@ onUnmounted(() => {
 }
 
 .pdf-preview {
+  display: block;
   width: 100%;
-  height: 100%;
-  min-height: calc(80vh - 40px);
+  min-height: 100%;
   border: none;
   border-radius: 6px;
   background: var(--gray-25);
@@ -851,6 +1035,7 @@ onUnmounted(() => {
 .unsupported-preview {
   min-height: 260px;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
   text-align: center;
@@ -858,7 +1043,40 @@ onUnmounted(() => {
   font-size: 14px;
   line-height: 1.6;
   height: 100%;
+  padding: 24px;
+  gap: 10px;
   white-space: pre-wrap;
+
+  &.loading-preview {
+    color: var(--gray-500);
+  }
+
+  &.error-preview {
+    color: var(--color-error-600);
+  }
+}
+
+.preview-spinner {
+  animation: spin 1s linear infinite;
+  color: var(--color-primary-500);
+}
+
+.preview-error-icon {
+  color: var(--color-error-500);
+}
+
+.preview-error-text {
+  max-width: 480px;
+  word-break: break-word;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .fullscreen-preview-overlay {

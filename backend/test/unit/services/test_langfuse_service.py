@@ -103,6 +103,7 @@ def test_get_trace_info_uses_run_context_trace_id(monkeypatch):
     _FakeLangfuseClient.instances.clear()
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "https://langfuse.local")
     monkeypatch.setattr(svc, "Langfuse", _FakeLangfuseClient)
     svc.get_langfuse_client.cache_clear()
 
@@ -127,6 +128,7 @@ async def test_get_trace_url_async_returns_trace_url(monkeypatch):
     _FakeLangfuseClient.instances.clear()
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "https://langfuse.local")
     monkeypatch.setattr(svc, "Langfuse", _FakeLangfuseClient)
     svc.get_langfuse_client.cache_clear()
 

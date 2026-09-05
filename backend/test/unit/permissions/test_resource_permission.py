@@ -135,6 +135,13 @@ def test_agent_and_skill_use_shared_resolver_with_resource_policy():
     assert resolve_skill_permission(_user(uid="user-2"), resource) == ResourcePermission.MANAGE
 
 
+def test_personal_skill_permission_is_limited_to_owner():
+    resource = SimpleNamespace(source_scope="personal", created_by="user-1", share_config=None)
+
+    assert resolve_skill_permission(_user(uid="user-1"), resource) == ResourcePermission.MANAGE
+    assert resolve_skill_permission(_user(uid="user-2"), resource) == ResourcePermission.NONE
+
+
 def test_manage_only_scope_also_grants_read_to_matching_users():
     resource = _resource(
         share_config={

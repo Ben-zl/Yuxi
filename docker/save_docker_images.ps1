@@ -15,11 +15,11 @@ Write-Host "开始导出Docker镜像到 $OutputFile..." -ForegroundColor Cyan
 # 从各个文件中提取的基础镜像列表
 $Images = @(
     "python:3.11-slim",
-    "ghcr.io/astral-sh/uv:0.11.26",
+    "ghcr.io/astral-sh/uv:0.12.6",
     "node:24-alpine",
     "node:24-slim",
     "nginx:alpine",
-    "neo4j:5.26",
+    "neo4j:5.26.29",
     "quay.io/coreos/etcd:v3.5.5",
     "minio/minio:RELEASE.2023-03-20T20-16-18Z",
     "milvusdb/milvus:v2.5.6",

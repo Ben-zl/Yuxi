@@ -20,7 +20,7 @@
 
 ## 简介
 
-Agent智能体平台（Yuxi）是一个基于大模型的智能知识库与知识图谱智能体开发平台。它把 **RAG 检索**、**Milvus 知识库内知识图谱** 与 **LangGraph 多智能体编排** 整合进统一的多租户工作台：管理员配置知识库、模型与权限，用户在类 ChatGPT 的界面中与可挂载 Skills、MCP、子智能体和沙盒工具的智能体对话，并获得带引用来源、知识图谱推理与可交付产物的回答。
+Agent智能体平台（Yuxi）是一个基于大模型的智能知识库与知识图谱智能体开发平台。它把 **RAG 检索**、**Milvus 知识库内知识图谱** 与 **AgentScope 多智能体执行** 整合进统一的多租户工作台：管理员配置知识库、模型与权限，用户在类 ChatGPT 的界面中与可挂载 Skills、MCP、子智能体和沙盒工具的智能体对话，并获得带引用来源、知识图谱推理与可交付产物的回答。
 
 导航：[项目介绍](https://xerrors.github.io/Yuxi/) ｜ [快速开始](https://xerrors.github.io/Yuxi/intro/quick-start) ｜ [开发路线图](https://xerrors.github.io/Yuxi/develop-guides/roadmap) | [0.7 版本特性](http://xhslink.com/o/5Y6QWnmjF2d)；最新开发动态，详见 [changelog](https://xerrors.github.io/Yuxi/develop-guides/changelog)。
 
@@ -35,7 +35,7 @@ Agent智能体平台（Yuxi）是一个基于大模型的智能知识库与知�
 | 层 | 技术 |
 | --- | --- |
 | 前端 | Vue 3 · Vite · Pinia |
-| 后端 | FastAPI · LangGraph · ARQ (异步 worker) |
+| 后端 | FastAPI · AgentScope · ARQ (异步 worker) |
 | 存储 | PostgreSQL · Redis · MinIO · Milvus · Neo4j |
 | 文档解析 | MinerU · PaddleX · RapidOCR |
 | 部署 | Docker Compose |
@@ -73,10 +73,9 @@ docker compose up --build
 本项目参考并引用了以下优秀开源项目，在此致以诚挚的感谢：
 
 - [LightRAG](https://github.com/HKUDS/LightRAG) - 早期版本曾参考其图谱构建与检索思路；当前 Yuxi 已实现自研 Milvus 知识库/图谱链路以替换历史集成，降低兼容性问题
-- [DeepAgents](https://github.com/langchain-ai/deepagents) - 直接引入作为深度智能体框架
+- [AgentScope](https://github.com/agentscope-ai/agentscope) - 承担 Session、工具、Team、Workspace 和模型执行
 - [DeerFlow](https://github.com/bytedance/deer-flow) - 参考了其 Sandbox 智能体架构的实现思路
 - [RAGflow](https://github.com/infiniflow/ragflow) - 参考了其文档 Text Chunking 的分块策略
-- [LangGraph](https://github.com/langchain-ai/langgraph) - 多智能体编排框架，本项目的核心架构基础
 - [QwenPaw](https://github.com/agentscope-ai/QwenPaw) - 参考模型配置与个人文件区域设计
 
 ## 参与贡献

@@ -30,7 +30,7 @@ async def verify_api_key(key: str, db: AsyncSession) -> tuple[User | None, APIKe
     if api_key is None:
         return None, None
 
-    if not api_key.is_enabled:
+    if not api_key.is_enabled or api_key.revoked_at is not None:
         return None, None
 
     if api_key.expires_at and utc_now_naive() > api_key.expires_at:

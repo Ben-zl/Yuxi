@@ -23,6 +23,14 @@ class _AsyncSessionContext:
         return False
 
 
+class _FailingSessionContext:
+    async def __aenter__(self):
+        raise RuntimeError("database-secret-must-not-be-swallowed")
+
+    async def __aexit__(self, *_args):
+        return False
+
+
 @pytest_asyncio.fixture
 async def mcp_session():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -130,6 +138,17 @@ async def test_ensure_builtin_mcp_servers_disables_legacy_user_stdio(monkeypatch
 
     await mcp_session.refresh(legacy_server)
     assert legacy_server.enabled == 0
+
+
+async def test_builtin_mcp_initialization_propagates_failure_to_entrypoint(monkeypatch):
+    monkeypatch.setattr(
+        postgres_manager.pg_manager,
+        "get_async_session_context",
+        lambda: _FailingSessionContext(),
+    )
+
+    with pytest.raises(RuntimeError, match="must-not-be-swallowed"):
+        await mcp_service.ensure_builtin_mcp_servers_in_db()
 
 
 async def test_runtime_configs_exclude_user_created_stdio_servers(mcp_session):

@@ -319,11 +319,12 @@ def _create_service_app_sync():
 
     async def _bootstrap() -> None:
         await _ensure_database_exists(AGENTSCOPE_DATABASE_URL)
+        # 仅校验由 storage-migrator 迁移完成的 Yuxi Schema，不在运行服务中取得 DDL Owner。
         # initialize 需在事件循环内执行（内部创建 asyncpg/psycopg 连接池）；
         # 用毕立即释放并复位，避免连接池绑定 bootstrap 线程的循环——
         # 服务主循环内的首次使用（extra_agent_tools）会按需重新初始化
         pg_manager.initialize()
-        await pg_manager.ensure_business_schema()
+        await pg_manager.require_current_schema(include_knowledge=not lite_mode_enabled())
         await pg_manager.reset()
 
     def _run_bootstrap():

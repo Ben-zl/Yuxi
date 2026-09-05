@@ -241,6 +241,11 @@ def resolve_agent_permission(user: Any, resource: ShareableResource) -> Resource
 def resolve_skill_permission(user: Any, resource: ShareableResource) -> ResourcePermission:
     """解析 Skill 权限。"""
 
+    if _value(resource, "source_scope") == "personal":
+        if str(_value(resource, "created_by", "") or "") == str(_value(user, "uid", "") or ""):
+            return ResourcePermission.MANAGE
+        return ResourcePermission.NONE
+
     return resolve_resource_permission(
         user,
         resource,

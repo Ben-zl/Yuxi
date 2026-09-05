@@ -25,7 +25,7 @@ from yuxi.services.thread_workspace_service import (
     resolve_thread_workspace,
 )
 from yuxi.utils.datetime_utils import utc_isoformat_from_timestamp
-from yuxi.utils.paths import VIRTUAL_PATH_PREFIX
+from yuxi.agents.backends.paths import VIRTUAL_PATH_PREFIX
 
 
 def _get_virtual_root() -> str:

@@ -1,33 +1,28 @@
 <template>
   <a-card title="AI智能体分析" :loading="loading" class="dashboard-card">
     <!-- 智能体概览 -->
-    <div class="stats-overview">
-      <a-row :gutter="16">
-        <a-col :span="8">
-          <a-statistic
-            title="智能体总数"
-            :value="agentStats?.total_agents || 0"
-            :value-style="{ color: 'var(--color-info-500)' }"
-            suffix="个"
-          />
-        </a-col>
-        <a-col :span="8">
-          <a-statistic
-            title="总对话数"
-            :value="totalConversations"
-            :value-style="{ color: 'var(--color-accent-500)' }"
-            suffix="次"
-          />
-        </a-col>
-        <a-col :span="8">
-          <a-statistic
-            title="工具调用总数"
-            :value="totalToolUsage"
-            :value-style="{ color: 'var(--color-warning-500)' }"
-            suffix="次"
-          />
-        </a-col>
-      </a-row>
+    <div class="dashboard-card-metric-grid">
+      <DashboardMetricCard
+        :icon="Bot"
+        :value="formatNumber(agentStats?.total_agents)"
+        label="智能体总数"
+        tone="info"
+        compact
+      />
+      <DashboardMetricCard
+        :icon="MessageSquare"
+        :value="formatNumber(totalConversations)"
+        label="总对话数"
+        tone="accent"
+        compact
+      />
+      <DashboardMetricCard
+        :icon="Wrench"
+        :value="formatNumber(totalToolUsage)"
+        label="工具调用总数"
+        tone="warning"
+        compact
+      />
     </div>
 
     <a-divider />
@@ -43,48 +38,6 @@
       </a-col>
     </a-row>
 
-    <!-- 表现排行榜 -->
-    <a-divider />
-    <div class="top-performers">
-      <h4>表现最佳智能体 TOP 5</h4>
-      <a-table
-        :columns="performerColumns"
-        :data-source="topPerformers"
-        size="small"
-        :pagination="false"
-      >
-        <template #bodyCell="{ column, record, index }">
-          <template v-if="column.key === 'rank'">
-            <div class="rank-display">
-              <span class="rank-number" :class="{ featured: index < 3 }">{{ index + 1 }}</span>
-            </div>
-          </template>
-          <template v-if="column.key === 'agent_id'">
-            <span class="agent-name" :title="resolveAgentName(record.agent_id)">
-              {{ resolveAgentName(record.agent_id) }}
-            </span>
-          </template>
-          <template v-if="column.key === 'satisfaction_rate'">
-            <a-statistic
-              :value="record.satisfaction_rate"
-              suffix="%"
-              :value-style="{
-                color:
-                  record.satisfaction_rate >= 80
-                    ? 'var(--color-success-500)'
-                    : record.satisfaction_rate >= 60
-                      ? 'var(--color-warning-500)'
-                      : 'var(--color-error-500)',
-                fontSize: '14px'
-              }"
-            />
-          </template>
-          <template v-if="column.key === 'conversation_count'">
-            <span class="metric-value">{{ record.conversation_count }}</span>
-          </template>
-        </template>
-      </a-table>
-    </div>
   </a-card>
 </template>
 
@@ -93,6 +46,9 @@ import { ref, onMounted, watch, nextTick, computed } from 'vue'
 import * as echarts from 'echarts'
 import { getColorByIndex } from '@/utils/chartColors'
 import { useThemeStore } from '@/stores/theme'
+import { formatNumber } from '@/utils/dashboard'
+import { Bot, MessageSquare, Wrench } from '@lucide/vue'
+import DashboardMetricCard from './DashboardMetricCard.vue'
 
 // CSS 变量解析工具函数
 function getCSSVariable(variableName, element = document.documentElement) {
@@ -118,33 +74,6 @@ const props = defineProps({
 const conversationToolChartRef = ref(null)
 let conversationToolChart = null
 
-// 表格列定义
-const performerColumns = [
-  {
-    title: '排名',
-    key: 'rank',
-    width: '80px',
-    align: 'center'
-  },
-  {
-    title: '智能体',
-    key: 'agent_id',
-    width: '30%'
-  },
-  {
-    title: '满意度',
-    key: 'satisfaction_rate',
-    width: '25%',
-    align: 'center'
-  },
-  {
-    title: '对话数',
-    key: 'conversation_count',
-    width: '20%',
-    align: 'center'
-  }
-]
-
 // 计算属性
 const totalConversations = computed(() => {
   const conversationCounts = props.agentStats?.agent_conversation_counts || []
@@ -154,10 +83,6 @@ const totalConversations = computed(() => {
 const totalToolUsage = computed(() => {
   const toolUsage = props.agentStats?.agent_tool_usage || []
   return toolUsage.reduce((sum, item) => sum + item.tool_usage_count, 0)
-})
-
-const topPerformers = computed(() => {
-  return props.agentStats?.top_performing_agents || []
 })
 
 const agentNames = computed(() => props.agentStats?.agent_names || {})
@@ -363,80 +288,3 @@ defineExpose({
   cleanup
 })
 </script>
-
-<style scoped lang="less">
-/* 指标值样式 */
-.metric-value {
-  font-weight: 500;
-  color: var(--gray-1000);
-  font-size: 14px;
-}
-
-/* 排名显示样式 */
-.rank-display {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-
-  .rank-number {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    background-color: var(--gray-50);
-    border-radius: 50%;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--gray-600);
-    border: 1px solid var(--gray-150);
-  }
-
-  .rank-number.featured {
-    background-color: var(--main-20);
-    border-color: var(--main-100);
-    color: var(--main-color);
-  }
-}
-
-.agent-name {
-  display: inline-block;
-  max-width: 100%;
-  color: var(--gray-900);
-  font-size: 13px;
-  font-weight: 500;
-  line-height: 1.4;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  vertical-align: middle;
-  white-space: nowrap;
-}
-
-// AgentStatsComponent 特有的样式
-.top-performers,
-.metrics-comparison {
-  h4 {
-    margin-bottom: 16px;
-    font-weight: 600;
-    color: var(--gray-1000);
-    font-size: 16px;
-  }
-
-  h5 {
-    margin-bottom: 12px;
-    color: var(--gray-600);
-    font-weight: 500;
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-}
-
-:deep(.ant-progress-bg) {
-  transition: all 0.3s ease;
-}
-
-:deep(.ant-statistic-content-value) {
-  font-weight: bold !important;
-}
-</style>

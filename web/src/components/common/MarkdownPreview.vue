@@ -13,10 +13,10 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useThemeStore } from '@/stores/theme'
+import { useUserStore } from '@/stores/user'
 import { renderMarkdown } from '@/utils/markdown_preview'
 import { HTML_PREVIEW_MAX_HEIGHT, HTML_PREVIEW_MIN_HEIGHT } from '@/utils/htmlPreviewRenderer'
 import 'katex/dist/katex.min.css'
-
 const props = defineProps({
   content: {
     type: String,
@@ -33,13 +33,17 @@ const props = defineProps({
 })
 
 const themeStore = useThemeStore()
+const userStore = useUserStore()
 const shikiTheme = computed(() => (themeStore.isDark ? 'github-dark' : 'github-light'))
 const previewRef = ref(null)
 const copiedTimers = new WeakMap()
 const htmlPreviewFrames = new Map()
+const kbImageBlobUrls = new Set()
 let pendingMarkdownHtml = null
 
 const HTML_PREVIEW_HEIGHT_MESSAGE = 'yuxi-html-preview-height'
+
+const KB_IMAGE_PROXY_PATH_RE = /\/api\/knowledge\/databases\/[^/]+\/images\//
 
 const getHtmlPreviewCssNumber = (slot, property, fallback) => {
   const preview = slot.closest('.html-preview-render')
@@ -311,12 +315,48 @@ const enhanceHtmlPreviews = () => {
   })
 }
 
+const revokeKbImageBlobUrls = () => {
+  kbImageBlobUrls.forEach((url) => URL.revokeObjectURL(url))
+  kbImageBlobUrls.clear()
+}
+
+const enhanceKbImages = () => {
+  const root = previewRef.value
+  if (!root) return
+
+  root.querySelectorAll('img').forEach((img) => {
+    const src = img.getAttribute('src')
+    if (!src || !KB_IMAGE_PROXY_PATH_RE.test(src) || img.dataset.kbImageLoaded) return
+
+    img.dataset.kbImageLoading = 'true'
+    fetch(src, { headers: userStore.getAuthHeaders() })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        return response.blob()
+      })
+      .then((blob) => {
+        if (!img.isConnected) return
+        const objectUrl = URL.createObjectURL(blob)
+        kbImageBlobUrls.add(objectUrl)
+        img.src = objectUrl
+        img.dataset.kbImageLoaded = 'true'
+      })
+      .catch((error) => {
+        console.error('加载知识库图片失败:', src, error)
+      })
+      .finally(() => {
+        delete img.dataset.kbImageLoading
+      })
+  })
+}
+
 onMounted(async () => {
   if (pendingMarkdownHtml === null) return
 
   replaceHtmlPreservingPreviews(pendingMarkdownHtml)
   await nextTick()
   enhanceHtmlPreviews()
+  enhanceKbImages()
   if (props.codeCopy) enhanceCodeBlocks()
 })
 
@@ -325,6 +365,7 @@ window.addEventListener('message', handleHtmlPreviewHeight)
 onBeforeUnmount(() => {
   window.removeEventListener('message', handleHtmlPreviewHeight)
   htmlPreviewFrames.clear()
+  revokeKbImageBlobUrls()
 })
 
 watch(
@@ -337,6 +378,7 @@ watch(
 
     if (!content) {
       htmlPreviewFrames.clear()
+      revokeKbImageBlobUrls()
       replaceHtmlPreservingPreviews('')
       return
     }
@@ -344,11 +386,13 @@ watch(
     const html = await renderMarkdown(content, { theme })
     if (!expired) {
       replaceHtmlPreservingPreviews(html)
+      revokeKbImageBlobUrls()
       cleanupHtmlPreviewFrames()
 
       await nextTick()
       if (expired) return
       enhanceHtmlPreviews()
+      enhanceKbImages()
       if (codeCopy) enhanceCodeBlocks()
       cleanupHtmlPreviewFrames()
     }
@@ -755,12 +799,9 @@ const showCopiedFeedback = (btn) => {
   table {
     width: 100%;
     border-collapse: collapse;
-    margin: 2em 0;
-    font-size: 15px;
+    margin: 1rem 0;
+    font-size: 0.8rem;
     display: table;
-    outline: 1px solid var(--gray-100);
-    outline-offset: 12px;
-    border-radius: 8px;
   }
 
   th,
@@ -884,8 +925,8 @@ const showCopiedFeedback = (btn) => {
   .html-preview-loading-slot {
     display: block;
     width: 100%;
-    height: clamp(var(--html-preview-height, 360px), 58vh, var(--html-preview-max-height, 1200px));
-    padding: 24px;
+    height: min(var(--html-preview-loading-height, 180px), 29vh);
+    padding: 14px;
     background: linear-gradient(180deg, #fff 0%, var(--gray-50) 100%);
   }
 
@@ -893,7 +934,7 @@ const showCopiedFeedback = (btn) => {
     box-sizing: border-box;
     width: 100%;
     height: 100%;
-    padding: 26px 28px;
+    padding: 14px 18px;
   }
 
   .html-preview-loading-text {
@@ -928,27 +969,27 @@ const showCopiedFeedback = (btn) => {
 
   .html-preview-skeleton-title {
     width: min(280px, 52%);
-    height: 28px;
-    margin-bottom: 22px;
+    height: 20px;
+    margin-bottom: 14px;
     border-radius: 6px;
   }
 
   .html-preview-skeleton-grid {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 14px;
-    margin-bottom: 22px;
+    gap: 10px;
+    margin-bottom: 12px;
   }
 
   .html-preview-skeleton-card {
-    height: 84px;
+    height: 42px;
     border-radius: 8px;
   }
 
   .html-preview-skeleton-line {
     width: 70%;
     height: 14px;
-    margin-top: 12px;
+    margin-top: 8px;
     border-radius: 999px;
   }
 

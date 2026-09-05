@@ -43,6 +43,12 @@ class _FakeDb:
     async def execute(self, _statement):
         return _FakeResult()
 
+    async def scalar(self, _statement):
+        return 0
+
+    async def flush(self):
+        return None
+
 
 class _FakeRepo:
     visible = True

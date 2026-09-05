@@ -34,12 +34,14 @@ async def test_task_resolution_uses_database_option(db_session):
     assert resolved["_ocr_processor_kwargs"] == {"server_url": "http://mineru-config:30001/"}
 
 
-def test_resolve_ocr_engine_id_accepts_disable():
-    assert ocr_service.resolve_ocr_engine_id("disable") == "disable"
+@pytest.mark.asyncio
+async def test_ocr_options_use_parser_metadata(db_session, monkeypatch):
+    async def get_options(option, _db=None):
+        assert option is ocr_service.system_options
+        return {"default_ocr_engine": "rapid_ocr"}
 
-
-def test_ocr_options_use_parser_metadata():
-    options = ocr_service.get_ocr_options()
+    monkeypatch.setattr(type(ocr_service.system_options), "get", get_options)
+    options = await ocr_service.get_ocr_options(db_session)
     rapid_ocr = next(item for item in options["engines"] if item["engine_id"] == "rapid_ocr")
 
     assert rapid_ocr["service_name"] == "rapid_ocr"

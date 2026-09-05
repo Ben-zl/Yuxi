@@ -124,6 +124,8 @@ def format_utc_datetime(value: dt.datetime | None) -> str | None:
     """
     if value is None:
         return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
     return utc_isoformat(value)
 
 

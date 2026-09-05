@@ -19,7 +19,7 @@
         </button>
         <button
           class="item-action-btn"
-          :title="isSaving(file.path) ? '保存中' : '保存到工作区'"
+          :title="isSaving(file.path) ? '保存中' : '保存到个人空间'"
           :disabled="isSaving(file.path)"
           @click.stop="saveToWorkspace(file)"
         >
@@ -29,15 +29,35 @@
       </div>
     </div>
   </section>
+
+  <a-modal
+    :open="saveDialogOpen"
+    title="保存交付物"
+    ok-text="保存"
+    cancel-text="取消"
+    :ok-button-props="{ disabled: !selectedDestination || pickerLoading }"
+    :confirm-loading="pendingSaveFile ? isSaving(pendingSaveFile.path) : false"
+    @ok="confirmSave"
+    @cancel="closeSaveDialog"
+  >
+    <p class="save-dialog-hint">选择保存到个人工作区的目录</p>
+    <WorkspacePathPicker
+      v-model="selectedDestination"
+      selection-mode="directory"
+      :active="saveDialogOpen"
+      :disabled="pendingSaveFile ? isSaving(pendingSaveFile.path) : false"
+      @loading-change="pickerLoading = $event"
+    />
+  </a-modal>
 </template>
 
 <script setup>
 import { computed, ref } from 'vue'
 import { message } from 'ant-design-vue'
-import { Download, LoaderCircle, Save } from 'lucide-vue-next'
+import { Download, LoaderCircle, Save } from '@lucide/vue'
 import { threadApi } from '@/apis/agent_api'
 import FileTypeIcon from '@/components/common/FileTypeIcon.vue'
-import { downloadViewerFile } from '@/apis/viewer_filesystem'
+import WorkspacePathPicker from '@/components/WorkspacePathPicker.vue'
 
 const props = defineProps({
   artifacts: {
@@ -63,6 +83,10 @@ const normalizedArtifacts = computed(() =>
     })
 )
 const savingState = ref({})
+const saveDialogOpen = ref(false)
+const pendingSaveFile = ref(null)
+const selectedDestination = ref('/saved_artifacts')
+const pickerLoading = ref(false)
 
 const parseDownloadFilename = (contentDisposition) => {
   if (!contentDisposition) return ''
@@ -92,14 +116,14 @@ const getFileMetaLabel = (path) => {
 }
 
 const openPreview = (file) => {
-  emit('open-preview', file)
+  emit('open-preview', { ...file })
 }
 
 const downloadFile = async (file) => {
   if (!props.threadId || !file?.path) return
 
   try {
-    const response = await downloadViewerFile(props.threadId, file.path)
+    const response = await threadApi.downloadThreadArtifact(props.threadId, file.path)
     const blob = await response.blob()
     const contentDisposition =
       response.headers.get('Content-Disposition') || response.headers.get('content-disposition')
@@ -126,16 +150,38 @@ const setSaving = (path, saving) => {
   }
 }
 
-const saveToWorkspace = async (file) => {
-  if (!props.threadId || !file?.path || isSaving(file.path)) return
+const saveToWorkspace = (file) => {
+  if (!props.threadId || !file?.path || isSaving(file.path)) {
+    return
+  }
+  pendingSaveFile.value = file
+  selectedDestination.value = '/saved_artifacts'
+  saveDialogOpen.value = true
+}
+
+const closeSaveDialog = () => {
+  if (pendingSaveFile.value && isSaving(pendingSaveFile.value.path)) return
+  saveDialogOpen.value = false
+  pendingSaveFile.value = null
+}
+
+const confirmSave = async () => {
+  const file = pendingSaveFile.value
+  if (!props.threadId || !file?.path || !selectedDestination.value || isSaving(file.path)) return
 
   setSaving(file.path, true)
   try {
-    const result = await threadApi.saveThreadArtifactToWorkspace(props.threadId, file.path)
-    message.success(`已保存到工作区：${result.saved_path}`)
+    const result = await threadApi.saveThreadArtifactToWorkspace(
+      props.threadId,
+      file.path,
+      selectedDestination.value
+    )
+    message.success(`已保存到个人空间：${result.saved_path}`)
     emit('saved', result)
+    saveDialogOpen.value = false
+    pendingSaveFile.value = null
   } catch (error) {
-    message.error(error?.message || '保存到工作区失败')
+    message.error(error?.message || '保存到个人空间失败')
   } finally {
     setSaving(file.path, false)
   }
@@ -143,6 +189,12 @@ const saveToWorkspace = async (file) => {
 </script>
 
 <style scoped lang="less">
+.save-dialog-hint {
+  margin-bottom: 12px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
 .artifacts-list {
   width: 100%;
   margin: 8px 0 4px;

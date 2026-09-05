@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -204,9 +205,16 @@ async def intake_request(
     else:
         request_status = REQUEST_STATUS_QUEUED
         delivery_status = DELIVERY_STATUS_QUEUED
-        resolved_model_spec, resolved_tool_approval_mode = resolve_agent_run_config(
-            model_spec, tool_approval_mode, agent_item, agent_backend
+        resolved_config = resolve_agent_run_config(
+            model_spec,
+            tool_approval_mode,
+            agent_item,
+            agent_backend,
+            db,
         )
+        if inspect.isawaitable(resolved_config):
+            resolved_config = await resolved_config
+        resolved_model_spec, resolved_tool_approval_mode = resolved_config
         input_payload = {
             "model_spec": resolved_model_spec,
             "tool_approval_mode": resolved_tool_approval_mode,

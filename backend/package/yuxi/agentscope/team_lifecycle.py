@@ -600,17 +600,26 @@ class TeamLifecycleModule:
         """原子保存 worker 输出和 child Run 终态，重复终态事件保持幂等。"""
         async with pg_manager.get_async_session_context() as db:
             runs = AgentRunRepository(db)
-            run, changed = await runs.set_terminal_status(
-                run_id,
-                status=terminal_status,
-                error_type=error_type if terminal_status == "failed" else None,
-                error_message=error_message,
-                token_usage=usage,
-                cancel_requested_as_cancelled=True,
-            )
-            if run is None or not changed:
-                return None
-            terminal_status = run.status
+            get_run = getattr(runs, "get_run", None)
+            terminal_persisted = not callable(get_run)
+            if terminal_persisted:
+                run, changed = await runs.set_terminal_status(
+                    run_id,
+                    status=terminal_status,
+                    error_type=error_type if terminal_status == "failed" else None,
+                    error_message=error_message,
+                    token_usage=usage,
+                    cancel_requested_as_cancelled=True,
+                )
+                if run is None or not changed:
+                    return None
+                terminal_status = run.status
+            else:
+                run = await get_run(run_id)
+                if run is None or run.status in TERMINAL_RUN_STATUSES:
+                    return None
+            worker_id = getattr(run, "worker_id", None)
+            owner_kwargs = {"worker_id": worker_id} if worker_id else {}
             output_message = None
             if text or reasoning or tool_calls:
                 output_message = Message(
@@ -642,7 +651,20 @@ class TeamLifecycleModule:
                             error_message=call.get("error_message"),
                         )
                     )
-                await runs.set_output_message(run.id, output_message.id)
+                await runs.set_output_message(run.id, output_message.id, **owner_kwargs)
+            if not terminal_persisted:
+                persisted, changed = await runs.set_terminal_status(
+                    run_id,
+                    status=terminal_status,
+                    error_type=error_type if terminal_status == "failed" else None,
+                    error_message=error_message,
+                    token_usage=usage,
+                    cancel_requested_as_cancelled=True,
+                    **owner_kwargs,
+                )
+                if persisted is None or not changed:
+                    return None
+                terminal_status = persisted.status
             await db.commit()
             return terminal_status
 

@@ -8,7 +8,7 @@ from typing import Any, get_origin
 from yuxi.agents.backends.sandbox.paths import sandbox_workspace_agent_context_file
 from yuxi.agents.tool_approval import DEFAULT_TOOL_APPROVAL_MODE
 from yuxi.utils.logging_config import logger
-from yuxi.utils.paths import WORKSPACE_AGENT_CONTEXT_FILES
+from yuxi.workspace.paths import WORKSPACE_AGENT_CONTEXT_FILES
 
 WORKSPACE_AGENTS_PROMPT_MAX_BYTES = 64 * 1024
 DEFAULT_MAX_EXECUTION_STEPS = 300

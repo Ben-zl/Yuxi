@@ -8,6 +8,12 @@ from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from yuxi.repositories.api_key_repository import (
+    APIKeyDepartmentConflict,
+    APIKeyIdempotencyConflict,
+    APIKeyRepository,
+    APIKeySubjectUnavailable,
+)
 from yuxi.storage.postgres.models_business import APIKey, CLIAuthSession, Department, User
 from yuxi.utils.auth_utils import AuthUtils
 from yuxi.utils.datetime_utils import utc_now_naive
@@ -110,6 +116,39 @@ async def approve_cli_auth_session(db: AsyncSession, user_code: str, user: User)
     return session
 
 
+async def _build_cli_exchange_result(db: AsyncSession, session: CLIAuthSession) -> dict:
+    """从 consumed 会话确定性重放同一密钥响应，不读取或保存明文。"""
+
+    if not session.approved_user_id or not session.api_key_id:
+        raise CLIAuthError("invalid_state", "授权会话缺少已提交的密钥事实", status_code=409)
+    result = await db.execute(
+        select(User, Department.name, APIKey)
+        .outerjoin(Department, User.department_id == Department.id)
+        .join(APIKey, APIKey.id == session.api_key_id)
+        .filter(User.id == session.approved_user_id, User.is_deleted == 0)
+    )
+    row = result.one_or_none()
+    if row is None:
+        raise CLIAuthError("invalid_user", "授权用户或 API Key 不存在", status_code=409)
+    user, department_name, api_key = row
+    if not api_key.is_valid():
+        raise CLIAuthError("api_key_revoked", "授权会话对应的 API Key 已失效", status_code=409)
+    full_key, key_hash, _ = AuthUtils.derive_api_key(
+        f"cli-session:{session.device_code_hash}",
+        user.id,
+    )
+    if key_hash != api_key.key_hash:
+        raise CLIAuthError("secret_replay_unavailable", "历史授权密钥无法安全重放", status_code=409)
+
+    user_data = user.to_dict()
+    user_data["department_name"] = department_name
+    return {
+        "api_key": api_key.to_dict(),
+        "secret": full_key,
+        "user": user_data,
+    }
+
+
 async def exchange_cli_auth_token(db: AsyncSession, device_code: str) -> dict:
     result = await db.execute(
         select(CLIAuthSession).filter(CLIAuthSession.device_code_hash == _hash_secret(device_code)).with_for_update()
@@ -123,42 +162,35 @@ async def exchange_cli_auth_token(db: AsyncSession, device_code: str) -> dict:
     if session.status == CLI_AUTH_STATUS_PENDING:
         raise CLIAuthError("authorization_pending", "等待浏览器授权", status_code=400)
     if session.status == CLI_AUTH_STATUS_CONSUMED:
-        raise CLIAuthError("already_consumed", "授权会话已完成", status_code=409)
+        if session.expires_at <= utc_now_naive():
+            raise CLIAuthError("expired_token", "授权结果重放窗口已过期", status_code=410)
+        return await _build_cli_exchange_result(db, session)
     if session.status != CLI_AUTH_STATUS_APPROVED or not session.approved_user_id:
         raise CLIAuthError("invalid_state", "授权会话状态无效", status_code=409)
 
-    user_result = await db.execute(
-        select(User, Department.name)
-        .outerjoin(Department, User.department_id == Department.id)
-        .filter(User.id == session.approved_user_id, User.is_deleted == 0)
+    _full_key, key_hash, key_prefix = AuthUtils.derive_api_key(
+        f"cli-session:{session.device_code_hash}",
+        session.approved_user_id,
     )
-    row = user_result.one_or_none()
-    if row is None:
-        raise CLIAuthError("invalid_user", "授权用户不存在", status_code=409)
-    user, department_name = row
-
-    full_key, key_hash, key_prefix = AuthUtils.generate_api_key()
-    api_key = APIKey(
-        key_hash=key_hash,
-        key_prefix=key_prefix,
-        name=session.key_name,
-        user_id=user.id,
-        created_by=str(user.id),
-    )
-    db.add(api_key)
-    await db.flush()
+    try:
+        api_key = await APIKeyRepository(db).create(
+            key_hash=key_hash,
+            key_prefix=key_prefix,
+            request_id=f"c:{session.device_code_hash[:62]}",
+            name=session.key_name,
+            user_id=session.approved_user_id,
+            department_id=None,
+            expires_at=None,
+            created_by=str(session.approved_user_id),
+        )
+    except APIKeySubjectUnavailable as exc:
+        raise CLIAuthError("invalid_user", "授权用户不存在", status_code=409) from exc
+    except (APIKeyIdempotencyConflict, APIKeyDepartmentConflict) as exc:
+        raise CLIAuthError("invalid_state", "授权会话无法创建 API Key", status_code=409) from exc
 
     session.status = CLI_AUTH_STATUS_CONSUMED
     session.api_key_id = api_key.id
     session.consumed_at = utc_now_naive()
     await db.commit()
     await db.refresh(api_key)
-
-    user_data = user.to_dict()
-    user_data["department_name"] = department_name
-
-    return {
-        "api_key": api_key.to_dict(),
-        "secret": full_key,
-        "user": user_data,
-    }
+    return await _build_cli_exchange_result(db, session)

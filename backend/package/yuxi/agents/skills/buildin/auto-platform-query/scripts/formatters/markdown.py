@@ -546,6 +546,8 @@ class MarkdownFormatter(BaseFormatter):
             return 'Yes' if value else 'No'
         elif isinstance(value, (list, dict)):
             return str(value)[:100] + '...' if len(str(value)) > 100 else str(value)
+        else:
+            return str(value)
 
     def _escape_device_name(self, name: str) -> str:
         """转义设备名称中的特殊字符，避免 Markdown 格式错误
@@ -556,8 +558,6 @@ class MarkdownFormatter(BaseFormatter):
             return 'N/A'
         # 将 | 替换为 - (区分符，在表格后需替换回)
         return name.replace('|', '-')
-        else:
-            return str(value)
 
     def _format_date(self, date_str: str) -> str:
         """格式化日期字符串"""

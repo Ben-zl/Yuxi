@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { agentApi, databaseApi, mcpApi, skillApi, toolApi } from '@/apis'
+import { useRuntimeCapabilitiesStore } from '@/stores/runtimeCapabilities'
 import { isDefaultAllAgentResourceKind } from '@/utils/agentConfigUtils'
 import { handleChatError } from '@/utils/errorHandler'
 
@@ -86,8 +87,12 @@ export const useAgentStore = defineStore(
 
     async function fetchMentionResources() {
       try {
+        const runtimeCapabilitiesStore = useRuntimeCapabilitiesStore()
+        await runtimeCapabilitiesStore.ensureLoaded()
         const [dbsRes, mcpsRes, skillsRes] = await Promise.all([
-          databaseApi.getAccessibleDatabases().catch(() => ({ databases: [] })),
+          runtimeCapabilitiesStore.knowledgeEnabled
+            ? databaseApi.getAccessibleDatabases().catch(() => ({ databases: [] }))
+            : Promise.resolve({ databases: [] }),
           mcpApi.getMcpServers().catch(() => ({ data: [] })),
           skillApi.listAccessibleSkills().catch(() => ({ data: [] }))
         ])

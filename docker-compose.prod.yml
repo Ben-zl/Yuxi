@@ -5,11 +5,19 @@ x-api-worker-env: &api-worker-env
   YUXI_ENV: production
   PYTHONPATH: /app/package
   JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env.prod}
+  API_KEY_DERIVATION_SECRET: ${API_KEY_DERIVATION_SECRET:?Set API_KEY_DERIVATION_SECRET in .env.prod}
+  NLTK_DATA: /home/yuxi/nltk_data
+  RAPIDOCR_MODEL_DIR: /home/yuxi/.cache/rapidocr/models
   YUXI_INSTANCE_ID: ${YUXI_INSTANCE_ID:?Set YUXI_INSTANCE_ID in .env.prod}
   POSTGRES_URL: ${POSTGRES_URL:-postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.prod}@postgres:5432/${POSTGRES_DB:-yuxi}}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
   RUN_CANCEL_KEY_TTL_SECONDS: ${RUN_CANCEL_KEY_TTL_SECONDS:-1800}
   RUN_EVENTS_STREAM_TTL_SECONDS: ${RUN_EVENTS_STREAM_TTL_SECONDS:-7200}
+  AGENTSCOPE_BASE_URL: ${AGENTSCOPE_BASE_URL:-http://agentscope:8100}
+  AGENTSCOPE_CHANNEL_CREDENTIAL_KEY: ${AGENTSCOPE_CHANNEL_CREDENTIAL_KEY:?Set AGENTSCOPE_CHANNEL_CREDENTIAL_KEY in .env.prod}
+  AGENTSCOPE_LEGACY_CUTOFF: ${AGENTSCOPE_LEGACY_CUTOFF:?Set AGENTSCOPE_LEGACY_CUTOFF in .env.prod}
+  READINESS_PROBE_TIMEOUT_SECONDS: ${READINESS_PROBE_TIMEOUT_SECONDS:-2}
+  READINESS_CACHE_TTL_SECONDS: ${READINESS_CACHE_TTL_SECONDS:-1}
   YUXI_CORS_ORIGINS: ${YUXI_CORS_ORIGINS:-}
   NEO4J_URI: ${NEO4J_URI:-bolt://graph:7687}
   NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
@@ -26,24 +34,26 @@ x-api-worker-env: &api-worker-env
   SANDBOX_VIRTUAL_PATH_PREFIX: ${SANDBOX_VIRTUAL_PATH_PREFIX:-/home/gem/user-data}
   SANDBOX_EXEC_TIMEOUT_SECONDS: ${SANDBOX_EXEC_TIMEOUT_SECONDS:-180}
   SANDBOX_MAX_OUTPUT_BYTES: ${SANDBOX_MAX_OUTPUT_BYTES:-262144}
-  AGENTSCOPE_BASE_URL: ${AGENTSCOPE_BASE_URL:-http://agentscope:8100}
-  AGENTSCOPE_LEGACY_CUTOFF: ${AGENTSCOPE_LEGACY_CUTOFF:?Set AGENTSCOPE_LEGACY_CUTOFF in .env.prod}
-  NO_PROXY: localhost,127.0.0.1,milvus,graph,minio,milvus-etcd,etcd,mineru,paddlex,sandbox-provisioner,agentscope,api.siliconflow.cn
-  no_proxy: localhost,127.0.0.1,milvus,graph,minio,milvus-etcd,etcd,mineru,paddlex,sandbox-provisioner,agentscope,api.siliconflow.cn
+  YUXI_SKILL_DATA_DIR: /app/skill-sources
+  YUXI_SKILL_PROJECTION_DIR: /app/skill-projections
+  NO_PROXY: localhost,127.0.0.1,milvus,graph,minio,milvus-etcd,etcd,mineru,paddlex,sandbox-provisioner,api.siliconflow.cn
+  no_proxy: localhost,127.0.0.1,milvus,graph,minio,milvus-etcd,etcd,mineru,paddlex,sandbox-provisioner,api.siliconflow.cn
 
 services:
   api:
     build:
       context: .
       dockerfile: docker/api.Dockerfile
-    image: yuxi-api:${YUXI_VERSION:-0.7.1}
+    image: yuxi-api:${YUXI_VERSION:-0.7.2}
     container_name: api-prod
     working_dir: /app
+    user: "1000:1000"
     networks:
       - app-network
     volumes:
-      - ./docker/volumes/yuxi:/app/saves
-      - ./docker/volumes/models:/app/models
+      - ./docker/volumes/yuxi/threads:/app/user-data
+      - ./docker/volumes/yuxi/skill-sources:/app/skill-sources
+      - ./docker/volumes/yuxi/skill-projections:/app/skill-projections
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
@@ -51,11 +61,14 @@ services:
     # region api_envs
     environment:
       <<: *api-worker-env
+      YUXI_CONFIG_DIR: /app/runtime/api
+      YUXI_RUNTIME_DIR: /app/runtime/api
+      YUXI_USER_DATA_DIR: /app/user-data
     # endregion api_envs
     command: uv run --no-sync --no-dev uvicorn server.main:app --host 0.0.0.0 --port 5050
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:5050/api/system/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:5050/api/system/ready || exit 1"]
       interval: 30s
       timeout: 15s
       retries: 8
@@ -71,27 +84,40 @@ services:
         condition: service_healthy
       agentscope:
         condition: service_healthy
+      storage-migrator:
+        condition: service_completed_successfully
 
   worker:
     build:
       context: .
       dockerfile: docker/api.Dockerfile
-    image: yuxi-api:${YUXI_VERSION:-0.7.1}
+    image: yuxi-api:${YUXI_VERSION:-0.7.2}
     container_name: worker-prod
     working_dir: /app
+    user: "1000:1000"
     networks:
       - app-network
     volumes:
-      - ./docker/volumes/yuxi:/app/saves
-      - ./docker/volumes/models:/app/models
+      - ./docker/volumes/yuxi/threads:/app/user-data
+      - ./docker/volumes/yuxi/skill-sources:/app/skill-sources
+      - ./docker/volumes/yuxi/skill-projections:/app/skill-projections
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
       - .env.prod
     environment:
       <<: *api-worker-env
+      YUXI_CONFIG_DIR: /app/runtime/worker
+      YUXI_RUNTIME_DIR: /app/runtime/worker
+      YUXI_USER_DATA_DIR: /app/user-data
     command: uv run --no-sync --no-dev arq server.worker_main.WorkerSettings
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "uv run --no-sync --no-dev arq --check server.worker_main.WorkerSettings"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 180s
     depends_on:
       postgres:
         condition: service_healthy
@@ -103,21 +129,29 @@ services:
         condition: service_healthy
       agentscope:
         condition: service_healthy
+      storage-migrator:
+        condition: service_completed_successfully
 
   agentscope:
     build:
       context: .
       dockerfile: docker/api.Dockerfile
-    image: yuxi-api:${YUXI_VERSION:-0.7.1}
+    image: yuxi-api:${YUXI_VERSION:-0.7.2}
     container_name: agentscope-prod
     working_dir: /app
+    user: "1000:1000"
     networks:
       - app-network
     volumes:
-      - ./docker/volumes/yuxi:/app/saves
-      - ./docker/volumes/models:/app/models
+      - type: bind
+        source: ./docker/volumes/yuxi/agentscope-workspaces
+        target: ${PWD}/docker/volumes/yuxi/agentscope-workspaces
+      - ./docker/volumes/yuxi/agentscope-memory:/app/agentscope-memory
+      - ./docker/volumes/yuxi/threads:/app/user-data
+      - ./docker/volumes/yuxi/skill-sources:/app/skill-sources
+      - ./docker/volumes/yuxi/skill-projections:/app/skill-projections
+      - ./docker/sandbox_provisioner/sandbox.env:/app/sandbox.env:ro
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${PWD}/docker/volumes/yuxi/agentscope-workspaces:${PWD}/docker/volumes/yuxi/agentscope-workspaces
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
@@ -126,7 +160,11 @@ services:
       <<: *api-worker-env
       AGENTSCOPE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.prod}@postgres:5432/agentscope
       AGENTSCOPE_WORKSPACE_BASEDIR: ${PWD}/docker/volumes/yuxi/agentscope-workspaces
-      AGENTSCOPE_WORKSPACE_BACKEND: docker
+      AGENTSCOPE_WORKSPACE_BACKEND: ${AGENTSCOPE_WORKSPACE_BACKEND:-docker}
+      AGENTSCOPE_MEMORY_BASEDIR: /app/agentscope-memory
+      YUXI_CONFIG_DIR: /app/runtime/agentscope
+      YUXI_RUNTIME_DIR: /app/runtime/agentscope
+      YUXI_USER_DATA_DIR: /app/user-data
     command: uv run --no-sync --no-dev uvicorn server.agentscope_main:app --host 0.0.0.0 --port 8100
     restart: unless-stopped
     healthcheck:
@@ -140,14 +178,46 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      storage-migrator:
+        condition: service_completed_successfully
+
+  storage-migrator:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: yuxi-api:${YUXI_VERSION:-0.7.2}
+    working_dir: /app
+    user: "0:0"
+    networks:
+      - app-network
+    volumes:
+      - ./docker/volumes/yuxi:/app/legacy-saves
+      - ./docker/volumes/yuxi/threads:/app/user-data
+      - ./docker/volumes/yuxi/skill-sources:/app/skill-sources
+      - ./docker/volumes/yuxi/skill-projections:/app/skill-projections
+    env_file:
+      - .env.prod
+    environment:
+      <<: *api-worker-env
+      YUXI_CONFIG_DIR: /app/runtime/storage-migrator
+      YUXI_RUNTIME_DIR: /app/runtime/storage-migrator
+      YUXI_LEGACY_STORAGE_DIR: /app/legacy-saves
+      YUXI_USER_DATA_DIR: /app/user-data
+    command: uv run --no-sync --no-dev python -m yuxi.storage_migration
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   sandbox-provisioner:
     build:
       context: ./docker/sandbox_provisioner
       dockerfile: Dockerfile
+    image: yuxi-sandbox-provisioner:${YUXI_VERSION:-0.7.2}
     container_name: sandbox-provisioner
     volumes:
-      - ./docker/volumes/yuxi:/app/saves
+      - ./docker/volumes/yuxi/threads:/app/user-data
+      - ./docker/volumes/yuxi/skill-projections:/app/skill-projections
       - ./docker/sandbox_provisioner/sandbox.env:/app/sandbox.env:ro
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
@@ -172,13 +242,14 @@ services:
       - NO_PROXY=localhost,127.0.0.1,host.docker.internal
       # Docker backend only
       - DOCKER_NETWORK_PREFIX=${SANDBOX_DOCKER_NETWORK_PREFIX:-yuxi-know-sandbox}
-      - DOCKER_THREADS_HOST_PATH=${SANDBOX_DOCKER_THREADS_HOST_PATH:-}
+      - DOCKER_USER_DATA_HOST_PATH=${SANDBOX_DOCKER_USER_DATA_HOST_PATH:-}
+      - DOCKER_SKILL_PROJECTIONS_HOST_PATH=${SANDBOX_DOCKER_SKILL_PROJECTIONS_HOST_PATH:-}
       - DOCKER_SANDBOX_PREFIX=${SANDBOX_DOCKER_SANDBOX_PREFIX:-yuxi-sandbox}
       # Kubernetes backend only
       - K8S_NAMESPACE=${SANDBOX_K8S_NAMESPACE:-yuxi-know}
       - NODE_HOST=${SANDBOX_NODE_HOST:-host.docker.internal}
       - KUBECONFIG_PATH=${KUBECONFIG_PATH:-}
-      - THREAD_PVC=${THREAD_PVC:-yuxi-thread}
+      - USER_DATA_PVC=${USER_DATA_PVC:-yuxi-user-data}
       - SKILLS_PVC=${SKILLS_PVC:-yuxi-skills}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health').read()"]
@@ -187,13 +258,16 @@ services:
       retries: 6
       start_period: 10s
     restart: unless-stopped
+    depends_on:
+      storage-migrator:
+        condition: service_completed_successfully
 
   web:
     build:
       context: .
       dockerfile: docker/web.Dockerfile
       target: production
-    image: yuxi-web:${YUXI_VERSION:-0.7.1}
+    image: yuxi-web:${YUXI_VERSION:-0.7.2}
     container_name: web-prod
     ports:
       - "80:80"
@@ -203,12 +277,11 @@ services:
       - app-network
     environment:
       - NODE_ENV=production
-      - VITE_LITE_MODE=${LITE_MODE:-}
     command: nginx -g "daemon off;"
     restart: unless-stopped
 
   graph:
-    image: neo4j:5.26
+    image: neo4j:5.26.29
     container_name: graph
     volumes:
       - ./docker/volumes/neo4j/data:/data
@@ -317,7 +390,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.10-alpine
     container_name: redis
     command: redis-server --appendonly yes
     healthcheck:

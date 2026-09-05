@@ -255,15 +255,8 @@ async def _persist_recovered_run(
         run = await runs.get_run(run_id)
         if run is None or run.status in TERMINAL_RUN_STATUSES:
             return False
-        persisted, changed = await runs.set_terminal_status(
-            run.id,
-            status=recovered.status,
-            error_type=recovered.error_type,
-            error_message=recovered.error_message,
-            token_usage=recovered.usage,
-        )
-        if persisted is None or not changed:
-            return False
+        worker_id = getattr(run, "worker_id", None)
+        owner_kwargs = {"worker_id": worker_id} if worker_id else {}
         existing_call_ids = set()
         existing_message_ids = set()
         if existing_tool_calls:
@@ -310,7 +303,17 @@ async def _persist_recovered_run(
                         error_message=call.get("error_message"),
                     )
                 )
-            await runs.set_output_message(run.id, output_message.id)
+            await runs.set_output_message(run.id, output_message.id, **owner_kwargs)
+        persisted, changed = await runs.set_terminal_status(
+            run.id,
+            status=recovered.status,
+            error_type=recovered.error_type,
+            error_message=recovered.error_message,
+            token_usage=recovered.usage,
+            **owner_kwargs,
+        )
+        if persisted is None or not changed:
+            return False
         await ConversationRepository(db).set_message_delivery_status(
             run.input_message_id,
             "complete" if recovered.status == "completed" else "failed",

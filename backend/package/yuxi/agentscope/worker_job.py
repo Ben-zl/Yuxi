@@ -11,7 +11,7 @@ from pathlib import Path
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
-from yuxi.agentscope.execution import execute_run, finalize_run, has_active_child_runs
+from yuxi.agentscope.execution import execute_run, finalize_run, has_active_child_runs, persist_run_output
 from yuxi.agentscope.event_stream import cancel_tasks, start_event_pump
 from yuxi.agentscope.gateway import (
     TEAM_TOOL_NAMES,
@@ -29,6 +29,7 @@ from yuxi.agentscope.thread_guard import (
     store_pending_confirm,
 )
 from yuxi.repositories.agent_run_repository import (
+    DEFAULT_WORKER_ID,
     TERMINAL_RUN_STATUSES,
     AgentRunRepository,
 )
@@ -37,6 +38,10 @@ from yuxi.services.agent_request_queue_service import dispatch_next_request
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Message
 from yuxi.utils import logger
+
+WORKER_ID = DEFAULT_WORKER_ID
+RUN_LEASE_SECONDS = 120
+RUN_HEARTBEAT_SECONDS = 30
 
 
 async def execute_agent_run_job(run_id: str) -> None:
@@ -62,10 +67,31 @@ async def execute_agent_run_job(run_id: str) -> None:
             await _fail_run(db, run_repo, run, "运行任务缺少输入消息")
             return
 
-        await run_repo.mark_running(run_id)
+        claim_result = await run_repo.mark_running(
+            run_id,
+            worker_id=WORKER_ID,
+            lease_seconds=RUN_LEASE_SECONDS,
+        )
+        lease_owned = isinstance(claim_result, tuple)
+        if lease_owned:
+            claimed_run, acquired = claim_result
+        else:
+            acquired = claim_result is not None
+            claimed_run = (
+                claim_result
+                if getattr(claim_result, "id", None) == run_id
+                else run
+            )
+        if claimed_run is None or not acquired:
+            await db.rollback()
+            return
+        run = claimed_run
+        worker_id = WORKER_ID if lease_owned else getattr(run, "worker_id", None)
+        owner_kwargs = {"worker_id": worker_id} if worker_id else {}
         await db.commit()
 
         client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
+        heartbeat_task = asyncio.create_task(_renew_run_lease(run.id)) if lease_owned else None
         try:
             if run.run_type == "resume":
                 result = await _execute_resume(db, client, run, input_message)
@@ -95,43 +121,19 @@ async def execute_agent_run_job(run_id: str) -> None:
                     model_spec=model_spec,
                     image_content=input_message.image_content,
                     mapping=mapping,
+                    persist_result=False,
                 )
             if result.parked in {"permission", "external"} and result.pending_confirm:
                 await store_pending_confirm(run.conversation_thread_id, result.pending_confirm)
 
-            # yuxi 消息表落库：正文、推理与工具生命周期需和实时流一致。
-            if result.text or result.reasoning or result.tool_calls:
-                additional_kwargs = {"reasoning_content": result.reasoning} if result.reasoning else {}
-                output_message = await conv_repo.add_message_by_thread_id(
-                    thread_id=run.conversation_thread_id,
-                    role="assistant",
-                    content=result.text,
-                    message_type="text",
-                    extra_metadata={
-                        "request_id": run.request_id,
-                        "run_id": run_id,
-                        "token_usage": result.usage or {},
-                        "additional_kwargs": additional_kwargs,
-                    },
-                    run_id=run_id,
-                    request_id=run.request_id,
-                )
-                if output_message is None:
-                    raise RuntimeError("回复消息落库失败：线程不存在")
-                for tool_call in result.tool_calls or []:
-                    await conv_repo.add_tool_call(
-                        message_id=output_message.id,
-                        tool_name=tool_call.get("name") or "unknown",
-                        tool_input=tool_call.get("args") or {},
-                        tool_output=tool_call.get("output") or "",
-                        status=tool_call.get("status") or "pending",
-                        error_message=tool_call.get("error_message"),
-                        langgraph_tool_call_id=tool_call.get("id"),
-                    )
-                await run_repo.set_output_message(run_id, output_message.id)
+            output_message = await persist_run_output(db, run, result)
+            if output_message is not None:
+                await run_repo.set_output_message(run_id, output_message.id, **owner_kwargs)
+            await finalize_run(db, run, result, **owner_kwargs)
             await _sync_input_delivery_status(db, run, result.run_status)
             await db.commit()
         except ValueError as exc:
+            await _stop_run_lease_heartbeat(heartbeat_task)
             await db.rollback()
             message = str(exc)
             await _fail_run(
@@ -142,10 +144,12 @@ async def execute_agent_run_job(run_id: str) -> None:
             )
             return
         except Exception as exc:  # noqa: BLE001 - 任务级失败统一终态
+            await _stop_run_lease_heartbeat(heartbeat_task)
             logger.exception(f"agentscope 执行失败 run={run_id}: {exc}")
             await db.rollback()
             await _fail_run(db, run_repo, run, f"执行失败: {exc}")
             return
+        await _stop_run_lease_heartbeat(heartbeat_task)
 
         # 挂起/中断终态补发 end 帧（前端收尾依赖）；completed 与 steer 中断
         # （非审批挂起）派发队头：引导消息需在被中断的 Run 结束后立即执行。
@@ -164,6 +168,31 @@ async def execute_agent_run_job(run_id: str) -> None:
                 {"status": result.run_status},
             )
         await _notify_agent_task(run.id, result.run_status)
+
+
+async def _renew_run_lease(run_id: str) -> None:
+    """在 AgentScope 回合运行期间续租当前 Run。"""
+
+    while True:
+        await asyncio.sleep(RUN_HEARTBEAT_SECONDS)
+        async with pg_manager.get_async_session_context() as db:
+            renewed = await AgentRunRepository(db).renew_lease(
+                run_id,
+                worker_id=WORKER_ID,
+                lease_seconds=RUN_LEASE_SECONDS,
+            )
+        if not renewed:
+            logger.warning("AgentScope Run lease lost: run=%s", run_id)
+            return
+
+
+async def _stop_run_lease_heartbeat(task: asyncio.Task | None) -> None:
+    """结束回合时回收续租任务。"""
+
+    if task is None:
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 async def _notify_agent_task(run_id: str, run_status: str) -> None:
@@ -207,11 +236,14 @@ async def _fail_run(db, run_repo, run, message: str) -> bool:
     error_message = None if cancelled else message
     end_payload = {"status": "cancelled"} if cancelled else {"status": "error", "error_message": message}
 
-    persisted, changed = await run_repo.set_terminal_status(
-        run.id,
-        status=terminal_status,
-        error_message=error_message,
-    )
+    terminal_kwargs = {
+        "status": terminal_status,
+        "error_message": error_message,
+    }
+    worker_id = getattr(run, "worker_id", None)
+    if worker_id:
+        terminal_kwargs["worker_id"] = worker_id
+    persisted, changed = await run_repo.set_terminal_status(run.id, **terminal_kwargs)
     if persisted is None or not changed:
         return False
     terminal_status = persisted.status
@@ -401,8 +433,7 @@ async def _materialize_run_attachments(
 async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
     """resume 执行：审批决定 → resume_confirm；文本回答 → 新一轮输入。
 
-    兼容旧栈 resume 载荷 {"decisions":[{"type":"approve"}]} 与
-    ask_user 文本回答（answer 字段或回退到消息正文）。
+    兼容已持久化的审批决定与主动提问回答，并由外层统一持久化输出和终态。
     """
     mapping = await ensure_thread_session(
         db,
@@ -427,8 +458,6 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
             raise ValueError("工具审批恢复缺少有效 decisions")
         approved = [str(d.get("type", "")).lower() in {"approve", "approved", "accept"} for d in decisions]
         result = await _resume_and_collect(client, run, mapping, confirm_event, approved)
-        # resume 路径同样必须回写终态，否则 Run 永远停在 running
-        await finalize_run(db, run, result)
         await _replace_pending_confirm(run.conversation_thread_id, result)
         return result
 
@@ -437,7 +466,6 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
         if answer is None:
             raise ValueError("外部问答恢复缺少 answer")
         result = await _resume_external_and_collect(client, run, mapping, confirm_event, answer)
-        await finalize_run(db, run, result)
         await _replace_pending_confirm(run.conversation_thread_id, result)
         return result
 
@@ -446,7 +474,14 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
 
     # 没有挂起事件时，文本 resume 仍按普通新一轮输入处理。
     text = answer if isinstance(answer, str) and answer.strip() else input_message.content
-    return await execute_run(db, client, run=run, text=text, model_spec=(run.input_payload or {}).get("model_spec"))
+    return await execute_run(
+        db,
+        client,
+        run=run,
+        text=text,
+        model_spec=(run.input_payload or {}).get("model_spec"),
+        persist_result=False,
+    )
 
 
 async def _collect_asking_tool_calls(

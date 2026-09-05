@@ -24,11 +24,12 @@ async def session():
 
 async def test_queue_history_keeps_each_request_with_its_reply(session):
     started_at = datetime(2026, 7, 12, 9, 0, 0)
-    session.add(Conversation(id=1, thread_id="thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(Conversation(id=1, thread_id="thread-1", project_id="project-thread-1", uid="user-1", agent_id="main", status="active"))
     session.add(
         AgentRun(
             id="run-a",
             conversation_thread_id="thread-1",
+            runtime_scope_id="thread-1",
             agent_slug="main",
             uid="user-1",
             request_id="request-a",
@@ -86,6 +87,7 @@ async def test_queue_history_keeps_each_request_with_its_reply(session):
         AgentRun(
             id="run-b",
             conversation_thread_id="thread-1",
+            runtime_scope_id="thread-1",
             agent_slug="main",
             uid="user-1",
             request_id="request-b",
@@ -124,11 +126,12 @@ async def test_queue_history_keeps_each_request_with_its_reply(session):
 async def test_history_keeps_cancelled_request_when_run_has_assistant_output(session):
     """执行后取消的 Run 已有回复时，历史必须保留完整问答。"""
     started_at = datetime(2026, 8, 21, 13, 0, 0)
-    session.add(Conversation(id=1, thread_id="thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(Conversation(id=1, thread_id="thread-1", project_id="project-thread-1", uid="user-1", agent_id="main", status="active"))
     session.add(
         AgentRun(
             id="run-cancelled",
             conversation_thread_id="thread-1",
+            runtime_scope_id="thread-1",
             agent_slug="main",
             uid="user-1",
             request_id="request-cancelled",
@@ -179,11 +182,12 @@ async def test_history_keeps_cancelled_request_when_run_has_assistant_output(ses
 async def test_history_exposes_failed_run_without_assistant_output(session):
     """失败 Run 没有回复消息时，历史仍应展示明确的错误回复。"""
     started_at = datetime(2026, 8, 28, 8, 5, 41)
-    session.add(Conversation(id=1, thread_id="thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(Conversation(id=1, thread_id="thread-1", project_id="project-thread-1", uid="user-1", agent_id="main", status="active"))
     session.add(
         AgentRun(
             id="run-failed",
             conversation_thread_id="thread-1",
+            runtime_scope_id="thread-1",
             agent_slug="main",
             uid="user-1",
             request_id="request-failed",
@@ -229,7 +233,7 @@ async def test_history_exposes_failed_run_without_assistant_output(session):
 
 async def test_history_restores_reasoning_and_tool_calls(session):
     """历史接口应恢复实时阶段可见的推理内容与工具执行详情。"""
-    session.add(Conversation(id=1, thread_id="thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(Conversation(id=1, thread_id="thread-1", project_id="project-thread-1", uid="user-1", agent_id="main", status="active"))
     session.add(
         Message(
             id=1,

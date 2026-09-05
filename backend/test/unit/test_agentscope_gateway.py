@@ -389,6 +389,7 @@ async def test_round_result_collects_tool_call_for_history(capture_events):
             "output": "知识库不可用",
             "status": "error",
             "error_message": "连接失败",
+            "metadata": {"message": "连接失败"},
         }
     ]
 

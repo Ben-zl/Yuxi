@@ -10,7 +10,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from yuxi.utils.logging_config import logger
-from yuxi.utils.paths import (
+from yuxi.agents.backends.paths import (
     OUTPUTS_DIR_NAME,
     UPLOADS_DIR_NAME,
     VIRTUAL_PATH_PREFIX,

@@ -7,7 +7,14 @@ from contextlib import asynccontextmanager
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import declarative_base
-from yuxi.storage.postgres.models_business import AGENT_RUN_TERMINAL_STATUSES, UNVIEWED_RUN_MARKER
+from yuxi.storage.postgres.models_business import (
+    AGENT_RUN_SHAPE_CONSTRAINT_NAME,
+    AGENT_RUN_SHAPE_CONSTRAINT_SQL,
+    AGENT_RUN_TERMINAL_STATUSES,
+    PROJECT_STATUS_CONSTRAINT_NAME,
+    PROJECT_STATUS_CONSTRAINT_SQL,
+    UNVIEWED_RUN_MARKER,
+)
 from yuxi.storage.postgres.models_business import Base as BusinessBase
 from yuxi.storage.postgres.models_knowledge import Base as KnowledgeBase
 from yuxi.utils import logger
@@ -16,6 +23,185 @@ from yuxi.utils.singleton import SingletonMeta
 # 合并两个 Base
 CombinedBase = declarative_base()
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
+BUSINESS_SCHEMA_VERSION = 2
+KNOWLEDGE_SCHEMA_VERSION = 1
+SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
+AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
+    "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS runtime_scope_id VARCHAR(64)",
+    "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS runtime_cleanup_pending BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(128)",
+    "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITHOUT TIME ZONE",
+    "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP WITHOUT TIME ZONE",
+    "CREATE INDEX IF NOT EXISTS ix_agent_runs_status_lease_expires ON agent_runs(status, lease_expires_at)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_runs_runtime_scope_id ON agent_runs(runtime_scope_id)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_runs_runtime_cleanup_pending ON agent_runs(runtime_cleanup_pending)",
+)
+AGENT_RUN_FACT_SCHEMA_STATEMENTS = (
+    "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS manifest JSONB",
+    "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS manifest_fingerprint VARCHAR(64)",
+    "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS manifest_recorded_at TIMESTAMP WITHOUT TIME ZONE",
+    """
+    CREATE TABLE IF NOT EXISTS agent_run_attempts (
+        id SERIAL PRIMARY KEY,
+        run_id VARCHAR(64) NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        attempt_no INTEGER NOT NULL,
+        worker_id VARCHAR(128) NOT NULL,
+        started_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+        heartbeat_at TIMESTAMP WITHOUT TIME ZONE,
+        lease_expires_at TIMESTAMP WITHOUT TIME ZONE,
+        finished_at TIMESTAMP WITHOUT TIME ZONE,
+        outcome VARCHAR(32),
+        error_type VARCHAR(64),
+        error_message TEXT,
+        created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+        CONSTRAINT uq_agent_run_attempts_run_attempt_no UNIQUE (run_id, attempt_no)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_agent_run_attempts_open ON agent_run_attempts(run_id, finished_at)",
+)
+WORKDIR_PATH_SCHEMA_STATEMENTS = (
+    f"""
+    CREATE TABLE IF NOT EXISTS projects (
+        id VARCHAR(64) PRIMARY KEY,
+        uid VARCHAR(64) NOT NULL CONSTRAINT fk_projects_uid_users REFERENCES users(uid) ON DELETE CASCADE,
+        name VARCHAR(255),
+        selection_status VARCHAR(20) NOT NULL,
+        workdir_path VARCHAR(512) NOT NULL,
+        directory_mode VARCHAR(20) NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'active',
+        deleted_at TIMESTAMP WITHOUT TIME ZONE,
+        idempotency_key VARCHAR(128),
+        created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_projects_id_uid UNIQUE (id, uid),
+        CONSTRAINT uq_projects_uid_idempotency_key UNIQUE (uid, idempotency_key),
+        CONSTRAINT ck_projects_selection_status CHECK (selection_status IN ('implicit', 'selectable')),
+        CONSTRAINT ck_projects_directory_mode CHECK (directory_mode IN ('managed', 'linked')),
+        CONSTRAINT {PROJECT_STATUS_CONSTRAINT_NAME} CHECK ({PROJECT_STATUS_CONSTRAINT_SQL})
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_projects_uid ON projects(uid)",
+    "CREATE INDEX IF NOT EXISTS ix_projects_selection_status ON projects(selection_status)",
+    "ALTER TABLE IF EXISTS projects ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active'",
+    "ALTER TABLE IF EXISTS projects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITHOUT TIME ZONE",
+    "CREATE INDEX IF NOT EXISTS ix_projects_status ON projects(status)",
+    f"""
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = '{PROJECT_STATUS_CONSTRAINT_NAME}'
+              AND conrelid = 'projects'::regclass
+        ) THEN
+            ALTER TABLE projects ADD CONSTRAINT {PROJECT_STATUS_CONSTRAINT_NAME}
+            CHECK ({PROJECT_STATUS_CONSTRAINT_SQL});
+        END IF;
+    END $$
+    """,
+    "ALTER TABLE IF EXISTS projects DROP CONSTRAINT IF EXISTS uq_projects_uid_workdir_path",
+    "ALTER TABLE IF EXISTS projects ALTER COLUMN name DROP NOT NULL",
+    "ALTER TABLE IF EXISTS conversations ADD COLUMN IF NOT EXISTS project_id VARCHAR(64)",
+    "ALTER TABLE IF EXISTS conversations ADD COLUMN IF NOT EXISTS creation_request_id VARCHAR(64)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_conversations_uid_creation_request_id ON conversations(uid, creation_request_id) WHERE creation_request_id IS NOT NULL",
+    "ALTER TABLE IF EXISTS conversations ALTER COLUMN project_id SET NOT NULL",
+    "CREATE INDEX IF NOT EXISTS ix_conversations_project_id ON conversations(project_id)",
+    "ALTER TABLE IF EXISTS conversations DROP CONSTRAINT IF EXISTS ck_conversations_workdir_binding",
+    "ALTER TABLE IF EXISTS conversations DROP COLUMN IF EXISTS workdir_path",
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'fk_conversations_project_uid'
+              AND conrelid = 'conversations'::regclass
+        ) THEN
+            ALTER TABLE conversations ADD CONSTRAINT fk_conversations_project_uid
+            FOREIGN KEY (project_id, uid) REFERENCES projects(id, uid);
+        END IF;
+    END $$
+    """,
+)
+V071_WORKDIR_CUTOVER_STATEMENTS = (
+    "ALTER TABLE IF EXISTS conversations ADD COLUMN IF NOT EXISTS project_id VARCHAR(64)",
+    """
+    WITH bindings AS (
+        SELECT
+            child.uid,
+            COALESCE(parent.thread_id, child.thread_id) AS owner_thread_id
+        FROM conversations AS child
+        LEFT JOIN subagent_threads AS relation ON relation.child_conversation_id = child.id
+        LEFT JOIN conversations AS parent ON parent.id = relation.parent_conversation_id
+    )
+    INSERT INTO projects (
+        id, uid, name, selection_status, workdir_path, directory_mode, idempotency_key, created_at, updated_at
+    )
+    SELECT DISTINCT
+        (md5('project:' || uid || ':' || owner_thread_id)::uuid)::text,
+        uid,
+        NULL,
+        'implicit',
+        'projects/' || (md5(uid || ':' || owner_thread_id)::uuid)::text,
+        'managed',
+        NULL,
+        timezone('utc', now()),
+        timezone('utc', now())
+    FROM bindings
+    ON CONFLICT (id) DO NOTHING
+    """,
+    """
+    UPDATE conversations AS child
+    SET project_id = (md5(
+        'project:' || owner.uid || ':' || owner.owner_thread_id
+    )::uuid)::text
+    FROM (
+        SELECT
+            current.id,
+            current.uid,
+            COALESCE(parent.thread_id, current.thread_id) AS owner_thread_id
+        FROM conversations AS current
+        LEFT JOIN subagent_threads AS relation ON relation.child_conversation_id = current.id
+        LEFT JOIN conversations AS parent ON parent.id = relation.parent_conversation_id
+    ) AS owner
+    WHERE child.id = owner.id
+      AND child.project_id IS NULL
+    """,
+    "ALTER TABLE IF EXISTS conversations ALTER COLUMN project_id SET NOT NULL",
+    "CREATE INDEX IF NOT EXISTS ix_conversations_project_id ON conversations(project_id)",
+)
+RUNTIME_SCOPE_SCHEMA_STATEMENTS = (
+    "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS runtime_scope_id VARCHAR(64)",
+    "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS runtime_cleanup_pending BOOLEAN NOT NULL DEFAULT FALSE",
+    """
+    UPDATE agent_runs AS run
+    SET runtime_scope_id = COALESCE(
+        (
+            SELECT parent.thread_id
+            FROM subagent_threads AS relation
+            JOIN conversations AS parent ON parent.id = relation.parent_conversation_id
+            WHERE relation.id = run.subagent_thread_relation_id
+        ),
+        run.conversation_thread_id
+    )
+    WHERE run.runtime_scope_id IS NULL
+    """,
+    "ALTER TABLE IF EXISTS agent_runs ALTER COLUMN runtime_scope_id SET NOT NULL",
+    "CREATE INDEX IF NOT EXISTS ix_agent_runs_runtime_scope_id ON agent_runs(runtime_scope_id)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_runs_runtime_cleanup_pending ON agent_runs(runtime_cleanup_pending)",
+    f"""
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = '{AGENT_RUN_SHAPE_CONSTRAINT_NAME}'
+              AND conrelid = 'agent_runs'::regclass
+        ) THEN
+            ALTER TABLE agent_runs ADD CONSTRAINT {AGENT_RUN_SHAPE_CONSTRAINT_NAME}
+            CHECK ({AGENT_RUN_SHAPE_CONSTRAINT_SQL}) NOT VALID;
+        END IF;
+    END $$
+    """,
+)
 
 # 继承所有表
 for module in [KnowledgeBase, BusinessBase]:
@@ -79,6 +265,74 @@ class PostgresManager(metaclass=SingletonMeta):
         if not self._initialized:
             raise RuntimeError("PostgreSQL manager not initialized. Please check configuration.")
 
+    @asynccontextmanager
+    async def schema_migration_lock(self):
+        """用独立 PostgreSQL session 串行化唯一 Schema migrator。"""
+        self._check_initialized()
+        async with self.async_engine.connect() as conn:
+            params = {"lock_scope": "yuxi:schema-migration"}
+            await conn.execute(text("SELECT pg_advisory_lock(hashtextextended(:lock_scope, 0))"), params)
+            await conn.commit()
+            try:
+                yield
+            finally:
+                unlocked = await conn.scalar(
+                    text("SELECT pg_advisory_unlock(hashtextextended(:lock_scope, 0))"), params
+                )
+                await conn.commit()
+                if unlocked is not True:
+                    raise RuntimeError("Failed to release Yuxi schema migration advisory lock")
+
+    async def create_schema_version_table(self) -> None:
+        """创建轻量 Schema 版本表；仅允许迁移器调用。"""
+        self._check_initialized()
+        async with self.async_engine.begin() as conn:
+            await conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {SCHEMA_VERSION_TABLE} (
+                    domain VARCHAR(32) PRIMARY KEY,
+                    version INTEGER NOT NULL CHECK (version > 0),
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+
+    async def get_schema_versions(self) -> dict[str, int]:
+        """读取当前数据库已完成的 Yuxi Schema 版本。"""
+        self._check_initialized()
+        async with self.async_engine.connect() as conn:
+            exists = await conn.scalar(
+                text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                {"table_name": SCHEMA_VERSION_TABLE},
+            )
+            if not exists:
+                return {}
+            rows = await conn.execute(text(f"SELECT domain, version FROM {SCHEMA_VERSION_TABLE}"))
+            return {str(row.domain): int(row.version) for row in rows}
+
+    async def record_schema_version(self, domain: str, version: int) -> None:
+        """在对应域迁移完整成功后记录当前版本。"""
+        self._check_initialized()
+        async with self.async_engine.begin() as conn:
+            await conn.execute(text(f"""
+                INSERT INTO {SCHEMA_VERSION_TABLE} (domain, version, applied_at)
+                VALUES (:domain, :version, CURRENT_TIMESTAMP)
+                ON CONFLICT (domain) DO UPDATE
+                SET version = EXCLUDED.version, applied_at = EXCLUDED.applied_at
+            """), {"domain": domain, "version": version})
+
+    async def require_current_schema(self, *, include_knowledge: bool) -> None:
+        """只读校验运行进程需要的 Schema 域均为精确当前版本。"""
+        versions = await self.get_schema_versions()
+        required = {"business": BUSINESS_SCHEMA_VERSION}
+        if include_knowledge:
+            required["knowledge"] = KNOWLEDGE_SCHEMA_VERSION
+        mismatches = [
+            f"{domain}={versions.get(domain, 'missing')} (required {version})"
+            for domain, version in required.items()
+            if versions.get(domain) != version
+        ]
+        if mismatches:
+            raise RuntimeError("Database schema migration is incomplete or incompatible: " + ", ".join(mismatches))
+
     async def create_tables(self):
         """创建所有表（知识库和业务表）"""
         self._check_initialized()
@@ -86,6 +340,13 @@ class PostgresManager(metaclass=SingletonMeta):
             await conn.run_sync(KnowledgeBase.metadata.create_all)
             await conn.run_sync(BusinessBase.metadata.create_all)
         logger.info("PostgreSQL tables created/checked (knowledge + business)")
+
+    async def create_knowledge_tables(self):
+        """创建完整模式使用的知识与评估表。"""
+        self._check_initialized()
+        async with self.async_engine.begin() as conn:
+            await conn.run_sync(KnowledgeBase.metadata.create_all)
+        logger.info("PostgreSQL knowledge tables created/checked")
 
     async def create_business_tables(self):
         """创建所有业务数据表"""
@@ -581,6 +842,12 @@ class PostgresManager(metaclass=SingletonMeta):
             """,
             "DELETE FROM api_keys WHERE user_id IS NULL",
             "ALTER TABLE IF EXISTS api_keys ALTER COLUMN user_id SET NOT NULL",
+            "ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS request_id VARCHAR(64)",
+            "ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS intent_hash VARCHAR(64)",
+            "ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP WITHOUT TIME ZONE",
+            "UPDATE api_keys SET is_enabled = FALSE, revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP) WHERE is_enabled = FALSE AND revoked_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_api_keys_request_id ON api_keys(request_id)",
+            "CREATE INDEX IF NOT EXISTS ix_api_keys_revoked_at ON api_keys(revoked_at)",
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_agents_slug ON agents(slug)",
             "CREATE INDEX IF NOT EXISTS ix_agents_backend_id ON agents(backend_id)",
             "CREATE INDEX IF NOT EXISTS ix_agents_is_subagent ON agents(is_subagent)",
@@ -645,6 +912,7 @@ class PostgresManager(metaclass=SingletonMeta):
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
             """,
+            *WORKDIR_PATH_SCHEMA_STATEMENTS,
             "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS agent_slug VARCHAR(64)",
             "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS conversation_thread_id VARCHAR(64)",
             "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS created_by_run_id VARCHAR(64)",
@@ -652,6 +920,8 @@ class PostgresManager(metaclass=SingletonMeta):
             "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'chat'",
             "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS channel VARCHAR(32) NOT NULL DEFAULT 'web'",
             "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS external_id VARCHAR(128)",
+            *AGENT_RUN_LEASE_SCHEMA_STATEMENTS,
+            *AGENT_RUN_FACT_SCHEMA_STATEMENTS,
             (
                 "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS "
                 "origin_metadata JSONB NOT NULL DEFAULT '{}'::jsonb"
@@ -671,6 +941,7 @@ class PostgresManager(metaclass=SingletonMeta):
             ),
             "ALTER TABLE IF EXISTS subagent_threads ADD COLUMN IF NOT EXISTS subagent_slug VARCHAR(64)",
             "ALTER TABLE IF EXISTS subagent_threads ADD COLUMN IF NOT EXISTS created_by_run_id VARCHAR(64)",
+            *RUNTIME_SCOPE_SCHEMA_STATEMENTS,
             """
             DO $$
             BEGIN

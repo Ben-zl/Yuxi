@@ -14,6 +14,7 @@ from yuxi.agentscope.runner import ensure_thread_session, recover_untracked_pend
 from yuxi.agentscope.thread_guard import has_pending_confirm
 from yuxi.repositories.agentscope_thread_sessions import AgentScopeThreadSession
 from yuxi.repositories.agent_run_repository import AgentRunRepository
+from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.storage.postgres.models_business import AgentRun
 
 
@@ -34,8 +35,9 @@ async def execute_run(
     model_spec: str | None = None,
     image_content: str | None = None,
     mapping: AgentScopeThreadSession | None = None,
+    persist_result: bool = True,
 ) -> GatewayRoundResult:
-    """执行一个已派发的 Run：事件写入 Redis Stream，终态回写 AgentRun。"""
+    """执行一个已派发的 Run，并按调用方需要持久化结果与终态。"""
     if mapping is None:
         mapping = await ensure_thread_session(
             db,
@@ -66,8 +68,53 @@ async def execute_run(
         configured_model_spec=mapping.model_spec,
         has_active_child_runs=lambda: has_active_child_runs(client, run.id, run.uid),
     )
-    await finalize_run(db, run, result)
+    if persist_result:
+        output_message = await persist_run_output(db, run, result)
+        if output_message is not None:
+            await AgentRunRepository(db).set_output_message(
+                run.id,
+                output_message.id,
+                worker_id=run.worker_id,
+            )
+        await finalize_run(db, run, result, worker_id=run.worker_id)
     return result
+
+
+async def persist_run_output(db: AsyncSession, run: AgentRun, result: GatewayRoundResult):
+    """将一个 AgentScope 回合的助手输出绑定到同一 Run。"""
+
+    if not (result.text or result.reasoning or result.tool_calls):
+        return None
+
+    output_message = await ConversationRepository(db).add_message_by_thread_id(
+        thread_id=run.conversation_thread_id,
+        role="assistant",
+        content=result.text,
+        message_type="text",
+        extra_metadata={
+            "request_id": run.request_id,
+            "run_id": run.id,
+            "token_usage": result.usage or {},
+            "additional_kwargs": {"reasoning_content": result.reasoning} if result.reasoning else {},
+        },
+        run_id=run.id,
+        request_id=run.request_id,
+    )
+    if output_message is None:
+        raise RuntimeError("回复消息落库失败：线程不存在")
+
+    conversation_repo = ConversationRepository(db)
+    for tool_call in result.tool_calls or []:
+        await conversation_repo.add_tool_call(
+            message_id=output_message.id,
+            tool_name=tool_call.get("name") or "unknown",
+            tool_input=tool_call.get("args") or {},
+            tool_output=tool_call.get("output") or "",
+            status=tool_call.get("status") or "pending",
+            error_message=tool_call.get("error_message"),
+            langgraph_tool_call_id=tool_call.get("id"),
+        )
+    return output_message
 
 
 def _terminal_error_message(result: GatewayRoundResult) -> str | None:
@@ -81,7 +128,13 @@ def _terminal_error_message(result: GatewayRoundResult) -> str | None:
     return result.error_message or "运行失败"
 
 
-async def finalize_run(db: AsyncSession, run: AgentRun, result: GatewayRoundResult) -> None:
+async def finalize_run(
+    db: AsyncSession,
+    run: AgentRun,
+    result: GatewayRoundResult,
+    *,
+    worker_id: str | None = None,
+) -> None:
     """按运行结果写 AgentRun 终态（执行路径与 resume 路径共用）。
 
     存在取消信号时终态归一为 cancelled（清除信号避免残留）——取消由
@@ -98,4 +151,5 @@ async def finalize_run(db: AsyncSession, run: AgentRun, result: GatewayRoundResu
         error_type=result.error_type,
         error_message=_terminal_error_message(result),
         token_usage=result.usage or {},
+        worker_id=worker_id,
     )

@@ -110,8 +110,17 @@ async def test_channel_steer_is_accepted_for_active_message_run(
 # ── AgentRunCreate request model ──
 
 
-def test_agent_run_create_accepts_thread_id():
-    from server.routers.agent_router import AgentRunCreate
+def test_agent_run_create_accepts_thread_id(monkeypatch: pytest.MonkeyPatch):
+    import importlib
+    import sys
+    from pathlib import Path
+    from types import ModuleType
+
+    routers = ModuleType("server.routers")
+    routers.__path__ = [str(Path(__file__).parents[3] / "server" / "routers")]
+    monkeypatch.setitem(sys.modules, "server.routers", routers)
+    monkeypatch.delitem(sys.modules, "server.routers.agent_router", raising=False)
+    AgentRunCreate = importlib.import_module("server.routers.agent_router").AgentRunCreate
 
     payload = AgentRunCreate(query="hi", agent_slug="bot", thread_id="t1")
     assert payload.thread_id == "t1"
@@ -133,9 +142,28 @@ async def session():
 
 
 async def _seed_thread(session, *, uid="user-1", msg_id=100, conv_id=10):
-    from yuxi.storage.postgres.models_business import Conversation, Message
+    from yuxi.storage.postgres.models_business import Conversation, Message, Project
 
-    session.add(Conversation(id=conv_id, thread_id="t1", uid=uid, agent_id="main", status="active"))
+    project_id = f"project-{uid}-t1"
+    session.add(
+        Project(
+            id=project_id,
+            uid=uid,
+            selection_status="implicit",
+            workdir_path=f"projects/{project_id}",
+            directory_mode="managed",
+        )
+    )
+    session.add(
+        Conversation(
+            id=conv_id,
+            thread_id="t1",
+            project_id=project_id,
+            uid=uid,
+            agent_id="main",
+            status="active",
+        )
+    )
     session.add(Message(id=msg_id, conversation_id=conv_id, role="user", content="hi"))
     await session.commit()
 
@@ -159,12 +187,14 @@ async def _seed_active_run(session, *, source="chat", status="running", run_type
         AgentRun(
             id="active-run",
             conversation_thread_id="t1",
+            runtime_scope_id="t1",
             agent_slug="main",
             uid="user-1",
             status=status,
             request_id="active-request",
             conversation_id=10,
             run_type=run_type,
+            created_by_run_id="parent-run" if run_type == "resume" else None,
             input_payload={},
         )
     )
@@ -442,7 +472,16 @@ async def test_intake_idempotent_rejects_scope_mismatch(session):
     from yuxi.storage.postgres.models_business import Conversation
 
     await _seed_thread(session)
-    session.add(Conversation(id=11, thread_id="t2", uid="user-1", agent_id="other", status="active"))
+    session.add(
+        Conversation(
+            id=11,
+            thread_id="t2",
+            project_id="project-user-1-t1",
+            uid="user-1",
+            agent_id="other",
+            status="active",
+        )
+    )
     await _create_request(session, request_id="req-scope")
 
     with pytest.raises(HTTPException) as exc_info:
@@ -556,7 +595,12 @@ async def test_dispatches_multiple_queued_requests_one_at_a_time(session):
     assert (await request_repo.get_by_request_id("request-b")).dispatched_run_id == run_b
     assert await request_repo.get_queue_position("request-c") == 1
 
-    await AgentRunRepository(session).set_terminal_status(run_b, status="completed")
+    terminal_run, changed = await AgentRunRepository(session).set_terminal_status(
+        run_b,
+        status="failed",
+    )
+    assert changed is True
+    terminal_run.runtime_cleanup_pending = False
     await session.commit()
     dispatched_c = await _dispatch_ready_head(
         db=session,
@@ -583,15 +627,34 @@ async def test_mark_run_terminal_sets_delivery_status(session):
     import uuid as _uuid
 
     from yuxi.repositories.agent_run_repository import AgentRunRepository
-    from yuxi.storage.postgres.models_business import AgentRun, Conversation, Message
+    from yuxi.storage.postgres.models_business import AgentRun, Conversation, Message, Project
 
     run_id = str(_uuid.uuid4())
-    session.add(Conversation(id=10, thread_id="t1", uid="user-1", agent_id="main", status="active"))
+    session.add(
+        Project(
+            id="project-terminal",
+            uid="user-1",
+            selection_status="implicit",
+            workdir_path="projects/project-terminal",
+            directory_mode="managed",
+        )
+    )
+    session.add(
+        Conversation(
+            id=10,
+            thread_id="t1",
+            project_id="project-terminal",
+            uid="user-1",
+            agent_id="main",
+            status="active",
+        )
+    )
     session.add(Message(id=100, conversation_id=10, role="user", content="hi", delivery_status="dispatched"))
     session.add(
         AgentRun(
             id=run_id,
             conversation_thread_id="t1",
+            runtime_scope_id="t1",
             agent_slug="main",
             uid="user-1",
             request_id="req-terminal",
@@ -621,15 +684,34 @@ async def test_mark_run_terminal_failed_sets_delivery_status(session):
     import uuid as _uuid
 
     from yuxi.repositories.agent_run_repository import AgentRunRepository
-    from yuxi.storage.postgres.models_business import AgentRun, Conversation, Message
+    from yuxi.storage.postgres.models_business import AgentRun, Conversation, Message, Project
 
     run_id = str(_uuid.uuid4())
-    session.add(Conversation(id=11, thread_id="t2", uid="user-1", agent_id="main", status="active"))
+    session.add(
+        Project(
+            id="project-failed",
+            uid="user-1",
+            selection_status="implicit",
+            workdir_path="projects/project-failed",
+            directory_mode="managed",
+        )
+    )
+    session.add(
+        Conversation(
+            id=11,
+            thread_id="t2",
+            project_id="project-failed",
+            uid="user-1",
+            agent_id="main",
+            status="active",
+        )
+    )
     session.add(Message(id=200, conversation_id=11, role="user", content="hi", delivery_status="dispatched"))
     session.add(
         AgentRun(
             id=run_id,
             conversation_thread_id="t2",
+            runtime_scope_id="t2",
             agent_slug="main",
             uid="user-1",
             request_id="req-failed",
@@ -668,6 +750,7 @@ async def test_reject_with_active_run_persists_request(session):
         AgentRun(
             id=str(_uuid.uuid4()),
             conversation_thread_id="t1",
+            runtime_scope_id="t1",
             agent_slug="main",
             uid="user-1",
             request_id="existing",
@@ -712,6 +795,7 @@ async def test_reject_idempotent(session):
         AgentRun(
             id=str(_uuid.uuid4()),
             conversation_thread_id="t1",
+            runtime_scope_id="t1",
             agent_slug="main",
             uid="user-1",
             request_id="existing",
@@ -778,6 +862,7 @@ async def _seed_terminal_run(session, *, run_id: str, status: str, created_at, f
         AgentRun(
             id=run_id,
             conversation_thread_id="t1",
+            runtime_scope_id="t1",
             agent_slug="main",
             uid="user-1",
             request_id=f"request-{run_id}",

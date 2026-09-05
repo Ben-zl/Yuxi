@@ -190,6 +190,13 @@ export const agentApi = {
   getAgentRun: (runId) => apiGet(`/api/agent/runs/${runId}`),
 
   /**
+   * 获取 Run 对应的 Langfuse 精确跳转地址
+   * @param {string} runId - run ID
+   * @returns {Promise<Object>}
+   */
+  getAgentRunLangfuseLink: (runId) => apiGet(`/api/agent/runs/${runId}/langfuse`),
+
+  /**
    * 取消 Run
    * @param {string} runId - run ID
    * @returns {Promise<Object>}
@@ -305,11 +312,13 @@ export const threadApi = {
    * @param {Object} metadata - 元数据
    * @returns {Promise} - 创建结果
    */
-  createThread: (agentId, title, metadata) =>
+  createThread: (agentId, title, metadata, { requestId, projectId } = {}) =>
     apiPost('/api/chat/thread', {
+      request_id: requestId,
       agent_id: agentId,
       title: title || '新的对话',
-      metadata: metadata || {}
+      metadata: metadata || {},
+      ...(projectId ? { project_id: projectId } : {})
     }),
 
   /**
@@ -349,31 +358,6 @@ export const threadApi = {
   getThreadAttachments: (threadId) => apiGet(`/api/chat/thread/${threadId}/attachments`),
 
   /**
-   * 列出线程文件（目录）
-   * @param {string} threadId
-   * @param {string} path
-   * @param {boolean} recursive
-   * @returns {Promise}
-   */
-  listThreadFiles: (threadId, path = '/home/gem/user-data', recursive = false) =>
-    apiGet(
-      `/api/chat/thread/${threadId}/files?path=${encodeURIComponent(path)}&recursive=${recursive}`
-    ),
-
-  /**
-   * 读取线程文本文件内容（分页）
-   * @param {string} threadId
-   * @param {string} path
-   * @param {number} offset
-   * @param {number} limit
-   * @returns {Promise}
-   */
-  readThreadFile: (threadId, path, offset = 0, limit = 2000) =>
-    apiGet(
-      `/api/chat/thread/${threadId}/files/content?path=${encodeURIComponent(path)}&offset=${offset}&limit=${limit}`
-    ),
-
-  /**
    * 获取线程文件下载/预览 URL
    * @param {string} threadId
    * @param {string} path
@@ -399,14 +383,27 @@ export const threadApi = {
   downloadThreadArtifact: (threadId, path) =>
     apiGet(threadApi.getThreadArtifactUrl(threadId, path, true), {}, true, 'blob'),
 
+  /** 读取允许跨 Project/User Data/Skills 的 artifact 预览字节。 */
+  previewThreadArtifact: (threadId, path) =>
+    apiGet(
+      `${threadApi.getThreadArtifactUrl(threadId, path, false)}?preview=true`,
+      {},
+      true,
+      'blob'
+    ),
+
   /**
-   * 保存交付物到 workspace/saved_artifacts
+   * 保存交付物到指定 workspace 目录
    * @param {string} threadId
    * @param {string} path
+   * @param {string} destinationPath
    * @returns {Promise}
    */
-  saveThreadArtifactToWorkspace: (threadId, path) =>
-    apiPost(`/api/chat/thread/${threadId}/artifacts/save`, { path }),
+  saveThreadArtifactToWorkspace: (threadId, path, destinationPath) =>
+    apiPost(`/api/chat/thread/${threadId}/artifacts/save`, {
+      path,
+      destination_path: destinationPath
+    }),
 
   /**
    * 上传临时附件
@@ -437,21 +434,6 @@ export const threadApi = {
    */
   confirmTmpThreadAttachments: (threadId, attachments) =>
     apiPost(`/api/chat/thread/${threadId}/attachments/confirm`, { attachments }),
-
-  /**
-   * 上传附件
-   * @param {string} threadId
-   * @param {File} file
-   * @returns {Promise}
-   */
-  uploadThreadAttachment: (threadId, file) => {
-    const formData = new FormData()
-    formData.append('file', file)
-    return apiRequest(`/api/chat/thread/${threadId}/attachments`, {
-      method: 'POST',
-      body: formData
-    })
-  },
 
   /**
    * 删除附件

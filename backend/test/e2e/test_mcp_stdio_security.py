@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import delete, select
 
 from yuxi.agents.mcp.service import ensure_builtin_mcp_servers_in_db, get_mcp_tools
@@ -13,11 +14,21 @@ from yuxi.storage.postgres.models_business import MCPServer
 pytestmark = pytest.mark.e2e
 
 
+@pytest_asyncio.fixture
+async def current_loop_pg_manager():
+    """让全局 PostgreSQL 引擎绑定到当前测试事件循环。"""
+    if pg_manager.async_engine is not None:
+        await pg_manager.async_engine.dispose()
+    pg_manager._initialized = False
+    pg_manager.initialize()
+    yield pg_manager
+
+
 async def test_stdio_mcp_payload_is_rejected_without_side_effects(e2e_client, e2e_headers):
     """恶意 stdio 请求应在持久化和进程启动前被拒绝。"""
     unique_id = uuid.uuid4().hex[:8]
     slug = f"pytest-unsafe-mcp-{unique_id}"
-    marker = Path(f"/app/saves/{slug}.marker")
+    marker = Path(f"/tmp/{slug}.marker")
 
     try:
         response = await e2e_client.post(
@@ -50,15 +61,18 @@ async def test_stdio_mcp_payload_is_rejected_without_side_effects(e2e_client, e2
             marker.unlink(missing_ok=True)
 
 
-async def test_legacy_stdio_mcp_is_disabled_without_starting_process(e2e_client, e2e_headers):
+async def test_legacy_stdio_mcp_is_disabled_without_starting_process(
+    e2e_client,
+    e2e_headers,
+    current_loop_pg_manager,
+):
     """历史 stdio 记录应被迁移逻辑和运行时加载双重拦截。"""
     unique_id = uuid.uuid4().hex[:8]
     slug = f"pytest-legacy-stdio-{unique_id}"
-    marker = Path(f"/app/saves/{slug}.marker")
+    marker = Path(f"/tmp/{slug}.marker")
 
-    pg_manager.initialize()
     try:
-        async with pg_manager.get_async_session_context() as db:
+        async with current_loop_pg_manager.get_async_session_context() as db:
             db.add(
                 MCPServer(
                     slug=slug,
@@ -76,7 +90,7 @@ async def test_legacy_stdio_mcp_is_disabled_without_starting_process(e2e_client,
         await ensure_builtin_mcp_servers_in_db()
         assert await get_mcp_tools(slug, cache=False, force_refresh=True) == []
 
-        async with pg_manager.get_async_session_context() as db:
+        async with current_loop_pg_manager.get_async_session_context() as db:
             server = await db.scalar(select(MCPServer).where(MCPServer.slug == slug))
             assert server is not None
             assert server.enabled == 0
@@ -85,7 +99,7 @@ async def test_legacy_stdio_mcp_is_disabled_without_starting_process(e2e_client,
         assert test_response.status_code == 400, test_response.text
         assert not marker.exists(), "legacy stdio MCP created a file in the API container"
     finally:
-        async with pg_manager.get_async_session_context() as db:
+        async with current_loop_pg_manager.get_async_session_context() as db:
             await db.execute(delete(MCPServer).where(MCPServer.slug == slug))
             await db.commit()
         marker.unlink(missing_ok=True)

@@ -2,12 +2,23 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { threadApi } from '@/apis'
 import { handleChatError } from '@/utils/errorHandler'
+import { createThreadDraftStore } from '@/utils/thread_draft'
 
 const PAGE_SIZE = 100
+const threadDraftStore = createThreadDraftStore()
+
+function countNonPinnedThreads(items) {
+  let count = 0
+  for (const item of items) {
+    if (!item.is_pinned) count += 1
+  }
+  return count
+}
 
 export const useChatThreadsStore = defineStore('chatThreads', () => {
   const threads = ref([])
   const currentThreadId = ref(null)
+  const threadCreationInFlight = ref(false)
   const hasMoreThreads = ref(true)
   const isLoadingMoreThreads = ref(false)
 
@@ -16,8 +27,14 @@ export const useChatThreadsStore = defineStore('chatThreads', () => {
     return threads.value.find((thread) => thread.id === currentThreadId.value) || null
   })
 
-  const setCurrentThreadId = (threadId) => {
+  const setCurrentThreadId = (threadId, { force = false } = {}) => {
+    if (threadCreationInFlight.value && !force) return false
     currentThreadId.value = threadId || null
+    return true
+  }
+
+  const setThreadCreationInFlight = (value) => {
+    threadCreationInFlight.value = Boolean(value)
   }
 
   const upsertThread = (thread) => {
@@ -69,12 +86,12 @@ export const useChatThreadsStore = defineStore('chatThreads', () => {
     try {
       const fetchedThreads = await threadApi.getThreads(agentId, PAGE_SIZE, 0)
       threads.value = fetchedThreads || []
-      hasMoreThreads.value = Boolean(fetchedThreads && fetchedThreads.length >= PAGE_SIZE)
+      hasMoreThreads.value = Boolean(fetchedThreads && countNonPinnedThreads(fetchedThreads) >= PAGE_SIZE)
       if (
         currentThreadId.value &&
         !threads.value.find((thread) => thread.id === currentThreadId.value)
       ) {
-        currentThreadId.value = null
+        setCurrentThreadId(null)
       }
       return threads.value
     } catch (error) {
@@ -89,13 +106,14 @@ export const useChatThreadsStore = defineStore('chatThreads', () => {
 
     isLoadingMoreThreads.value = true
     try {
-      const fetchedThreads = await threadApi.getThreads(agentId, PAGE_SIZE, threads.value.length)
+      const nonPinnedOffset = countNonPinnedThreads(threads.value)
+      const fetchedThreads = await threadApi.getThreads(agentId, PAGE_SIZE, nonPinnedOffset)
       if (fetchedThreads && fetchedThreads.length > 0) {
         // 后端分页会重复返回置顶项，这里只追加列表中尚不存在的线程。
         const existingIds = new Set(threads.value.map((thread) => thread.id))
         const newThreads = fetchedThreads.filter((thread) => !existingIds.has(thread.id))
         threads.value = [...threads.value, ...newThreads]
-        hasMoreThreads.value = newThreads.length >= PAGE_SIZE
+        hasMoreThreads.value = countNonPinnedThreads(fetchedThreads) >= PAGE_SIZE
       } else {
         hasMoreThreads.value = false
       }
@@ -107,11 +125,11 @@ export const useChatThreadsStore = defineStore('chatThreads', () => {
     }
   }
 
-  const createThread = async (agentId, title = '新的对话', metadata = {}) => {
+  const createThread = async (agentId, title = '新的对话', metadata = {}, options = {}) => {
     if (!agentId) return null
 
     try {
-      const thread = await threadApi.createThread(agentId, title, metadata)
+      const thread = await threadApi.createThread(agentId, title, metadata, options)
       if (thread) {
         threads.value = [thread, ...threads.value.filter((item) => item.id !== thread.id)]
       }
@@ -129,14 +147,37 @@ export const useChatThreadsStore = defineStore('chatThreads', () => {
     try {
       await threadApi.deleteThread(threadId)
       threads.value = threads.value.filter((thread) => thread.id !== threadId)
+      // 线程已删除，同步清理其输入草稿
+      threadDraftStore.remove(threadId)
       if (currentThreadId.value === threadId) {
-        currentThreadId.value = null
+        setCurrentThreadId(null)
       }
     } catch (error) {
       console.error('Failed to delete thread:', error)
       handleChatError(error, 'delete')
       throw error
     }
+  }
+
+  const removeThreadsByProject = (projectId) => {
+    if (!projectId) return []
+    const removedIds = []
+    const remainingThreads = []
+    for (const thread of threads.value) {
+      if (thread.project_id !== projectId) {
+        remainingThreads.push(thread)
+        continue
+      }
+      removedIds.push(thread.id)
+    }
+    if (!removedIds.length) return []
+
+    threads.value = remainingThreads
+    removedIds.forEach((threadId) => threadDraftStore.remove(threadId))
+    if (removedIds.includes(currentThreadId.value)) {
+      setCurrentThreadId(null)
+    }
+    return removedIds
   }
 
   const updateThread = async (threadId, title, isPinned, toolApprovalMode) => {
@@ -166,9 +207,11 @@ export const useChatThreadsStore = defineStore('chatThreads', () => {
     threads,
     currentThreadId,
     currentThread,
+    threadCreationInFlight,
     hasMoreThreads,
     isLoadingMoreThreads,
     setCurrentThreadId,
+    setThreadCreationInFlight,
     upsertThread,
     setThreadStatus,
     markThreadViewed,
@@ -177,6 +220,7 @@ export const useChatThreadsStore = defineStore('chatThreads', () => {
     loadMoreThreads,
     createThread,
     deleteThread,
+    removeThreadsByProject,
     updateThread
   }
 })

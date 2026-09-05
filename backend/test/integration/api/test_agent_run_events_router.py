@@ -80,6 +80,8 @@ async def test_run_events_verbose_false_returns_compact_payload(test_client, sta
                 "agent_slug": "deep-research",
                 "backend_id": "ChatbotAgent",
                 "uid": uid,
+                "run_type": "chat",
+                "source": "chat",
             },
             thread_id=thread_id,
         )
@@ -154,7 +156,10 @@ async def test_run_events_verbose_false_returns_compact_payload(test_client, sta
             assert response.status_code == 200, response.text
             payloads = await _collect_sse_payloads(response)
 
-        assert {event for event, _payload, _event_id in payloads} == {"messages", "end"}
+        assert {event for event, _payload, _event_id in payloads} == {"metadata", "messages", "end"}
+
+        metadata_event = next(item for item in payloads if item[0] == "metadata")
+        assert metadata_event[1]["payload"] == {"run_type": "chat", "source": "chat"}
 
         message_event = next(item for item in payloads if item[0] == "messages")
         message_chunk = message_event[1]["payload"]["items"][0]

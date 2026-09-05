@@ -5,7 +5,13 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.repositories.agent_run_repository import AgentRunRepository
-from yuxi.storage.postgres.models_business import AgentRun, Base, Conversation, SubagentThread
+from yuxi.storage.postgres.models_business import (
+    AgentRun,
+    Base,
+    Conversation,
+    Project,
+    SubagentThread,
+)
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
@@ -25,6 +31,7 @@ async def _seed_subagent_runs(db, *, relation_child_thread_id: str = "child-thre
     child_run = AgentRun(
         id="child-run",
         conversation_thread_id="child-thread",
+        runtime_scope_id="parent-thread",
         agent_slug="worker",
         uid="user-1",
         status="completed",
@@ -37,8 +44,29 @@ async def _seed_subagent_runs(db, *, relation_child_thread_id: str = "child-thre
     )
     db.add_all(
         [
-            Conversation(id=10, thread_id="parent-thread", uid="user-1", agent_id="main", status="active"),
-            Conversation(id=20, thread_id="child-thread", uid="user-1", agent_id="worker", status="subagent"),
+            Project(
+                id="project-1",
+                uid="user-1",
+                selection_status="implicit",
+                workdir_path="projects/project-1",
+                directory_mode="managed",
+            ),
+            Conversation(
+                id=10,
+                thread_id="parent-thread",
+                project_id="project-1",
+                uid="user-1",
+                agent_id="main",
+                status="active",
+            ),
+            Conversation(
+                id=20,
+                thread_id="child-thread",
+                project_id="project-1",
+                uid="user-1",
+                agent_id="worker",
+                status="subagent",
+            ),
             SubagentThread(
                 id=77,
                 uid="user-1",
@@ -51,6 +79,7 @@ async def _seed_subagent_runs(db, *, relation_child_thread_id: str = "child-thre
             AgentRun(
                 id="parent-run",
                 conversation_thread_id="parent-thread",
+                runtime_scope_id="parent-thread",
                 agent_slug="main",
                 uid="user-1",
                 status="completed",
@@ -115,6 +144,7 @@ async def _seed_thread_run(db, *, thread_id: str, run_id: str, status: str, run_
     run = AgentRun(
         id=run_id,
         conversation_thread_id=thread_id,
+        runtime_scope_id=thread_id,
         agent_slug="main",
         uid="user-1",
         status=status,
@@ -130,7 +160,7 @@ async def _seed_thread_run(db, *, thread_id: str, run_id: str, status: str, run_
 async def test_get_latest_top_level_runs_for_threads_picks_latest_chat_resume(session):
     await _seed_thread_run(session, thread_id="t1", run_id="t1-old", status="completed")
     await _seed_thread_run(session, thread_id="t1", run_id="t1-running", status="running")
-    await _seed_thread_run(session, thread_id="t2", run_id="t2-sub", status="running", run_type="subagent")
+    await _seed_thread_run(session, thread_id="t2", run_id="t2-sub", status="completed", run_type="subagent")
     await _seed_thread_run(session, thread_id="t2", run_id="t2-done", status="completed")
     await session.commit()
 
@@ -146,6 +176,7 @@ async def test_get_latest_top_level_runs_for_threads_scopes_by_user(session):
         AgentRun(
             id="t1-other",
             conversation_thread_id="t1",
+            runtime_scope_id="t1",
             agent_slug="main",
             uid="user-2",
             status="running",
@@ -185,6 +216,7 @@ async def test_list_child_runs_by_thread_returns_children_from_all_top_level_run
             AgentRun(
                 id="child-1",
                 conversation_thread_id="child-thread-1",
+                runtime_scope_id="thread-1",
                 agent_slug="worker-1",
                 uid="user-1",
                 status="completed",
@@ -196,6 +228,7 @@ async def test_list_child_runs_by_thread_returns_children_from_all_top_level_run
             AgentRun(
                 id="child-2",
                 conversation_thread_id="child-thread-2",
+                runtime_scope_id="thread-1",
                 agent_slug="worker-2",
                 uid="user-1",
                 status="completed",
@@ -234,12 +267,12 @@ async def test_set_terminal_status_persists_token_usage_only_for_winner(session)
 
     persisted, changed = await repo.set_terminal_status(
         run.id,
-        status="completed",
+        status="failed",
         token_usage=usage,
     )
     loser, loser_changed = await repo.set_terminal_status(
         run.id,
-        status="failed",
+        status="completed",
         token_usage={"total": {"input_tokens": 999}},
     )
 
@@ -260,6 +293,8 @@ async def test_set_terminal_status_normalizes_cancel_request_under_lock(session)
         request_id="cancelled-team-request",
         input_payload={},
     )
+    _, claimed = await repo.mark_running(run.id, worker_id="worker-1")
+    assert claimed is True
     await repo.request_cancel(run.id)
 
     persisted, changed = await repo.set_terminal_status(
@@ -267,6 +302,7 @@ async def test_set_terminal_status_normalizes_cancel_request_under_lock(session)
         status="completed",
         error_type="unexpected",
         error_message="should be cleared",
+        worker_id="worker-1",
         cancel_requested_as_cancelled=True,
     )
 

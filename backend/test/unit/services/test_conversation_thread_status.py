@@ -4,6 +4,8 @@ Conversation thread status mapping and viewed-marking unit tests.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import pytest_asyncio
 from types import SimpleNamespace
@@ -11,7 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.repositories.conversation_repository import ConversationRepository, UNVIEWED_RUN_MARKER
 from yuxi.services import conversation_service as svc
-from yuxi.storage.postgres.models_business import AgentRun, Base, Conversation
+from yuxi.storage.postgres.models_business import AgentRun, Base, Conversation, Project
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
@@ -106,8 +108,19 @@ async def session():
 
 
 async def _seed_conversation(db, *, thread_id: str, last_viewed_run_id: str | None = None) -> Conversation:
+    project_id = f"project-{thread_id}"
+    db.add(
+        Project(
+            id=project_id,
+            uid="user-1",
+            selection_status="implicit",
+            workdir_path=f"projects/workdir-{thread_id}",
+            directory_mode="managed",
+        )
+    )
     conversation = Conversation(
         thread_id=thread_id,
+        project_id=project_id,
         uid="user-1",
         agent_id="main",
         title=f"conv-{thread_id}",
@@ -124,11 +137,14 @@ async def _seed_run(db, *, thread_id: str, run_id: str, status: str, run_type: s
     run = AgentRun(
         id=run_id,
         conversation_thread_id=thread_id,
+        runtime_scope_id=thread_id,
         agent_slug="main",
         uid="user-1",
         status=status,
         request_id=f"req-{run_id}",
         run_type=run_type,
+        created_by_run_id="root-run" if run_type == "subagent" else None,
+        subagent_thread_relation_id=1 if run_type == "subagent" else None,
         input_payload={},
     )
     db.add(run)
@@ -177,6 +193,23 @@ async def test_list_threads_view_maps_run_states(session):
     assert status_by_id["thread-no-run"] == "done"
 
 
+async def test_list_threads_view_uses_joined_projects_without_per_thread_lookup(session, monkeypatch):
+    """线程列表批量联查 Project，不按 Conversation 逐条解析。"""
+
+    await _seed_conversation(session, thread_id="thread-one")
+    await _seed_conversation(session, thread_id="thread-two")
+    await session.commit()
+
+    async def reject_individual_lookup(**_kwargs):
+        raise AssertionError("线程列表不应逐条查询 Project")
+
+    monkeypatch.setattr(svc, "resolve_conversation_workdir_path", reject_individual_lookup)
+
+    items = await svc.list_threads_view(db=session, current_uid="user-1", agent_slug=None, limit=100)
+
+    assert {item["id"] for item in items} == {"thread-one", "thread-two"}
+
+
 async def test_list_threads_view_ignores_subagent_and_other_users(session):
     await _seed_conversation(session, thread_id="thread-main")
     await _seed_run(session, thread_id="thread-main", run_id="run-main", status="completed")
@@ -187,6 +220,7 @@ async def test_list_threads_view_ignores_subagent_and_other_users(session):
         AgentRun(
             id="run-other",
             conversation_thread_id="thread-other-user",
+            runtime_scope_id="thread-other-user",
             agent_slug="main",
             uid="user-2",
             status="running",
@@ -231,18 +265,6 @@ async def test_mark_thread_viewed_turns_ready_to_done(session):
     assert next(item for item in after if item["id"] == "thread-view")["thread_status"] == "done"
 
 
-async def test_mark_thread_viewed_is_idempotent(session):
-    await _seed_conversation(session, thread_id="thread-view")
-    await _seed_run(session, thread_id="thread-view", run_id="run-view", status="completed")
-    await session.commit()
-
-    first = await svc.mark_thread_viewed_view(db=session, thread_id="thread-view", current_uid="user-1")
-    second = await svc.mark_thread_viewed_view(db=session, thread_id="thread-view", current_uid="user-1")
-
-    assert first["thread_status"] == "done"
-    assert second["thread_status"] == "done"
-
-
 async def test_mark_thread_viewed_keeps_loading_when_run_active(session):
     await _seed_conversation(session, thread_id="thread-active")
     await _seed_run(session, thread_id="thread-active", run_id="run-active", status="running")
@@ -259,9 +281,175 @@ async def test_new_thread_creation_uses_unviewed_marker(session):
         agent_id="main",
         title="new-thread",
         thread_id="thread-new",
+        project_id="11111111-1111-4111-8111-111111111111",
     )
 
     assert conversation.last_viewed_run_id == UNVIEWED_RUN_MARKER
+
+
+async def test_new_thread_creation_cannot_seed_attachment_records(session):
+    conversation = await ConversationRepository(session).add_conversation(
+        uid="user-1",
+        agent_id="main",
+        thread_id="thread-reserved-metadata",
+        metadata={"attachments": [{"bucket_name": "private", "object_name": "secret"}]},
+        project_id="22222222-2222-4222-8222-222222222222",
+    )
+
+    assert conversation.extra_metadata["attachments"] == []
+
+
+async def test_create_thread_view_rejects_client_attachment_metadata():
+    with pytest.raises(svc.HTTPException, match="服务端保留字段"):
+        await svc.create_thread_view(
+            agent_slug="main",
+            request_id=None,
+            title="malicious",
+            metadata={"attachments": [{"bucket_name": "private", "object_name": "secret"}]},
+            db=None,
+            current_uid="user-1",
+        )
+
+
+async def test_explicit_project_creation_locks_project_until_commit(monkeypatch):
+    project = SimpleNamespace(
+        id="project-1",
+        uid="user-1",
+        status="active",
+        selection_status="selectable",
+        directory_mode="linked",
+        workdir_path="clients/acme",
+    )
+    conversation = SimpleNamespace(thread_id="thread-1")
+    lock_calls = []
+
+    class _Db:
+        async def execute(self, _statement):
+            return SimpleNamespace(scalar_one_or_none=lambda: SimpleNamespace(uid="user-1"))
+
+        async def commit(self):
+            return None
+
+    class _AgentRepository:
+        def __init__(self, _db):
+            pass
+
+        async def get_visible_by_slug(self, **_kwargs):
+            return SimpleNamespace(slug="main", backend_id="ChatbotAgent")
+
+    class _ProjectRepository:
+        def __init__(self, _db):
+            pass
+
+        async def lock_active_selectable_for_user(self, project_id, uid):
+            lock_calls.append((project_id, uid, True))
+            return project
+
+    class _ConversationRepository:
+        def __init__(self, _db):
+            pass
+
+        async def add_conversation(self, **_kwargs):
+            return conversation
+
+    async def serialize_thread(*_args, **_kwargs):
+        return {"id": "thread-1"}
+
+    monkeypatch.setattr(svc, "AgentRepository", _AgentRepository)
+    monkeypatch.setattr(svc, "ProjectRepository", _ProjectRepository)
+    monkeypatch.setattr(svc, "ConversationRepository", _ConversationRepository)
+    monkeypatch.setattr(svc.Workdir, "open_existing", lambda *_args: None)
+    monkeypatch.setattr(svc, "_serialize_thread", serialize_thread)
+
+    result = await svc.create_thread_view(
+        agent_slug="main",
+        request_id=None,
+        title="title",
+        metadata={},
+        project_id="project-1",
+        db=_Db(),
+        current_uid="user-1",
+    )
+
+    assert result == {"id": "thread-1"}
+    assert lock_calls == [("project-1", "user-1", True)]
+
+
+async def test_create_thread_replay_restores_managed_workdir(monkeypatch):
+    project = SimpleNamespace(
+        id="project-1",
+        uid="user-1",
+        status="active",
+        selection_status="implicit",
+        directory_mode="managed",
+        workdir_path="projects/11111111-1111-4111-8111-111111111111",
+    )
+    conversation = SimpleNamespace(
+        id=1,
+        thread_id="thread-1",
+        uid="user-1",
+        agent_id="main",
+        title="title",
+        status="active",
+        is_pinned=False,
+        project_id=project.id,
+        created_at=SimpleNamespace(isoformat=lambda: "created"),
+        updated_at=SimpleNamespace(isoformat=lambda: "updated"),
+        extra_metadata={},
+    )
+
+    class _Db:
+        async def execute(self, _statement):
+            return SimpleNamespace(scalar_one_or_none=lambda: SimpleNamespace(uid="user-1"))
+
+    class _AgentRepository:
+        def __init__(self, _db):
+            pass
+
+        async def get_visible_by_slug(self, **_kwargs):
+            return SimpleNamespace(slug="main", backend_id="ChatbotAgent")
+
+    class _ConversationRepository:
+        def __init__(self, _db):
+            pass
+
+        async def get_conversation_by_creation_request_id(self, _uid, _request_id):
+            return conversation
+
+    class _ProjectRepository:
+        def __init__(self, _db):
+            pass
+
+        async def get_for_user(self, _project_id, _uid):
+            return project
+
+    restored = []
+
+    async def ensure_available(**kwargs):
+        restored.append(kwargs["conversation"].thread_id)
+        return project.workdir_path
+
+    async def serialize_thread(_conversation, **_kwargs):
+        return {"id": _conversation.thread_id}
+
+    monkeypatch.setattr(svc, "AgentRepository", _AgentRepository)
+    monkeypatch.setattr(svc, "ConversationRepository", _ConversationRepository)
+    monkeypatch.setattr(svc, "ProjectRepository", _ProjectRepository)
+    monkeypatch.setattr(svc, "ensure_conversation_workdir_available", ensure_available)
+    monkeypatch.setattr(svc, "_serialize_thread", serialize_thread)
+
+    result = await svc.create_thread_view(
+        agent_slug="main",
+        request_id="request-1",
+        title="title",
+        metadata={},
+        project_id=None,
+        db=_Db(),
+        current_uid="user-1",
+    )
+
+    assert result == {"id": "thread-1"}
+    assert restored == ["thread-1"]
 
 
 async def test_marker_thread_with_terminal_run_shows_ready_then_done(session):

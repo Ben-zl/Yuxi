@@ -1,5 +1,39 @@
 <template>
   <div class="file-table-container">
+    <!-- 解析/批量解析/重试解析参数配置模态框 -->
+    <a-modal
+      v-model:open="parseConfigModalVisible"
+      :title="parseConfigModalTitle"
+      :confirm-loading="parseConfigModalLoading"
+      width="560px"
+      @cancel="handleParseConfigCancel"
+    >
+      <template #footer>
+        <a-button key="back" @click="handleParseConfigCancel">取消</a-button>
+        <a-button key="submit" type="primary" @click="handleParseConfigConfirm">开始解析</a-button>
+      </template>
+      <div class="parse-params">
+        <a-alert
+          v-if="isPendingParseOperation"
+          class="parse-pending-alert"
+          type="info"
+          show-icon
+          :message="`将提交 ${pendingParseTotalText} 个待解析文件，任务会在后台按批处理，可在任务中心查看进度。`"
+        />
+        <div class="setting-item">
+          <div class="setting-label">OCR 引擎（仅应用于 PDF/图片文件）</div>
+          <div class="setting-content">
+            <OCRSelector
+              v-model="parseParams.ocr_engine"
+              :disabled="parseConfigModalLoading"
+              @options-loaded="handleOcrOptionsLoaded"
+            />
+          </div>
+          <p class="param-description">选择用于识别 PDF 和图片中文字的 OCR 引擎</p>
+        </div>
+      </div>
+    </a-modal>
+
     <!-- 入库/重新入库参数配置模态框 -->
     <a-modal
       v-model:open="indexConfigModalVisible"
@@ -45,6 +79,20 @@
       />
     </a-modal>
 
+    <a-modal
+      v-model:open="renameFolderModalVisible"
+      title="重命名文件夹"
+      :confirm-loading="renameFolderLoading"
+      @ok="handleRenameFolder"
+    >
+      <a-input
+        v-model:value="renamedFolderName"
+        aria-label="文件夹名称"
+        placeholder="请输入文件夹名称"
+        @pressEnter="handleRenameFolder"
+      />
+    </a-modal>
+
     <FileBrowserTable
       class="knowledge-file-browser"
       :rows="files"
@@ -58,9 +106,11 @@
       :empty-text="emptyText"
       refreshable
       :refreshing="refreshing"
+      :breadcrumb-droppable="canUseFileMutations"
       @refresh="handleRefresh"
       @open-row="handleOpenRow"
       @breadcrumb-click="handleBreadcrumbPayloadClick"
+      @breadcrumb-drop="handleBreadcrumbDrop"
       @page-change="handleTablePageChange"
     >
       <template #breadcrumb-suffix>
@@ -69,6 +119,23 @@
 
       <template #toolbar-actions>
         <div class="panel-actions">
+          <button
+            type="button"
+            class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-table-mindmap-button"
+            @click="emit('mindmap')"
+          >
+            <MapIcon :size="14" />
+            <span>思维导图</span>
+          </button>
+          <button
+            type="button"
+            class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-table-search-button"
+            @click="emit('search')"
+          >
+            <Search :size="14" />
+            <span>搜索文件</span>
+          </button>
+
           <div class="panel-actions-default">
             <a-dropdown trigger="click">
               <a-button
@@ -199,7 +266,19 @@
       </template>
 
       <template #name="{ row }">
-        <span class="file-name-cell">
+        <span
+          class="file-name-cell"
+          :class="{
+            'is-dragging': draggedRecord?.file_id === row.file_id,
+            'is-drop-target': dragOverFolderId === row.file_id
+          }"
+          :draggable="canDragRow(row)"
+          @dragstart="handleDragStart($event, row)"
+          @dragover="handleDragOver($event, row)"
+          @dragleave="handleDragLeave($event, row)"
+          @drop.stop="handleDrop($event, row)"
+          @dragend="resetDragState"
+        >
           <template v-if="row.is_folder">
             <span class="folder-row" :title="row.filename" @click.stop="openFolder(row)">
               <FileTypeIcon is-dir :size="16" :style="{ marginRight: '8px' }" />
@@ -257,7 +336,7 @@
       </template>
 
       <template #cell-created_by="{ row }">
-        <span v-if="row.is_folder || !row.created_by" class="file-creator-empty">-</span>
+        <span v-if="row.is_virtual_folder || !row.created_by" class="file-creator-empty">-</span>
         <a-tooltip v-else :title="row.created_by_name || row.created_by">
           <span class="file-creator">
             <FallbackAvatar
@@ -276,7 +355,7 @@
 
       <template #cell-created_at="{ row, text }">
         <span class="file-time-cell">
-          {{ row.is_folder ? '-' : formatFileTableTime(text) }}
+          {{ row.is_virtual_folder ? '-' : formatFileTableTime(text) }}
         </span>
       </template>
 
@@ -292,6 +371,15 @@
             <template #content>
               <div class="file-action-list">
                 <template v-if="row.is_folder">
+                  <a-button
+                    v-if="canUseFileMutations"
+                    type="text"
+                    block
+                    @click="showRenameFolderModal(row)"
+                  >
+                    <template #icon><component :is="h(Pencil)" size="14" /></template>
+                    重命名
+                  </a-button>
                   <a-button
                     v-if="!readonly"
                     type="text"
@@ -385,6 +473,8 @@
 <script setup>
 import { ref, computed, h, watch } from 'vue'
 import { useDatabaseStore } from '@/stores/database'
+import { useConfigStore } from '@/stores/config'
+import OCRSelector from '@/components/OCRSelector.vue'
 import { message, Modal } from 'ant-design-vue'
 import { documentApi } from '@/apis/knowledge_api'
 import {
@@ -401,6 +491,11 @@ import {
   getFileStatusSortWeight,
   getFileStatusView
 } from '@/utils/knowledge_file_policy'
+import {
+  canDragKnowledgeFile,
+  canDropKnowledgeFileIntoFolder,
+  canMutateKnowledgeFiles
+} from '@/utils/knowledgeFileMutations'
 import {
   CheckCircleFilled,
   HourglassFilled,
@@ -419,10 +514,15 @@ import {
   FileText,
   Database,
   Filter,
-  MoreHorizontal
-} from 'lucide-vue-next'
+  MoreHorizontal,
+  Pencil,
+  Search,
+  Map as MapIcon
+} from '@lucide/vue'
 
 const store = useDatabaseStore()
+
+const emit = defineEmits(['mindmap', 'search'])
 
 const props = defineProps({
   readonly: { type: Boolean, default: false }
@@ -486,10 +586,12 @@ const fileBreadcrumbItems = computed(() =>
   folderBreadcrumbs.value.map((item, index) => ({
     ...item,
     key: item.file_id || `root-${index}`,
-    name: item.filename || '全部文件'
+    name: item.filename || '全部文件',
+    dropDisabled: Boolean(item.is_virtual_folder)
   }))
 )
 const isFilteredView = computed(() => Boolean(store.fileBrowser.recursive))
+const isVirtualPathView = computed(() => Boolean(store.fileBrowser.pathPrefix))
 const refreshing = computed(() => store.state.databaseLoading || store.fileBrowser.loading)
 const lock = computed(() => store.state.lock)
 const batchDeleting = computed(() => store.state.batchDeleting)
@@ -566,6 +668,7 @@ defineExpose({
     await applyFilters({ status })
   },
   startPendingIndex: (count) => startPendingIndex(count),
+  startPendingParse: (count) => startPendingParse(count),
   getCurrentFolderId: () => store.fileBrowser.parentId,
   refresh: () => handleRefresh()
 })
@@ -582,6 +685,15 @@ const toggleSelectionMode = () => {
   }
 }
 
+const refreshAfterMutation = async () => {
+  try {
+    await handleRefresh()
+  } catch (error) {
+    console.error(error)
+    message.warning('操作已完成，但列表刷新失败，请手动刷新')
+  }
+}
+
 const handleCreateFolder = async () => {
   if (!newFolderName.value.trim()) {
     message.warning('请输入文件夹名称')
@@ -593,7 +705,7 @@ const handleCreateFolder = async () => {
     await documentApi.createFolder(store.kbId, newFolderName.value, currentParentId.value)
     message.success('创建成功')
     createFolderModalVisible.value = false
-    handleRefresh()
+    await refreshAfterMutation()
   } catch (error) {
     console.error(error)
     message.error('创建失败: ' + (error.message || '未知错误'))
@@ -602,10 +714,161 @@ const handleCreateFolder = async () => {
   }
 }
 
+const renameFolderModalVisible = ref(false)
+const renameFolderLoading = ref(false)
+const renamedFolderName = ref('')
+const folderBeingRenamed = ref(null)
+
+const showRenameFolderModal = (record) => {
+  if (!canUseFileMutations.value || record.is_virtual_folder) return
+  closePopover(record.file_id)
+  folderBeingRenamed.value = record
+  renamedFolderName.value = record.filename || ''
+  renameFolderModalVisible.value = true
+}
+
+const handleRenameFolder = async () => {
+  if (!canUseFileMutations.value || !folderBeingRenamed.value) return
+  const folderName = renamedFolderName.value.trim()
+  if (!folderName) {
+    message.warning('请输入文件夹名称')
+    return
+  }
+
+  renameFolderLoading.value = true
+  try {
+    await documentApi.renameFolder(store.kbId, folderBeingRenamed.value.file_id, folderName)
+    renameFolderModalVisible.value = false
+    message.success('重命名成功')
+    await refreshAfterMutation()
+  } catch (error) {
+    console.error(error)
+    message.error('重命名失败: ' + (error.message || '未知错误'))
+  } finally {
+    renameFolderLoading.value = false
+  }
+}
+
+const draggedRecord = ref(null)
+const dragOverFolderId = ref(null)
+
+const canUseFileMutations = computed(() =>
+  canMutateKnowledgeFiles({
+    readonly: readonly.value,
+    locked: lock.value,
+    filtered: isFilteredView.value,
+    virtualPath: isVirtualPathView.value
+  })
+)
+
+const canDragRow = (record) =>
+  canDragKnowledgeFile({
+    enabled: canUseFileMutations.value,
+    record,
+    breadcrumbs: fileBreadcrumbItems.value,
+    files: files.value
+  })
+
+const canDropInto = (target) => canDropKnowledgeFileIntoFolder(draggedRecord.value, target)
+
+const resetDragState = () => {
+  draggedRecord.value = null
+  dragOverFolderId.value = null
+}
+
+const handleDragStart = (event, record) => {
+  if (!canDragRow(record)) {
+    event.preventDefault()
+    return
+  }
+  draggedRecord.value = record
+  event.dataTransfer.effectAllowed = 'move'
+  event.dataTransfer.setData('text/plain', record.file_id)
+}
+
+const handleDragOver = (event, target) => {
+  if (!canDropInto(target)) return
+  event.preventDefault()
+  event.dataTransfer.dropEffect = 'move'
+  dragOverFolderId.value = target.file_id
+}
+
+const handleDragLeave = (event, target) => {
+  if (event.currentTarget.contains(event.relatedTarget)) return
+  if (dragOverFolderId.value === target.file_id) dragOverFolderId.value = null
+}
+
+const moveDocument = async (record, targetFolderId) => {
+  if (!canUseFileMutations.value || !record || record.is_virtual_folder) return
+  try {
+    await documentApi.moveDocument(store.kbId, record.file_id, targetFolderId)
+    message.success(`已将“${record.filename}”移动到目标文件夹`)
+    await refreshAfterMutation()
+  } catch (error) {
+    console.error(error)
+    message.error('移动失败: ' + (error.message || '未知错误'))
+  }
+}
+
+const handleDrop = async (event, target) => {
+  if (!canDropInto(target)) return
+  event.preventDefault()
+  const record = draggedRecord.value
+  resetDragState()
+  await moveDocument(record, target.file_id)
+}
+
+const handleBreadcrumbDrop = async ({ item }) => {
+  if (!draggedRecord.value || item.dropDisabled) return
+  const record = draggedRecord.value
+  resetDragState()
+  await moveDocument(record, item.file_id || null)
+}
+
 // 入库/重新入库参数配置相关
 const indexConfigModalVisible = ref(false)
 const indexConfigModalLoading = computed(() => store.state.chunkLoading)
 const indexConfigModalTitle = ref('入库参数配置')
+
+// 解析/批量解析/重试解析参数配置相关
+const DEFAULT_OCR_ENGINE = 'rapid_ocr'
+const configStore = useConfigStore()
+
+const parseConfigModalVisible = ref(false)
+const parseConfigModalLoading = computed(() => store.state.chunkLoading)
+const parseConfigModalTitle = ref('解析参数配置')
+const currentParseFileIds = ref([])
+const isBatchParseOperation = ref(false)
+const isPendingParseOperation = ref(false)
+const pendingParseTotal = ref(0)
+const defaultOcrEngine = ref(DEFAULT_OCR_ENGINE)
+
+const resolveDefaultOcrEngine = () => {
+  return configStore.config?.default_ocr_engine || defaultOcrEngine.value || DEFAULT_OCR_ENGINE
+}
+
+const parseParams = ref({
+  ocr_engine: resolveDefaultOcrEngine()
+})
+
+const pendingParseTotalText = computed(() =>
+  Number(pendingParseTotal.value || 0).toLocaleString('zh-CN')
+)
+
+const handleOcrOptionsLoaded = (data) => {
+  defaultOcrEngine.value = data?.default_engine || DEFAULT_OCR_ENGINE
+  if (!parseParams.value.ocr_engine) {
+    parseParams.value.ocr_engine = resolveDefaultOcrEngine()
+  }
+}
+
+const resetParseParams = (processingParams = null) => {
+  if (processingParams?.ocr_engine) {
+    parseParams.value = { ocr_engine: processingParams.ocr_engine }
+  } else {
+    parseParams.value = { ocr_engine: resolveDefaultOcrEngine() }
+  }
+}
 
 const createDefaultIndexParams = () => ({
   chunk_preset_id: '',
@@ -730,9 +993,11 @@ const canBatchIndex = computed(() => {
   })
 })
 
-const handleRefresh = () => {
-  store.getDatabaseInfo(undefined, true, true)
-  store.loadDocumentFiles()
+const handleRefresh = async () => {
+  await Promise.all([
+    store.getDatabaseInfo(undefined, true, true),
+    store.loadDocumentFiles({ isBackground: true })
+  ])
 }
 
 const handleBreadcrumbClick = async (index) => {
@@ -814,8 +1079,35 @@ const handleBatchParse = async () => {
     return
   }
 
-  await store.parseFiles(validKeys)
-  selectedRowKeys.value = []
+  currentParseFileIds.value = [...validKeys]
+  isBatchParseOperation.value = true
+  isPendingParseOperation.value = false
+  pendingParseTotal.value = 0
+  parseConfigModalTitle.value = '批量解析参数配置'
+  resetParseParams()
+  parseConfigModalVisible.value = true
+}
+
+const startPendingParse = (count = 0) => {
+  if (lock.value) {
+    message.warning('当前有文件处理中，请稍后再试')
+    return false
+  }
+
+  const total = Number(count || 0)
+  if (total <= 0) {
+    message.info('没有待解析文档')
+    return false
+  }
+
+  currentParseFileIds.value = []
+  isBatchParseOperation.value = false
+  isPendingParseOperation.value = true
+  pendingParseTotal.value = total
+  parseConfigModalTitle.value = '待解析文件参数配置'
+  resetParseParams()
+  parseConfigModalVisible.value = true
+  return true
 }
 
 const handleBatchIndex = async () => {
@@ -929,7 +1221,50 @@ const handleDownloadFile = async (record) => {
 
 const handleParseFile = async (record) => {
   closePopover(record.file_id)
-  await store.parseFiles([record.file_id])
+  currentParseFileIds.value = [record.file_id]
+  isBatchParseOperation.value = false
+  isPendingParseOperation.value = false
+  pendingParseTotal.value = 0
+  parseConfigModalTitle.value =
+    record.status === 'error_parsing' ? '重试解析参数配置' : '解析参数配置'
+
+  const processingParams = await loadRecordProcessingParams(record)
+  resetParseParams(processingParams)
+
+  parseConfigModalVisible.value = true
+}
+
+const handleParseConfigConfirm = async () => {
+  try {
+    const params = { ocr_engine: parseParams.value.ocr_engine }
+    const result = isPendingParseOperation.value
+      ? await store.parsePendingFiles(params, pendingParseTotal.value)
+      : await store.parseFiles(currentParseFileIds.value, params)
+    if (result) {
+      currentParseFileIds.value = []
+      pendingParseTotal.value = 0
+      if (isBatchParseOperation.value || isPendingParseOperation.value) {
+        selectedRowKeys.value = []
+      }
+      parseConfigModalVisible.value = false
+      isBatchParseOperation.value = false
+      isPendingParseOperation.value = false
+      resetParseParams()
+    }
+  } catch (error) {
+    console.error('解析失败:', error)
+    const errorMessage = error.message || '解析失败，请稍后重试'
+    message.error(errorMessage)
+  }
+}
+
+const handleParseConfigCancel = () => {
+  parseConfigModalVisible.value = false
+  currentParseFileIds.value = []
+  isBatchParseOperation.value = false
+  isPendingParseOperation.value = false
+  pendingParseTotal.value = 0
+  resetParseParams()
 }
 
 const handleStatusAction = async (record) => {
@@ -1082,6 +1417,8 @@ import { generatePixelAvatar } from '@/utils/pixelAvatar'
 </script>
 
 <style scoped lang="less">
+@import '@/assets/css/extensions.less';
+
 .file-table-container {
   display: flex;
   flex-grow: 1;
@@ -1098,6 +1435,11 @@ import { generatePixelAvatar } from '@/utils/pixelAvatar'
 .knowledge-file-browser {
   flex: 1 1 auto;
   min-height: 0;
+}
+
+.file-table-search-button,
+.file-table-mindmap-button {
+  font-size: 12px;
 }
 
 .file-breadcrumb-filter {
@@ -1177,6 +1519,35 @@ import { generatePixelAvatar } from '@/utils/pixelAvatar'
   margin-bottom: 12px;
 }
 
+.parse-params {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.parse-pending-alert {
+  margin-bottom: 4px;
+}
+
+.setting-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.setting-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--gray-700);
+}
+
+.param-description {
+  font-size: 12px;
+  color: var(--gray-400);
+  margin: 4px 0 0 0;
+  line-height: 1.4;
+}
+
 .file-name-cell,
 .folder-row,
 .main-btn {
@@ -1189,6 +1560,24 @@ import { generatePixelAvatar } from '@/utils/pixelAvatar'
   display: inline-flex;
   vertical-align: middle;
   width: auto;
+  border-radius: 4px;
+  transition:
+    background-color 0.12s ease,
+    box-shadow 0.12s ease,
+    opacity 0.12s ease;
+
+  &[draggable='true'] {
+    cursor: grab;
+  }
+
+  &.is-dragging {
+    opacity: 0.45;
+  }
+
+  &.is-drop-target {
+    background: var(--main-10);
+    box-shadow: 0 0 0 2px var(--main-200);
+  }
 }
 
 .main-btn {

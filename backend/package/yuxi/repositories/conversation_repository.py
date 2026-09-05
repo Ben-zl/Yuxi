@@ -6,15 +6,15 @@ import uuid as uuid_lib
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload, selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
 from yuxi.storage.postgres.models_business import (
+    UNVIEWED_RUN_MARKER,
     Conversation,
     ConversationStats,
     Message,
     ToolCall,
-    UNVIEWED_RUN_MARKER,
 )
 from yuxi.utils import logger
 from yuxi.utils.datetime_utils import utc_now_naive
@@ -106,24 +106,28 @@ class ConversationRepository:
         title: str | None = None,
         thread_id: str | None = None,
         metadata: dict | None = None,
+        project_id: str,
+        creation_request_id: str | None = None,
     ) -> Conversation:
         """创建对话和统计记录但只 flush，供外层事务继续绑定关系。"""
         if not thread_id:
             thread_id = str(uuid_lib.uuid4())
 
         metadata = (metadata or {}).copy()
-        metadata.setdefault("attachments", [])
+        metadata["attachments"] = []
 
         normalized_title = self._normalize_title(title)
 
         conversation = Conversation(
             thread_id=thread_id,
+            creation_request_id=creation_request_id,
             uid=str(uid),
             agent_id=agent_id,
             title=normalized_title or "New Conversation",
             status="active",
             extra_metadata=metadata,
             last_viewed_run_id=UNVIEWED_RUN_MARKER,
+            project_id=project_id,
         )
 
         self.db.add(conversation)
@@ -140,9 +144,11 @@ class ConversationRepository:
         self,
         uid: str,
         agent_id: str,
+        project_id: str,
         title: str | None = None,
         thread_id: str | None = None,
         metadata: dict | None = None,
+        creation_request_id: str | None = None,
     ) -> Conversation:
         """创建并提交一个完整对话，适用于不需要外层事务编排的入口。"""
         conversation = await self.add_conversation(
@@ -151,6 +157,8 @@ class ConversationRepository:
             title=title,
             thread_id=thread_id,
             metadata=metadata,
+            project_id=project_id,
+            creation_request_id=creation_request_id,
         )
         await self.db.commit()
         await self.db.refresh(conversation)
@@ -160,10 +168,23 @@ class ConversationRepository:
         result = await self.db.execute(select(Conversation).where(Conversation.thread_id == thread_id))
         return result.scalar_one_or_none()
 
+    async def get_conversation_by_creation_request_id(self, uid: str, request_id: str) -> Conversation | None:
+        """按用户和创建幂等键读取 Conversation。"""
+        result = await self.db.execute(
+            select(Conversation).where(
+                Conversation.uid == str(uid),
+                Conversation.creation_request_id == request_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def lock_conversation_by_thread_id(self, thread_id: str) -> Conversation | None:
         """锁定线程根记录，串行化同一对话的调度决策。"""
         result = await self.db.execute(
-            select(Conversation).where(Conversation.thread_id == thread_id).with_for_update()
+            select(Conversation)
+            .where(Conversation.thread_id == thread_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
@@ -192,8 +213,18 @@ class ConversationRepository:
         conversation.extra_metadata = metadata
         flag_modified(conversation, "extra_metadata")
         conversation.updated_at = utc_now_naive()
-        await self.db.commit()
-        await self.db.refresh(conversation)
+        await self.db.flush()
+
+    async def set_model_spec(self, conversation: Conversation, model_spec: str) -> None:
+        """在请求事务内更新对话绑定模型。"""
+        metadata = dict(conversation.extra_metadata or {})
+        metadata["model_spec"] = model_spec
+        await self._save_metadata(conversation, metadata)
+
+    async def _lock_conversation_by_id(self, conversation_id: int) -> Conversation | None:
+        """锁定会话元数据，串行化同一线程的附件更新。"""
+        result = await self.db.execute(select(Conversation).where(Conversation.id == conversation_id).with_for_update())
+        return result.scalar_one_or_none()
 
     async def add_message(
         self,
@@ -206,6 +237,7 @@ class ConversationRepository:
         run_id: str | None = None,
         request_id: str | None = None,
         delivery_status: str = "complete",
+        commit: bool = True,
     ) -> Message:
         message = Message(
             conversation_id=conversation_id,
@@ -224,10 +256,12 @@ class ConversationRepository:
         if conversation:
             conversation.updated_at = utc_now_naive()
 
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(message)
 
         await self._update_message_count(conversation_id)
+        if commit:
+            await self.db.commit()
 
         logger.debug(f"Added {role} message to conversation {conversation_id}")
         return message
@@ -243,6 +277,7 @@ class ConversationRepository:
         run_id: str | None = None,
         request_id: str | None = None,
         delivery_status: str = "complete",
+        commit: bool = True,
     ) -> Message | None:
         conversation = await self.get_conversation_by_thread_id(thread_id)
         if not conversation:
@@ -259,6 +294,7 @@ class ConversationRepository:
             run_id=run_id,
             request_id=request_id,
             delivery_status=delivery_status,
+            commit=commit,
         )
 
     async def add_tool_call(
@@ -270,6 +306,7 @@ class ConversationRepository:
         status: str = "pending",
         error_message: str | None = None,
         langgraph_tool_call_id: str | None = None,
+        commit: bool = True,
     ) -> ToolCall:
         if langgraph_tool_call_id:
             existing = await self.get_tool_call_by_langgraph_id(langgraph_tool_call_id)
@@ -301,8 +338,10 @@ class ConversationRepository:
         )
 
         self.db.add(tool_call)
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(tool_call)
+        if commit:
+            await self.db.commit()
 
         logger.debug(f"Added tool call {tool_name} to message {message_id}")
         return tool_call
@@ -359,6 +398,7 @@ class ConversationRepository:
         # First, get all pinned conversations (no limit)
         pinned_query = (
             select(Conversation)
+            .options(joinedload(Conversation.project))
             .where(*base_conditions)
             .where(Conversation.is_pinned)
             .order_by(Conversation.updated_at.desc())
@@ -366,31 +406,19 @@ class ConversationRepository:
         result = await self.db.execute(pinned_query)
         pinned_conversations = list(result.scalars().all())
 
-        # Then, get non-pinned conversations with limit/offset
-        remaining_limit = None
-        remaining_offset = offset
-
+        # limit/offset 只作用于非置顶对话，避免重复附带的置顶项改变分页游标。
+        non_pinned_query = (
+            select(Conversation)
+            .options(joinedload(Conversation.project))
+            .where(*base_conditions)
+            .where(~Conversation.is_pinned)
+            .order_by(Conversation.updated_at.desc())
+            .offset(offset)
+        )
         if limit is not None:
-            # Calculate how many slots are taken by pinned conversations
-            pinned_count = len(pinned_conversations)
-            if pinned_count >= limit:
-                # All slots taken by pinned conversations
-                return pinned_conversations[:limit]
-            remaining_limit = limit - pinned_count
-
-        if remaining_limit is not None and remaining_limit > 0:
-            non_pinned_query = (
-                select(Conversation)
-                .where(*base_conditions)
-                .where(~Conversation.is_pinned)
-                .order_by(Conversation.updated_at.desc())
-                .limit(remaining_limit)
-                .offset(remaining_offset)
-            )
-            result = await self.db.execute(non_pinned_query)
-            non_pinned_conversations = list(result.scalars().all())
-        else:
-            non_pinned_conversations = []
+            non_pinned_query = non_pinned_query.limit(limit)
+        result = await self.db.execute(non_pinned_query)
+        non_pinned_conversations = list(result.scalars().all())
 
         return pinned_conversations + non_pinned_conversations
 
@@ -446,6 +474,7 @@ class ConversationRepository:
 
         result = await self.db.execute(
             select(Conversation, summary.c.matched_count, summary.c.latest_match_at)
+            .options(joinedload(Conversation.project))
             .join(summary, Conversation.id == summary.c.conversation_id)
             .order_by(summary.c.latest_match_at.desc(), Conversation.updated_at.desc(), Conversation.id.desc())
             .limit(limit + 1)
@@ -597,6 +626,7 @@ class ConversationRepository:
         tool_output: str,
         status: str = "success",
         error_message: str | None = None,
+        commit: bool = True,
     ) -> ToolCall | None:
         tool_call = await self.get_tool_call_by_langgraph_id(langgraph_tool_call_id)
         if not tool_call:
@@ -608,8 +638,10 @@ class ConversationRepository:
         if error_message:
             tool_call.error_message = error_message
 
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(tool_call)
+        if commit:
+            await self.db.commit()
 
         logger.debug(f"Updated tool call {langgraph_tool_call_id} with output")
         return tool_call
@@ -622,7 +654,7 @@ class ConversationRepository:
             result = await self.db.execute(select(func.count()).where(Message.conversation_id == conversation_id))
             message_count = result.scalar()
             stats.message_count = message_count
-            await self.db.commit()
+            await self.db.flush()
 
     async def get_attachments(self, conversation_id: int) -> list[dict]:
         conversation = await self.get_conversation_by_id(conversation_id)
@@ -631,6 +663,13 @@ class ConversationRepository:
         metadata = self._ensure_metadata(conversation)
         return list(metadata.get("attachments", []))
 
+    async def lock_attachments(self, conversation_id: int) -> list[dict]:
+        """锁定会话并返回当前附件，用于需要检查后更新的用例。"""
+        conversation = await self._lock_conversation_by_id(conversation_id)
+        if not conversation:
+            return []
+        return list(self._ensure_metadata(conversation).get("attachments", []))
+
     async def get_attachments_by_thread_id(self, thread_id: str) -> list[dict]:
         conversation = await self.get_conversation_by_thread_id(thread_id)
         if not conversation:
@@ -638,7 +677,7 @@ class ConversationRepository:
         return await self.get_attachments(conversation.id)
 
     async def add_attachment(self, conversation_id: int, attachment_info: dict) -> dict | None:
-        conversation = await self.get_conversation_by_id(conversation_id)
+        conversation = await self._lock_conversation_by_id(conversation_id)
         if not conversation:
             return None
 
@@ -651,7 +690,7 @@ class ConversationRepository:
         return attachment_info
 
     async def add_attachments(self, conversation_id: int, attachment_infos: list[dict]) -> list[dict] | None:
-        conversation = await self.get_conversation_by_id(conversation_id)
+        conversation = await self._lock_conversation_by_id(conversation_id)
         if not conversation:
             return None
 
@@ -667,7 +706,7 @@ class ConversationRepository:
     async def update_attachment_status(
         self, conversation_id: int, file_id: str, status: str, update_fields: dict | None = None
     ) -> dict | None:
-        conversation = await self.get_conversation_by_id(conversation_id)
+        conversation = await self._lock_conversation_by_id(conversation_id)
         if not conversation:
             return None
 
@@ -690,7 +729,7 @@ class ConversationRepository:
     async def bind_attachments_to_request(
         self, conversation_id: int, request_id: str, file_ids: list[str]
     ) -> list[dict]:
-        conversation = await self.get_conversation_by_id(conversation_id)
+        conversation = await self._lock_conversation_by_id(conversation_id)
         if not conversation or not request_id or not file_ids:
             return []
 
@@ -720,7 +759,7 @@ class ConversationRepository:
         return [item for item in attachments if item.get("request_id") == request_id]
 
     async def remove_attachment(self, conversation_id: int, file_id: str) -> bool:
-        conversation = await self.get_conversation_by_id(conversation_id)
+        conversation = await self._lock_conversation_by_id(conversation_id)
         if not conversation:
             return False
 

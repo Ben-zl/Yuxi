@@ -10,18 +10,20 @@ import asyncpg
 import httpx
 import pytest
 
+from e2e_helpers import cancel_run, delete_agent, postgres_dsn, skip_if_external_quota
+from test.live_api_cleanup import (
+    TEST_CONVERSATION_TITLE_PREFIX,
+    make_test_conversation_metadata,
+    make_test_conversation_title,
+    make_test_resource_id,
+)
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.e2e, pytest.mark.slow]
 
 POLL_INTERVAL_SECONDS = float(os.getenv("E2E_RUN_POLL_INTERVAL_SECONDS", "2"))
 RUN_TIMEOUT_SECONDS = int(os.getenv("E2E_RUN_TIMEOUT_SECONDS", "240"))
 EVAL_EXPECTED_OUTPUT = "AGENT_EVAL_E2E_OK"
 CALL_EXPECTED_OUTPUT = "AGENT_CALL_E2E_OK"
-
-
-def _postgres_dsn() -> str:
-    return os.getenv("POSTGRES_URL", "postgresql+asyncpg://postgres:postgres@postgres:5432/yuxi").replace(
-        "+asyncpg", ""
-    )
 
 
 def _json_dict(value: Any) -> dict[str, Any]:
@@ -74,18 +76,6 @@ async def _create_agent(client: httpx.AsyncClient, headers: dict[str, str], uid:
     return slug
 
 
-async def _delete_agent(client: httpx.AsyncClient, headers: dict[str, str], slug: str) -> None:
-    response = await client.delete(f"/api/agent/{slug}", headers=headers)
-    assert response.status_code in {200, 404}, response.text
-
-
-async def _cancel_run(client: httpx.AsyncClient, headers: dict[str, str], run_id: str | None) -> None:
-    if not run_id:
-        return
-    response = await client.post(f"/api/agent/runs/{run_id}/cancel", headers=headers)
-    assert response.status_code < 500, response.text
-
-
 async def _wait_agent_call_result(
     client: httpx.AsyncClient,
     headers: dict[str, str],
@@ -111,8 +101,32 @@ async def _wait_agent_call_result(
     pytest.fail("Agent Call run timed out: " + json.dumps(last_payload or {}, ensure_ascii=False))
 
 
+async def _create_test_thread(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    *,
+    agent_slug: str,
+    label: str,
+) -> str:
+    """创建带统一可见前缀和测试标记的调用线程。"""
+
+    response = await client.post(
+        "/api/chat/thread",
+        json={
+            "agent_id": agent_slug,
+            "title": make_test_conversation_title(label),
+            "metadata": make_test_conversation_metadata(label, e2e=True),
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert str(payload.get("title") or "").startswith(TEST_CONVERSATION_TITLE_PREFIX), payload
+    return str(payload.get("thread_id") or payload["id"])
+
+
 async def _load_run_metadata(run_id: str) -> dict[str, Any]:
-    conn = await asyncpg.connect(_postgres_dsn())
+    conn = await asyncpg.connect(postgres_dsn())
     try:
         row = await conn.fetchrow(
             """
@@ -157,7 +171,13 @@ async def test_agent_eval_and_agent_call_entrypoints_share_run_invocation_flow(
     agent_call_completed = False
 
     try:
-        eval_request_id = f"agent-eval-e2e-{uuid.uuid4()}"
+        eval_thread_id = await _create_test_thread(
+            e2e_client,
+            e2e_headers,
+            agent_slug=agent_slug,
+            label="agent-eval-e2e",
+        )
+        eval_request_id = make_test_resource_id("agent-eval-e2e")
         eval_metadata = {
             "dataset_name": "agent-entrypoint-e2e",
             "dataset_item_id": f"item-{uuid.uuid4().hex[:8]}",
@@ -168,6 +188,7 @@ async def test_agent_eval_and_agent_call_entrypoints_share_run_invocation_flow(
             json={
                 "query": f"请只输出 {EVAL_EXPECTED_OUTPUT}，不要添加任何解释。",
                 "agent_slug": agent_slug,
+                "thread_id": eval_thread_id,
                 "evaluation": eval_metadata,
                 "meta": {"request_id": eval_request_id},
             },
@@ -175,6 +196,8 @@ async def test_agent_eval_and_agent_call_entrypoints_share_run_invocation_flow(
         )
         assert eval_response.status_code == 200, eval_response.text
         eval_payload = eval_response.json()
+        if eval_payload.get("status") != "completed":
+            skip_if_external_quota(eval_payload)
         assert eval_payload.get("status") == "completed", eval_payload
         assert eval_payload.get("request_id") == eval_request_id
         assert EVAL_EXPECTED_OUTPUT in str(eval_payload.get("output") or ""), eval_payload
@@ -190,12 +213,19 @@ async def test_agent_eval_and_agent_call_entrypoints_share_run_invocation_flow(
         assert eval_run["input_metadata"]["agent_invocation_meta"] == {"evaluation": eval_metadata}
         assert "evaluation" not in eval_run["input_metadata"]
 
-        agent_call_request_id = f"agent-call-e2e-{uuid.uuid4()}"
+        agent_call_thread_id = await _create_test_thread(
+            e2e_client,
+            e2e_headers,
+            agent_slug=agent_slug,
+            label="agent-call-e2e",
+        )
+        agent_call_request_id = make_test_resource_id("agent-call-e2e")
         create_response = await e2e_client.post(
             "/api/agent-invocation/agent-call/runs",
             json={
                 "agent_slug": agent_slug,
                 "messages": [{"role": "user", "content": f"请只输出 {CALL_EXPECTED_OUTPUT}，不要添加任何解释。"}],
+                "thread_id": agent_call_thread_id,
                 "request_id": agent_call_request_id,
                 "async_mode": True,
             },
@@ -214,6 +244,8 @@ async def test_agent_eval_and_agent_call_entrypoints_share_run_invocation_flow(
             run_id=str(agent_call_run_id),
             agent_slug=agent_slug,
         )
+        if call_payload.get("status") != "completed":
+            skip_if_external_quota(call_payload)
         assert call_payload.get("status") == "completed", call_payload
         assert call_payload.get("request_id") == agent_call_request_id
         assert CALL_EXPECTED_OUTPUT in str(call_payload.get("output") or ""), call_payload
@@ -233,5 +265,5 @@ async def test_agent_eval_and_agent_call_entrypoints_share_run_invocation_flow(
         assert "custom_variables" not in agent_call_run["input_metadata"]
     finally:
         if not agent_call_completed:
-            await _cancel_run(e2e_client, e2e_headers, agent_call_run_id)
-        await _delete_agent(e2e_client, e2e_headers, agent_slug)
+            await cancel_run(e2e_client, e2e_headers, agent_call_run_id)
+        await delete_agent(e2e_client, e2e_headers, agent_slug)

@@ -20,6 +20,7 @@ from yuxi.agents.backends.sandbox.paths import (
     validate_thread_id,
 )
 from yuxi.repositories.conversation_repository import HIDDEN_USER_CONVERSATION_SOURCES, ConversationRepository
+from yuxi.repositories.project_repository import ProjectRepository
 from yuxi.services.file_preview import (
     MAX_BINARY_PREVIEW_SIZE_BYTES,
     OfficePreviewConversionError,
@@ -35,17 +36,18 @@ from yuxi.services.mention_search_service import invalidate_workspace_mention_ca
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.datetime_utils import utc_isoformat_from_timestamp
 from yuxi.utils.logging_config import logger
-from yuxi.utils.paths import (
+from yuxi.agents.backends.paths import (
     CONVERSATION_HISTORY_DIR_NAME,
     LARGE_TOOL_RESULTS_DIR_NAME,
     OUTPUTS_DIR_NAME,
     UPLOADS_DIR_NAME,
     VIRTUAL_PATH_WORKSPACE,
-    WORKSPACE_AGENTS_DIR_NAME,
-    WORKSPACE_DIR_NAME,
-    ensure_within_root,
 )
+from yuxi.workspace.paths import WORKSPACE_AGENTS_DIR_NAME, WORKSPACE_DIR_NAME
+from yuxi.utils.paths import ensure_within_root
 from yuxi.utils.upload_utils import MAX_UPLOAD_SIZE_BYTES, write_upload_to_buffer
+from yuxi.workspace.filesystem import Workspace
+from yuxi.workspace.errors import FileTransferLimitError
 
 EDITABLE_WORKSPACE_SUFFIXES = {".md", ".markdown", ".mdx", ".txt"}
 MAX_WORKSPACE_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_BYTES
@@ -67,6 +69,7 @@ async def list_workspace_tree(
     path: str,
     recursive: bool = False,
     files_only: bool = False,
+    include_unbound_project_dirs: bool = False,
     current_user: User,
     thread_titles: dict[str, str] | None = None,
     db: AsyncSession | None = None,
@@ -98,12 +101,38 @@ async def list_workspace_tree(
         )
         return {"entries": entries, "readonly": True, "truncated": False}
 
-    target = _resolve_workspace_path(current_user, path)
-    if not target.exists():
+    backend = _workspace_backend(current_user)
+    workspace_path = _workspace_path(path)
+    try:
+        if recursive:
+            scanned = await asyncio.to_thread(
+                backend.search_authorized_tree,
+                workspace_path,
+                "",
+                include_directories=not files_only,
+                max_results=5000,
+            )
+            entries = [_entry_from_workspace_metadata(item["path"], item) for item in scanned]
+        else:
+            entries = await asyncio.to_thread(
+                _list_workspace_directory,
+                backend,
+                workspace_path,
+                files_only=files_only,
+            )
+    except FileNotFoundError:
         return {"entries": [], "truncated": False}
-    if not target.is_dir():
-        raise HTTPException(status_code=400, detail="当前路径不是目录")
-    entries = await asyncio.to_thread(_list_directory, root, target, recursive=recursive, files_only=files_only)
+    except NotADirectoryError as exc:
+        raise HTTPException(status_code=400, detail="当前路径不是目录") from exc
+    except (PermissionError, ValueError) as exc:
+        raise HTTPException(status_code=403, detail="Access denied") from exc
+
+    if not include_unbound_project_dirs and db is not None:
+        entries = await _filter_project_tree_entries(entries, uid=str(current_user.uid), db=db)
+
+    if include_unbound_project_dirs:
+        return {"entries": entries}
+
     if (
         thread_titles is not None
         and _normalize_workspace_path(path).as_posix().rstrip("/") == f"/{WORKSPACE_AGENTS_DIR_NAME}"
@@ -149,6 +178,27 @@ def resolve_workspace_file_path(*, path: str, current_user: User, thread_titles:
     if not target.is_file():
         raise HTTPException(status_code=400, detail=f"当前路径不是文件: {path}")
     return target
+
+
+async def read_workspace_file_bytes(*, path: str, current_user: User) -> tuple[str, bytes]:
+    """在当前用户 Workspace 的 no-follow 边界内读取知识库导入文件。"""
+    normalized_path = _normalize_workspace_path(path).as_posix()
+    workspace = _workspace_backend(current_user)
+    try:
+        content = await asyncio.to_thread(
+            workspace.read_authorized_file,
+            normalized_path,
+            MAX_WORKSPACE_UPLOAD_SIZE_BYTES,
+        )
+    except FileTransferLimitError as exc:
+        raise HTTPException(status_code=400, detail="文件过大，当前仅支持 100 MB 以内的工作区文件") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"工作区文件不存在: {path}") from exc
+    except IsADirectoryError as exc:
+        raise HTTPException(status_code=400, detail=f"当前路径不是文件: {path}") from exc
+    except (PermissionError, NotADirectoryError, ValueError) as exc:
+        raise HTTPException(status_code=403, detail="Access denied") from exc
+    return PurePosixPath(normalized_path).name, content
 
 
 async def read_workspace_file_content(
@@ -315,6 +365,64 @@ async def upload_workspace_files(*, parent_path: str, files: list[UploadFile], c
     return {"success": True, "entries": [_entry_for_path(root, target) for _file, target in upload_targets]}
 
 
+async def search_workspace_files(
+    *,
+    query: str,
+    current_user: User,
+    db: AsyncSession | None = None,
+) -> dict:
+    """在当前用户 UserWorkspace 内执行有界文件名搜索。"""
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return {"entries": []}
+
+    try:
+        entries = await asyncio.to_thread(
+            _workspace_backend(current_user).search_authorized_tree,
+            "/",
+            normalized_query,
+            exclude_directories=frozenset(
+                {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
+            ),
+            exclude_hidden=True,
+            max_results=100,
+            max_directories=600,
+        )
+    except (FileNotFoundError, NotADirectoryError, PermissionError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="工作区不可用") from exc
+
+    results = [
+        {
+            "path": str(item["path"]),
+            "name": str(item["name"]),
+            "is_dir": bool(item.get("is_dir")),
+            "size": int(item.get("size", 0) or 0),
+            "modified_at": item.get("modified_at"),
+        }
+        for item in entries
+    ]
+    if db is not None:
+        results = await _filter_project_tree_entries(results, uid=str(current_user.uid), db=db)
+
+    serialized = []
+    for item in results:
+        scope_path = item["path"]
+        virtual_path = VIRTUAL_PATH_WORKSPACE if scope_path == "/" else f"{VIRTUAL_PATH_WORKSPACE}{scope_path}"
+        if item.get("is_dir") and not virtual_path.endswith("/"):
+            virtual_path = f"{virtual_path}/"
+        serialized.append(
+            {
+                "path": scope_path,
+                "virtual_path": virtual_path,
+                "name": str(item["name"]),
+                "is_dir": bool(item.get("is_dir")),
+                "size": int(item.get("size", 0) or 0),
+                "modified_at": utc_isoformat_from_timestamp(float(item.get("modified_at") or 0)) or "",
+            }
+        )
+    return {"entries": serialized}
+
+
 async def download_workspace_file(
     *, path: str, current_user: User, thread_titles: dict[str, str] | None = None, db: AsyncSession | None = None
 ) -> StreamingResponse | FileResponse:
@@ -389,6 +497,16 @@ def _workspace_root(user: User) -> Path:
         raise HTTPException(status_code=403, detail="Access denied") from exc
     ensure_workspace_default_files(resolved_root)
     return resolved_root
+
+
+def _workspace_backend(user: User) -> Workspace:
+    """返回当前用户的持久化 Workspace 访问 Owner。"""
+    return Workspace(str(user.uid), workspace_root=_workspace_root(user))
+
+
+def _workspace_path(path: str | None) -> str:
+    """把工作区请求路径规范化为 Workspace scope 路径。"""
+    return _normalize_workspace_path(path).as_posix()
 
 
 def _normalize_workspace_path(path: str | None) -> PurePosixPath:
@@ -485,6 +603,63 @@ def _list_directory(
             if child.is_dir() and not child.is_symlink():
                 entries.extend(_list_directory(root, child, recursive=True, files_only=files_only))
     return _sort_entries(entries)
+
+
+def _list_workspace_directory(
+    backend: Workspace,
+    path: str,
+    *,
+    files_only: bool = False,
+) -> list[dict]:
+    """在 no-follow Workspace 边界内列出一个目录。"""
+    entries = []
+    for item in backend.list_authorized_directory(path, root="/"):
+        if files_only and item["is_dir"]:
+            continue
+        child_path = f"{path.rstrip('/')}/{item['name']}" if path != "/" else f"/{item['name']}"
+        entries.append(_entry_from_workspace_metadata(child_path, item))
+    return _sort_entries(entries)
+
+
+def _entry_from_workspace_metadata(path: str, metadata: dict) -> dict:
+    """把 Workspace 元数据转换为工作区文件树条目。"""
+    normalized_path = _normalize_workspace_path(path).as_posix()
+    is_dir = bool(metadata.get("is_dir"))
+    display_path = normalized_path
+    if is_dir and display_path != "/" and not display_path.endswith("/"):
+        display_path = f"{display_path}/"
+    name = str(metadata.get("name") or PurePosixPath(normalized_path.rstrip("/")).name or "工作区")
+    virtual_path = VIRTUAL_PATH_WORKSPACE if normalized_path == "/" else f"{VIRTUAL_PATH_WORKSPACE}{display_path}"
+    return {
+        "path": display_path,
+        "virtual_path": virtual_path,
+        "name": name,
+        "is_dir": is_dir,
+        "size": 0 if is_dir else int(metadata.get("size", 0) or 0),
+        "modified_at": utc_isoformat_from_timestamp(metadata.get("modified_at")) or "",
+    }
+
+
+async def _filter_project_tree_entries(entries: list[dict], *, uid: str, db: AsyncSession) -> list[dict]:
+    """隐藏未归属可选 Project 的 projects 子树。"""
+    entries_with_paths = [(entry, PurePosixPath(str(entry.get("path") or "/").strip("/"))) for entry in entries]
+    if not any(path.parts[:1] == ("projects",) and path.as_posix() != "projects" for _, path in entries_with_paths):
+        return entries
+
+    visible_paths = await ProjectRepository(db).list_selectable_workdir_paths_for_user(uid)
+    selected_project_paths = [
+        PurePosixPath(path) for path in visible_paths if PurePosixPath(path).parts[:1] == ("projects",)
+    ]
+
+    def is_visible(candidate: PurePosixPath) -> bool:
+        if candidate.parts[:1] != ("projects",) or candidate.as_posix() == "projects":
+            return True
+        return any(
+            candidate == selected or candidate.is_relative_to(selected) or selected.is_relative_to(candidate)
+            for selected in selected_project_paths
+        )
+
+    return [entry for entry, path in entries_with_paths if is_visible(path)]
 
 
 def _chat_path_parts(path: str | None) -> tuple[str, ...] | None:

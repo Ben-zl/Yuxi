@@ -1,5 +1,5 @@
 from yuxi.utils.datetime_utils import shanghai_now
-from yuxi.utils.paths import (
+from yuxi.agents.backends.paths import (
     VIRTUAL_PATH_OUTPUTS,
     VIRTUAL_PATH_PREFIX,
     VIRTUAL_PATH_UPLOADS,

@@ -11,7 +11,7 @@ from agentscope.message import Base64Source, DataBlock, Msg, TextBlock, URLSourc
 from agentscope.model import AnthropicChatModel, GeminiChatModel, OpenAIChatModel
 from pydantic import SecretStr
 
-from yuxi import config as sys_config
+from yuxi.config import config as sys_config
 from yuxi.models.providers.cache import ModelInfo, model_cache
 from yuxi.utils import get_docker_safe_url, logger
 

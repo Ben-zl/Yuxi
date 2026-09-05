@@ -1,6 +1,7 @@
 """Yuxi ReMe 召回候选治理测试。"""
 
 import json
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -22,7 +23,7 @@ def test_auto_memory_extraction_hint_rejects_runtime_state_and_inference():
     assert "不得推断" in AUTO_MEMORY_EXTRACTION_HINT
 
 
-async def test_auto_memory_governance_archives_cross_date_source_and_reindexes(tmp_path):
+async def test_auto_memory_governance_archives_cross_date_source_and_reindexes(tmp_path, monkeypatch):
     """auto_memory 写入后必须先治理同主题来源，再刷新完整索引。"""
     old_daily = tmp_path / "daily" / "2026-09-01"
     new_daily = tmp_path / "daily" / "2026-09-02"
@@ -46,6 +47,10 @@ async def test_auto_memory_governance_archives_cross_date_source_and_reindexes(t
         encoding="utf-8",
     )
     calls = []
+    monkeypatch.setattr(
+        "yuxi.agentscope.memory.shanghai_now",
+        lambda: datetime(2026, 9, 2, 12, 0, 0),
+    )
 
     async def run_job(name, **kwargs):
         calls.append((name, kwargs))

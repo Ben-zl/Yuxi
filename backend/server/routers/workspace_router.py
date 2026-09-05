@@ -9,7 +9,6 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.utils.auth_middleware import get_db, get_required_user
-from yuxi.knowledge.runtime import knowledge_base
 from yuxi.services.workspace_service import (
     build_owned_thread_titles,
     create_workspace_directory,
@@ -18,6 +17,7 @@ from yuxi.services.workspace_service import (
     is_workspace_chat_path,
     list_workspace_tree,
     read_workspace_file_content,
+    search_workspace_files,
     upload_workspace_files,
     workspace_path_uses_chat_mapping,
     write_workspace_file_content,
@@ -25,6 +25,7 @@ from yuxi.services.workspace_service import (
 from yuxi.storage.postgres.models_business import User
 
 workspace = APIRouter(prefix="/workspace", tags=["workspace"])
+workspace_knowledge = APIRouter(prefix="/workspace", tags=["workspace"])
 
 
 class CreateWorkspaceDirectoryRequest(BaseModel):
@@ -37,8 +38,16 @@ class UpdateWorkspaceFileContentRequest(BaseModel):
     content: str
 
 
+def _get_knowledge_base():
+    """仅在完整模式注册知识工作区路由时加载知识库运行时。"""
+
+    from yuxi.knowledge.runtime import knowledge_base
+
+    return knowledge_base
+
+
 async def _ensure_knowledge_read_access(current_user: User, kb_id: str) -> None:
-    allowed = await knowledge_base.check_accessible(
+    allowed = await _get_knowledge_base().check_accessible(
         {
             "uid": current_user.uid,
             "role": current_user.role,
@@ -51,7 +60,7 @@ async def _ensure_knowledge_read_access(current_user: User, kb_id: str) -> None:
 
 
 async def _ensure_knowledge_supports_documents(kb_id: str) -> None:
-    db_info, supports_documents = await knowledge_base.get_database_document_support(kb_id)
+    db_info, supports_documents = await _get_knowledge_base().get_database_document_support(kb_id)
     if not db_info:
         raise HTTPException(status_code=404, detail=f"知识库 {kb_id} 不存在")
     if not supports_documents:
@@ -102,6 +111,7 @@ async def get_workspace_tree(
     path: str = Query("/", description="工作区目录路径"),
     recursive: bool = Query(False, description="是否递归返回子目录文件"),
     files_only: bool = Query(False, description="是否仅返回文件"),
+    include_unbound_project_dirs: bool = Query(False, description="是否保留未绑定 Project 的目录"),
     current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -112,10 +122,22 @@ async def get_workspace_tree(
         path=path,
         recursive=recursive,
         files_only=files_only,
+        include_unbound_project_dirs=include_unbound_project_dirs,
         current_user=current_user,
         thread_titles=thread_titles,
         db=db,
     )
+
+
+@workspace.get("/search", response_model=dict)
+async def search_workspace_files_route(
+    query: str = Query(..., description="搜索关键词"),
+    current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """搜索当前用户可见的工作区文件。"""
+
+    return await search_workspace_files(query=query, current_user=current_user, db=db)
 
 
 def _binary_preview_response(data: dict) -> StreamingResponse:
@@ -148,7 +170,7 @@ async def get_workspace_file(
     return await read_workspace_file_content(path=path, current_user=current_user, thread_titles=thread_titles, db=db)
 
 
-@workspace.get("/knowledge/tree", response_model=dict)
+@workspace_knowledge.get("/knowledge/tree", response_model=dict)
 async def get_workspace_knowledge_tree(
     kb_id: str = Query(..., description="知识库 ID"),
     parent_id: str | None = Query(None, description="父文件夹 ID"),
@@ -162,7 +184,7 @@ async def get_workspace_knowledge_tree(
     await _ensure_knowledge_read_access(current_user, kb_id)
     await _ensure_knowledge_supports_documents(kb_id)
     try:
-        data = await knowledge_base.list_document_files(
+        data = await _get_knowledge_base().list_document_files(
             kb_id=kb_id,
             parent_id=parent_id,
             path_prefix=path_prefix,
@@ -186,7 +208,7 @@ async def get_workspace_knowledge_tree(
         _raise_knowledge_read_error(error)
 
 
-@workspace.get("/knowledge/file")
+@workspace_knowledge.get("/knowledge/file")
 async def get_workspace_knowledge_file(
     kb_id: str = Query(..., description="知识库 ID"),
     file_id: str = Query(..., description="知识库文件 ID"),
@@ -194,12 +216,15 @@ async def get_workspace_knowledge_file(
 ):
     await _ensure_knowledge_read_access(current_user, kb_id)
     try:
-        return _preview_response(await knowledge_base.read_file_preview(kb_id=kb_id, file_id=file_id))
+        await _ensure_knowledge_supports_documents(kb_id)
+        from yuxi.knowledge.preview import read_knowledge_file_preview
+
+        return _preview_response(await read_knowledge_file_preview(kb_id=kb_id, file_id=file_id))
     except ValueError as error:
         _raise_knowledge_read_error(error)
 
 
-@workspace.get("/knowledge/download")
+@workspace_knowledge.get("/knowledge/download")
 async def download_workspace_knowledge_file(
     kb_id: str = Query(..., description="知识库 ID"),
     file_id: str = Query(..., description="知识库文件 ID"),
@@ -208,7 +233,7 @@ async def download_workspace_knowledge_file(
 ):
     await _ensure_knowledge_read_access(current_user, kb_id)
     try:
-        data = await knowledge_base.get_file_download(kb_id=kb_id, file_id=file_id, variant=variant)
+        data = await _get_knowledge_base().get_file_download(kb_id=kb_id, file_id=file_id, variant=variant)
     except ValueError as error:
         _raise_knowledge_read_error(error)
 

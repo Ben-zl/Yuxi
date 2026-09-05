@@ -52,3 +52,8 @@ export const uploadViewerFiles = (threadId, parentPath, files) => {
   files.forEach((file) => formData.append('files', file))
   return apiPost('/api/viewer/filesystem/upload', formData)
 }
+
+export const searchViewerFiles = (threadId, query) => {
+  const queryStr = buildQuery({ thread_id: threadId, query })
+  return apiGet(`/api/viewer/filesystem/search?${queryStr}`)
+}

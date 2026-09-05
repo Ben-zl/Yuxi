@@ -48,9 +48,15 @@ from yuxi.services.workspace_service import (
 from yuxi.services.workspace_service import (
     upload_workspace_files as upload_workspace_files_entry,
 )
+from yuxi.services.workdir_service import resolve_authorized_workdir
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.datetime_utils import utc_isoformat_from_timestamp
-from yuxi.utils.paths import VIRTUAL_PATH_OUTPUTS, VIRTUAL_PATH_UPLOADS, VIRTUAL_PATH_WORKSPACE
+from yuxi.agents.backends.paths import (
+    VIRTUAL_PATH_OUTPUTS,
+    VIRTUAL_PATH_UPLOADS,
+    VIRTUAL_PATH_WORKSPACE,
+    runtime_path_for_workdir_scope,
+)
 
 AGENTSCOPE_OUTPUT_ROOT = PurePosixPath("/workspace/outputs")
 
@@ -380,8 +386,7 @@ async def list_viewer_filesystem_tree(
                         return {"entries": []}
                     raise _agentscope_http_error(exc) from exc
                 entries = [
-                    _viewer_entry_from_agentscope(normalized_path, entry)
-                    for entry in response.get("entries", [])
+                    _viewer_entry_from_agentscope(normalized_path, entry) for entry in response.get("entries", [])
                 ]
                 return {"entries": _sort_entries(entries)}
             uid = str(current_user.uid)
@@ -390,6 +395,7 @@ async def list_viewer_filesystem_tree(
                 response = await list_workspace_tree(
                     path=_workspace_relative_path(normalized_path),
                     current_user=current_user,
+                    db=db,
                 )
                 entries = [_viewer_entry_from_workspace_entry(entry) for entry in response.get("entries", [])]
                 return {"entries": _sort_entries(entries)}
@@ -416,6 +422,52 @@ async def list_viewer_filesystem_tree(
         raise HTTPException(status_code=422, detail=str(e)) from e
 
     raise HTTPException(status_code=400, detail=f"Access denied: '{normalized_path}' is outside viewer namespace")
+
+
+async def search_viewer_files(
+    *,
+    thread_id: str,
+    query: str,
+    current_user: User,
+    db: AsyncSession,
+) -> dict:
+    """在当前已授权 Workdir 中按名称搜索文件。"""
+    normalized_query = str(query or "").strip().lower()
+    if not normalized_query:
+        return {"entries": []}
+
+    access = await resolve_authorized_workdir(
+        thread_id=thread_id,
+        uid=str(current_user.uid),
+        db=db,
+    )
+    try:
+        matches = await asyncio.to_thread(
+            access.workdir.search,
+            normalized_query,
+            max_results=100,
+            max_directories=600,
+        )
+    except (FileNotFoundError, NotADirectoryError, PermissionError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="目录不存在") from exc
+
+    entries = []
+    for item in matches:
+        scope = str(item["path"])
+        runtime_path = runtime_path_for_workdir_scope(access.workdir_path, scope)
+        entries.append(
+            {
+                "path": runtime_path + ("/" if item.get("is_dir") else ""),
+                "name": str(item["name"]),
+                "is_dir": bool(item.get("is_dir")),
+                "size": int(item.get("size") or 0),
+                "modified_at": utc_isoformat_from_timestamp(float(item.get("modified_at") or 0)) or "",
+                "artifact_url": (
+                    None if item.get("is_dir") else f"/api/chat/thread/{thread_id}/artifacts/{runtime_path.lstrip('/')}"
+                ),
+            }
+        )
+    return {"entries": entries}
 
 
 async def read_viewer_file_content(

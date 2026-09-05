@@ -108,81 +108,77 @@ async def ensure_builtin_mcp_servers_in_db() -> None:
     """Ensure built-in MCP server definitions exist in the database."""
     from yuxi.storage.postgres.manager import pg_manager
 
-    try:
-        async with pg_manager.get_async_session_context() as session:
-            any_changed = False
+    async with pg_manager.get_async_session_context() as session:
+        any_changed = False
 
-            result = await session.execute(
-                select(MCPServer).where(
-                    MCPServer.transport == "stdio",
-                    ~MCPServer.slug.in_(_BUILTIN_MCP_SERVER_SLUGS),
-                    MCPServer.enabled == 1,
-                )
+        result = await session.execute(
+            select(MCPServer).where(
+                MCPServer.transport == "stdio",
+                ~MCPServer.slug.in_(_BUILTIN_MCP_SERVER_SLUGS),
+                MCPServer.enabled == 1,
             )
-            for server in result.scalars().all():
-                server.enabled = 0
-                server.updated_by = "system"
-                clear_mcp_server_tools_cache(server.slug)
+        )
+        for server in result.scalars().all():
+            server.enabled = 0
+            server.updated_by = "system"
+            clear_mcp_server_tools_cache(server.slug)
+            any_changed = True
+            logger.warning(f"Disabled legacy user stdio MCP server '{server.slug}'")
+
+        for slug in _RETIRED_BUILTIN_MCP_SERVER_SLUGS:
+            result = await session.execute(
+                select(MCPServer).filter(MCPServer.slug == slug, MCPServer.created_by == "system")
+            )
+            retired = result.scalar_one_or_none()
+            if retired:
+                await session.delete(retired)
+                clear_mcp_server_tools_cache(slug)
                 any_changed = True
-                logger.warning(f"Disabled legacy user stdio MCP server '{server.slug}'")
+                logger.info(f"Removed retired built-in MCP server '{slug}' from database")
 
-            for slug in _RETIRED_BUILTIN_MCP_SERVER_SLUGS:
-                result = await session.execute(
-                    select(MCPServer).filter(MCPServer.slug == slug, MCPServer.created_by == "system")
-                )
-                retired = result.scalar_one_or_none()
-                if retired:
-                    await session.delete(retired)
-                    clear_mcp_server_tools_cache(slug)
-                    any_changed = True
-                    logger.info(f"Removed retired built-in MCP server '{slug}' from database")
-
-            for slug, config in _DEFAULT_MCP_SERVERS.items():
-                result = await session.execute(select(MCPServer).filter(MCPServer.slug == slug))
-                existing = result.scalar_one_or_none()
-                if not existing:
-                    session.add(
-                        MCPServer(
-                            slug=slug,
-                            name=config.get("name", slug),
-                            description=config.get("description"),
-                            transport=config["transport"],
-                            url=config.get("url"),
-                            command=config.get("command"),
-                            args=config.get("args"),
-                            env=config.get("env"),
-                            headers=config.get("headers"),
-                            timeout=config.get("timeout"),
-                            sse_read_timeout=config.get("sse_read_timeout"),
-                            tags=config.get("tags"),
-                            icon=config.get("icon"),
-                            enabled=0,
-                            created_by="system",
-                            updated_by="system",
-                        )
+        for slug, config in _DEFAULT_MCP_SERVERS.items():
+            result = await session.execute(select(MCPServer).filter(MCPServer.slug == slug))
+            existing = result.scalar_one_or_none()
+            if not existing:
+                session.add(
+                    MCPServer(
+                        slug=slug,
+                        name=config.get("name", slug),
+                        description=config.get("description"),
+                        transport=config["transport"],
+                        url=config.get("url"),
+                        command=config.get("command"),
+                        args=config.get("args"),
+                        env=config.get("env"),
+                        headers=config.get("headers"),
+                        timeout=config.get("timeout"),
+                        sse_read_timeout=config.get("sse_read_timeout"),
+                        tags=config.get("tags"),
+                        icon=config.get("icon"),
+                        enabled=0,
+                        created_by="system",
+                        updated_by="system",
                     )
-                    any_changed = True
-                    logger.info(f"Added built-in MCP server '{slug}' to database")
-                    continue
+                )
+                any_changed = True
+                logger.info(f"Added built-in MCP server '{slug}' to database")
+                continue
 
-                server_changed = False
-                for field in _SYNCED_MCP_FIELDS:
-                    next_value = config.get(field)
-                    if getattr(existing, field) != next_value:
-                        setattr(existing, field, next_value)
-                        server_changed = True
-                if existing.created_by != "system":
-                    existing.created_by = "system"
+            server_changed = False
+            for field in _SYNCED_MCP_FIELDS:
+                next_value = config.get(field)
+                if getattr(existing, field) != next_value:
+                    setattr(existing, field, next_value)
                     server_changed = True
-                if server_changed:
-                    existing.updated_by = "system"
-                    any_changed = True
+            if existing.created_by != "system":
+                existing.created_by = "system"
+                server_changed = True
+            if server_changed:
+                existing.updated_by = "system"
+                any_changed = True
 
-            if any_changed:
-                await session.commit()
-
-    except Exception as e:
-        logger.exception(f"Failed to ensure builtin MCP servers in database: {e}")
+        if any_changed:
+            await session.commit()
 
 
 async def get_mcp_client(

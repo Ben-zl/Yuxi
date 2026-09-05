@@ -9,14 +9,7 @@
     "vitepress": "^1.6.4"
   },
   "devDependencies": {
-    "esbuild": "0.28.1"
+    "esbuild": "0.28.2"
   },
-  "pnpm": {
-    "overrides": {
-      "esbuild": "0.28.1",
-      "vitepress>@vitejs/plugin-vue": "6.0.6",
-      "vitepress>vite": "8.0.16"
-    }
-  },
-  "packageManager": "pnpm@10.11.0"
+  "packageManager": "pnpm@11.24.0"
 }

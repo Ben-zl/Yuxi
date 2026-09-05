@@ -146,7 +146,7 @@ const cases = [
 // 技术栈分层
 const techStack = [
   { group: '前端', items: ['Vue 3', 'Vite', 'Pinia'] },
-  { group: '后端', items: ['FastAPI', 'LangGraph', 'ARQ'] },
+  { group: '后端', items: ['FastAPI', 'AgentScope', 'ARQ'] },
   { group: '存储', items: ['PostgreSQL', 'Redis', 'MinIO', 'Milvus', 'Neo4j'] },
   { group: '解析', items: ['MinerU', 'PaddleX', 'RapidOCR'] },
   { group: '部署', items: ['Docker Compose'] }
@@ -154,11 +154,10 @@ const techStack = [
 
 // 开源致谢
 const credits = [
+  { name: 'AgentScope', url: 'https://github.com/agentscope-ai/agentscope' },
   { name: 'LightRAG', url: 'https://github.com/HKUDS/LightRAG' },
-  { name: 'DeepAgents', url: 'https://github.com/langchain-ai/deepagents' },
   { name: 'DeerFlow', url: 'https://github.com/bytedance/deer-flow' },
   { name: 'RAGflow', url: 'https://github.com/infiniflow/ragflow' },
-  { name: 'LangGraph', url: 'https://github.com/langchain-ai/langgraph' },
   { name: 'QwenPaw', url: 'https://github.com/agentscope-ai/QwenPaw' }
 ]
 
@@ -209,7 +208,7 @@ const vReveal = {
         <div class="yx-grid"></div>
       </div>
       <div class="yx-container yx-hero__inner">
-        <span class="yx-badge">v0.7.1 · MIT 开源 · LangGraph 驱动</span>
+        <span class="yx-badge">v0.7.1 · MIT 开源 · AgentScope 驱动</span>
         <h1 class="yx-hero__title">Agent智能体平台 <span class="yx-accent">Yuxi</span></h1>
         <p class="yx-hero__subtitle">融合 RAG 与知识图谱的智能体 Harness 平台</p>
         <p class="yx-hero__desc">

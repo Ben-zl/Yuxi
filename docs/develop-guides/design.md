@@ -39,6 +39,10 @@ Yuxi 是知识库、知识图谱与 Agent 开发平台，界面应保持克制�
 
 主色只用于表达“当前选择、主要操作、关键入口”。不要把主色当作普通装饰色铺在卡片或大面积背景上。
 
+### 辅助色
+
+`--second-*` 是暖金色辅助色系（基准 `--second-500`），刻度与 `--main-*` 对齐，`--second-color` 为语义入口。辅助色只用于少量点缀（徽标、装饰性视觉元素），不能替代主色表达交互状态，也不与语义色混用。
+
 ### 中性色
 
 `--gray-*` 是默认界面骨架，用于背景、文本、边框和分割线：
@@ -73,7 +77,7 @@ Yuxi 是知识库、知识图谱与 Agent 开发平台，界面应保持克制�
 
 ### 暗色模式
 
-Yuxi 通过 `:root.dark` 覆盖同名 token。新增 UI 必须使用 CSS 变量而不是固定浅色值，并检查浅色、暗色两套表现。
+Yuxi 通过 `:root.dark` 覆盖同名 token。新增 UI 必须使用 CSS 变量，禁止固定浅色值，并检查浅色、暗色两套表现。
 
 新增组件时至少检查：
 
@@ -110,7 +114,7 @@ Yuxi 通过 `:root.dark` 覆盖同名 token。新增 UI 必须使用 CSS 变量�
 ### 技术栈约束
 
 - 包管理器：`pnpm`
-- 图标库：优先使用 `lucide-vue-next`
+- 图标库：优先使用 `@lucide/vue`
 - 样式语言：LESS
 - 颜色变量：使用 `base.css` / `base.dark.css` 中的 CSS 变量
 - UI 基础：复用 Ant Design Vue 和项目现有组件模式，避免为单次需求封装新组件体系
@@ -234,7 +238,7 @@ Yuxi 默认采用“背景 + 边框”的轻量层级：
 - 为新增交互补齐 hover、focus、disabled、loading、empty、error 等必要状态。
 - 用背景、边框、字号、间距建立层级。
 - 保持浅色和暗色模式一致可用。
-- 复用 `lucide-vue-next`、Ant Design Vue 和项目已有组件模式。
+- 复用 `@lucide/vue`、Ant Design Vue 和项目已有组件模式。
 - 在复杂配置区保留简短说明，帮助用户理解设置影响。
 
 ### Don't
@@ -298,7 +302,7 @@ AI agent 修改或生成 Yuxi UI 时，优先按这一节执行。
 实现工具栏按钮：
 
 ```text
-实现一个工具栏按钮：优先使用 lucide-vue-next 图标，图标尺寸 16px，按钮添加 lucide-icon-btn。默认使用中性色，hover 时使用 var(--main-color) 或 var(--main-10) 强化，不位移、不放大。
+实现一个工具栏按钮：优先使用 @lucide/vue 图标，图标尺寸 16px，按钮添加 lucide-icon-btn。默认使用中性色，hover 时使用 var(--main-color) 或 var(--main-10) 强化，不位移、不放大。
 ```
 
 实现状态标签：
@@ -318,7 +322,7 @@ AI agent 修改或生成 Yuxi UI 时，优先按这一节执行。
 - hover、focus、disabled、loading、empty、error 状态符合场景。
 - 没有使用 hover 位移、放大、旋转或装饰性动画。
 - 普通卡片没有使用重阴影。
-- 图标来自 `lucide-vue-next`，尺寸和对齐符合现有模式。
+- 图标来自 `@lucide/vue`，尺寸和对齐符合现有模式。
 - API 接口、组件位置、样式语言符合前端开发规范。
 - 已在真实页面和关键响应式宽度截图验收，而不只依赖构建通过。
 

@@ -2,15 +2,13 @@ import traceback
 import uuid
 from typing import Any
 
-import aiofiles
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File
-from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.storage.postgres.models_business import User
 from server.utils.auth_middleware import get_db, get_required_user
-from yuxi import config as conf
+from yuxi.config import config as conf
 from yuxi.agents.tool_approval import ToolApprovalMode
 from yuxi.models import select_model
 from yuxi.services.thread_state_service import get_thread_state_view
@@ -29,18 +27,16 @@ from yuxi.services.conversation_service import (
     upload_thread_attachment_view,
     upload_tmp_attachment_view,
 )
-from yuxi.services.file_preview import detect_media_type
 from yuxi.services.thread_files_service import (
     list_thread_files_view,
     read_thread_file_content_view,
     resolve_thread_artifact_view,
-    InMemoryArtifact,
     save_thread_artifact_to_workspace_view,
 )
 from yuxi.services.feedback_service import get_message_feedback_view, submit_message_feedback_view
 from yuxi.utils.logging_config import logger
 from yuxi.utils.image_processor import process_uploaded_image
-from yuxi.utils.paths import VIRTUAL_PATH_PREFIX
+from yuxi.agents.backends.paths import VIRTUAL_PATH_PREFIX
 
 
 # TODO：当前文件的功能过于庞杂，路由标签混乱
@@ -122,9 +118,15 @@ async def get_thread_state(
 
 
 class ThreadCreate(BaseModel):
+    """新线程创建请求，只允许在创建时选择 Project。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str | None = Field(None, max_length=64)
     title: str | None = None
     agent_id: str
     metadata: dict | None = None
+    project_id: str | None = None
 
 
 class ThreadResponse(BaseModel):
@@ -133,6 +135,8 @@ class ThreadResponse(BaseModel):
     agent_id: str
     title: str | None = None
     is_pinned: bool = False
+    project_id: str | None = None
+    workdir_path: str | None = None
     created_at: str
     updated_at: str
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -281,8 +285,10 @@ async def create_thread(
     """创建新对话线程 (使用新存储系统)"""
     return await create_thread_view(
         agent_slug=thread.agent_id,
+        request_id=thread.request_id,
         title=thread.title,
         metadata=thread.metadata,
+        project_id=thread.project_id,
         db=db,
         current_uid=str(current_user.uid),
     )
@@ -331,6 +337,10 @@ async def delete_thread(
 
 
 class ThreadUpdate(BaseModel):
+    """线程可变展示字段，不接受绑定字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
     title: str | None = None
     is_pinned: bool | None = None
     tool_approval_mode: ToolApprovalMode | None = None
@@ -499,27 +509,19 @@ async def get_thread_artifact(
     thread_id: str,
     path: str,
     download: bool = Query(False),
+    preview: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_required_user),
 ):
     """下载或预览线程文件。"""
-    file_path = await resolve_thread_artifact_view(
+    return await resolve_thread_artifact_view(
         thread_id=thread_id,
         current_uid=str(current_user.uid),
         db=db,
         path=path,
+        download=download,
+        preview=preview,
     )
-
-    if isinstance(file_path, InMemoryArtifact):
-        media_type = detect_media_type(file_path.name, file_path.content[:512])
-        headers = {"Content-Disposition": f'attachment; filename="{file_path.name}"'} if download else None
-        return Response(content=file_path.content, media_type=media_type, headers=headers)
-
-    async with aiofiles.open(file_path, "rb") as artifact_file:
-        file_head = await artifact_file.read(512)
-    media_type = detect_media_type(file_path.name, file_head)
-    headers = {"Content-Disposition": f'attachment; filename="{file_path.name}"'} if download else None
-    return FileResponse(path=file_path, media_type=media_type, headers=headers)
 
 
 @chat.post("/thread/{thread_id}/artifacts/save", response_model=SaveThreadArtifactResponse)

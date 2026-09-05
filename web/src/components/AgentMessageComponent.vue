@@ -56,9 +56,11 @@
             <ChevronRight v-else size="14" />
           </span>
         </button>
-        <div v-if="!isReasoningActive && reasoningExpanded" class="reasoning-panel">
-          <p class="reasoning-content">{{ parsedData.reasoning_content }}</p>
-        </div>
+        <CollapseTransition>
+          <div v-if="!isReasoningActive && reasoningExpanded" class="reasoning-panel">
+            <p class="reasoning-content">{{ parsedData.reasoning_content }}</p>
+          </div>
+        </CollapseTransition>
       </div>
 
       <!-- 消息内容 -->
@@ -114,8 +116,6 @@
       <!-- 错误消息 -->
     </div>
 
-    <div v-if="infoStore.debugMode" class="status-info">{{ message }}</div>
-
     <!-- 自定义内容 -->
     <slot></slot>
   </div>
@@ -158,12 +158,12 @@
 <script setup>
 import { computed, ref, onUnmounted } from 'vue'
 import RefsComponent from '@/components/RefsComponent.vue'
-import { Brain, Check, ChevronDown, ChevronRight, Copy, LoaderCircle, X } from 'lucide-vue-next'
+import { Brain, Check, ChevronDown, ChevronRight, Copy, LoaderCircle, X } from '@lucide/vue'
 import ToolCallsGroupComponent from '@/components/ToolCallsGroupComponent.vue'
+import CollapseTransition from '@/components/common/CollapseTransition.vue'
 import MarkdownPreview from '@/components/common/MarkdownPreview.vue'
 import MentionTextRenderer from '@/components/common/MentionTextRenderer.vue'
 import { useAgentStore } from '@/stores/agent'
-import { useInfoStore } from '@/stores/info'
 import { storeToRefs } from 'pinia'
 import { MessageProcessor } from '@/utils/messageProcessor'
 import { inferImageMimeTypeFromBase64, normalizeAttachmentPreviews } from '@/utils/file_utils'
@@ -204,11 +204,6 @@ const props = defineProps({
   mention: {
     type: Object,
     default: () => null
-  },
-  // 是否显示调试信息 (已废弃，使用 infoStore.debugMode)
-  debugMode: {
-    type: Boolean,
-    default: false
   }
 })
 
@@ -312,7 +307,7 @@ const getErrorMessage = computed(() => {
 // 引入智能体 store
 const agentStore = useAgentStore()
 const { availableKnowledgeBases } = storeToRefs(agentStore)
-const infoStore = useInfoStore()
+
 const messageAttachments = computed(() =>
   normalizeAttachmentPreviews(props.message.extra_metadata?.attachments)
 )
@@ -501,8 +496,7 @@ const parsedData = computed(() => {
 
     .reasoning-panel {
       margin-top: 4px;
-      padding: 4px 0 4px 22px;
-      border-top: 1px solid var(--gray-100);
+      padding: 4px 0;
     }
 
     .reasoning-content {

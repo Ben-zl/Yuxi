@@ -15,9 +15,10 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from yuxi.storage.postgres.models_business import Base
+from sqlalchemy.orm import declarative_base
 from yuxi.utils.datetime_utils import utc_now_naive
 
+Base = declarative_base()
 JSON_VALUE = JSON().with_variant(JSONB, "postgresql")
 
 

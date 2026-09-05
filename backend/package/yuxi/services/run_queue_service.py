@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 
 from yuxi.storage.redis import close_async_redis_client, create_arq_redis_pool, get_async_redis_client
@@ -15,6 +15,15 @@ RUN_CANCEL_KEY_TTL_SECONDS = int(os.getenv("RUN_CANCEL_KEY_TTL_SECONDS", "1800")
 RUN_EVENTS_STREAM_TTL_SECONDS = int(os.getenv("RUN_EVENTS_STREAM_TTL_SECONDS", "7200"))
 RUN_EVENTS_STREAM_MAXLEN = int(os.getenv("RUN_EVENTS_STREAM_MAXLEN", "0"))
 RUN_CANCEL_CHANNEL = os.getenv("RUN_CANCEL_CHANNEL", "run:cancel:ch")
+WORKER_HEALTH_CONTRACT = "agent-run-v1"
+WORKER_HEALTH_KEY = f"yuxi:worker:health:{WORKER_HEALTH_CONTRACT}"
+WORKER_HEALTH_INTERVAL_SECONDS = float(os.getenv("WORKER_HEALTH_INTERVAL_SECONDS", "5"))
+if not 0 < WORKER_HEALTH_INTERVAL_SECONDS <= 10:
+    raise ValueError("WORKER_HEALTH_INTERVAL_SECONDS 必须大于 0 且不超过 10")
+WORKER_HEALTH_MAX_TTL_MS = int((WORKER_HEALTH_INTERVAL_SECONDS + 1) * 1000)
+RUN_RECONCILIATION_SECONDS = 30
+WORKER_RECONCILIATION_HEALTH_KEY = f"{WORKER_HEALTH_KEY}:lease-reconciliation"
+WORKER_RECONCILIATION_HEALTH_TTL_SECONDS = RUN_RECONCILIATION_SECONDS * 2 + 5
 
 _arq_pool = None
 
@@ -91,62 +100,101 @@ async def get_arq_pool():
 async def redis_pubsub(channel: str):
     redis = await get_redis_client()
     pubsub = redis.pubsub()
-    await pubsub.subscribe(channel)
     try:
-        yield pubsub
-    finally:
+        await pubsub.subscribe(channel)
         try:
-            await pubsub.unsubscribe(channel)
+            yield pubsub
         finally:
+            with suppress(Exception):
+                await pubsub.unsubscribe(channel)
+    finally:
+        with suppress(Exception):
             await pubsub.close()
 
 
 async def publish_cancel_signal(run_id: str) -> None:
-    redis = await get_redis_client()
-    key = _cancel_key(run_id)
     try:
+        redis = await get_redis_client()
+        key = _cancel_key(run_id)
         await redis.set(key, "1", ex=RUN_CANCEL_KEY_TTL_SECONDS)
         await redis.publish(RUN_CANCEL_CHANNEL, run_id)
     except Exception as e:
         logger.warning(f"Failed to publish cancel signal for run {run_id}: {e}")
 
 
-async def has_cancel_signal(run_id: str) -> bool:
+async def _read_cancel_signal(run_id: str) -> bool:
     redis = await get_redis_client()
-    key = _cancel_key(run_id)
+    return bool(await redis.get(_cancel_key(run_id)))
+
+
+async def has_cancel_signal(run_id: str) -> bool:
     try:
-        return bool(await redis.get(key))
+        return await _read_cancel_signal(run_id)
     except Exception as e:
         logger.warning(f"Failed to read cancel signal for run {run_id}: {e}")
         return False
 
 
 async def wait_for_cancel_signal(run_id: str, poll_timeout_seconds: float = 1.0) -> bool:
-    if await has_cancel_signal(run_id):
-        return True
+    poll_timeout_seconds = max(0.0, float(poll_timeout_seconds))
+    loop = asyncio.get_running_loop()
+    key_failure_logged = False
+    pubsub_failure_logged = False
 
-    try:
-        async with redis_pubsub(RUN_CANCEL_CHANNEL) as pubsub:
-            while True:
-                msg = await pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=poll_timeout_seconds,
-                )
-                if msg and str(msg.get("data")) == run_id:
+    while True:
+        attempt_started_at = loop.time()
+        try:
+            try:
+                if await _read_cancel_signal(run_id):
                     return True
-                if await has_cancel_signal(run_id):
-                    return True
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        logger.warning(f"Failed to wait cancel signal for run {run_id}: {e}")
-        return False
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if not key_failure_logged:
+                    logger.warning(f"Failed to read cancel signal for run {run_id}: {e}")
+                    key_failure_logged = True
+            else:
+                key_failure_logged = False
+
+            async with redis_pubsub(RUN_CANCEL_CHANNEL) as pubsub:
+                while True:
+                    poll_started_at = loop.time()
+                    msg = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=poll_timeout_seconds,
+                    )
+                    pubsub_failure_logged = False
+                    if msg and str(msg.get("data")) == run_id:
+                        return True
+                    try:
+                        if await _read_cancel_signal(run_id):
+                            return True
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        if not key_failure_logged:
+                            logger.warning(f"Failed to read cancel signal for run {run_id}: {e}")
+                            key_failure_logged = True
+                    else:
+                        key_failure_logged = False
+                    remaining = poll_timeout_seconds - (loop.time() - poll_started_at)
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if not pubsub_failure_logged:
+                logger.warning(f"Failed to wait cancel signal for run {run_id}: {e}")
+                pubsub_failure_logged = True
+            remaining = poll_timeout_seconds - (loop.time() - attempt_started_at)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
 
 
 async def clear_cancel_signal(run_id: str) -> None:
-    redis = await get_redis_client()
-    key = _cancel_key(run_id)
     try:
+        redis = await get_redis_client()
+        key = _cancel_key(run_id)
         await redis.delete(key)
     except Exception as e:
         logger.warning(f"Failed to clear cancel signal for run {run_id}: {e}")

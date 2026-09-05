@@ -1,6 +1,6 @@
 # 使用轻量级Python基础镜像
 FROM python:3.13-slim
-COPY --from=ghcr.io/astral-sh/uv:0.11.26 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.6 /uv /uvx /bin/
 COPY --from=node:24-slim /usr/local/bin /usr/local/bin
 COPY --from=node:24-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=node:24-slim /usr/local/include /usr/local/include
@@ -56,3 +56,18 @@ RUN uv sync --no-cache --group test --no-dev --frozen
 
 # 复制 server 代码
 COPY backend/server /app/server
+COPY docker/api-entrypoint.sh /usr/local/bin/yuxi-entrypoint
+
+RUN groupadd --gid 1000 yuxi \
+    && useradd --uid 1000 --gid 1000 --create-home yuxi \
+    && mkdir -p /app/runtime /home/yuxi/nltk_data /home/yuxi/.cache/rapidocr/models \
+    && chown -R 1000:1000 /app/runtime /home/yuxi \
+    && chmod 0755 /usr/local/bin/yuxi-entrypoint
+
+ENV HOME=/home/yuxi \
+    NLTK_DATA=/home/yuxi/nltk_data \
+    RAPIDOCR_MODEL_DIR=/home/yuxi/.cache/rapidocr/models
+
+USER 1000:1000
+
+ENTRYPOINT ["/usr/local/bin/yuxi-entrypoint"]

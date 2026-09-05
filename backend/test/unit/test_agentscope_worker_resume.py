@@ -169,6 +169,7 @@ async def test_resume_streams_reasoning_tools_and_terminal_event(monkeypatch):
             "output": "知识库结果",
             "status": "success",
             "error_message": None,
+            "metadata": {},
         }
     ]
     assert any(name == "messages" for name, _ in emitted)
@@ -438,6 +439,8 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
 
 async def test_worker_persists_reasoning_and_tool_calls(monkeypatch):
     """公共 worker 路径应保存推理内容与工具生命周期，刷新后仍可恢复。"""
+    from yuxi.agentscope import execution
+
     run = SimpleNamespace(
         id="run",
         uid="u",
@@ -494,10 +497,13 @@ async def test_worker_persists_reasoning_and_tool_calls(monkeypatch):
     monkeypatch.setattr(worker_job.pg_manager, "get_async_session_context", lambda: _SessionContext())
     monkeypatch.setattr(worker_job, "AgentRunRepository", lambda current_db: run_repo)
     monkeypatch.setattr(worker_job, "ConversationRepository", lambda current_db: conv_repo)
+    monkeypatch.setattr(execution, "ConversationRepository", lambda current_db: conv_repo)
     monkeypatch.setattr(worker_job, "ensure_thread_session", AsyncMock(return_value=mapping))
     monkeypatch.setattr(worker_job, "_apply_permission_mode", AsyncMock())
     monkeypatch.setattr(worker_job, "execute_run", AsyncMock(return_value=result))
     monkeypatch.setattr(worker_job, "dispatch_next_request", AsyncMock())
+    finalize = AsyncMock()
+    monkeypatch.setattr(worker_job, "finalize_run", finalize)
 
     await worker_job.execute_agent_run_job("run")
 
@@ -514,6 +520,7 @@ async def test_worker_persists_reasoning_and_tool_calls(monkeypatch):
         langgraph_tool_call_id="tc1",
     )
     run_repo.set_output_message.assert_awaited_once_with("run", 2)
+    finalize.assert_awaited_once_with(db, run, result)
 
 
 async def test_apply_permission_mode_maps_always_trust_to_bypass():

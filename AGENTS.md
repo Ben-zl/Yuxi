@@ -1,143 +1,65 @@
+# Yuxi Agent 开发约定
 
-# 项目目录结构 (Project Overview)
+Yuxi 是基于 AgentScope、FastAPI、Vue 和多种持久化服务构建的知识库与多智能体平台。Docker Compose 是开发拓扑的事实来源；修改陌生模块前先读 [ARCHITECTURE.md](ARCHITECTURE.md)，再用符号搜索确认真实实现。
 
-Yuxi 是一个基于大模型的智能知识库与知识图谱智能体开发平台，融合了 RAG 技术与知识图谱技术，基于 LangGraph v1 + Vue.js + FastAPI + LightRAG 架构构建。项目完全通过 Docker Compose 进行管理，支持热重载开发。
+## 任务边界
 
-架构代码地图见 [ARCHITECTURE.md](ARCHITECTURE.md)。修改不熟悉的模块前，先阅读其中的后端、前端、运行链路和架构不变量说明，再用符号搜索定位具体实现；该文档只维护相对稳定的系统边界，不替代细节文档或源码注释。
+- 围绕用户目标工作，先写可验证目标、非目标、假设和风险；多步任务先给出带验证方式的简短计划。
+- 区分已验证事实、推断和未知项。缺少关键决策且会改变数据、安全或外部状态时才询问，其余基于保守假设继续。
+- 只改验收所需范围，不顺手重构、格式化或添加兼容层、fallback、配置和依赖。
+- 非平凡变更先在 `docs/develop-guides/decisions/proposed/` 建立 tracked decision；完成后移到 `implemented/` 并改写为现在时。
+- `docs/vibe/` 仅用于本地临时计划，不作为组织记忆或完成事实。
 
-## 开发准则
+## 当前架构事实
 
-Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+- HTTP 路由只做解析、认证和响应装配；用例属于 `yuxi.services`，持久化查询属于 `yuxi.repositories`。
+- 所有 Web、Channel、任务和内部调用通过 `RunSubmissionCommand` 提交；PostgreSQL 持有 ExecutionRequest、AgentRun、Attempt、lease、heartbeat、manifest、事件和终态事实。
+- AgentScope 是唯一执行事实 Owner：Session、Message、Run、Team/SubAgent、HITL、取消、恢复、SSE、reconciliation 和 Workspace 均沿当前 `yuxi.agentscope` 链路实现。
+- PostgreSQL 持有业务事实；Redis 只承载投递、短期事件、取消信号和缓存。完成状态、输出、事件、Artifact 和错误必须绑定同一 Request/Execution/Run。
+- 普通请求按用户、Agent、Session 串行调度；非终态 Run 必须有明确 Owner、lease/heartbeat 和 reconciliation 结局。
+- `/api/system/health` 只表达 liveness；接流量条件由 `/api/system/ready` 证明。权限最终在后端依赖和 repository 可见性查询处执行。
+- AgentScope Session、Execution、Message 只使用 PostgreSQL Storage；API 与 AgentScope 服务不提供本地后端选择或静默降级。
+- LITE 启动、路由注册和能力发现不得导入知识库、图谱、评估重运行时；解析器只在真实解析动作发生时惰性加载。
+- Workspace 虚拟路径、对象 URL 和宿主路径不可混用；用户路径必须在 owning filesystem boundary 校验，并拒绝 symlink 越界。
 
-**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+## 实现规则
 
-## 1. Think Before Coding
+- 沿 producer → registration → consumer → persistence/publication → user-visible result 追踪主链路，在真实语义 Owner 处闭合主张。
+- 复用现有类型、依赖、repository、Workspace、Artifact 和 AgentScope projection；已有能力足够时不重复实现。
+- 输入只在 parser、配置、模型/tool JSON、持久化、worker、process、wire 和用户路径等真实边界校验；副作用 executor/repository fail-closed。
+- 新函数/类使用简洁中文 docstring；注释只解释非显然约束、时序、Owner 和安全用法。
+- 不提交 `.env`、账号、Token、用户数据、运行目录和构建产物；文件以换行结尾，提交前运行 `git diff --check`。
 
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
+## 验证与证据
 
-Before implementing:
+测试职责见 [docs/develop-guides/testing-guidelines.md](docs/develop-guides/testing-guidelines.md)。先跑最小相关集合，再按风险升级；unit 不能替代真实 HTTP、PostgreSQL、worker、SSE、文件、对象或浏览器验证。每个新 guard 都要有能恢复目标缺陷并在正确原因上失败的负向测试。
 
-- Restate the request as the smallest acceptance criteria you are about to satisfy. If you cannot state it simply, you do not understand the request yet.
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
-- Treat phrases like "可以", "也可以", "类似这样", or "for example" as acceptable simple directions, not permission to design a larger mechanism.
-
-## 2. Goal-Driven Execution
-
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
-
-```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
-```
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
-
----
-
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
-
-## 代码整洁规范 (Code Cleanliness)
-
-### 核心原则
-
-1. **简单直接**：使用能满足验收标准的最小实现，不增加未被要求的功能、配置、兼容层或扩展点。
-2. **职责完整**：相关逻辑应集中在最容易理解的位置，优先保持主流程线性、完整、可一眼读懂。
-3. **最小改动**：每一处变更都应能直接追溯到当前需求；不顺手重构、格式化或清理无关代码。
-4. **显式失败**：预设条件不成立时及时暴露错误，不使用静默回退、冗余保底或吞异常来掩盖设计问题。
-5. **阅读优先**：代码首先服务于维护者理解，其次才是抽象复用；抽象后调用链更绕时应选择更直接的写法。
-
-### 实现细则
-
-- 不为单次使用的逻辑创建抽象，不为想象中的未来需求预留“灵活性”或“可配置性”。
-- 不为简单线性逻辑拆出一组细碎 helper。拆函数必须用于明确复用、隔离副作用或实质降低认知负担。
-- 遵循向下规则（The Stepdown Rule）：公开、高层方法在上，实现细节逐层下沉；读者应能从上到下连续理解调用关系。
-- 优先使用早返回和清晰的主路径，避免不必要的嵌套、间接跳转、聚合层、优先级规则、协议解释器和多层 fallback。
-- 常量和具名值应放在最小合理作用域：跨函数复用、协议标识、配置约束或需要全局统一维护时使用模块级常量；仅服务单个函数的错误文案或局部规则，即使需要复用，也优先定义为函数内具名变量。不要为了减少变量而强行内联，也不要把局部实现细节提升为全局状态。
-- 命名应表达业务意图；注释用于说明原因、约束和非显然取舍，不复述代码表面行为。
-- 禁止导入其他模块以下划线 `_` 开头的私有标识（函数、变量、常量）；跨模块确有共享需求时，应将该符号改为公开命名，而不是从外部 import 私有符号。
-- 修改现有代码时匹配当前文件风格，不“顺便优化”相邻实现。发现无关坏味道可以说明，但不要擅自处理。
-- 删除由本次修改产生的未使用 import、变量、函数和分支；除非用户要求，不清理修改前已存在的无关死代码。
-- 对小型状态、进度或摘要需求，直接读取来源、选择必要字段并返回最小结果，不重建事件流或调试视图。
-- 如果实现明显长于问题本身，或 200 行可以清楚地写成 50 行，应停下来简化。
-- 新增函数/类 需要有明确的清晰凝练的 docstring（中文），重要的、关键的位置需要有额外的注释。
-- 代码要注重可读性，要有“段落”的概念，不同语义关联的代码之间可以留一个空行，方便阅读。
-
-自检问题：高级工程师是否会认为这段实现过度设计、过度防御、过度嵌套或过于零碎？如果会，先简化再提交。
-
-## 代码 Review 准则
-
-进行代码 Review 时，按以下顺序审查：
-
-1. 首先确认代码是否能够完成基本功能，并覆盖主要使用场景；如果主路径或关键场景没有验证清楚，应优先指出。
-2. 审查当前实施方案是否是上下文中的最优解，是否会增加用户或维护者的理解负担；如果存在更简洁、更容易理解但改动面更大的方案，不要直接重写，先向用户说明取舍并确认。
-3. 检查是否存在过度设计、过度防御或过度嵌套：过度设计通常表现为加入无关功能；过度防御通常表现为用非预期的回退或保底掩盖设计问题；过度嵌套通常表现为 helper 过多、调用链绕、没有遵循从上到下的阅读顺序。
-4. 认真评估测试脚本和测试用例的价值。对繁琐但只是在“给出靶子后评估靶子”的低价值测试，应建议清理或合并；保留能验证真实行为、关键路径和回归风险的测试。
-
-## 开发与调试工作流 (Development & Debugging Workflow)
-
-本项目完全通过 Docker Compose 进行管理。所有开发和调试都应在运行的容器环境中进行。使用 `docker compose up -d` 命令进行构建和启动。
-
-**核心原则**:
-
-1. 由于 Compose 服务 `api` / `web`（容器名 `api-dev` / `web-dev`）均配置了热重载 (hot-reloading)，本地修改代码后无需重启容器，服务会自动更新。应该先检查项目是否已经在后台启动（`docker ps`），查看日志（`docker logs api-dev --tail 100`）具体的可以阅读 [docker-compose.yml](docker-compose.yml).
-2. 开发完成之后必须按改动范围进行 检查 -> 测试 -> Lint：相关单元测试必跑；涉及接口时跑集成测试；涉及关键主链路时补跑端到端测试。测试脚本不完善时应完善脚本。
-3. 测试规范务必遵守 [testing-guidelines.md](docs/develop-guides/testing-guidelines.md) 中的规范，测试脚本务必放在 backend/test/unit、backend/test/integration 或 backend/test/e2e 对应目录下，并且在提交前确保测试通过。
-
-### 需求沟通规范
-
-在沟通需求的时候，当需求不明确的时候，需要主动挖掘需求细节，对齐需求的验收标准，明确需求的优先级和范围，避免模糊需求导致的过度设计和不必要的工作。
-
-- 需求/修改 明确之后，如果改动较大，则需要在 docs/vibe 目录下创建一个包含日期的文档，记录需求的细节和验收标准
-- 该需求文档中，还应该包括本次任务的目标以及 checklist（简要）
-
-### 前端开发规范
-
-- 使用 pnpm 管理
-- API 接口规范：所有的 API 接口都应该定义在 web/src/apis 下面
-- Icon 应该优先从 lucide-vue-next （推荐，但是需要注意尺寸）
-- 样式使用 less，非特殊情况必须使用 [base.css](web/src/assets/css/base.css) 中的颜色变量
-- UI 设计规范详见 [design](docs/develop-guides/design.md)
-
-### 后端开发规范
+提交前在仓库根目录至少运行：
 
 ```bash
-# 代码检查和格式化
-make format        # 格式化代码
+python3 scripts/verify_engineering_contracts.py
+python3 -m unittest scripts.test_verify_engineering_contracts
+docker compose exec api uv run --group test pytest test/unit -m "not slow"
+git diff --check
 ```
 
-注意：
+涉及范围时补充：
 
-- Python 代码要符合 pythonic 风格
-- 尽量使用较新的语法，避免使用旧版本的语法（版本兼容到 3.12+）
-- 更新 [changelog.md](docs/develop-guides/changelog.md) 文档记录本次修改，多个类似的功能更新已经补充在一起
-- 开发完成后务必在 docker 中进行测试，可以读取 .env 获取管理员账户和密码；敏感值仅用于本地测试命令，不要输出到回复、日志摘录、测试文件或文档中
+```bash
+docker compose exec api uv run ruff check package
+docker compose exec api uv run ruff format package --check
+docker compose exec api uv run --group test pytest test/integration
+docker compose exec api uv run --group test pytest test/e2e -m e2e
+docker compose exec web pnpm run lint:check
+docker compose exec web pnpm run test:unit
+docker compose exec web pnpm run build
+cd docs && pnpm run build
+```
 
-**其他**：
+实际命令、结果、数据库/文件/对象回读、未运行原因和剩余风险必须如实记录；`Passed` 只表示命令真实成功且结果已核对，缺少凭证或服务写 `Not run`。
 
-- 如果需要新建说明文档（仅开发者可见，非必要不创建），则保存在 `docs/vibe` 文件夹下面
-- 代码更新后要检查文档部分是否有需要更新的地方，文档的目录定义在 `docs/.vitepress/config.mts` 中
-- 如果新增面向用户的正式文档，除了补正文档内容外，还需要同步更新 `docs/.vitepress/config.mts` 的导航；Langfuse 集成说明归档在 `docs/agents` 分组下维护，并同步更新 `docs/develop-guides/changelog.md`
+## Git 与 Review
 
-## 提交规范
-
-1. 参考 [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) 规范编写提交信息。
-2. 使用中文提交信息，标题简洁明了，描述具体改动内容和原因。
-3. 创建 PR 必须参考 [contributing.md](docs/develop-guides/contributing.md) 以及 PR 模板[PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md)，并在提交前完成其中的检查项。
-
-## GitHub 远端发布约束
-
-- 代码改动、文档、规格、方案和计划默认只生成本地产物。未经用户针对本次发布的明确授权，不得执行任何会修改 GitHub 远端状态的操作，包括 push、创建或更新 PR、Issue、Release、远端标签、评论及上传产物。
-- 用户要求生成、整理、评审或完善内容，不等同于授权发布。即使所调用的 Skill 默认包含 GitHub 发布步骤，也必须先获得用户对目标仓库、发布内容和发布方式的当次明确授权。
-- 完成工作后只汇报本地变更与验证结果；需要发布时，将其作为独立步骤等待用户确认，不得自行继续。
+- 默认分支前缀为 `codex/`。并行 worktree 使用独立 Compose project、端口和 `../.yuxi/slots/<slot>` 数据目录；不删除现有 volume、`.env` 或生产数据。
+- 未经当前请求明确授权，不执行 push、PR、Issue、Release、远端标签或评论等远端写操作。
+- 提交信息使用中文 Conventional Commit。代码变更在 commit 前必须由不继承开发上下文的全新 Reviewer 审查完整需求、decision、diff、测试和未验证范围；先修复功能、边界、证据或认知负担问题，再提交。

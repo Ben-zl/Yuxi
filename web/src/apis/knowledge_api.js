@@ -45,6 +45,22 @@ export const databaseApi = {
     return apiAdminPost(`/api/knowledge/databases/${kbId}/stats/repair`, {})
   },
 
+  detectVirtualFolders: async (kbId) => {
+    return apiAdminGet(`/api/knowledge/databases/${kbId}/virtual-folders/detect`)
+  },
+
+  startVirtualFolderMigration: async (kbId) => {
+    return apiAdminPost(`/api/knowledge/databases/${kbId}/virtual-folders/migrate`, {})
+  },
+
+  streamVirtualFolderMigration: async (kbId, taskId, signal) => {
+    return apiAdminGet(
+      `/api/knowledge/databases/${kbId}/virtual-folders/migrations/${taskId}/events`,
+      { signal },
+      'response'
+    )
+  },
+
   /**
    * 更新知识库信息
    * @param {string} kbId - 知识库ID
@@ -143,6 +159,18 @@ export const documentApi = {
     return apiAdminPost(`/api/knowledge/databases/${kbId}/folders`, {
       folder_name: folderName,
       parent_id: parentId
+    })
+  },
+
+  renameFolder: async (kbId, folderId, folderName) => {
+    return apiAdminPut(`/api/knowledge/databases/${kbId}/folders/${folderId}/rename`, {
+      folder_name: folderName
+    })
+  },
+
+  moveDocument: async (kbId, documentId, newParentId) => {
+    return apiAdminPut(`/api/knowledge/databases/${kbId}/documents/${documentId}/move`, {
+      new_parent_id: newParentId
     })
   },
 
@@ -249,19 +277,26 @@ export const documentApi = {
    * 手动触发文档解析
    * @param {string} kbId - 知识库ID
    * @param {Array} fileIds - 文件ID列表
+   * @param {Object} params - 处理参数（如 ocr_engine）
    * @returns {Promise} - 解析任务结果
    */
-  parseDocuments: async (kbId, fileIds) => {
-    return apiAdminPost(`/api/knowledge/databases/${kbId}/documents/parse`, fileIds)
+  parseDocuments: async (kbId, fileIds, params = {}) => {
+    return apiAdminPost(`/api/knowledge/databases/${kbId}/documents/parse`, {
+      file_ids: fileIds,
+      params
+    })
   },
 
   /**
    * 手动触发全部待解析文档解析
    * @param {string} kbId - 知识库ID
+   * @param {Object} params - 处理参数（如 ocr_engine）
    * @returns {Promise} - 解析任务结果
    */
-  parsePendingDocuments: async (kbId) => {
-    return apiAdminPost(`/api/knowledge/databases/${kbId}/documents/parse-pending`, {})
+  parsePendingDocuments: async (kbId, params = {}) => {
+    return apiAdminPost(`/api/knowledge/databases/${kbId}/documents/parse-pending`, {
+      params
+    })
   },
 
   /**
@@ -435,6 +470,18 @@ export const queryApi = {
 
 export const fileApi = {
   /**
+   * 构造知识库文件上传端点，供需要原生上传进度的调用方复用。
+   * @param {string|null} kbId - 知识库 ID
+   * @returns {string} - 上传端点
+   */
+  getUploadUrl: (kbId = null) => {
+    if (kbId === null || kbId === undefined || kbId === '') {
+      return '/api/knowledge/files/upload'
+    }
+    return `/api/knowledge/files/upload?kb_id=${encodeURIComponent(kbId)}`
+  },
+
+  /**
    * 抓取 URL 内容
    * @param {string} url - 目标 URL
    * @param {string} kbId - 知识库 ID
@@ -470,13 +517,7 @@ export const fileApi = {
     const formData = new FormData()
     formData.append('file', file)
 
-    const url = kbId ? `/api/knowledge/files/upload?kb_id=${kbId}` : '/api/knowledge/files/upload'
-
-    return apiAdminPost(url, formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data'
-      }
-    })
+    return apiAdminPost(fileApi.getUploadUrl(kbId), formData)
   },
 
   /**
@@ -612,7 +653,8 @@ export const evaluationApi = {
 
     if (params.page) queryParams.append('page', params.page)
     if (params.pageSize) queryParams.append('page_size', params.pageSize)
-    if (params.errorOnly !== undefined) queryParams.append('error_only', params.errorOnly)
+    if (params.resultFilter !== undefined) queryParams.append('result_filter', params.resultFilter)
+    else if (params.errorOnly !== undefined) queryParams.append('error_only', params.errorOnly)
 
     const url = `/api/evaluation/databases/${kbId}/runs/${runId}${queryParams.toString() ? '?' + queryParams.toString() : ''}`
     return apiAdminGet(url)

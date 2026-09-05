@@ -110,6 +110,17 @@ def test_fresh_import_ignores_invalid_ocr_engine_and_loads_later_config(tmp_path
     assert loaded["default_model"] == "test-provider:after-invalid-ocr"
 
 
+def test_config_uses_explicit_environment_config_directory(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """配置文件目录由显式环境变量决定，不依赖当前工作目录。"""
+    config_dir = tmp_path / "runtime" / "api"
+    monkeypatch.setenv("YUXI_CONFIG_DIR", str(config_dir))
+
+    cfg = Config()
+
+    assert cfg.save_dir == str(config_dir)
+    assert cfg._config_file == config_dir / "config" / "base.toml"
+
+
 def test_save_writes_runtime_snapshot_after_base_toml(tmp_path, monkeypatch: pytest.MonkeyPatch):
     redis = _FakeRedis()
     _patch_runtime_redis(monkeypatch, redis)

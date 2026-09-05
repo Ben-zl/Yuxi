@@ -20,6 +20,71 @@ def test_generate_api_key_returns_secret_hash_and_prefix():
     assert key_hash == hashlib.sha256(full_key.encode()).hexdigest()
 
 
+def test_derived_api_key_is_replayable_and_independent_from_jwt_secret(monkeypatch):
+    monkeypatch.setenv("API_KEY_DERIVATION_SECRET", "api-key-master-secret-one-at-least-32")
+    monkeypatch.setenv("JWT_SECRET_KEY", "jwt-secret-one-at-least-thirty-two")
+    first = AuthUtils.derive_api_key("request:123", 7)
+
+    monkeypatch.setenv("JWT_SECRET_KEY", "jwt-secret-two-at-least-thirty-two")
+    replay = AuthUtils.derive_api_key("request:123", 7)
+    assert replay == first
+
+    monkeypatch.setenv("API_KEY_DERIVATION_SECRET", "api-key-master-secret-two-at-least-32")
+    assert AuthUtils.derive_api_key("request:123", 7) != first
+
+
+def test_api_key_derivation_secret_is_required_and_strong(monkeypatch):
+    monkeypatch.delenv("API_KEY_DERIVATION_SECRET", raising=False)
+    with pytest.raises(ValueError, match="API_KEY_DERIVATION_SECRET"):
+        AuthUtils.require_api_key_derivation_secret()
+
+    monkeypatch.setenv("API_KEY_DERIVATION_SECRET", "too-short")
+    with pytest.raises(ValueError, match="至少 32"):
+        AuthUtils.derive_api_key("request:123", 7)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("JWT_SECRET_KEY", "x" * 30, "至少 32"),
+        ("JWT_SECRET_KEY", " jwt-secret-that-is-long-enough ", "首尾空白"),
+        ("API_KEY_DERIVATION_SECRET", "x" * 30, "至少 32"),
+        ("SANDBOX_PROVISIONER_TOKEN", "x" * 30, "至少 32"),
+    ],
+)
+def test_runtime_rejects_invalid_effective_security_secret(monkeypatch, name, value, message):
+    """dotenv 去引号后的进程值仍必须在最终信任边界重新校验。"""
+
+    monkeypatch.setenv("YUXI_ENV", "production")
+    monkeypatch.setenv("JWT_SECRET_KEY", "jwt-secret-that-is-distinct-and-at-least-32")
+    monkeypatch.setenv("API_KEY_DERIVATION_SECRET", "api-key-secret-that-is-distinct-and-at-least-32")
+    monkeypatch.setenv("SANDBOX_PROVISIONER_TOKEN", "sandbox-secret-that-is-distinct-and-at-least-32")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=message):
+        AuthUtils.require_security_secrets()
+
+
+@pytest.mark.parametrize(
+    ("first_name", "second_name"),
+    [
+        ("JWT_SECRET_KEY", "API_KEY_DERIVATION_SECRET"),
+        ("API_KEY_DERIVATION_SECRET", "SANDBOX_PROVISIONER_TOKEN"),
+        ("JWT_SECRET_KEY", "SANDBOX_PROVISIONER_TOKEN"),
+    ],
+)
+def test_security_secrets_must_not_be_reused(monkeypatch, first_name, second_name):
+    monkeypatch.setenv("JWT_SECRET_KEY", "jwt-secret-that-is-distinct-and-at-least-32")
+    monkeypatch.setenv("API_KEY_DERIVATION_SECRET", "api-key-secret-that-is-distinct-and-at-least-32")
+    monkeypatch.setenv("SANDBOX_PROVISIONER_TOKEN", "sandbox-secret-that-is-distinct-and-at-least-32")
+    shared_secret = "shared-security-secret-that-is-at-least-32-chars"
+    monkeypatch.setenv(first_name, shared_secret)
+    monkeypatch.setenv(second_name, shared_secret)
+
+    with pytest.raises(ValueError, match="安全密钥必须相互独立"):
+        AuthUtils.require_api_key_derivation_secret()
+
+
 def test_hash_password_uses_argon2():
     hashed = AuthUtils.hash_password("secret-password")
 
