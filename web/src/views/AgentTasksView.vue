@@ -3,16 +3,14 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { agentTaskApi } from '@/apis/agent_task_api'
-import { useUserStore } from '@/stores/user'
 import { formatFullDateTime } from '@/utils/time'
 import AgentTaskEditModal from '@/components/agent-tasks/AgentTaskEditModal.vue'
 import {
   Plus, Play, Power, Archive, Search, SquarePen, Copy,
   ChevronDown, ChevronRight, XCircle, CheckCircle2, Loader2, Ban, Clock
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 
 const router = useRouter()
-const userStore = useUserStore()
 
 const searchText = ref('')
 const filterStatus = ref('all')
@@ -198,14 +196,6 @@ function execMeta(s) { return EXEC_STATUS[s] || EXEC_STATUS.queued }
 
 function triggerLabelShort(t) {
   return { manual: '手动', api: 'API', schedule: '定时' }[t] || t
-}
-
-function fmtDuration(exec) {
-  if (!exec.started_at) return '-'
-  const end = exec.finished_at ? new Date(exec.finished_at) : new Date()
-  const secs = Math.round((end - new Date(exec.started_at)) / 1000)
-  if (secs < 60) return `${secs}s`
-  return `${Math.floor(secs / 60)}m${secs % 60}s`
 }
 
 function apiTriggerUrl(task) {

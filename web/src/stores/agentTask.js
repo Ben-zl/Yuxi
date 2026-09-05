@@ -2,10 +2,8 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { message } from 'ant-design-vue'
 import { agentTaskApi } from '@/apis/agent_task_api'
-import { parseToShanghai } from '@/utils/time'
 
 const ACTIVE_STATUSES = new Set(['queued', 'running', 'interrupted'])
-const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'cancelled', 'skipped', 'missed'])
 
 export const useAgentTaskStore = defineStore('agentTask', () => {
   const tasks = ref([])

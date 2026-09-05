@@ -5,6 +5,7 @@
 
 // 导出API模块
 export * from './system_api' // 系统管理API
+export * from './auth_api' // 认证与用户管理 API
 export * from './knowledge_api' // 知识库管理API
 export * from './graph_api' // 图谱API
 export * from './agent_api' // 智能体API

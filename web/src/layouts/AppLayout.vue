@@ -13,7 +13,7 @@ import {
   PanelLeftOpen,
   MessageCirclePlus,
   Search
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 
 import { useConfigStore } from '@/stores/config'
 import { useAgentStore } from '@/stores/agent'
@@ -23,13 +23,15 @@ import { useDatabaseStore } from '@/stores/database'
 import { useInfoStore } from '@/stores/info'
 import { useTaskerStore } from '@/stores/tasker'
 import { useUserStore } from '@/stores/user'
+import { useProjectsStore } from '@/stores/projects'
 import { storeToRefs } from 'pinia'
+import { projectApi } from '@/apis/project_api'
 import UserInfoComponent from '@/components/UserInfoComponent.vue'
 import DebugComponent from '@/components/DebugComponent.vue'
 import TaskCenterDrawer from '@/components/TaskCenterDrawer.vue'
 import SettingsModal from '@/components/SettingsModal.vue'
 import ConversationNavSection from '@/components/ConversationNavSection.vue'
-import ConversationSearchModal from '@/components/ConversationSearchModal.vue'
+import GlobalSearchModal from '@/components/GlobalSearchModal.vue'
 
 const configStore = useConfigStore()
 const agentStore = useAgentStore()
@@ -39,9 +41,11 @@ const databaseStore = useDatabaseStore()
 const infoStore = useInfoStore()
 const taskerStore = useTaskerStore()
 const userStore = useUserStore()
+const projectsStore = useProjectsStore()
 const { activeCount: activeCountRef, isDrawerOpen } = storeToRefs(taskerStore)
 const { threads, currentThreadId, hasMoreThreads, isLoadingMoreThreads } =
   storeToRefs(chatThreadsStore)
+const { projects, isLoading: projectsLoading, error: projectsError } = storeToRefs(projectsStore)
 
 // Add state for GitHub stars
 const githubStars = ref(0)
@@ -101,7 +105,13 @@ const fetchGithubStars = async () => {
 
 onMounted(async () => {
   // 加载信息配置与知识库数据无依赖，可并行
-  await Promise.all([infoStore.loadInfoConfig(), getRemoteDatabase()])
+  await Promise.all([
+    infoStore.loadInfoConfig(),
+    getRemoteDatabase(),
+    projectsStore.loadProjects().catch((error) => {
+      console.warn('加载项目列表失败:', error)
+    })
+  ])
   await initAgentNavigation()
   await getRemoteConfig()
   // 仅管理员加载任务中心数据
@@ -257,6 +267,30 @@ const handleCreateConversationFromSearch = () => {
   router.push({ name: 'AgentComp' })
 }
 
+const handleRenameProject = async ({ projectId, name }) => {
+  try {
+    const project = await projectApi.renameProject(projectId, name)
+    projectsStore.replaceProject(project)
+  } catch (error) {
+    console.warn('重命名项目失败:', error)
+  }
+}
+
+const handleDeleteProject = async (projectId) => {
+  try {
+    await projectApi.deleteProject(projectId)
+    projectsStore.removeProject(projectId)
+    const removedThreadIds = chatThreadsStore.removeThreadsByProject(projectId)
+    if (removedThreadIds.includes(String(route.params.thread_id))) {
+      await router.replace({ name: 'AgentComp' })
+    }
+  } catch (error) {
+    console.warn('删除项目失败:', error)
+  }
+}
+
+const reloadProjects = () => projectsStore.loadProjects().catch(() => {})
+
 const handleDeleteChat = async (threadId) => {
   if (!threadId) return
   try {
@@ -397,6 +431,9 @@ provide('settingsModal', {
           class="sidebar-conversations"
           :current-chat-id="activeConversationThreadId"
           :chats-list="threads"
+          :projects="projects"
+          :projects-loading="projectsLoading"
+          :projects-error="projectsError"
           :has-more-chats="hasMoreThreads"
           :is-loading-more="isLoadingMoreThreads"
           @select-chat="handleSelectChat"
@@ -404,6 +441,9 @@ provide('settingsModal', {
           @rename-chat="handleRenameChat"
           @toggle-pin="handleTogglePinChat"
           @load-more-chats="() => chatThreadsStore.loadMoreThreads()"
+          @rename-project="handleRenameProject"
+          @delete-project="handleDeleteProject"
+          @retry-projects="reloadProjects"
         />
       </div>
       <div class="foo">
@@ -453,8 +493,10 @@ provide('settingsModal', {
       <component :is="Component" v-else />
     </router-view>
 
-    <ConversationSearchModal
+    <GlobalSearchModal
       v-model:open="conversationSearchOpen"
+      :modes="['conversation']"
+      default-mode="conversation"
       :recent-threads="threads"
       @select-thread="handleSearchSelectThread"
       @create-thread="handleCreateConversationFromSearch"

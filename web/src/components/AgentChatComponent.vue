@@ -477,7 +477,11 @@
                       v-for="(todo, index) in currentTodos"
                       :key="`${todo.fullContent}-${index}`"
                       class="todo-item"
-                      :class="{ completed: todo.status === 'completed' }"
+                      :class="{
+                        completed: todo.status === 'completed',
+                        'is-cancelled': todo.status === 'cancelled'
+                      }"
+                      :aria-label="getTodoStatusLabel(todo.status)"
                     >
                       <div class="todo-item-icon" :class="todo.status || 'unknown'">
                         <CheckCircleOutlined v-if="todo.status === 'completed'" />
@@ -710,17 +714,19 @@
       </div>
     </div>
 
-    <SubagentThreadModal
+    <a-modal
       v-model:open="subagentThreadModal.open"
-      :child-thread-id="subagentThreadModal.childThreadId"
-      :run-id="activeSubagentThreadRunId"
-      :run-status="activeSubagentThreadRunStatus"
-      :subagent-name="activeSubagentThreadName"
-      :subagent-avatar="activeSubagentThreadAvatar"
-      :subagent-default-avatar="activeSubagentThreadDefaultAvatar"
-      :ongoing-messages="activeSubagentThreadOngoingMessages"
-      :is-streaming="activeSubagentThreadIsStreaming"
-    />
+      :title="activeSubagentThreadName"
+      :footer="null"
+      :width="720"
+      destroy-on-close
+    >
+      <SubagentThreadView
+        v-if="subagentThreadModal.childThreadId"
+        :thread-id="subagentThreadModal.childThreadId"
+        active
+      />
+    </a-modal>
   </div>
 </template>
 
@@ -747,7 +753,7 @@ import {
   Play,
   RefreshCw,
   Trash2
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { formatFileSize } from '@/utils/file_utils'
 import FileTypeIcon from '@/components/common/FileTypeIcon.vue'
 import { generatePixelAvatar } from '@/utils/pixelAvatar'
@@ -785,7 +791,7 @@ import { useAgentMentionConfig } from '@/composables/useAgentMentionConfig'
 import AgentArtifactsCard from '@/components/AgentArtifactsCard.vue'
 import AgentPanel from '@/components/AgentPanel.vue'
 import AttachmentTmpUploadModal from '@/components/AttachmentTmpUploadModal.vue'
-import SubagentThreadModal from '@/components/SubagentThreadModal.vue'
+import SubagentThreadView from '@/components/SubagentThreadView.vue'
 import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
 import { enrichTaskToolCalls, parseToolCallArgs } from '@/components/ToolCallingResult/toolRegistry'
 import { getConversationDisplayItems } from '@/utils/messageGrouping'
@@ -868,7 +874,6 @@ const { getThreadState, resetOnGoingConv, stopThreadStream } = useAgentThreadSta
 
 // 组件级别的消息、附件与提示状态
 const threadMessages = ref({})
-const threadFilesMap = ref({})
 const threadAttachmentsMap = ref({})
 const attachmentUploadModalOpen = ref(false)
 const attachmentInitialFiles = ref([])
@@ -929,6 +934,14 @@ const formatTodoName = (content) => {
   return Array.from(String(content || ''))
     .slice(0, TODO_NAME_MAX_LENGTH)
     .join('')
+}
+
+const getTodoStatusLabel = (status) => {
+  if (status === 'cancelled') return '已取消'
+  if (status === 'completed') return '已完成'
+  if (status === 'in_progress') return '进行中'
+  if (status === 'pending') return '待处理'
+  return '未知状态'
 }
 
 const getPanelContainerWidth = () => {
@@ -1184,7 +1197,10 @@ const agentDefaultModel = computed(
     ''
 )
 const currentModelSpec = computed(
-  () => selectedModelByThread[currentChatId.value || DRAFT_MODEL_KEY] || agentDefaultModel.value
+  () =>
+    selectedModelByThread[currentChatId.value || DRAFT_MODEL_KEY] ||
+    currentThread.value?.metadata?.model_spec ||
+    agentDefaultModel.value
 )
 const handleModelSelect = (spec) => {
   if (typeof spec === 'string') {
@@ -1597,20 +1613,12 @@ const currentSubagentOptionBySlug = computed(() => {
 const subagentThreadModal = reactive({
   open: false,
   childThreadId: '',
-  runId: '',
-  runStatus: '',
-  subagentName: '',
-  subagentAvatar: '',
-  subagentDefaultAvatar: ''
+  subagentName: ''
 })
 const openSubagentThread = (run) => {
   if (!run?.child_thread_id) return
   subagentThreadModal.childThreadId = String(run.child_thread_id)
-  subagentThreadModal.runId = run.run_id ? String(run.run_id) : ''
-  subagentThreadModal.runStatus = run.status ? String(run.status) : ''
   subagentThreadModal.subagentName = getSubagentRunName(run)
-  subagentThreadModal.subagentAvatar = getSubagentIconSrc(run)
-  subagentThreadModal.subagentDefaultAvatar = getSubagentDefaultIconSrc(run)
   subagentThreadModal.open = true
 }
 const isStateSectionExpanded = (key) => !collapsedStateSections[key]
@@ -1807,7 +1815,7 @@ const runningSubagentRunsFromStream = computed(() => {
 
 // task 工具调用入参里携带的任务描述（tool_call_id -> description），覆盖历史与进行中消息。
 // 后端 subagent_runs 不再冗余存储 description，面板据此为已完成的 run 回填展示文案。
-const taskDescriptionByToolCallId = computed(() => {
+const subagentDescriptionByToolCallId = computed(() => {
   const map = new Map()
   const collect = (messages) => {
     if (!Array.isArray(messages)) return
@@ -1823,14 +1831,15 @@ const taskDescriptionByToolCallId = computed(() => {
       })
     })
   }
-  collect(historyConversations.value)
+  historyConversations.value.forEach((conversation) => collect(conversation?.messages))
   collect(onGoingConvMessages.value)
   return map
 })
 
+// 先按真实 run 合并，再补充尚未落库的流式 task 占位。
 // 后端按 run_id 合并持久化状态；流式期的临时 task 条目还没有 run_id，仅用工具调用 id 合并占位。
 const displaySubagentRuns = computed(() => {
-  const descByToolCall = taskDescriptionByToolCallId.value
+  const descByToolCall = subagentDescriptionByToolCallId.value
   const merged = currentSubagentRuns.value.map((run) => {
     const copy = { ...run }
     // 持久化条目不带 description，按 tool_call_id（即 run.id）从 task 调用入参回填。
@@ -1868,48 +1877,8 @@ const displaySubagentRuns = computed(() => {
   return merged
 })
 
-const activeSubagentThreadRun = computed(() => {
-  if (!subagentThreadModal.childThreadId) return null
-  return (
-    displaySubagentRuns.value.find(
-      (run) => String(run?.child_thread_id || '') === subagentThreadModal.childThreadId
-    ) || null
-  )
-})
 const activeSubagentThreadName = computed(() =>
-  activeSubagentThreadRun.value
-    ? getSubagentRunName(activeSubagentThreadRun.value)
-    : subagentThreadModal.subagentName
-)
-const activeSubagentThreadRunId = computed(() =>
-  activeSubagentThreadRun.value?.run_id
-    ? String(activeSubagentThreadRun.value.run_id)
-    : subagentThreadModal.runId
-)
-const activeSubagentThreadRunStatus = computed(() =>
-  activeSubagentThreadRun.value?.status
-    ? String(activeSubagentThreadRun.value.status)
-    : subagentThreadModal.runStatus
-)
-const activeSubagentThreadAvatar = computed(() =>
-  activeSubagentThreadRun.value
-    ? getSubagentIconSrc(activeSubagentThreadRun.value) || subagentThreadModal.subagentAvatar
-    : subagentThreadModal.subagentAvatar
-)
-const activeSubagentThreadDefaultAvatar = computed(() =>
-  activeSubagentThreadRun.value
-    ? getSubagentDefaultIconSrc(activeSubagentThreadRun.value) ||
-      subagentThreadModal.subagentDefaultAvatar
-    : subagentThreadModal.subagentDefaultAvatar
-)
-const activeSubagentThreadOngoingMessages = computed(() => {
-  if (!subagentThreadModal.childThreadId) return []
-  return getThreadOngoingMessages(subagentThreadModal.childThreadId)
-})
-const activeSubagentThreadIsStreaming = computed(
-  () =>
-    activeSubagentThreadOngoingMessages.value.length > 0 ||
-    activeSubagentThreadRun.value?.status === 'running'
+  subagentThreadModal.subagentName || '子智能体'
 )
 
 // 首次运行的子智能体：前端按后端同样的哈希推算 child_thread_id，缓存到映射里供面板/轨迹定位。
@@ -2505,7 +2474,6 @@ const createThread = async (agentId, title = '新的对话') => {
     })
     if (thread) {
       threadMessages.value[thread.id] = []
-      threadFilesMap.value[thread.id] = []
       threadAttachmentsMap.value[thread.id] = []
     }
     return thread
@@ -2561,18 +2529,6 @@ const restoreThreadModelSelection = (threadId, history) => {
   restoreField(selectedModelByThread, (spec) => spec, 'model_spec')
 }
 
-const fetchThreadFiles = async (threadId) => {
-  if (!threadId) return
-  try {
-    const response = await threadApi.listThreadFiles(threadId, '/home/gem/user-data', false)
-    const entries = Array.isArray(response?.files) ? response.files : []
-    threadFilesMap.value[threadId] = entries
-  } catch (error) {
-    console.warn('Failed to fetch thread files:', error)
-    threadFilesMap.value[threadId] = []
-  }
-}
-
 const fetchThreadAttachments = async (threadId) => {
   if (!threadId) return
   try {
@@ -2588,7 +2544,7 @@ const fetchThreadAttachments = async (threadId) => {
 
 const refreshThreadFilesAndAttachments = async (threadId) => {
   if (!threadId) return
-  await Promise.all([fetchThreadFiles(threadId), fetchThreadAttachments(threadId)])
+  await fetchThreadAttachments(threadId)
 }
 
 const handleArtifactSaved = async () => {
@@ -2617,7 +2573,7 @@ const fetchAgentState = async (agentId, threadId, { required = false } = {}) => 
 
     latestState.agentState = res.agent_state || null
     const pendingInterrupt = extractPendingInterrupt(res.interrupt, threadId)
-    // resume 已开始或 active run 已切换时，旧 checkpoint 响应不能重新显示审批。
+    // resume 已开始或 active run 已切换时，旧状态响应不能重新显示审批。
     const interruptIsCurrent =
       pendingInterrupt &&
       !latestState.isStreaming &&
@@ -2625,7 +2581,7 @@ const fetchAgentState = async (agentId, threadId, { required = false } = {}) => 
         !latestState.activeRunId ||
         pendingInterrupt.interruptedRunId === latestState.activeRunId)
     if (required && !interruptIsCurrent) {
-      throw new Error('checkpoint 中没有可恢复的审批状态')
+      throw new Error('当前状态中没有可恢复的审批状态')
     }
     if (interruptIsCurrent) {
       latestState.pendingInterrupt = pendingInterrupt
@@ -2981,8 +2937,7 @@ const handleSendMessage = async ({ image, queuePolicy = 'enqueue' } = {}) => {
     // 新建线程：把草稿态的模型选择迁移到真实线程，避免选择丢失
     promoteDraftSelection(selectedModelByThread, threadId)
   }
-  // 仅当用户显式选择过模型才下发覆盖；否则传 null，由后端使用智能体配置的模型
-  const modelSpec = selectedModelByThread[threadId] || null
+  const modelSpec = currentModelSpec.value || null
   const toolApprovalMode = currentToolApprovalMode.value
 
   userInput.value = ''
@@ -3059,6 +3014,12 @@ const handleSendMessage = async ({ image, queuePolicy = 'enqueue' } = {}) => {
     })
     const status = runResp?.status
     const runId = runResp?.run_id
+    if (status !== 'rejected' && modelSpec) {
+      const thread = threads.value.find((item) => item.id === threadId)
+      if (thread) {
+        thread.metadata = { ...(thread.metadata || {}), model_spec: modelSpec }
+      }
+    }
     if (status === 'queued' || (!runId && status !== 'rejected')) {
       threadState.queuedRequests = threadState.queuedRequests || []
       threadState.queuedRequests.push({
@@ -3382,7 +3343,6 @@ const loadChatsList = async () => {
     threads.value = []
     resetAgentPanelState()
     setCurrentThreadId(null)
-    threadFilesMap.value = {}
     threadAttachmentsMap.value = {}
     return
   }
@@ -3462,7 +3422,6 @@ watch(
       // 清理当前线程状态
       setCurrentThreadId(null)
       threadMessages.value = {}
-      threadFilesMap.value = {}
       threadAttachmentsMap.value = {}
       resetAgentPanelState()
       // 清理所有线程状态
@@ -4904,6 +4863,10 @@ watch(currentChatId, (threadId, oldThreadId) => {
   align-items: center;
   gap: 6px;
   padding: 2px 0;
+
+  &.is-cancelled {
+    border-style: dashed;
+  }
 }
 
 .todo-item:last-child {

@@ -1,7 +1,7 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
-import { Brain, Trash2 } from 'lucide-vue-next'
+import { Brain, Trash2 } from '@lucide/vue'
 
 import { agentApi } from '@/apis/agent_api'
 

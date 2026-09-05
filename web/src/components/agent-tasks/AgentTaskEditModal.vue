@@ -5,7 +5,7 @@ import { agentApi } from '@/apis/agent_api'
 import { useAgentTaskStore } from '@/stores/agentTask'
 import { useUserStore } from '@/stores/user'
 import { getDepartments } from '@/apis/department_api'
-import { Clock, Zap, KeyRound, Globe, Copy } from 'lucide-vue-next'
+import { Clock, Zap, KeyRound } from '@lucide/vue'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -152,7 +152,7 @@ async function doPreview() {
     if (!payload.schedule?.enabled) return
     const data = await store.previewSchedule(payload)
     previewTimes.value = data.preview || []
-  } catch (e) {
+  } catch {
     previewTimes.value = []
   }
 }

@@ -1,7 +1,7 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
-import { CirclePlus, Pencil, RefreshCw, RotateCw, Trash2, X } from 'lucide-vue-next'
+import { CirclePlus, Pencil, RefreshCw, RotateCw, Trash2, X } from '@lucide/vue'
 
 import { agentChannelApi } from '@/apis/agent_channel_api'
 
