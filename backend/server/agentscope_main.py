@@ -16,6 +16,7 @@ import uvicorn
 from fastapi import File, Header, HTTPException, Query, UploadFile, status
 
 from yuxi.storage.postgres.manager import pg_manager
+from yuxi.config.runtime import lite_mode_enabled
 from agentscope.app import create_app
 from agentscope.app.channel import WPSXiezuoChannel
 from agentscope.app.message_bus import RedisMessageBus
