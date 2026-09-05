@@ -30,21 +30,22 @@ Owner：backend/server/agentscope_main.py
 
 正面后果是合并结果只有一个执行事实源：AgentScope Session/Execution 与 Yuxi Run/Attempt/lease/manifest/SSE/reconciliation 保持现有绑定关系，同时保留远程用户可观察能力和安全边界。Workspace 列表现在也复用当前 no-follow Workspace Owner，避免普通树视图绕过文件边界。
 
-剩余限制是完整 API/integration/E2E 真实服务链路仍依赖独立 PostgreSQL、Redis、AgentScope、对象存储和外部凭证；本轮环境未提供稳定的独立 Compose 槽位，因此不能把 unit 或预构建镜像结果扩大解释为真实持久化链路已通过。
+剩余限制是 API 的 `/api/system/ready` 仍报告 `WorkerUnavailableError`，因为本次预构建镜像中的 worker 没有发布 readiness 所需的短 TTL health lease；这不影响本次直接通过 AgentScope Session/Execution 的真实模型回路，但不能把 API readiness 视为通过。Docker Workspace 需要以 root 运行 AgentScope 容器才能访问宿主 Docker socket，本次验证通过临时 Compose override 处理，未修改 shipping Compose。
 
 ## 验证
 
 | 验收主张 | 失败面 | 语义 Owner | 直接证据 / 命令 | 负向案例 | 当前结果 |
 |---|---|---|---|---|---|
 | worktree 从本地 `main` 基线创建，当前本地 `main` 与原工作分支不变 | 起点错误、污染当前工作树或修改远程引用 | Git refs/worktree | `git worktree list`、`git rev-parse`、最终 `git status`/`git log` | 当前 `main` SHA、原工作分支或 `origin/main` 发生变化 | `Passed`：本地 `main=d9182c06`、`origin/main=bd07ab4a`，最终 worktree clean |
-| 合并提交保留双方历史 | 误用 reset/rebase 或丢失远程父提交 | Git merge commit | `git show -s --format=%P HEAD`、`git log --graph` | 任一父提交不可达或 HEAD 不是 `--no-ff` 合并提交 | `Passed`：`d552db25` 父提交为 `7a1272f3` 与 `bd07ab4a` |
+| 合并提交保留双方历史 | 误用 reset/rebase 或丢失远程父提交 | Git merge commit | `git show -s --format=%P HEAD`、`git log --graph` | 任一父提交不可达或 HEAD 不是 `--no-ff` 合并提交 | `Passed`：`a2564a33` 父提交为 `7a1272f3` 与 `bd07ab4a`；后续仅增加必要修复提交 `ce1a18f0` |
 | AgentScope 是唯一执行事实和运行时入口 | 恢复旧 LangGraph/checkpoint/worker，或从相邻 Run 推断结果 | `backend/server/agentscope_main.py`、`backend/package/yuxi/agentscope`、Run service/repository | AgentScope recovery/team/worker/gateway/manifest 相关 unit；完整后端 unit `1581 passed`；旧 checkpointer surface 的负向测试 | 旧 checkpoint 模块仍作为 shipping 入口暴露，或结果不绑定同一 Request/Execution/Run | `Passed`（unit/源码路径）；真实 worker/SSE E2E `Not run` |
 | Workspace/Project/Artifact/preview 权限在后端闭合 | 未绑定 Project 目录泄露、symlink 路径绕过或跨 Owner 读取 | `Workspace`、`ProjectRepository`、workspace/artifact/viewer service | Workspace/Project visibility/search 45 tests；完整 backend unit `1581 passed`；目标文件 ruff check/format | 普通 `/projects` 列表暴露未绑定目录；Project picker 不能保留未绑定目录；no-follow 负向测试失败 | `Passed` |
 | 远程前端 AgentScope Run/SSE、时间、草稿、Artifact/文件树能力保留 | 前端从相邻消息或旧执行状态推断，或 UI/API 边界漂移 | `web/src/apis`、stores、composables、Agent/Workspace views | `pnpm run lint:check`、`pnpm run test:unit`、`pnpm run build` | Run 失败/取消/断线状态被误报为成功，或 Project/Workspace 请求越权 | `Passed`（命令）；真实浏览器/完整服务页面 `Not run` |
 | Schema、工程信任、依赖和文档契约一致 | 迁移不可重复、旧描述残留、链接失效或依赖漂移 | storage migration、Compose、docs、contract scripts | `verify_engineering_contracts.py`、61 contract tests、`docs pnpm run build`、`git diff --check` | 二次迁移失败、文档链接 dead link、旧能力被写成当前入口 | `Passed`（docs build 有 VitePress/Rolldown 警告但无 dead link） |
 | 后端完整 lint/format gate 通过 | merge-wide 远程脚本和历史文件已有大量风格问题 | backend package | 全包 `ruff check package` / `ruff format package --check`；目标改动文件定向 check | 将全包历史问题误报为本次适配已通过 | `Not run`/`Blocked`：全包存在 477 个已有/merge-wide 问题；目标 6 文件定向检查 Passed |
 | 合并前独立 Reviewer 检查完整需求、diff 和证据 | Reviewer 未返回或把未检查范围误报为通过 | 独立 Reviewer Agent | 独立只读 Reviewer 调度与当前 bounded static review | 未检查完整 merge diff 却宣称全部通过 | `Not run`/`Blocked`：独立 Reviewer 子 Agent 多次超时或运行时参数错误；当前 Agent 完成了不继承上下文的 bounded static review，未把它等同于独立完整 Review |
-| 真实持久化与完整运行链路可回读 | mock/预构建镜像误替代 PostgreSQL、Redis、worker、SSE 或外部 provider | Docker Compose、PostgreSQL、AgentScope、Redis、MinIO | 计划中的 integration/E2E 命令 | 仅凭 HTTP 200、日志或 mock 调用宣称终态事实成立 | `Not run`：独立 Compose 槽位、外部凭证和可重新构建的 AgentScope Git ref 不可用 |
+| 真实 MiniMax 模型链路通过 AgentScope 完成 | provider/base URL/credential/session 映射错误、流式事件或 usage 丢失 | Docker Compose、PostgreSQL、Redis、AgentScope、MiniMax provider | 临时独立 Compose 槽位；真实 `MiniMax-M3` Anthropic-compatible endpoint；`python -m pytest test/e2e/test_agentscope_real_model_e2e.py -m e2e -q -s` | 无非空 assistant 文本、无 reasoning、usage 为 0、Run 非 completed 或 Session 消息未持久化 | `Passed`：1 passed；真实 Docker Workspace、AgentScope `/chat/`、SSE、终态、reasoning、usage 和消息读取均完成；测试清理了临时 fixture |
+| API 接流量 readiness 通过 | worker health lease 缺失导致 API 错误放行 | `readiness_service`、worker health lease | `curl http://127.0.0.1:25050/api/system/ready` | 仅 health 200 而 readiness 非 ready | `Not passed`：HTTP 503，`worker=WorkerUnavailableError`；容器、PostgreSQL、Redis、MinIO、sandbox 和 AgentScope 均正常，原因限定为预构建 worker 未发布 readiness lease |
 
 ### 实际命令与环境
 
@@ -73,4 +74,4 @@ docker compose exec api uv run ruff check package
 docker compose exec api uv run ruff format package --check
 ```
 
-当前独立 compose 配置缺少 `AGENTSCOPE_LEGACY_CUTOFF` 等 `.env` 变量，且预构建镜像没有可执行的 ruff entrypoint；主机 ruff 对全包检查得到 477 个历史/merge-wide 问题，不能把它们归因于本次 Workspace 适配。独立 Reviewer 调度未得到可用回报，因此完整独立 Review 记为 `Not run`/`Blocked`；当前 Agent 只完成了不继承上下文的范围收敛静态检查。integration、E2E、真实页面和外部 provider probe 因独立服务/凭证不可用记为 `Not run`。
+当前独立 compose 配置缺少 `AGENTSCOPE_LEGACY_CUTOFF` 等 `.env` 变量，且预构建镜像没有可执行的 ruff entrypoint；主机 ruff 对全包检查得到 477 个历史/merge-wide 问题，不能把它们归因于本次 Workspace 适配。独立 Reviewer 调度未得到可用回报，因此完整独立 Review 记为 `Not run`/`Blocked`；当前 Agent 只完成了不继承上下文的范围收敛静态检查。`uv run` 在容器中尝试更新或替换 root-owned `/app/uv.lock`/site-packages，故本次真实 E2E 使用容器内已安装依赖直接执行 `python -m pytest`；该命令已通过。真实页面、完整 integration suite 和独立 Reviewer 仍未执行。API readiness 的 worker lease 问题保留为未闭合风险。
