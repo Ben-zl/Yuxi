@@ -28,7 +28,7 @@ from yuxi.repositories.subagent_thread_repository import SubagentThreadRepositor
 from yuxi.services.agent_run_manifest_service import build_run_manifest_result, compute_manifest_fingerprint
 from yuxi.services.run_queue_service import append_run_stream_event
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Message, ToolCall, User
+from yuxi.storage.postgres.models_business import Conversation, Message, ToolCall, User
 from yuxi.utils.hash_utils import hash_id, subagent_child_thread_id
 from yuxi.utils.logging_config import logger
 
@@ -183,11 +183,15 @@ class TeamLifecycleModule:
             child_thread_id = subagent_child_thread_id(leader.thread_id, subagent_slug, tool_call_id)
             conversation = await ConversationRepository(db).get_conversation_by_thread_id(child_thread_id)
             if conversation is None:
+                parent_conversation = await db.get(Conversation, parent_run.conversation_id)
+                if parent_conversation is None or not parent_conversation.project_id:
+                    raise ValueError("Team child Conversation 缺少父 Project 归属")
                 conversation = await ConversationRepository(db).add_conversation(
                     uid=self.uid,
                     agent_id=subagent_slug,
                     title=f"SubAgent: {subagent.name}",
                     thread_id=child_thread_id,
+                    project_id=parent_conversation.project_id,
                     metadata={
                         "source": "agentscope_team",
                         "parent_thread_id": leader.thread_id,

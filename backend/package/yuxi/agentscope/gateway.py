@@ -154,6 +154,10 @@ async def collect_run_events(
                     continue
                 break
             if idle_callback is None:
+                from yuxi.services.run_queue_service import has_cancel_signal
+
+                if await has_cancel_signal(run_id):
+                    raise RuntimeError("运行任务已取消")
                 raise
             await idle_callback()
             continue
