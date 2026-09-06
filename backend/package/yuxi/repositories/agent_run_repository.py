@@ -61,9 +61,7 @@ class AgentRunRepository:
         run_id: str,
     ) -> AgentRun | None:
         """读取子 Run，并校验其属于指定父 Run 的同一执行树。"""
-        pair = await self.get_subagent_run_with_creator(
-            uid=uid, created_by_run_id=created_by_run_id, run_id=run_id
-        )
+        pair = await self.get_subagent_run_with_creator(uid=uid, created_by_run_id=created_by_run_id, run_id=run_id)
         return pair[1] if pair else None
 
     async def get_subagent_run_with_creator(
@@ -210,9 +208,7 @@ class AgentRunRepository:
         )
         return [dict(usage) for usage in result.scalars().all() if usage]
 
-    async def list_child_runs_by_thread_for_user(
-        self, conversation_thread_id: str, uid: str
-    ) -> list[AgentRun]:
+    async def list_child_runs_by_thread_for_user(self, conversation_thread_id: str, uid: str) -> list[AgentRun]:
         """按时间列出线程所有顶层 Run 创建的子智能体 Run。"""
         parent_run_ids = select(AgentRun.id).where(
             AgentRun.conversation_thread_id == conversation_thread_id,
@@ -237,10 +233,7 @@ class AgentRunRepository:
             .where(
                 AgentRun.created_by_run_id == created_by_run_id,
                 AgentRun.uid == str(uid),
-                or_(
-                    AgentRun.status.notin_(TERMINAL_RUN_STATUSES),
-                    AgentRun.runtime_cleanup_pending.is_(True),
-                ),
+                AgentRun.status.notin_(TERMINAL_RUN_STATUSES),
             )
             .order_by(AgentRun.created_at.asc(), AgentRun.id.asc())
         )
@@ -260,10 +253,7 @@ class AgentRunRepository:
                 AgentRun.agent_slug == agent_slug,
                 AgentRun.uid == str(uid),
                 AgentRun.conversation_thread_id == conversation_thread_id,
-                or_(
-                    AgentRun.status.notin_(TERMINAL_RUN_STATUSES),
-                    AgentRun.runtime_cleanup_pending.is_(True),
-                ),
+                AgentRun.status.notin_(TERMINAL_RUN_STATUSES),
             )
             .order_by(AgentRun.created_at.desc())
             .limit(1)
@@ -282,10 +272,7 @@ class AgentRunRepository:
             .where(
                 AgentRun.runtime_scope_id == str(runtime_scope_id),
                 AgentRun.uid == str(uid),
-                or_(
-                    AgentRun.status.notin_(TERMINAL_RUN_STATUSES),
-                    AgentRun.runtime_cleanup_pending.is_(True),
-                ),
+                AgentRun.status.notin_(TERMINAL_RUN_STATUSES),
             )
             .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
             .limit(1)
@@ -347,7 +334,6 @@ class AgentRunRepository:
         now: datetime | None = None,
     ) -> AgentRun | None:
         """仅允许当前 attempt 绑定属于本 Run 的 assistant 输出。"""
-
 
         run = await self._lock_run(run_id)
         if not run:
@@ -442,7 +428,15 @@ class AgentRunRepository:
             return run, False
 
         current_time = now or utc_now_naive()
-        initial_claim = run.status == "pending" or (run.status == "cancel_requested" and run.worker_id is None)
+        expired_claim = (
+            run.status == "running"
+            and (run.lease_expires_at is None or run.lease_expires_at <= current_time)
+        )
+        initial_claim = (
+            run.status == "pending"
+            or (run.status == "cancel_requested" and run.worker_id is None)
+            or expired_claim
+        )
         same_live_owner = (
             run.status in LEASED_RUN_STATUSES
             and run.worker_id == worker_id
@@ -548,7 +542,9 @@ class AgentRunRepository:
         run.worker_id = None
         run.heartbeat_at = None
         run.lease_expires_at = None
-        run.runtime_cleanup_pending = run.run_type != "subagent"
+        # AgentScope Session/Workspace 跨 Run 持久存在，不存在需要在单个 Run
+        # 终态后异步销毁的旧执行 runtime。
+        run.runtime_cleanup_pending = False
         run.updated_at = current_time
         await self._finish_open_attempt(
             run_id,
@@ -604,7 +600,7 @@ class AgentRunRepository:
             run.worker_id = None
             run.heartbeat_at = None
             run.lease_expires_at = None
-            run.runtime_cleanup_pending = run.run_type != "subagent"
+            run.runtime_cleanup_pending = False
             await self._project_input_delivery_status(run)
             await self._close_open_attempts(
                 run.id,
@@ -817,7 +813,7 @@ class AgentRunRepository:
         run.worker_id = None
         run.heartbeat_at = None
         run.lease_expires_at = None
-        run.runtime_cleanup_pending = run.run_type != "subagent"
+        run.runtime_cleanup_pending = False
         await self._project_input_delivery_status(run)
         await self._finish_open_attempt(
             run.id,

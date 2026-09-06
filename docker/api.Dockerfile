@@ -19,14 +19,11 @@ ENV TZ=Asia/Shanghai \
 RUN npm config set registry https://registry.npmmirror.com --global \
     && npm cache clean --force
 
-# 设置代理和时区，更换镜像源，安装系统依赖 - 合并为一个RUN减少层数
+# 设置时区并从基础镜像的官方 Debian 源安装系统依赖
 RUN set -ex \
     # (A) 设置时区
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
-    # (B) 替换清华源 (针对 Debian Bookworm 的新版格式)
-    && sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
-    && sed -i 's|security.debian.org/debian-security|mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources \
-    # (C) 安装必要的系统库
+    # (B) 使用基础镜像维护的官方源安装必要系统库
     && apt-get update \
     && apt-get install -y --no-install-recommends --fix-missing \
         curl \
@@ -39,7 +36,7 @@ RUN set -ex \
         libxext6 \
         libreoffice-impress-nogui \
         libreoffice-writer-nogui \
-    # (D) 清理垃圾，减小体积
+    # (C) 清理垃圾，减小体积
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

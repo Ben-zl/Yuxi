@@ -16,7 +16,7 @@ def _project_root() -> Path:
     for parent in Path(__file__).resolve().parents:
         if (parent / "docker-compose.yml").exists():
             return parent
-    pytest.skip("当前测试环境未挂载仓库根目录")
+    raise AssertionError("当前测试环境未挂载仓库根目录，无法验证 shipping Compose")
 
 
 def test_compose_does_not_expose_checkpoint_backend_or_local_storage():

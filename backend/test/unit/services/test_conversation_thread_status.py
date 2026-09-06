@@ -31,6 +31,11 @@ async def test_delete_agentscope_thread_resources_uses_retryable_order(monkeypat
         agentscope_workspace_id="workspace-1",
     )
     calls = []
+    child_binding = SimpleNamespace(
+        active_run_id="child-run-1",
+        child_thread_id="child-thread-1",
+        agentscope_workspace_id="workspace-child",
+    )
 
     class Client:
         def __init__(self, *_args, **_kwargs):
@@ -65,12 +70,25 @@ async def test_delete_agentscope_thread_resources_uses_retryable_order(monkeypat
 
         async def deactivate_parent_runtime(self, *, uid, parent_thread_id):
             calls.append(("team_runtime", uid, parent_thread_id))
-            return []
+            return [child_binding]
 
     monkeypatch.setattr(client_module, "AgentScopeServiceClient", Client)
     monkeypatch.setattr(mapping_repo, "get_thread_session", get_mapping)
     monkeypatch.setattr(mapping_repo, "delete_thread_session", delete_mapping)
     monkeypatch.setattr(team_repo, "AgentScopeTeamWorkerRepository", TeamWorkerRepository)
+
+    async def stop_heartbeat(run_id):
+        calls.append(("stop_heartbeat", run_id))
+
+    async def get_child_conversation(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(svc, "stop_run_lease_heartbeat", stop_heartbeat)
+    monkeypatch.setattr(
+        svc.ConversationRepository,
+        "get_conversation_by_thread_id",
+        get_child_conversation,
+    )
 
     class FakeDB:
         async def commit(self):
@@ -89,11 +107,13 @@ async def test_delete_agentscope_thread_resources_uses_retryable_order(monkeypat
         "agent",
         "credential",
         "team_runtime",
+        "stop_heartbeat",
         "mapping",
         "flush",
         "commit",
     ]
     assert calls[2][-1] == {"missing_ok": True}
+    assert ("stop_heartbeat", "child-run-1") in calls
 
 
 @pytest_asyncio.fixture()

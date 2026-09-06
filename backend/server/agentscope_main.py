@@ -18,7 +18,6 @@ from fastapi import File, Header, HTTPException, Query, UploadFile, status
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.config.runtime import lite_mode_enabled
 from agentscope.app import create_app
-from agentscope.app.channel import WPSXiezuoChannel
 from agentscope.app.message_bus import RedisMessageBus
 from agentscope.app.storage import AsyncSQLAlchemyStorage
 from agentscope.app.workspace_manager import (
@@ -168,20 +167,6 @@ async def _build_extra_agent_middlewares(user_id: str, agent_id: str, session_id
         )
         if memory_middleware is not None:
             middlewares.append(memory_middleware)
-    session = await app.state.storage.get_session(user_id, agent_id, session_id)
-    source = getattr(session, "source", None) if session is not None else None
-    if getattr(source, "value", source) == "channel":
-        from yuxi.agentscope.channel_middleware import (
-            build_channel_run_mirror_middleware,
-        )
-
-        middlewares.append(
-            build_channel_run_mirror_middleware(
-                uid=user_id,
-                agent_id=agent_id,
-                session_id=session_id,
-            ),
-        )
     team_lifecycle = await build_team_lifecycle_middleware(
         app.state.storage,
         app.state.message_bus,
@@ -369,7 +354,6 @@ def _create_service_app_sync():
         ),
         extra_agent_middlewares=_extra_agent_middlewares,
         extra_agent_tools=_extra_agent_tools,
-        channels=[WPSXiezuoChannel],
         workspace_manager=workspace_manager,
         title="Yuxi AgentScope Service",
     )

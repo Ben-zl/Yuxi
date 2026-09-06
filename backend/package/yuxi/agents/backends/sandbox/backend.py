@@ -253,6 +253,7 @@ class ProvisionerSandboxBackend:
         skill_sources: dict[str, str] | None = None,
         file_thread_id: str | None = None,
         skills_thread_id: str | None = None,
+        workdir_path: str | None = None,
         inherit_env: bool = True,
     ):
         self._thread_id = str(thread_id or "").strip()
@@ -271,8 +272,9 @@ class ProvisionerSandboxBackend:
         self._readable_skills = list(readable_skills or [])
         self._skill_sources = dict(skill_sources or {})
         self._inherit_env = inherit_env
+        self._workdir_path = workdir_path
         self._provider = get_sandbox_provider()
-        self._id = sandbox_id_for_thread(self._file_thread_id, self._skills_thread_id, uid=self._uid)
+        self._id = sandbox_id_for_thread(self._thread_id, uid=self._uid)
         self._client: Any | None = None
         self._client_url: str | None = None
         self._command_timeout_seconds = int(os.getenv("SANDBOX_EXEC_TIMEOUT_SECONDS") or 180)
@@ -301,8 +303,7 @@ class ProvisionerSandboxBackend:
             self._thread_id,
             uid=self._uid,
             create_if_missing=True,
-            file_thread_id=self._file_thread_id,
-            skills_thread_id=self._skills_thread_id,
+            workdir_path=self._workdir_path,
             inherit_env=self._inherit_env,
         )
         if connection is None:

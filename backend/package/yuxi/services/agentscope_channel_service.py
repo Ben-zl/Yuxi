@@ -1,7 +1,8 @@
-"""WPS 协作 Channel binding 的控制面同步服务。"""
+"""WPS 协作 Channel binding 的 Yuxi 控制面服务。"""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
@@ -9,11 +10,10 @@ import uuid
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.config_projection import project_runtime
-from yuxi.repositories.agentscope_channel_bindings import (
-    AgentScopeChannelBindingRepository,
-)
+from yuxi.repositories.agentscope_channel_bindings import AgentScopeChannelBindingRepository
+from yuxi.services.run_queue_service import get_redis_client
+from yuxi.services.wps_channel_runtime import wps_channel_status_key
 from yuxi.storage.postgres.models_business import AgentScopeChannelBinding
 
 
@@ -29,7 +29,7 @@ def _credential_cipher() -> Fernet:
 
 
 def encrypt_app_secret(secret: str) -> str:
-    """加密 WPS app secret，数据库和 AgentScope 均只保存密文。"""
+    """加密 WPS app secret，数据库只保存密文。"""
     value = secret.strip()
     if not value:
         raise ValueError("app_secret 不能为空")
@@ -37,7 +37,7 @@ def encrypt_app_secret(secret: str) -> str:
 
 
 def _validate_ciphertext(ciphertext: str) -> None:
-    """在同步前验证现有密文可由当前共享 key 解密。"""
+    """验证现有密文可由当前共享 key 解密。"""
     try:
         _credential_cipher().decrypt(ciphertext.encode())
     except InvalidToken as exc:
@@ -52,11 +52,10 @@ def _safe_error(exc: Exception) -> str:
 
 
 class AgentScopeChannelService:
-    """维护 Yuxi binding 与 AgentScope WPS Channel 的最终一致性。"""
+    """维护 WPS binding；实际执行始终由 Yuxi RunSubmissionCommand 提交。"""
 
-    def __init__(self, db: AsyncSession, client: AgentScopeServiceClient):
+    def __init__(self, db: AsyncSession):
         self.db = db
-        self.client = client
         self.bindings = AgentScopeChannelBindingRepository(db)
 
     async def create_intent(
@@ -72,7 +71,7 @@ class AgentScopeChannelService:
         enabled: bool,
         actor_uid: str,
     ) -> AgentScopeChannelBinding:
-        """先提交本地意图，再执行可重入的远端 reconcile。"""
+        """提交本地 binding，并验证其 AgentScope 运行时投影。"""
         binding = await self.bindings.create(
             id=str(uuid.uuid4()),
             owner_uid=owner_uid,
@@ -92,13 +91,7 @@ class AgentScopeChannelService:
         await self.db.commit()
         return await self.reconcile(binding)
 
-    async def update_binding(
-        self,
-        binding: AgentScopeChannelBinding,
-        *,
-        updates: dict,
-        actor_uid: str,
-    ) -> AgentScopeChannelBinding:
+    async def update_binding(self, binding: AgentScopeChannelBinding, *, updates: dict, actor_uid: str):
         """更新本地意图；secret 未提供时保留原密文。"""
         app_secret = updates.pop("app_secret", None)
         for field, value in updates.items():
@@ -107,206 +100,71 @@ class AgentScopeChannelService:
         if app_secret is not None:
             binding.encrypted_app_secret = encrypt_app_secret(app_secret)
         if "allow_from" in updates and updates["allow_from"] is not None:
-            binding.allow_from = sorted(
-                {item.strip() for item in updates["allow_from"] if item.strip()},
-            )
+            binding.allow_from = sorted({item.strip() for item in updates["allow_from"] if item.strip()})
         binding.updated_by = actor_uid
         binding.sync_status = "pending"
         binding.last_error = None
         await self.db.commit()
         return await self.reconcile(binding)
 
-    async def reconcile(
-        self,
-        binding: AgentScopeChannelBinding,
-    ) -> AgentScopeChannelBinding:
-        """按 credential、agent、channel 顺序幂等同步并回写远端 ID。"""
+    async def reconcile(self, binding: AgentScopeChannelBinding) -> AgentScopeChannelBinding:
+        """验证凭据和 Agent 投影，不创建 AgentScope 原生 Channel。"""
         try:
             _validate_ciphertext(binding.encrypted_app_secret)
-            projection = await project_runtime(
+            await project_runtime(
                 self.db,
                 uid=binding.owner_uid,
                 agent_slug=binding.agent_slug,
                 model_spec=None,
             )
-            binding.model_spec = projection.model_spec
-
-            if binding.agentscope_credential_id:
-                await self.client.update_credential(
-                    binding.owner_uid,
-                    binding.agentscope_credential_id,
-                    projection.credential_data,
-                )
-            else:
-                binding.agentscope_credential_id = await self.client.create_credential(
-                    binding.owner_uid,
-                    projection.credential_data,
-                )
-                await self.db.commit()
-
-            chat_model_config = {
-                **projection.chat_model_config,
-                "credential_id": binding.agentscope_credential_id,
-            }
-            if binding.agentscope_agent_id:
-                await self.client.update_agent(
-                    binding.owner_uid,
-                    binding.agentscope_agent_id,
-                    projection.agent_request,
-                )
-            else:
-                binding.agentscope_agent_id = await self.client.create_agent(
-                    binding.owner_uid,
-                    projection.agent_request,
-                )
-                await self.db.commit()
-
-            channel_payload = self._channel_payload(binding, chat_model_config)
-            if binding.agentscope_channel_id:
-                await self.client.update_channel(
-                    binding.owner_uid,
-                    binding.agentscope_channel_id,
-                    channel_payload,
-                )
-            else:
-                record = await self.client.create_channel(
-                    binding.owner_uid,
-                    channel_payload,
-                )
-                binding.agentscope_channel_id = str(record["id"])
-                await self.db.commit()
-
-            sessions = await self.client.list_channel_sessions(
-                binding.owner_uid,
-                binding.agentscope_channel_id,
-            )
-            for session in sessions:
-                await self.client.update_session_model(
-                    binding.owner_uid,
-                    str(session["agent_id"]),
-                    str(session["id"]),
-                    chat_model_config,
-                )
-                await self.client.set_permission_mode(
-                    binding.owner_uid,
-                    str(session["agent_id"]),
-                    str(session["id"]),
-                    "dont_ask",
-                )
-
+            binding.model_spec = None
+            binding.agentscope_channel_id = None
+            binding.agentscope_agent_id = None
+            binding.agentscope_credential_id = None
             binding.sync_status = "synced"
             binding.last_error = None
-            await self.db.commit()
-            await self.db.refresh(binding)
-            return binding
         except Exception as exc:
             await self.db.rollback()
-            current = await self.bindings.get(binding.id)
-            if current is None:
+            binding = await self.bindings.get(binding.id)
+            if binding is None:
                 raise
-            current.sync_status = "error"
-            current.last_error = _safe_error(exc)
-            await self.db.commit()
-            await self.db.refresh(current)
-            return current
-
-    async def set_enabled(
-        self,
-        binding: AgentScopeChannelBinding,
-        enabled: bool,
-        *,
-        actor_uid: str,
-    ) -> AgentScopeChannelBinding:
-        """切换远端 Channel 生命周期并更新本地意图。"""
-        if not binding.agentscope_channel_id:
-            binding.enabled = enabled
-            binding.updated_by = actor_uid
-            binding.sync_status = "pending"
-            await self.db.commit()
-            return await self.reconcile(binding)
-        try:
-            await self.client.set_channel_enabled(
-                binding.owner_uid,
-                binding.agentscope_channel_id,
-                enabled,
-            )
-            binding.enabled = enabled
-            binding.updated_by = actor_uid
-            binding.sync_status = "synced"
-            binding.last_error = None
-        except Exception as exc:
             binding.sync_status = "error"
             binding.last_error = _safe_error(exc)
         await self.db.commit()
         await self.db.refresh(binding)
         return binding
 
+    async def set_enabled(self, binding, enabled: bool, *, actor_uid: str):
+        """更新连接意图，独立 WPS runtime 将按数据库状态 reconcile。"""
+        binding.enabled = enabled
+        binding.updated_by = actor_uid
+        binding.last_error = None
+        if binding.sync_status == "error":
+            binding.sync_status = "pending"
+        await self.db.commit()
+        if binding.sync_status == "pending":
+            return await self.reconcile(binding)
+        await self.db.refresh(binding)
+        return binding
+
     async def status(self, binding: AgentScopeChannelBinding) -> dict:
-        """以 AgentScope 状态接口为 Channel 运行态事实来源。"""
-        if not binding.agentscope_channel_id:
-            return {"state": "not_created", "last_error": binding.last_error or ""}
-        return await self.client.get_channel_status(
-            binding.owner_uid,
-            binding.agentscope_channel_id,
-        )
+        """读取 WPS runtime 发布的短 TTL 连接状态。"""
+        if not binding.enabled or binding.sync_status != "synced":
+            return {"state": "stopped", "last_error": binding.last_error or ""}
+        redis = await get_redis_client()
+        raw = await redis.get(wps_channel_status_key(binding.id))
+        if not raw:
+            return {"state": "stopped", "last_error": binding.last_error or ""}
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return {"state": "stopped", "last_error": "invalid runtime status"}
+        return {
+            "state": str(value.get("state") or "stopped"),
+            "last_error": str(value.get("last_error") or ""),
+        }
 
     async def delete(self, binding: AgentScopeChannelBinding) -> None:
-        """按 Channel、Agent、Credential 顺序清理，保留历史 Thread。"""
-        try:
-            if binding.agentscope_channel_id:
-                await self.client.delete_channel(
-                    binding.owner_uid,
-                    binding.agentscope_channel_id,
-                    missing_ok=True,
-                )
-            if binding.agentscope_agent_id:
-                await self.client.delete_agent(
-                    binding.owner_uid,
-                    binding.agentscope_agent_id,
-                    missing_ok=True,
-                )
-            if binding.agentscope_credential_id:
-                await self.client.delete_credential(
-                    binding.owner_uid,
-                    binding.agentscope_credential_id,
-                    missing_ok=True,
-                )
-        except Exception as exc:
-            binding.sync_status = "error"
-            binding.last_error = _safe_error(exc)
-            await self.db.commit()
-            raise
+        """删除本地 binding；runtime reconcile 将关闭对应连接。"""
         await self.bindings.delete(binding)
         await self.db.commit()
-
-    @staticmethod
-    def _channel_payload(binding: AgentScopeChannelBinding, chat_model_config: dict) -> dict:
-        """构造 AgentScope 原生 Channel CRUD 载荷。"""
-        return {
-            "channel_type": "wps_xiezuo",
-            "name": binding.name,
-            "credentials": {
-                "app_id": binding.app_id,
-                "app_secret": binding.encrypted_app_secret,
-            },
-            "platform_config": {
-                "allow_from": binding.allow_from or [],
-                "group_reply_policy": binding.group_reply_policy,
-            },
-            "routing": {
-                "bindings": [
-                    {
-                        "match_key": "chat_id",
-                        "match_value": "*",
-                        "agent_id": binding.agentscope_agent_id,
-                        "session_scope": "per_chat",
-                    },
-                ],
-            },
-            "session": {
-                "chat_model_config": chat_model_config,
-                "permission_mode": "dont_ask",
-                "busy_message_policy": "queue",
-            },
-            "enabled": bool(binding.enabled),
-        }

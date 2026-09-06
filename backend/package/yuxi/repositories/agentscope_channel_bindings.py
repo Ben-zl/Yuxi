@@ -25,18 +25,6 @@ class AgentScopeChannelBindingRepository:
         """按 Yuxi binding ID 查询。"""
         return await self.db.get(AgentScopeChannelBinding, binding_id)
 
-    async def get_by_channel_id(
-        self,
-        channel_id: str,
-    ) -> AgentScopeChannelBinding | None:
-        """按 AgentScope Channel ID 反查 binding。"""
-        result = await self.db.execute(
-            select(AgentScopeChannelBinding).where(
-                AgentScopeChannelBinding.agentscope_channel_id == channel_id,
-            ),
-        )
-        return result.scalar_one_or_none()
-
     async def create(self, **values) -> AgentScopeChannelBinding:
         """创建待同步 binding intent。"""
         binding = AgentScopeChannelBinding(**values)

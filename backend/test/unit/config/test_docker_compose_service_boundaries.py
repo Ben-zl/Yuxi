@@ -43,7 +43,7 @@ def _project_root() -> Path:
     for parent in Path(__file__).resolve().parents:
         if (parent / "docker-compose.yml").exists():
             return parent
-    pytest.skip("当前测试环境未挂载仓库根目录")
+    raise AssertionError("当前测试环境未挂载仓库根目录，无法验证 shipping Compose")
 
 
 def _load_compose(filename: str) -> dict:
@@ -144,12 +144,29 @@ def test_worker_user_data_mount_is_writable_for_personal_skill_install(filename:
 
 @pytest.mark.parametrize("filename", ["docker-compose.yml", "docker-compose.prod.yml"])
 def test_workspace_consumers_use_fixed_runtime_identity_after_root_migration(filename: str) -> None:
-    """普通文件 consumer 使用 1000:1000，只有一次性 migrator 保留 root。"""
+    """普通文件 consumer 使用 1000:1000；Docker daemon consumer 显式使用 root。"""
     services = _load_compose(filename)["services"]
 
     assert services["api"]["user"] == "1000:1000"
     assert services["worker"]["user"] == "1000:1000"
+    assert services["agentscope"]["user"] == "0:0"
+    assert "/var/run/docker.sock:/var/run/docker.sock" in services["agentscope"]["volumes"]
     assert services["storage-migrator"]["user"] == "0:0"
+
+
+def test_system_tests_supply_required_agentscope_cutoff_before_compose_validation() -> None:
+    """CI 必须在 Compose 解析前写入 AgentScope cutover 必填项。"""
+    source = (_project_root() / ".github/workflows/system-tests.yml").read_text()
+
+    credential_write = "AGENTSCOPE_CHANNEL_CREDENTIAL_KEY=${AGENTSCOPE_CHANNEL_CREDENTIAL_KEY}"
+    cutoff_write = "AGENTSCOPE_LEGACY_CUTOFF=${AGENTSCOPE_LEGACY_CUTOFF}"
+    config_gate = "docker compose config --quiet"
+    assert "AGENTSCOPE_CHANNEL_CREDENTIAL_KEY:" in source
+    assert "AGENTSCOPE_LEGACY_CUTOFF:" in source
+    assert credential_write in source
+    assert cutoff_write in source
+    assert source.index(credential_write) < source.index(config_gate)
+    assert source.index(cutoff_write) < source.index(config_gate)
 
 
 def test_api_image_applies_owner_only_umask_before_dropping_to_runtime_identity() -> None:

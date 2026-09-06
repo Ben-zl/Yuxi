@@ -16,8 +16,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from test.live_api_cleanup import (  # noqa: E402
+    cleanup_provisioned_sandboxes,
     cleanup_test_chat_resources,
     cleanup_pytest_knowledge_resources,
+    list_test_sandbox_ids,
 )
 from yuxi.config.runtime import lite_mode_enabled  # noqa: E402
 
@@ -31,6 +33,8 @@ CLEANUP_USERNAME = E2E_USERNAME or os.getenv("TEST_USERNAME")
 CLEANUP_PASSWORD = E2E_PASSWORD or os.getenv("TEST_PASSWORD")
 E2E_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 LITE_MODE = lite_mode_enabled()
+SANDBOX_PROVISIONER_URL = os.getenv("SANDBOX_PROVISIONER_URL", "http://sandbox-provisioner:8002").rstrip("/")
+SANDBOX_PROVISIONER_TOKEN = os.getenv("SANDBOX_PROVISIONER_TOKEN", "")
 
 
 def _require_e2e_credentials() -> tuple[str, str]:
@@ -82,7 +86,21 @@ def cleanup_e2e_test_resources(e2e_base_url: str):
             if not cleanup_uid:
                 raise RuntimeError("E2E cleanup current user payload is missing uid")
 
+            sandbox_ids = await list_test_sandbox_ids(cleanup_uid)
             await cleanup_test_chat_resources(client, headers, owner_uid=cleanup_uid)
+            if sandbox_ids:
+                if not SANDBOX_PROVISIONER_TOKEN:
+                    raise RuntimeError("SANDBOX_PROVISIONER_TOKEN is required for owned E2E sandbox cleanup")
+                async with httpx.AsyncClient(
+                    base_url=SANDBOX_PROVISIONER_URL,
+                    timeout=E2E_TIMEOUT,
+                    follow_redirects=True,
+                ) as provisioner_client:
+                    await cleanup_provisioned_sandboxes(
+                        provisioner_client,
+                        {"Authorization": f"Bearer {SANDBOX_PROVISIONER_TOKEN}"},
+                        sandbox_ids,
+                    )
             if not LITE_MODE:
                 await cleanup_pytest_knowledge_resources(client, headers)
 

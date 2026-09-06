@@ -14,6 +14,7 @@ from yuxi.agents.backends.sandbox import (
 )
 from yuxi.config import config as app_config
 from yuxi.agents.backends.paths import VIRTUAL_PATH_UPLOADS
+from yuxi.agentscope.run_lease import stop_run_lease_heartbeat
 from yuxi.knowledge.parser.factory import DocumentProcessorFactory
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_repository import AgentRunRepository
@@ -725,6 +726,9 @@ async def _delete_agentscope_thread_resources(db: AsyncSession, *, uid: str, thr
     await client.delete_credential(uid, mapping.agentscope_credential_id, missing_ok=True)
 
     bindings = await binding_repo.deactivate_parent_runtime(uid=uid, parent_thread_id=thread_id)
+    for binding in bindings:
+        if binding.active_run_id:
+            await stop_run_lease_heartbeat(binding.active_run_id)
     child_conversations = ConversationRepository(db)
     for binding in bindings:
         child = await child_conversations.get_conversation_by_thread_id(binding.child_thread_id)

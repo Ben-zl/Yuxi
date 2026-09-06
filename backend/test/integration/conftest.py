@@ -24,6 +24,7 @@ from test.live_api_cleanup import (  # noqa: E402
     cleanup_provisioned_sandboxes,
     cleanup_pytest_knowledge_resources,
     cleanup_test_chat_resources,
+    list_test_sandbox_ids,
 )
 from yuxi.config.runtime import lite_mode_enabled  # noqa: E402
 
@@ -147,36 +148,28 @@ def cleanup_test_knowledge_resources():
             if not cleanup_uid:
                 raise RuntimeError("Test resource cleanup current user payload is missing uid")
 
+            sandbox_ids = await list_test_sandbox_ids(cleanup_uid)
             await cleanup_test_chat_resources(client, headers, owner_uid=cleanup_uid)
+            if sandbox_ids:
+                if not SANDBOX_PROVISIONER_TOKEN:
+                    raise RuntimeError("SANDBOX_PROVISIONER_TOKEN is required for owned sandbox cleanup")
+                provisioner_headers = {"Authorization": f"Bearer {SANDBOX_PROVISIONER_TOKEN}"}
+                async with httpx.AsyncClient(
+                    base_url=SANDBOX_PROVISIONER_URL,
+                    timeout=HTTP_TIMEOUT,
+                    follow_redirects=True,
+                ) as provisioner_client:
+                    await cleanup_provisioned_sandboxes(
+                        provisioner_client,
+                        provisioner_headers,
+                        sandbox_ids,
+                    )
             if not LITE_MODE:
                 await cleanup_pytest_knowledge_resources(client, headers)
 
     anyio.run(run_cleanup)
     yield
     anyio.run(run_cleanup)
-
-
-def _cleanup_provisioned_sandboxes() -> None:
-    if not SANDBOX_PROVISIONER_TOKEN:
-        raise RuntimeError("SANDBOX_PROVISIONER_TOKEN is required for integration sandbox cleanup")
-
-    async def run_cleanup() -> None:
-        headers = {"Authorization": f"Bearer {SANDBOX_PROVISIONER_TOKEN}"}
-        async with httpx.AsyncClient(
-            base_url=SANDBOX_PROVISIONER_URL,
-            timeout=HTTP_TIMEOUT,
-            follow_redirects=True,
-        ) as client:
-            await cleanup_provisioned_sandboxes(client, headers)
-
-    anyio.run(run_cleanup)
-
-
-@pytest.fixture(scope="session", autouse=True)
-def cleanup_test_sandboxes():
-    _cleanup_provisioned_sandboxes()
-    yield
-    _cleanup_provisioned_sandboxes()
 
 
 @pytest_asyncio.fixture(scope="function")

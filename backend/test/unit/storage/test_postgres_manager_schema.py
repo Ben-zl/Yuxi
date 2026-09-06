@@ -41,6 +41,10 @@ def test_business_schema_registers_agentscope_channel_bindings():
     assert table.c.encrypted_app_secret.nullable is False
     assert table.c.agentscope_channel_id.unique is True
 
+    delivery = BusinessBase.metadata.tables["channel_deliveries"]
+    assert delivery.c.request_id.unique is True
+    assert delivery.c.binding_id.nullable is False
+
 
 @pytest.mark.asyncio
 async def test_ensure_business_schema_backfills_subagent_thread_columns_before_dropping_legacy_columns():

@@ -36,6 +36,15 @@ class RunOrigin:
 
 
 @dataclass(frozen=True)
+class RunSubmissionAttachment:
+    """外部入口随 Run 提交的有界附件。"""
+
+    file_name: str
+    media_type: str | None
+    content: bytes
+
+
+@dataclass(frozen=True)
 class RunSubmissionCommand:
     """统一的消息型 Run 提交命令。"""
 
@@ -51,6 +60,7 @@ class RunSubmissionCommand:
     create_conversation: bool = False
     conversation_title: str | None = None
     agent_kind: str = "main"
+    attachments: tuple[RunSubmissionAttachment, ...] = ()
 
 
 async def submit_run_command(
@@ -120,6 +130,7 @@ async def submit_run_command(
 
     conversation_repo = ConversationRepository(db)
     conversation = await conversation_repo.get_conversation_by_thread_id(command.thread_id)
+    created_conversation = conversation is None
     if not conversation:
         if not command.create_conversation:
             raise HTTPException(status_code=404, detail="对话线程不存在")
@@ -153,36 +164,62 @@ async def submit_run_command(
             continue
         request_metadata.setdefault(key, value)
 
-    intake = await intake_request(
-        db=db,
-        request_id=command.request_id,
-        uid=str(current_user.uid),
-        agent_slug=agent_item.slug,
-        thread_id=command.thread_id,
-        source=origin.source,
-        channel=origin.channel,
-        external_id=external_id,
-        origin_metadata=origin_metadata,
-        queue_policy=command.queue_policy,
-        input_message=command.input_message,
-        agent_item=agent_item,
-        agent_backend=agent_backend,
-        model_spec=command.model_spec,
-        tool_approval_mode=command.tool_approval_mode,
-        meta=request_metadata,
-    )
     workdir_path, project = await resolve_conversation_workdir_binding(
         conversation=conversation,
         uid=str(current_user.uid),
         db=db,
     )
-    await finalize_intake(
-        db=db,
-        intake=intake,
-        uid=str(current_user.uid),
-        workdir_path=workdir_path,
-        materialize_managed=project is not None and project.directory_mode == "managed",
-    )
+    stored_attachments: list[dict[str, Any]] = []
+    if command.attachments:
+        if created_conversation:
+            await db.commit()
+        from yuxi.services.attachment_service import persist_run_submission_attachments
+
+        stored_attachments = await persist_run_submission_attachments(
+            conversation=conversation,
+            uid=str(current_user.uid),
+            attachments=command.attachments,
+            db=db,
+        )
+        request_metadata["attachment_file_ids"] = [item["file_id"] for item in stored_attachments]
+
+    try:
+        intake = await intake_request(
+            db=db,
+            request_id=command.request_id,
+            uid=str(current_user.uid),
+            agent_slug=agent_item.slug,
+            thread_id=command.thread_id,
+            source=origin.source,
+            channel=origin.channel,
+            external_id=external_id,
+            origin_metadata=origin_metadata,
+            queue_policy=command.queue_policy,
+            input_message=command.input_message,
+            agent_item=agent_item,
+            agent_backend=agent_backend,
+            model_spec=command.model_spec,
+            tool_approval_mode=command.tool_approval_mode,
+            meta=request_metadata,
+        )
+        await finalize_intake(
+            db=db,
+            intake=intake,
+            uid=str(current_user.uid),
+            workdir_path=workdir_path,
+            materialize_managed=project.directory_mode == "managed",
+        )
+    except Exception:
+        if stored_attachments:
+            from yuxi.services.attachment_service import rollback_run_submission_attachments
+
+            await db.rollback()
+            await rollback_run_submission_attachments(
+                records=stored_attachments,
+                uid=str(current_user.uid),
+                workdir_path=workdir_path,
+            )
+        raise
 
     return {
         "request_id": intake.request_id,

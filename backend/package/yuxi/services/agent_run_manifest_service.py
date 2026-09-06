@@ -1,6 +1,6 @@
 """AgentRun 运行清单与执行指纹。
 
-在 worker 取得执行所有权后、真正构造 LangGraph 执行上下文前，从数据库
+在 worker 取得执行所有权后、真正构造 AgentScope 运行时投影前，从数据库
 解析本次运行实际采用的运行资产，生成只含稳定标识与非敏感摘要的 manifest，
 并以规范化 JSON 的 SHA-256 作为指纹。manifest 由 AgentRun 行拥有，
 write-once 固化后不得改写；历史 Run 保持 NULL 表示 unknown。

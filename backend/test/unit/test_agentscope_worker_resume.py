@@ -46,6 +46,7 @@ async def test_worker_preserves_mixed_approval_decisions(monkeypatch):
         return GatewayRoundResult("completed", "ok", "", 1)
 
     monkeypatch.setattr(worker_job, "ensure_thread_session", AsyncMock(return_value=mapping))
+    monkeypatch.setattr(worker_job, "_verify_run_manifest", AsyncMock())
     monkeypatch.setattr(worker_job, "load_pending_confirm", AsyncMock(return_value=pending))
     monkeypatch.setattr(worker_job, "_resume_and_collect", _resume)
     monkeypatch.setattr(worker_job, "finalize_run", AsyncMock())
@@ -78,6 +79,7 @@ async def test_resume_failure_keeps_pending_confirmation(monkeypatch):
         "tool_calls": [{"id": "one"}],
     }
     monkeypatch.setattr(worker_job, "ensure_thread_session", AsyncMock(return_value=mapping))
+    monkeypatch.setattr(worker_job, "_verify_run_manifest", AsyncMock())
     monkeypatch.setattr(worker_job, "load_pending_confirm", AsyncMock(return_value=pending))
     monkeypatch.setattr(
         worker_job,
@@ -263,6 +265,7 @@ async def test_permission_resume_requires_decisions(monkeypatch):
     )
     mapping = SimpleNamespace(agentscope_agent_id="agent-id", agentscope_session_id="session-id")
     monkeypatch.setattr(worker_job, "ensure_thread_session", AsyncMock(return_value=mapping))
+    monkeypatch.setattr(worker_job, "_verify_run_manifest", AsyncMock())
     monkeypatch.setattr(
         worker_job,
         "load_pending_confirm",
@@ -417,6 +420,7 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
             set_message_delivery_status=AsyncMock(),
         ),
     )
+    monkeypatch.setattr(worker_job, "_record_run_manifest", AsyncMock())
     monkeypatch.setattr(
         worker_job,
         "ensure_thread_session",
@@ -497,11 +501,14 @@ async def test_worker_persists_reasoning_and_tool_calls(monkeypatch):
     monkeypatch.setattr(worker_job.pg_manager, "get_async_session_context", lambda: _SessionContext())
     monkeypatch.setattr(worker_job, "AgentRunRepository", lambda current_db: run_repo)
     monkeypatch.setattr(worker_job, "ConversationRepository", lambda current_db: conv_repo)
+    monkeypatch.setattr(worker_job, "_record_run_manifest", AsyncMock())
     monkeypatch.setattr(execution, "ConversationRepository", lambda current_db: conv_repo)
     monkeypatch.setattr(worker_job, "ensure_thread_session", AsyncMock(return_value=mapping))
+    monkeypatch.setattr(worker_job, "_verify_run_manifest", AsyncMock())
     monkeypatch.setattr(worker_job, "_apply_permission_mode", AsyncMock())
     monkeypatch.setattr(worker_job, "execute_run", AsyncMock(return_value=result))
     monkeypatch.setattr(worker_job, "dispatch_next_request", AsyncMock())
+    monkeypatch.setattr(worker_job, "_notify_agent_task", AsyncMock())
     finalize = AsyncMock()
     monkeypatch.setattr(worker_job, "finalize_run", finalize)
 

@@ -16,8 +16,9 @@ dependencies = [
     "pypdf>=6.13.3",
     "yuxi",
     # agentscope 承接迁移（工单 01/06）：固定 commit 的 fork，经 lock 锁定，升级必须显式 bump
-    "agentscope[channel,memory-reme,service,storage-sql,workspace-docker] @ git+https://github.com/Ben-zl/agentscope.git@71f492287b9e24d81fbe5813b5816bb997e5db28",
+    "agentscope[memory-reme,service,storage-sql,workspace-docker] @ git+https://github.com/Ben-zl/agentscope.git@7a9ef73662fb96cde89e0eb984bd4a2c6334c07d",
     "reme-ai==0.4.0.6",
+    "websockets>=13.0",
 ]
 [tool.ruff]
 line-length = 120  # 代码最大行宽

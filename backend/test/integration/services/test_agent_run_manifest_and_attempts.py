@@ -179,9 +179,7 @@ async def test_attempt_history_survives_retry_takeover_and_reconciliation(fact_d
         async with session_factory() as db:
             run = await db.get(AgentRun, run_id)
             assert run is not None
-            assert run.runtime_cleanup_pending is True
-            run.runtime_cleanup_pending = False
-            await db.commit()
+            assert run.runtime_cleanup_pending is False
 
         async with session_factory() as db:
             repository = AgentRunRepository(db)

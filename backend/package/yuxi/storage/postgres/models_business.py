@@ -889,12 +889,39 @@ class AgentScopeChannelBinding(Base):
             "allow_from": self.allow_from or [],
             "group_reply_policy": self.group_reply_policy,
             "enabled": bool(self.enabled),
-            "agentscope_channel_id": self.agentscope_channel_id,
             "sync_status": self.sync_status,
             "last_error": self.last_error,
             "created_at": format_utc_datetime(self.created_at),
             "updated_at": format_utc_datetime(self.updated_at),
         }
+
+
+class ChannelDelivery(Base):
+    """外部 Channel 回复投递事实，独立于 Agent Run 终态。"""
+
+    __tablename__ = "channel_deliveries"
+    __table_args__ = (
+        UniqueConstraint("binding_id", "channel_message_id", name="uq_channel_deliveries_binding_message"),
+        Index("ix_channel_deliveries_ready", "status", "next_attempt_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    binding_id = Column(
+        String(36),
+        ForeignKey("agentscope_channel_bindings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    request_id = Column(String(64), nullable=False, unique=True, index=True)
+    channel_message_id = Column(String(128), nullable=False)
+    chat_id = Column(String(128), nullable=False)
+    status = Column(String(16), nullable=False, default="pending", index=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=utc_now_naive)
+    updated_at = Column(DateTime, nullable=False, default=utc_now_naive, onupdate=utc_now_naive)
 
 
 class AgentScopeTeamWorkerBinding(Base):
@@ -1074,7 +1101,11 @@ class AgentRun(Base):
     conversation_thread_id = Column(String(64), index=True, nullable=False, comment="Conversation thread ID snapshot")
     runtime_scope_id = Column(String(64), index=True, nullable=False, comment="Root conversation runtime scope")
     runtime_cleanup_pending = Column(
-        Boolean, nullable=False, default=False, server_default="false", index=True,
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+        index=True,
         comment="Root terminal Run still owns execution runtime cleanup",
     )
     agent_slug = Column(String(64), index=True, nullable=False, comment="Agent slug")
@@ -1126,9 +1157,7 @@ class AgentRun(Base):
     created_at = Column(DateTime, default=utc_now_naive, comment="Creation time")
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive, comment="Update time")
 
-    __table_args__ = (
-        CheckConstraint(AGENT_RUN_SHAPE_CONSTRAINT_SQL, name=AGENT_RUN_SHAPE_CONSTRAINT_NAME),
-    )
+    __table_args__ = (CheckConstraint(AGENT_RUN_SHAPE_CONSTRAINT_SQL, name=AGENT_RUN_SHAPE_CONSTRAINT_NAME),)
 
     def to_dict(self) -> dict[str, Any]:
         return {

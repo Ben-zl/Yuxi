@@ -47,6 +47,8 @@ jobs:
       JWT_SECRET_KEY: ci-jwt-secret-at-least-thirty-two-characters
       API_KEY_DERIVATION_SECRET: ci-api-key-derivation-secret-at-least-32-chars
       SANDBOX_PROVISIONER_TOKEN: ci-sandbox-token-at-least-thirty-two-characters
+      AGENTSCOPE_CHANNEL_CREDENTIAL_KEY: 'MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA='
+      AGENTSCOPE_LEGACY_CUTOFF: '2026-01-01T00:00:00+00:00'
       E2E_USERNAME: ci_e2e_admin
       E2E_PASSWORD: ci-e2e-password-at-least-eight
     steps:
@@ -57,7 +59,12 @@ jobs:
           sed -i "s/^JWT_SECRET_KEY=.*/JWT_SECRET_KEY=${JWT_SECRET_KEY}/" .env
           sed -i "s/^API_KEY_DERIVATION_SECRET=.*/API_KEY_DERIVATION_SECRET=${API_KEY_DERIVATION_SECRET}/" .env
           sed -i "s/^SANDBOX_PROVISIONER_TOKEN=.*/SANDBOX_PROVISIONER_TOKEN=${SANDBOX_PROVISIONER_TOKEN}/" .env
-          grep -E "^(JWT_SECRET_KEY|API_KEY_DERIVATION_SECRET|SANDBOX_PROVISIONER_TOKEN)=.+" .env
+          sed -i "s|^AGENTSCOPE_CHANNEL_CREDENTIAL_KEY=.*|AGENTSCOPE_CHANNEL_CREDENTIAL_KEY=${AGENTSCOPE_CHANNEL_CREDENTIAL_KEY}|" .env
+          sed -i "s|^AGENTSCOPE_LEGACY_CUTOFF=.*|AGENTSCOPE_LEGACY_CUTOFF=${AGENTSCOPE_LEGACY_CUTOFF}|" .env
+          grep -E "^(JWT_SECRET_KEY|API_KEY_DERIVATION_SECRET|SANDBOX_PROVISIONER_TOKEN|AGENTSCOPE_CHANNEL_CREDENTIAL_KEY|AGENTSCOPE_LEGACY_CUTOFF)=.+" .env \
+            | cut -d= -f1
+      - name: Validate Compose contract
+        run: docker compose config --quiet
       - name: Start focused runtime topology
         run: docker compose up -d --build postgres redis minio sandbox-provisioner api worker
       - name: Wait for truthful readiness

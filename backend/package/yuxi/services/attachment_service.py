@@ -526,3 +526,61 @@ async def delete_thread_attachment_view(
             logger.warning("附件元数据已删除，但 Workdir 文件清理失败: thread=%s path=%s", thread_id, path)
 
     return {"message": "附件已删除"}
+
+
+async def persist_run_submission_attachments(
+    *,
+    conversation,
+    uid: str,
+    attachments,
+    db: AsyncSession,
+) -> list[dict]:
+    """在统一 Run intake 前把外部入口附件写入 Project Workdir。"""
+    if len(attachments) > 10:
+        raise ValueError("单次 Run 最多提交 10 个附件")
+
+    from yuxi.services.workdir_service import ensure_conversation_workdir_available
+    from yuxi.workspace.workdir import Workdir
+
+    workdir_path = await ensure_conversation_workdir_available(
+        conversation=conversation,
+        uid=str(uid),
+        db=db,
+    )
+    workdir = Workdir.open_existing(str(uid), workdir_path)
+    records: list[dict] = []
+    try:
+        for attachment in attachments:
+            content = bytes(attachment.content)
+            if len(content) > MAX_ATTACHMENT_SIZE_BYTES:
+                raise ValueError("附件超过 5 MB 限制")
+            file_id = uuid.uuid4().hex
+            record = await _store_attachment(
+                workdir=workdir,
+                file_id=file_id,
+                file_name=attachment.file_name,
+                file_type=attachment.media_type,
+                file_content=content,
+            )
+            records.append(record)
+        await ConversationRepository(db).add_attachments(conversation.id, records)
+        return records
+    except Exception:
+        await _rollback_stored_attachments(workdir, records)
+        raise
+
+
+async def rollback_run_submission_attachments(
+    *,
+    records: list[dict],
+    uid: str,
+    workdir_path: str,
+) -> None:
+    """通过 Workdir capability 删除尚未归属已提交请求的附件。"""
+    from yuxi.workspace.workdir import Workdir
+
+    try:
+        workdir = Workdir.open_existing(str(uid), workdir_path)
+    except (FileNotFoundError, ValueError):
+        return
+    await _rollback_stored_attachments(workdir, records)

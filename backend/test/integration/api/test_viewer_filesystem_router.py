@@ -14,7 +14,7 @@ async def _create_thread(test_client, headers) -> tuple[str, str]:
     agent = response.json().get("agent") or {}
     agent_id = agent.get("slug") or agent.get("id")
     if not agent_id:
-        pytest.skip("default agent unavailable")
+        pytest.fail("default agent unavailable; integration fixture must create or seed it")
     response = await test_client.post(
         "/api/chat/thread",
         json={

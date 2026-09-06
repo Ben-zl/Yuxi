@@ -9,7 +9,14 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import select
+
 from yuxi.agentscope.protocol import ToolEventConverter, event_to_chunks, make_chunk, reply_end_to_terminal
+from yuxi.agentscope.run_lease import (
+    RUN_LEASE_SECONDS,
+    start_run_lease_heartbeat,
+    stop_run_lease_heartbeat,
+)
 from yuxi.agentscope.team_protocol import resolve_worker_team_leader
 from yuxi.agentscope.usage import CacheInputMode, UsageAccumulator
 from yuxi.repositories.agent_repository import AgentRepository
@@ -18,9 +25,10 @@ from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerReposi
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session_by_agentscope_context
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.repositories.subagent_thread_repository import SubagentThreadRepository
+from yuxi.services.agent_run_manifest_service import build_run_manifest_result, compute_manifest_fingerprint
 from yuxi.services.run_queue_service import append_run_stream_event
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Message, ToolCall
+from yuxi.storage.postgres.models_business import Message, ToolCall, User
 from yuxi.utils.hash_utils import hash_id, subagent_child_thread_id
 from yuxi.utils.logging_config import logger
 
@@ -218,7 +226,14 @@ class TeamLifecycleModule:
                 run_type="subagent",
                 input_message_id=input_message.id,
             )
-            await AgentRunRepository(db).mark_running(run.id)
+            claimed_run, acquired = await AgentRunRepository(db).mark_running(
+                run.id,
+                lease_seconds=RUN_LEASE_SECONDS,
+            )
+            if claimed_run is None or not acquired or not claimed_run.worker_id:
+                raise RuntimeError("Team child Run 无法取得执行 lease")
+            worker_id = claimed_run.worker_id
+            await _record_team_run_manifest(db, claimed_run, worker_id=worker_id)
             await binding_repo.create(
                 uid=self.uid,
                 parent_thread_id=leader.thread_id,
@@ -234,6 +249,7 @@ class TeamLifecycleModule:
             )
             await db.commit()
 
+        start_run_lease_heartbeat(run.id, worker_id=worker_id)
         await append_run_stream_event(
             run.id,
             "metadata",
@@ -526,16 +542,29 @@ class TeamLifecycleModule:
             runs = AgentRunRepository(db)
             active = await runs.get_run(binding.active_run_id) if binding.active_run_id else None
             if active is not None and active.status not in TERMINAL_RUN_STATUSES and not binding.last_reply_id:
+                claimed, acquired = await runs.mark_running(active.id, lease_seconds=RUN_LEASE_SECONDS)
+                if claimed is None or not acquired or not claimed.worker_id:
+                    raise RuntimeError("Team child Run 无法重新取得执行 lease")
+                await _record_team_run_manifest(db, claimed, worker_id=claimed.worker_id)
                 binding.last_reply_id = reply_id
                 await db.commit()
-                return active.id, active.request_id
+                start_run_lease_heartbeat(claimed.id, worker_id=claimed.worker_id)
+                return claimed.id, claimed.request_id
 
             request_id = hash_id("team-reply:", f"{worker_session_id}:{reply_id}", length=64)
             existing = await runs.get_run_by_request_id(request_id)
             if existing is not None:
+                if existing.status not in TERMINAL_RUN_STATUSES:
+                    claimed, acquired = await runs.mark_running(existing.id, lease_seconds=RUN_LEASE_SECONDS)
+                    if claimed is None or not acquired or not claimed.worker_id:
+                        raise RuntimeError("Team child Run 无法重新取得执行 lease")
+                    existing = claimed
+                    await _record_team_run_manifest(db, existing, worker_id=existing.worker_id)
                 binding.active_run_id = existing.id
                 binding.last_reply_id = reply_id
                 await db.commit()
+                if existing.status not in TERMINAL_RUN_STATUSES:
+                    start_run_lease_heartbeat(existing.id, worker_id=existing.worker_id)
                 return existing.id, existing.request_id
             relation = await SubagentThreadRepository(db).get_for_user(binding.subagent_thread_relation_id, self.uid)
             conversation = await ConversationRepository(db).get_conversation_by_thread_id(binding.child_thread_id)
@@ -579,11 +608,40 @@ class TeamLifecycleModule:
                 run_type="subagent",
                 input_message_id=message.id,
             )
-            await runs.mark_running(run.id)
+            claimed_run, acquired = await runs.mark_running(
+                run.id,
+                lease_seconds=RUN_LEASE_SECONDS,
+            )
+            if claimed_run is None or not acquired or not claimed_run.worker_id:
+                raise RuntimeError("Team child Run 无法取得执行 lease")
+            await _record_team_run_manifest(db, claimed_run, worker_id=claimed_run.worker_id)
             binding.active_run_id = run.id
             binding.last_reply_id = reply_id
             await db.commit()
+            start_run_lease_heartbeat(run.id, worker_id=claimed_run.worker_id)
             return run.id, request_id
+
+    @staticmethod
+    async def _record_team_run_manifest(db, run, *, worker_id: str) -> None:
+        """在 Team child Run 进入 AgentScope worker 前固化运行资产。"""
+        user = await db.scalar(select(User).where(User.uid == run.uid))
+        if user is None:
+            raise RuntimeError("Run 所属用户不存在")
+        projected = await build_run_manifest_result(run=run, user=user, db=db)
+        fingerprint = compute_manifest_fingerprint(projected.manifest)
+        persisted, _recorded = await AgentRunRepository(db).record_run_manifest(
+            run.id,
+            manifest=projected.manifest,
+            fingerprint=fingerprint,
+            worker_id=worker_id,
+        )
+        if persisted is None:
+            raise RuntimeError("Team child Run 不存在")
+        persisted_fingerprint = getattr(persisted, "manifest_fingerprint", fingerprint)
+        if persisted_fingerprint != fingerprint:
+            raise RuntimeError("Team child Run manifest 已变化，拒绝继续执行")
+        run.manifest_fingerprint = persisted_fingerprint
+
 
     async def _finish_worker_run(
         self,
@@ -598,6 +656,7 @@ class TeamLifecycleModule:
         tool_calls: list[dict],
     ) -> str | None:
         """原子保存 worker 输出和 child Run 终态，重复终态事件保持幂等。"""
+        await stop_run_lease_heartbeat(run_id)
         async with pg_manager.get_async_session_context() as db:
             runs = AgentRunRepository(db)
             get_run = getattr(runs, "get_run", None)

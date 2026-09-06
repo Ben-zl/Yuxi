@@ -28,10 +28,12 @@ from yuxi.services.agent_run_service import (
     resolve_agent_run_config,
 )
 from yuxi.services.input_message_service import AgentRunInputMessage
+from yuxi.services.workdir_service import resolve_conversation_workdir_binding
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import AgentRun, AgentRunRequest, Message
 from yuxi.utils.datetime_utils import utc_now_naive
 from yuxi.utils.logging_config import logger
+from yuxi.workspace.paths import ensure_bound_user_workdir
 from yuxi.utils.sse_utils import (
     SSE_HEARTBEAT_SECONDS,
     SSE_MAX_CONNECTION_MINUTES,
@@ -90,6 +92,9 @@ class DispatchResult:
 
     request_id: str
     run_id: str
+    uid: str = ""
+    workdir_path: str = ""
+    materialize_managed: bool = False
 
 
 def validate_queue_policy(queue_policy: str) -> str:
@@ -385,21 +390,40 @@ async def should_end_run_for_steer(run_id: str) -> bool:
         return request is not None
 
 
-async def finalize_intake(*, db: AsyncSession, intake: IntakeResult) -> None:
-    """调用方在 intake_request 后提交事务，并条件性将派发的 run 投入 ARQ。"""
+async def finalize_intake(
+    *,
+    db: AsyncSession,
+    intake: IntakeResult,
+    uid: str,
+    workdir_path: str,
+    materialize_managed: bool = False,
+) -> None:
+    """提交 intake，物化其 Workdir 后才将 Run 投递到 ARQ。"""
     dispatch = (
-        DispatchResult(request_id=intake.request_id, run_id=intake.run_id)
+        DispatchResult(
+            request_id=intake.request_id,
+            run_id=intake.run_id,
+            uid=str(uid),
+            workdir_path=workdir_path,
+            materialize_managed=materialize_managed,
+        )
         if intake.status == REQUEST_STATUS_DISPATCHED and intake.run_id
         else None
     )
-    await finalize_dispatch(db=db, dispatch=dispatch)
-
-
-async def finalize_dispatch(*, db: AsyncSession, dispatch: DispatchResult | None) -> None:
-    """提交当前事务；提交成功后才把已创建的 run 投递给 ARQ。"""
+    if dispatch is not None:
+        await finalize_dispatch(db=db, dispatch=dispatch)
+        return
     await db.commit()
-    if dispatch:
-        await enqueue_agent_run(dispatch.run_id)
+    if materialize_managed:
+        ensure_bound_user_workdir(str(uid), workdir_path)
+
+
+async def finalize_dispatch(*, db: AsyncSession, dispatch: DispatchResult) -> None:
+    """提交事务并物化 Workdir，随后才把已创建的 Run 投入 ARQ。"""
+    await db.commit()
+    if dispatch.materialize_managed:
+        ensure_bound_user_workdir(dispatch.uid, dispatch.workdir_path)
+    await enqueue_agent_run(dispatch.run_id)
 
 
 async def dispatch_next_request(
@@ -417,6 +441,10 @@ async def dispatch_next_request(
         conversation = await ConversationRepository(db).lock_conversation_by_thread_id(thread_id)
         if not _conversation_matches(conversation, uid=uid, agent_slug=agent_slug):
             return None
+        workdir_path, project = await resolve_conversation_workdir_binding(
+            conversation=conversation, uid=str(uid), db=db
+        )
+        materialize_managed = project.directory_mode == "managed"
         active_run = await AgentRunRepository(db).get_active_run_by_thread_for_user(
             uid=str(uid),
             agent_slug=agent_slug,
@@ -437,6 +465,8 @@ async def dispatch_next_request(
                 run_id = dispatch.run_id
 
     if run_id:
+        if materialize_managed:
+            ensure_bound_user_workdir(str(uid), workdir_path)
         await enqueue_agent_run(run_id)
         return run_id
     return None
@@ -622,7 +652,16 @@ async def continue_thread_queue(
         conversation_id=conversation.id,
     )
     if dispatched:
-        return dispatched
+        workdir_path, project = await resolve_conversation_workdir_binding(
+            conversation=conversation, uid=str(uid), db=db
+        )
+        return DispatchResult(
+            request_id=dispatched.request_id,
+            run_id=dispatched.run_id,
+            uid=str(uid),
+            workdir_path=workdir_path,
+            materialize_managed=project.directory_mode == "managed",
+        )
 
     active_run = await AgentRunRepository(db).get_active_run_by_thread_for_user(
         uid=str(uid),

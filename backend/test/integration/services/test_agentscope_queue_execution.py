@@ -28,6 +28,7 @@ from yuxi.storage.postgres.models_business import (
     Conversation,
     Message,
     ModelProvider,
+    Project,
     User,
 )
 
@@ -56,6 +57,7 @@ async def env(monkeypatch):
     monkeypatch.setattr(agent_request_queue_service, "enqueue_agent_run", _capture_enqueue)
     monkeypatch.setattr(agent_request_queue_service, "reenqueue_agent_run", _capture_enqueue)
 
+    project_id = str(uuid.uuid4())
     async with session_factory() as db:
         db.add(
             User(
@@ -65,7 +67,25 @@ async def env(monkeypatch):
                 role="superadmin",
             )
         )
-        db.add(Conversation(thread_id=thread_id, uid=uid, agent_id=agent_slug, status="active"))
+        await db.flush()
+        db.add(
+            Project(
+                id=project_id,
+                uid=uid,
+                selection_status="implicit",
+                workdir_path=f"projects/{project_id}",
+                directory_mode="managed",
+            )
+        )
+        db.add(
+            Conversation(
+                thread_id=thread_id,
+                uid=uid,
+                agent_id=agent_slug,
+                project_id=project_id,
+                status="active",
+            )
+        )
         db.add(
             Agent(
                 slug=agent_slug,
@@ -100,6 +120,7 @@ async def env(monkeypatch):
         "agent_slug": agent_slug,
         "thread_id": thread_id,
         "uid": uid,
+        "project_id": project_id,
         "session_factory": session_factory,
         "enqueued": enqueued,
     }
@@ -111,6 +132,7 @@ async def env(monkeypatch):
             await db.execute(delete(Message).where(Message.conversation_id == conversation_id))
         await db.execute(delete(AgentRun).where(AgentRun.conversation_thread_id == thread_id))
         await db.execute(delete(Conversation).where(Conversation.thread_id == thread_id))
+        await db.execute(delete(Project).where(Project.id == project_id))
         await db.execute(delete(Agent).where(Agent.slug == agent_slug))
         await db.execute(delete(User).where(User.uid == uid))
         await db.commit()
@@ -138,7 +160,13 @@ async def _intake(env, request_id: str, text: str):
             agent_item=MagicMock(),
             agent_backend=MagicMock(),
         )
-        await agent_request_queue_service.finalize_intake(db=db, intake=result)
+        await agent_request_queue_service.finalize_intake(
+            db=db,
+            intake=result,
+            uid=env["uid"],
+            workdir_path=f"projects/{env['project_id']}",
+            materialize_managed=True,
+        )
         return result
 
 
@@ -200,6 +228,7 @@ async def test_interrupted_run_blocks_intake(env):
             AgentRun(
                 id=f"itq-run-{uuid.uuid4().hex[:10]}",
                 conversation_thread_id=env["thread_id"],
+                runtime_scope_id=env["thread_id"],
                 agent_slug=env["agent_slug"],
                 uid=env["uid"],
                 status="interrupted",

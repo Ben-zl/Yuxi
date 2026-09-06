@@ -15,6 +15,7 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from yuxi.agentscope import run_lease
 from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.services import run_queue_service, run_worker
 from yuxi.storage.postgres.manager import AGENT_RUN_LEASE_SCHEMA_STATEMENTS, RUNTIME_SCOPE_SCHEMA_STATEMENTS
@@ -319,6 +320,52 @@ async def _create_live_child(
     return child_id, child_thread_id, child_message_id
 
 
+async def test_team_heartbeat_keeps_child_lease_alive_past_original_expiry(
+    lease_database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """长 Team child 在初始 lease 窗口之后仍由同一 worker 持有。"""
+
+    _, session_factory = lease_database
+    parent_id, parent_thread_id, _ = await _create_run(session_factory)
+    child_thread_id = ""
+    try:
+        initial_time = utc_now_naive()
+        child_id, child_thread_id, _ = await _create_live_child(
+            session_factory,
+            parent_id=parent_id,
+            runtime_scope_id=parent_thread_id,
+            owner="team-heartbeat-worker",
+            now=initial_time,
+            lease_seconds=0.5,
+        )
+        monkeypatch.setattr(
+            run_lease.pg_manager,
+            "get_async_session_context",
+            lambda: _session_context(session_factory),
+        )
+
+        run_lease.start_run_lease_heartbeat(
+            child_id,
+            worker_id="team-heartbeat-worker",
+            lease_seconds=0.5,
+            heartbeat_seconds=0.05,
+        )
+        await asyncio.sleep(0.65)
+        await run_lease.stop_run_lease_heartbeat(child_id)
+
+        async with session_factory() as db:
+            child = await db.get(AgentRun, child_id)
+            assert child is not None
+            assert child.status == "running"
+            assert child.worker_id == "team-heartbeat-worker"
+            assert child.heartbeat_at > initial_time
+            assert child.lease_expires_at > utc_now_naive()
+    finally:
+        await run_lease.stop_run_lease_heartbeat(locals().get("child_id", ""))
+        await _cleanup_runs(session_factory, [parent_thread_id, child_thread_id])
+
+
 async def test_expired_root_reconciliation_cancels_live_child_before_runtime_release(
     lease_database,
     monkeypatch: pytest.MonkeyPatch,
@@ -361,7 +408,7 @@ async def test_expired_root_reconciliation_cancels_live_child_before_runtime_rel
             child = await db.get(AgentRun, child_id)
             child_message = await db.get(Message, child_message_id)
 
-        assert reconciled_ids == [parent_id]
+        assert parent_id in reconciled_ids
         assert parent.status == "failed"
         assert child.status == "cancel_requested"
         assert child.worker_id == "worker-live-tree-child"

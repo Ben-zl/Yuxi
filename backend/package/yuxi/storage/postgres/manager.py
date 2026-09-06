@@ -23,12 +23,13 @@ from yuxi.utils.singleton import SingletonMeta
 # 合并两个 Base
 CombinedBase = declarative_base()
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
-BUSINESS_SCHEMA_VERSION = 2
+BUSINESS_SCHEMA_VERSION = 3
 KNOWLEDGE_SCHEMA_VERSION = 1
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS runtime_scope_id VARCHAR(64)",
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS runtime_cleanup_pending BOOLEAN NOT NULL DEFAULT FALSE",
+    "UPDATE agent_runs SET runtime_cleanup_pending = FALSE WHERE runtime_cleanup_pending IS TRUE",
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(128)",
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITHOUT TIME ZONE",
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP WITHOUT TIME ZONE",
@@ -101,9 +102,37 @@ WORKDIR_PATH_SCHEMA_STATEMENTS = (
     """,
     "ALTER TABLE IF EXISTS projects DROP CONSTRAINT IF EXISTS uq_projects_uid_workdir_path",
     "ALTER TABLE IF EXISTS projects ALTER COLUMN name DROP NOT NULL",
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'fk_projects_uid_users'
+              AND conrelid = 'projects'::regclass
+        ) THEN
+            ALTER TABLE projects
+            ADD CONSTRAINT fk_projects_uid_users
+            FOREIGN KEY (uid) REFERENCES users(uid) ON DELETE CASCADE;
+        END IF;
+    END $$
+    """,
     "ALTER TABLE IF EXISTS conversations ADD COLUMN IF NOT EXISTS project_id VARCHAR(64)",
     "ALTER TABLE IF EXISTS conversations ADD COLUMN IF NOT EXISTS creation_request_id VARCHAR(64)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_conversations_uid_creation_request_id ON conversations(uid, creation_request_id) WHERE creation_request_id IS NOT NULL",
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_conversations_uid_creation_request_id "
+        "ON conversations(uid, creation_request_id) WHERE creation_request_id IS NOT NULL"
+    ),
+    """
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM conversations
+            WHERE project_id IS NULL
+        ) THEN
+            RAISE EXCEPTION 'Conversation project_id requires storage-migrator cutover';
+        END IF;
+    END $$
+    """,
     "ALTER TABLE IF EXISTS conversations ALTER COLUMN project_id SET NOT NULL",
     "CREATE INDEX IF NOT EXISTS ix_conversations_project_id ON conversations(project_id)",
     "ALTER TABLE IF EXISTS conversations DROP CONSTRAINT IF EXISTS ck_conversations_workdir_binding",
@@ -172,6 +201,7 @@ V071_WORKDIR_CUTOVER_STATEMENTS = (
 RUNTIME_SCOPE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS runtime_scope_id VARCHAR(64)",
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS runtime_cleanup_pending BOOLEAN NOT NULL DEFAULT FALSE",
+    "UPDATE agent_runs SET runtime_cleanup_pending = FALSE WHERE runtime_cleanup_pending IS TRUE",
     """
     UPDATE agent_runs AS run
     SET runtime_scope_id = COALESCE(
@@ -287,13 +317,15 @@ class PostgresManager(metaclass=SingletonMeta):
         """创建轻量 Schema 版本表；仅允许迁移器调用。"""
         self._check_initialized()
         async with self.async_engine.begin() as conn:
-            await conn.execute(text(f"""
+            await conn.execute(
+                text(f"""
                 CREATE TABLE IF NOT EXISTS {SCHEMA_VERSION_TABLE} (
                     domain VARCHAR(32) PRIMARY KEY,
                     version INTEGER NOT NULL CHECK (version > 0),
                     applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
-            """))
+            """)
+            )
 
     async def get_schema_versions(self) -> dict[str, int]:
         """读取当前数据库已完成的 Yuxi Schema 版本。"""
@@ -312,12 +344,15 @@ class PostgresManager(metaclass=SingletonMeta):
         """在对应域迁移完整成功后记录当前版本。"""
         self._check_initialized()
         async with self.async_engine.begin() as conn:
-            await conn.execute(text(f"""
+            await conn.execute(
+                text(f"""
                 INSERT INTO {SCHEMA_VERSION_TABLE} (domain, version, applied_at)
                 VALUES (:domain, :version, CURRENT_TIMESTAMP)
                 ON CONFLICT (domain) DO UPDATE
                 SET version = EXCLUDED.version, applied_at = EXCLUDED.applied_at
-            """), {"domain": domain, "version": version})
+            """),
+                {"domain": domain, "version": version},
+            )
 
     async def require_current_schema(self, *, include_knowledge: bool) -> None:
         """只读校验运行进程需要的 Schema 域均为精确当前版本。"""
@@ -845,7 +880,15 @@ class PostgresManager(metaclass=SingletonMeta):
             "ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS request_id VARCHAR(64)",
             "ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS intent_hash VARCHAR(64)",
             "ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP WITHOUT TIME ZONE",
-            "UPDATE api_keys SET is_enabled = FALSE, revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP) WHERE is_enabled = FALSE AND revoked_at IS NULL",
+            """
+            UPDATE api_keys AS api_key
+            SET is_enabled = FALSE,
+                revoked_at = COALESCE(api_key.revoked_at, users.deleted_at, CURRENT_TIMESTAMP)
+            FROM users
+            WHERE api_key.user_id = users.id
+              AND users.is_deleted <> 0
+              AND api_key.revoked_at IS NULL
+            """,
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_api_keys_request_id ON api_keys(request_id)",
             "CREATE INDEX IF NOT EXISTS ix_api_keys_revoked_at ON api_keys(revoked_at)",
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_agents_slug ON agents(slug)",
@@ -1201,13 +1244,36 @@ class PostgresManager(metaclass=SingletonMeta):
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_agentscope_thread_sessions_thread "
                 "ON agentscope_thread_sessions(uid, thread_id)"
             ),
-            (
-                "ALTER TABLE agentscope_thread_sessions "
-                "ADD COLUMN IF NOT EXISTS agentscope_workspace_id VARCHAR(64)"
-            ),
+            ("ALTER TABLE agentscope_thread_sessions ADD COLUMN IF NOT EXISTS agentscope_workspace_id VARCHAR(64)"),
             (
                 "ALTER TABLE agentscope_team_worker_bindings "
                 "ADD COLUMN IF NOT EXISTS agentscope_workspace_id VARCHAR(64)"
+            ),
+            """
+            CREATE TABLE IF NOT EXISTS channel_deliveries (
+                id SERIAL PRIMARY KEY,
+                binding_id VARCHAR(36) NOT NULL REFERENCES agentscope_channel_bindings(id) ON DELETE CASCADE,
+                request_id VARCHAR(64) NOT NULL UNIQUE,
+                channel_message_id VARCHAR(128) NOT NULL,
+                chat_id VARCHAR(128) NOT NULL,
+                status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TIMESTAMP WITHOUT TIME ZONE,
+                last_error TEXT,
+                sent_at TIMESTAMP WITHOUT TIME ZONE,
+                created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_channel_deliveries_binding_message UNIQUE (binding_id, channel_message_id)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_channel_deliveries_binding_id ON channel_deliveries(binding_id)",
+            "CREATE INDEX IF NOT EXISTS ix_channel_deliveries_request_id ON channel_deliveries(request_id)",
+            "CREATE INDEX IF NOT EXISTS ix_channel_deliveries_ready ON channel_deliveries(status, next_attempt_at)",
+            (
+                "UPDATE agentscope_channel_bindings SET model_spec = NULL, "
+                "agentscope_channel_id = NULL, agentscope_agent_id = NULL, agentscope_credential_id = NULL "
+                "WHERE model_spec IS NOT NULL OR agentscope_channel_id IS NOT NULL "
+                "OR agentscope_agent_id IS NOT NULL OR agentscope_credential_id IS NOT NULL"
             ),
         ]
         async with self.async_engine.begin() as conn:

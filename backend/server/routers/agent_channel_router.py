@@ -7,14 +7,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.utils.auth_middleware import get_admin_user, get_db
-from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.repositories.agentscope_channel_bindings import (
     AgentScopeChannelBindingRepository,
 )
 from yuxi.services.agentscope_channel_service import AgentScopeChannelService
 from yuxi.storage.postgres.models_business import User
-
-import os
 
 
 agent_channels = APIRouter(prefix="/agent-channels", tags=["agent-channels"])
@@ -46,10 +43,7 @@ class ChannelUpdate(BaseModel):
 
 def _service(db: AsyncSession) -> AgentScopeChannelService:
     """构造无状态 Channel 控制面服务。"""
-    return AgentScopeChannelService(
-        db,
-        AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")),
-    )
+    return AgentScopeChannelService(db)
 
 
 async def _binding_or_404(db: AsyncSession, binding_id: str):
@@ -93,7 +87,7 @@ async def update_channel(
     current_user: User = Depends(get_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """更新 binding 并同步 Agent、模型、Session 和 WPS 配置。"""
+    """更新 WPS binding 并重新验证 AgentScope 投影。"""
     binding = await _binding_or_404(db, binding_id)
     updates = payload.model_dump(exclude_unset=True)
     binding = await _service(db).update_binding(
@@ -110,7 +104,7 @@ async def reconcile_channel(
     _current_user: User = Depends(get_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """重试未完成或失败的跨库同步。"""
+    """重试未完成或失败的 WPS runtime 投影验证。"""
     binding = await _service(db).reconcile(await _binding_or_404(db, binding_id))
     return {"success": binding.sync_status == "synced", "data": binding.to_dict()}
 
@@ -122,7 +116,7 @@ async def set_channel_enabled(
     current_user: User = Depends(get_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """启用或禁用远端 AgentScope Channel。"""
+    """启用或禁用 Yuxi WPS Channel。"""
     binding = await _binding_or_404(db, binding_id)
     binding = await _service(db).set_enabled(
         binding,
@@ -138,12 +132,12 @@ async def get_channel_status(
     _current_user: User = Depends(get_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """读取 AgentScope 权威连接状态。"""
+    """读取 Yuxi WPS runtime 连接状态。"""
     binding = await _binding_or_404(db, binding_id)
     try:
         runtime = await _service(db).status(binding)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail="AgentScope Channel 状态读取失败") from exc
+        raise HTTPException(status_code=502, detail="WPS Channel 状态读取失败") from exc
     return {"success": True, "data": {**binding.to_dict(), "runtime": runtime}}
 
 
@@ -153,7 +147,7 @@ async def delete_channel(
     _current_user: User = Depends(get_admin_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """清理远端运行资源并删除 binding，历史 Thread 保留。"""
+    """删除 binding 并由 WPS runtime 关闭连接，历史 Thread 保留。"""
     binding = await _binding_or_404(db, binding_id)
     try:
         await _service(db).delete(binding)

@@ -12,6 +12,7 @@ from pathlib import PurePosixPath
 import asyncpg
 import httpx
 from yuxi.workspace.paths import normalize_workdir_path, user_workdir_host_dir
+from yuxi.agents.backends.sandbox.provider import sandbox_id_for_thread
 from yuxi.config import get_user_data_dir
 from yuxi.storage.postgres.models_business import AGENT_RUN_TERMINAL_STATUSES
 
@@ -117,22 +118,45 @@ async def _list_provisioned_sandbox_ids(
 async def cleanup_provisioned_sandboxes(
     client: httpx.AsyncClient,
     headers: dict[str, str],
+    sandbox_ids: set[str],
 ) -> None:
-    """通过 provisioner 管理 API 删除测试环境中的全部沙盒。"""
+    """只删除已由测试数据库事实证明归属本次测试的 Sandbox。"""
 
-    initial_ids = await _list_provisioned_sandbox_ids(client, headers)
+    if not sandbox_ids:
+        return
+    provisioned_ids = await _list_provisioned_sandbox_ids(client, headers)
+    target_ids = sandbox_ids & provisioned_ids
     failures: list[str] = []
-    for sandbox_id in sorted(initial_ids):
+    for sandbox_id in sorted(target_ids):
         delete_response = await client.delete(f"/api/sandboxes/{sandbox_id}", headers=headers)
         if delete_response.status_code not in {200, 404}:
             failures.append(f"Failed to delete provisioned sandbox {sandbox_id}: {delete_response.text}")
 
-    remaining_ids = initial_ids & await _list_provisioned_sandbox_ids(client, headers)
+    remaining_ids = target_ids & await _list_provisioned_sandbox_ids(client, headers)
     if remaining_ids:
         failures.append(f"Provisioner cleanup left sandboxes behind: {', '.join(sorted(remaining_ids))}")
 
     if failures:
         raise RuntimeError("; ".join(failures))
+
+
+async def list_test_sandbox_ids(owner_uid: str) -> set[str]:
+    """从测试 Run 的持久化 runtime scope 推导其唯一 Sandbox 标识。"""
+
+    resources = await list_test_conversation_resources(owner_uid)
+    if not resources:
+        return set()
+    conn = await asyncpg.connect(_postgres_dsn())
+    try:
+        rows = await conn.fetch(
+            "SELECT DISTINCT uid, runtime_scope_id FROM agent_runs "
+            "WHERE conversation_thread_id = ANY($1::text[]) "
+            "AND runtime_scope_id IS NOT NULL AND runtime_scope_id <> ''",
+            sorted(resources),
+        )
+    finally:
+        await conn.close()
+    return {sandbox_id_for_thread(str(row["runtime_scope_id"]), uid=str(row["uid"])) for row in rows}
 
 
 def _postgres_dsn() -> str:

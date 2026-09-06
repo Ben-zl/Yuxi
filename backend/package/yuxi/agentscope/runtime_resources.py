@@ -1,20 +1,12 @@
 """把 AgentScope 会话上下文解析为唯一的 Yuxi 运行时投影。"""
 
 import asyncio
-import uuid
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agentscope.config_projection import RuntimeProjection, project_runtime
-from yuxi.repositories.agentscope_thread_sessions import (
-    create_thread_session,
-    get_thread_session_by_agentscope_context,
-)
-from yuxi.repositories.agentscope_channel_bindings import (
-    AgentScopeChannelBindingRepository,
-)
-from yuxi.repositories.conversation_repository import ConversationRepository
+from yuxi.repositories.agentscope_thread_sessions import get_thread_session_by_agentscope_context
 from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerRepository
 
 
@@ -55,52 +47,6 @@ async def resolve_runtime_projection(
     runtime_agent_slug: str | None = None
     if mapping is None:
         session = await storage.get_session(user_id, agent_id, session_id)
-        source = getattr(session, "source", None) if session is not None else None
-        source_value = getattr(source, "value", source)
-        if session is not None and source_value == "channel" and session.source_channel_id:
-            binding = await AgentScopeChannelBindingRepository(db).get_by_channel_id(
-                session.source_channel_id,
-            )
-            if binding is None or binding.sync_status != "synced":
-                raise ValueError("AgentScope Channel 不存在已同步的 Yuxi binding")
-            if user_id != binding.owner_uid:
-                raise ValueError("AgentScope Channel 执行身份与 binding owner 不一致")
-
-            thread_id = str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"yuxi:agentscope-channel:{session.source_channel_id}:{session_id}",
-                ),
-            )
-            conversation = await ConversationRepository(db).get_conversation_by_thread_id(
-                thread_id,
-            )
-            if conversation is None:
-                conversation = await ConversationRepository(db).add_conversation(
-                    uid=binding.owner_uid,
-                    agent_id=binding.agent_slug,
-                    title=f"WPS 协作 · {binding.name}",
-                    thread_id=thread_id,
-                    metadata={
-                        "source": "agentscope_channel",
-                        "channel": "wps_xiezuo",
-                        "agentscope_channel_id": session.source_channel_id,
-                        "agentscope_session_id": session_id,
-                    },
-                )
-            mapping = await create_thread_session(
-                db,
-                uid=binding.owner_uid,
-                thread_id=thread_id,
-                agent_slug=binding.agent_slug,
-                model_spec=binding.model_spec,
-                agentscope_agent_id=agent_id,
-                agentscope_credential_id=binding.agentscope_credential_id,
-                agentscope_session_id=session_id,
-                agentscope_workspace_id=session.config.workspace_id,
-            )
-            await db.commit()
-
         if session is None or session.team_id is None:
             if mapping is None:
                 raise ValueError("AgentScope 会话不存在有效的 Yuxi 线程映射")

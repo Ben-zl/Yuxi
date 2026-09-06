@@ -31,7 +31,17 @@ async def test_fail_run_with_cancel_signal_finishes_as_cancelled(monkeypatch):
     notify_task = AsyncMock()
     monkeypatch.setattr(worker_job, "_notify_agent_task", notify_task)
 
-    await worker_job._fail_run(db, run_repo, run, "执行失败: timeout")
+    await worker_job._fail_run(
+        db,
+        run_repo,
+        run_id=run.id,
+        uid=run.uid,
+        agent_slug=run.agent_slug,
+        thread_id=run.conversation_thread_id,
+        input_message_id=None,
+        worker_id=None,
+        message="执行失败: timeout",
+    )
 
     run_repo.set_terminal_status.assert_awaited_once_with(
         "run-1",
@@ -43,7 +53,11 @@ async def test_fail_run_with_cancel_signal_finishes_as_cancelled(monkeypatch):
         "thread-1",
         {"status": "cancelled"},
     )
-    sync_delivery.assert_awaited_once_with(db, run, "cancelled")
+    sync_delivery.assert_awaited_once_with(
+        db,
+        input_message_id=None,
+        run_status="cancelled",
+    )
     clear_cancel.assert_awaited_once_with("run-1")
     dispatch_next.assert_awaited_once_with(
         uid="u",
@@ -75,7 +89,20 @@ async def test_fail_run_loser_has_no_terminal_side_effects(monkeypatch):
     notify_task = AsyncMock()
     monkeypatch.setattr(worker_job, "_notify_agent_task", notify_task)
 
-    assert await worker_job._fail_run(db, run_repo, run, "timeout") is False
+    assert (
+        await worker_job._fail_run(
+            db,
+            run_repo,
+            run_id=run.id,
+            uid=run.uid,
+            agent_slug=run.agent_slug,
+            thread_id=run.conversation_thread_id,
+            input_message_id=None,
+            worker_id=None,
+            message="timeout",
+        )
+        is False
+    )
 
     db.commit.assert_not_awaited()
     emit_end.assert_not_awaited()
@@ -100,14 +127,19 @@ async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
     )
     run_repo = SimpleNamespace(
         get_run=AsyncMock(return_value=run),
-        mark_running=AsyncMock(),
+        mark_running=AsyncMock(return_value=(run, True)),
+        record_run_manifest=AsyncMock(return_value=(run, True)),
     )
     conv_repo = SimpleNamespace(
         get_message_by_id=AsyncMock(
             return_value=SimpleNamespace(content="hello", extra_metadata={}, image_content=None)
         ),
     )
-    db = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=SimpleNamespace(uid="u")),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
 
     class _SessionContext:
         async def __aenter__(self):
@@ -119,6 +151,11 @@ async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
     monkeypatch.setattr(worker_job.pg_manager, "get_async_session_context", lambda: _SessionContext())
     monkeypatch.setattr(worker_job, "AgentRunRepository", lambda _db: run_repo)
     monkeypatch.setattr(worker_job, "ConversationRepository", lambda _db: conv_repo)
+    monkeypatch.setattr(
+        worker_job,
+        "build_run_manifest_result",
+        AsyncMock(return_value=SimpleNamespace(manifest={"manifest_version": 1})),
+    )
     monkeypatch.setattr(
         worker_job,
         "ensure_thread_session",
@@ -141,8 +178,85 @@ async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
     fail_run.assert_awaited_once_with(
         db,
         run_repo,
-        run,
-        "执行失败: database aborted",
+        run_id="run-1",
+        uid="u",
+        agent_slug="agent-1",
+        thread_id="thread-1",
+        input_message_id=1,
+        worker_id=worker_job.WORKER_ID,
+        message="执行失败: database aborted",
+    )
+
+
+async def test_manifest_failure_prevents_agentscope_execution(monkeypatch):
+    """manifest 未成为持久事实时不得启动 AgentScope Session 或模型执行。"""
+    run = SimpleNamespace(
+        id="run-manifest",
+        uid="u",
+        status="pending",
+        input_message_id=1,
+        run_type="chat",
+        input_payload={},
+        conversation_id=1,
+        request_id="request-manifest",
+        conversation_thread_id="thread-manifest",
+        agent_slug="agent-manifest",
+        worker_id=worker_job.WORKER_ID,
+    )
+    run_repo = SimpleNamespace(
+        get_run=AsyncMock(return_value=run),
+        mark_running=AsyncMock(return_value=(run, True)),
+        record_run_manifest=AsyncMock(side_effect=RuntimeError("write-once rejected")),
+    )
+    conv_repo = SimpleNamespace(
+        get_message_by_id=AsyncMock(
+            return_value=SimpleNamespace(content="hello", extra_metadata={}, image_content=None)
+        ),
+    )
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=SimpleNamespace(uid="u")),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+    class _SessionContext:
+        async def __aenter__(self):
+            return db
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(worker_job.pg_manager, "get_async_session_context", lambda: _SessionContext())
+    monkeypatch.setattr(worker_job, "AgentRunRepository", lambda _db: run_repo)
+    monkeypatch.setattr(worker_job, "ConversationRepository", lambda _db: conv_repo)
+    monkeypatch.setattr(
+        worker_job,
+        "build_run_manifest_result",
+        AsyncMock(return_value=SimpleNamespace(manifest={"manifest_version": 1})),
+    )
+    ensure_session = AsyncMock()
+    execute = AsyncMock()
+    fail_run = AsyncMock()
+    monkeypatch.setattr(worker_job, "ensure_thread_session", ensure_session)
+    monkeypatch.setattr(worker_job, "execute_run", execute)
+    monkeypatch.setattr(worker_job, "_fail_run", fail_run)
+
+    await worker_job.execute_agent_run_job(run.id)
+
+    db.commit.assert_awaited_once()
+    db.rollback.assert_awaited_once()
+    ensure_session.assert_not_awaited()
+    execute.assert_not_awaited()
+    fail_run.assert_awaited_once_with(
+        db,
+        run_repo,
+        run_id="run-manifest",
+        uid="u",
+        agent_slug="agent-manifest",
+        thread_id="thread-manifest",
+        input_message_id=1,
+        worker_id=worker_job.WORKER_ID,
+        message="运行清单固化失败: write-once rejected",
     )
 
 
@@ -157,7 +271,10 @@ async def test_timeout_interrupts_remote_sessions_before_finishing_run(monkeypat
         id="parent-run",
         uid="u",
         status="running",
+        agent_slug="agent",
         conversation_thread_id="thread",
+        input_message_id=1,
+        worker_id="worker",
     )
     child = SimpleNamespace(id="child-run")
     first_repo = SimpleNamespace(
@@ -220,8 +337,8 @@ async def test_timeout_interrupts_remote_sessions_before_finishing_run(monkeypat
 
     monkeypatch.setattr(worker_job, "_fail_remaining_timeout_children", _finish_children)
 
-    async def _finish(_db, _repo, _run, _message):
-        order.append(("finish", _run.id))
+    async def _finish(_db, _repo, **kwargs):
+        order.append(("finish", kwargs["run_id"]))
 
     monkeypatch.setattr(worker_job, "_fail_run", _finish)
 
@@ -236,3 +353,24 @@ async def test_timeout_interrupts_remote_sessions_before_finishing_run(monkeypat
         ("finish-children", "parent-run", "u"),
         ("finish", "parent-run"),
     ]
+
+async def test_manifest_write_once_rejects_persisted_fingerprint_mismatch(monkeypatch):
+    """重复投递不得用新配置覆盖已固化的 manifest 指纹。"""
+    run = SimpleNamespace(id="run-manifest", uid="u", manifest_fingerprint="old")
+    db = SimpleNamespace(scalar=AsyncMock(return_value=SimpleNamespace(uid="u")))
+    repo = SimpleNamespace(
+        record_run_manifest=AsyncMock(
+            return_value=(SimpleNamespace(manifest_fingerprint="old"), False)
+        )
+    )
+    monkeypatch.setattr(
+        worker_job,
+        "build_run_manifest_result",
+        AsyncMock(return_value=SimpleNamespace(manifest={"model": "new"})),
+    )
+    monkeypatch.setattr(worker_job, "compute_manifest_fingerprint", lambda _manifest: "new")
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="拒绝覆盖"):
+        await worker_job._record_run_manifest(db, repo, run, worker_id="worker-1")

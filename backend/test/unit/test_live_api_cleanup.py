@@ -22,11 +22,11 @@ from test.live_api_cleanup import (
 pytestmark = pytest.mark.asyncio
 
 
-async def test_cleanup_deletes_every_sandbox_through_provisioner_api():
-    """测试环境沙盒只能通过 provisioner 的受控管理接口清理。"""
+async def test_cleanup_deletes_only_explicitly_owned_sandboxes_through_provisioner_api():
+    """共享 provisioner 中未登记为本次测试所有的 Sandbox 必须保留。"""
 
     deleted_paths: list[str] = []
-    sandbox_ids = {"sandbox-one", "sandbox-two"}
+    sandbox_ids = {"sandbox-one", "sandbox-two", "shared-production"}
     authorization_headers: list[str | None] = []
 
     def handle_request(request: httpx.Request) -> httpx.Response:
@@ -46,9 +46,14 @@ async def test_cleanup_deletes_every_sandbox_through_provisioner_api():
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handle_request), base_url="http://provisioner"
     ) as client:
-        await cleanup_provisioned_sandboxes(client, {"Authorization": "Bearer test-token"})
+        await cleanup_provisioned_sandboxes(
+            client,
+            {"Authorization": "Bearer test-token"},
+            {"sandbox-one", "sandbox-two"},
+        )
 
     assert deleted_paths == ["/api/sandboxes/sandbox-one", "/api/sandboxes/sandbox-two"]
+    assert sandbox_ids == {"shared-production"}
     assert authorization_headers == ["Bearer test-token"] * 4
 
 
@@ -64,7 +69,11 @@ async def test_cleanup_rejects_delete_that_does_not_remove_sandbox():
         transport=httpx.MockTransport(handle_request), base_url="http://provisioner"
     ) as client:
         with pytest.raises(RuntimeError, match="left sandboxes behind: sandbox-stale"):
-            await cleanup_provisioned_sandboxes(client, {"Authorization": "Bearer test-token"})
+            await cleanup_provisioned_sandboxes(
+                client,
+                {"Authorization": "Bearer test-token"},
+                {"sandbox-stale"},
+            )
 
 
 async def test_cleanup_rejects_invalid_provisioner_list_payload():
@@ -77,7 +86,11 @@ async def test_cleanup_rejects_invalid_provisioner_list_payload():
         transport=httpx.MockTransport(handle_request), base_url="http://provisioner"
     ) as client:
         with pytest.raises(RuntimeError, match="missing a sandboxes list"):
-            await cleanup_provisioned_sandboxes(client, {"Authorization": "Bearer test-token"})
+            await cleanup_provisioned_sandboxes(
+                client,
+                {"Authorization": "Bearer test-token"},
+                {"sandbox-stale"},
+            )
 
 
 async def _patch_chat_cleanup_database(
@@ -287,10 +300,7 @@ async def test_cleanup_only_exempts_projects_whose_managed_workdir_is_deleted(tm
         if request.url.path == "/api/chat/threads":
             return httpx.Response(
                 200,
-                json=[
-                    {"id": thread_id, "metadata": {"_yuxi_test": True}}
-                    for thread_id in resources
-                ],
+                json=[{"id": thread_id, "metadata": {"_yuxi_test": True}} for thread_id in resources],
             )
         if request.url.path == "/api/agent":
             return httpx.Response(200, json={"agents": []})

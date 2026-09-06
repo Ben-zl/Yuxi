@@ -32,6 +32,7 @@ from yuxi.storage.postgres.models_business import (
     Conversation,
     Message,
     ModelProvider,
+    Project,
     User,
 )
 from yuxi.storage.postgres.manager import pg_manager
@@ -65,6 +66,7 @@ async def env(monkeypatch):
     monkeypatch.setenv("AGENTSCOPE_LEGACY_CUTOFF", "2000-01-01T00:00:00+00:00")
 
     async with session_factory() as db:
+        project_id = str(uuid.uuid4())
         db.add(
             User(
                 uid=uid,
@@ -73,7 +75,25 @@ async def env(monkeypatch):
                 role="superadmin",
             )
         )
-        db.add(Conversation(thread_id=thread_id, uid=uid, agent_id=agent_slug, status="active"))
+        await db.flush()
+        db.add(
+            Project(
+                id=project_id,
+                uid=uid,
+                selection_status="implicit",
+                workdir_path=f"projects/{project_id}",
+                directory_mode="managed",
+            )
+        )
+        db.add(
+            Conversation(
+                thread_id=thread_id,
+                uid=uid,
+                agent_id=agent_slug,
+                project_id=project_id,
+                status="active",
+            )
+        )
         db.add(
             Agent(
                 slug=agent_slug,
@@ -109,6 +129,7 @@ async def env(monkeypatch):
         "agent_slug": agent_slug,
         "thread_id": thread_id,
         "uid": uid,
+        "project_id": project_id,
         "session_factory": session_factory,
         "enqueued": enqueued,
     }
@@ -120,6 +141,7 @@ async def env(monkeypatch):
             await db.execute(delete(Message).where(Message.conversation_id == conversation_id))
         await db.execute(delete(AgentRun).where(AgentRun.conversation_thread_id == thread_id))
         await db.execute(delete(Conversation).where(Conversation.thread_id == thread_id))
+        await db.execute(delete(Project).where(Project.id == project_id))
         await db.execute(delete(User).where(User.uid == uid))
         await db.execute(
             delete(Agent).where(
@@ -150,7 +172,13 @@ async def _intake(env, request_id: str, text: str, policy: str = "enqueue"):
             agent_item=MagicMock(),
             agent_backend=MagicMock(),
         )
-        await agent_request_queue_service.finalize_intake(db=db, intake=result)
+        await agent_request_queue_service.finalize_intake(
+            db=db,
+            intake=result,
+            uid=env["uid"],
+            workdir_path=f"projects/{env['project_id']}",
+            materialize_managed=True,
+        )
         return result
 
 
@@ -202,6 +230,9 @@ async def test_worker_job_full_pipeline(env):
         run = await AgentRunRepository(db).get_run_by_request_id(first.request_id)
         assert run.status == "completed"
         assert run.finished_at is not None
+        assert run.manifest is not None
+        assert run.manifest_fingerprint
+        assert run.manifest_recorded_at is not None
 
         messages = (
             (
@@ -251,6 +282,7 @@ async def test_steer_interrupted_run_dispatches_queue_head(env, monkeypatch):
         model_spec=None,
         image_content=None,
         mapping=None,
+        persist_result=True,
     ):
         return GatewayRoundResult(run_status="interrupted", text="", reasoning="", event_count=1)
 
@@ -318,6 +350,7 @@ async def test_approval_parked_interrupted_run_holds_queue(env, monkeypatch):
         model_spec=None,
         image_content=None,
         mapping=None,
+        persist_result=True,
     ):
         return GatewayRoundResult(
             run_status="interrupted",

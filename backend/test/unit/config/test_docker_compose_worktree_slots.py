@@ -2,7 +2,6 @@ from copy import deepcopy
 import os
 from pathlib import Path
 
-import pytest
 import yaml
 
 
@@ -12,6 +11,7 @@ PORT_MARKERS = {
     "api": {"${YUXI_API_PORT:-5050}:5050"},
     "web": {"${YUXI_WEB_PORT:-5173}:5173"},
     "sandbox-provisioner": {"127.0.0.1:${YUXI_SANDBOX_PORT:-8002}:8002"},
+    "agentscope": {"127.0.0.1:${YUXI_AGENTSCOPE_PORT:-8100}:8100"},
     "graph": {
         "127.0.0.1:${YUXI_NEO4J_HTTP_PORT:-7474}:7474",
         "127.0.0.1:${YUXI_NEO4J_BOLT_PORT:-7687}:7687",
@@ -49,7 +49,7 @@ def _project_root() -> Path:
     for parent in Path(__file__).resolve().parents:
         if (parent / "docker-compose.yml").exists():
             return parent
-    pytest.skip("当前测试环境未挂载仓库根目录")
+    raise AssertionError("当前测试环境未挂载仓库根目录，无法验证 shipping Compose")
 
 
 def _load_compose(filename: str = "docker-compose.yml") -> dict:
@@ -93,6 +93,10 @@ def _slot_isolation_violations(compose: dict) -> set[str]:
     expected_container = "${SANDBOX_DOCKER_SANDBOX_PREFIX:-${COMPOSE_PROJECT_NAME:-yuxi}-sandbox}"
     if f"DOCKER_SANDBOX_PREFIX={expected_container}" not in provisioner_env:
         violations.add("sandbox:container-prefix")
+    if any(item.startswith("DOCKER_USER_DATA_HOST_PATH=") for item in provisioner_env):
+        violations.add("sandbox:user-data-host-override")
+    if any(item.startswith("DOCKER_SKILL_PROJECTIONS_HOST_PATH=") for item in provisioner_env):
+        violations.add("sandbox:skill-host-override")
 
     return violations
 
@@ -124,6 +128,7 @@ def test_slot_isolation_guard_rejects_fixed_host_resources() -> None:
     compose["services"]["api"]["image"] = "yuxi-api:latest"
     compose["services"]["postgres"]["volumes"][0]["source"] = "./docker/volumes/postgresql"
     compose["networks"]["app-network"]["name"] = "yuxi-app-network"
+    compose["services"]["sandbox-provisioner"]["environment"].append("DOCKER_USER_DATA_HOST_PATH=/fixed/user-data")
 
     assert {
         "container:api",
@@ -131,6 +136,7 @@ def test_slot_isolation_guard_rejects_fixed_host_resources() -> None:
         "image:api",
         "state:postgres:./docker/volumes/postgresql",
         "network:app-network",
+        "sandbox:user-data-host-override",
     } <= _slot_isolation_violations(compose)
 
 
