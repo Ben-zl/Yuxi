@@ -36,6 +36,27 @@ from yuxi.utils.logging_config import logger
 TEAM_MEMBER_MAX_NUDGES = 3
 
 
+async def _record_team_run_manifest(db, run, *, worker_id: str) -> None:
+    """在 Team child Run 进入 AgentScope worker 前固化运行资产。"""
+    user = await db.scalar(select(User).where(User.uid == run.uid))
+    if user is None:
+        raise RuntimeError("Run 所属用户不存在")
+    projected = await build_run_manifest_result(run=run, user=user, db=db)
+    fingerprint = compute_manifest_fingerprint(projected.manifest)
+    persisted, _recorded = await AgentRunRepository(db).record_run_manifest(
+        run.id,
+        manifest=projected.manifest,
+        fingerprint=fingerprint,
+        worker_id=worker_id,
+    )
+    if persisted is None:
+        raise RuntimeError("Team child Run 不存在")
+    persisted_fingerprint = getattr(persisted, "manifest_fingerprint", fingerprint)
+    if persisted_fingerprint != fingerprint:
+        raise RuntimeError("Team child Run manifest 已变化，拒绝继续执行")
+    run.manifest_fingerprint = persisted_fingerprint
+
+
 @dataclass(frozen=True)
 class TeamRosterSnapshot:
     """一次 Team roster 快照，只保留生命周期投影需要的字段。"""
@@ -620,28 +641,6 @@ class TeamLifecycleModule:
             await db.commit()
             start_run_lease_heartbeat(run.id, worker_id=claimed_run.worker_id)
             return run.id, request_id
-
-    @staticmethod
-    async def _record_team_run_manifest(db, run, *, worker_id: str) -> None:
-        """在 Team child Run 进入 AgentScope worker 前固化运行资产。"""
-        user = await db.scalar(select(User).where(User.uid == run.uid))
-        if user is None:
-            raise RuntimeError("Run 所属用户不存在")
-        projected = await build_run_manifest_result(run=run, user=user, db=db)
-        fingerprint = compute_manifest_fingerprint(projected.manifest)
-        persisted, _recorded = await AgentRunRepository(db).record_run_manifest(
-            run.id,
-            manifest=projected.manifest,
-            fingerprint=fingerprint,
-            worker_id=worker_id,
-        )
-        if persisted is None:
-            raise RuntimeError("Team child Run 不存在")
-        persisted_fingerprint = getattr(persisted, "manifest_fingerprint", fingerprint)
-        if persisted_fingerprint != fingerprint:
-            raise RuntimeError("Team child Run manifest 已变化，拒绝继续执行")
-        run.manifest_fingerprint = persisted_fingerprint
-
 
     async def _finish_worker_run(
         self,
