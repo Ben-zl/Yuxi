@@ -10,6 +10,7 @@ import os
 import uuid
 
 import pytest
+from sqlalchemy import delete
 
 from test.e2e.agentscope_e2e_fixtures import (
     PROVIDER_ID,
@@ -21,8 +22,10 @@ from test.e2e.agentscope_e2e_fixtures import (
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.gateway import stream_round_to_run_events
 from yuxi.agentscope.runner import ensure_thread_session
+from yuxi.agents.skills.service import refresh_user_skill_projection_async
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Agent
+from yuxi.config import get_skill_data_dir
+from yuxi.storage.postgres.models_business import Agent, Skill
 from yuxi.storage.redis.manager import close_async_redis_client, get_async_redis_client
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
@@ -40,6 +43,28 @@ async def db_session():
     async with pg_manager.get_async_session_context() as session:
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
         await seed_test_users(session, USER_ID)
+        skill_dir = get_skill_data_dir() / "shared" / SKILL_NAME
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nslug: e2e-skill-demo\nname: E2E Skill\ndescription: 用于渐进披露验证的技能\n---\n\n用于渐进披露验证的技能。\n",
+            encoding="utf-8",
+        )
+        session.add(
+            Skill(
+                slug=SKILL_NAME,
+                name="E2E Skill",
+                description="用于渐进披露验证的技能",
+                source_type="upload",
+                dir_path=f"shared/{SKILL_NAME}",
+                share_config={
+                    "version": 2,
+                    "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+                    "manage_scope": None,
+                },
+                created_by="e2e",
+                updated_by="e2e",
+            )
+        )
         session.add(
             Agent(
                 slug=CHATBOT_SLUG,
@@ -49,6 +74,7 @@ async def db_session():
                     "context": {
                         "model": f"{PROVIDER_ID}:mock-chat-model",
                         "mcps": [],
+                        "skills": [SKILL_NAME],
                         "system_prompt": "你是技能测试助手。",
                     }
                 },
@@ -56,9 +82,15 @@ async def db_session():
             )
         )
         await upsert_mock_provider(session)
+        await refresh_user_skill_projection_async(USER_ID)
         yield session
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
+        await session.execute(delete(Skill).where(Skill.slug == SKILL_NAME))
+        await session.commit()
         await cleanup_test_users(session, USER_ID)
+        import shutil
+
+        shutil.rmtree(get_skill_data_dir() / "shared" / SKILL_NAME, ignore_errors=True)
     await close_async_redis_client()
     await pg_manager.close()
     pg_manager._initialized = False

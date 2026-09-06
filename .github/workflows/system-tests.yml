@@ -66,7 +66,7 @@ jobs:
       - name: Validate Compose contract
         run: docker compose config --quiet
       - name: Start focused runtime topology
-        run: docker compose up -d --build postgres redis minio sandbox-provisioner api worker
+        run: docker compose up -d --build postgres redis minio sandbox-provisioner openai-mock mcp-mock api worker
       - name: Wait for truthful readiness
         run: |
           for attempt in $(seq 1 90); do

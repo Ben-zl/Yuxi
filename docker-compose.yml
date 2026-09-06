@@ -48,6 +48,24 @@ x-api-worker-env: &api-worker-env
   no_proxy: localhost,127.0.0.1,milvus,graph,minio,etcd,mineru,paddlex,sandbox-provisioner,api.siliconflow.cn
 
 services:
+  openai-mock:
+    image: ${COMPOSE_PROJECT_NAME:-yuxi}-api:${YUXI_VERSION:-0.7.2}
+    volumes:
+      - ./backend/test:/app/test:ro
+    command: ["uv", "run", "--no-sync", "--no-dev", "uvicorn", "test.e2e.mock_openai_server:app", "--host", "0.0.0.0", "--port", "8080"]
+    networks:
+      - app-network
+    restart: "no"
+
+  mcp-mock:
+    image: ${COMPOSE_PROJECT_NAME:-yuxi}-api:${YUXI_VERSION:-0.7.2}
+    volumes:
+      - ./backend/test:/app/test:ro
+    command: ["uv", "run", "--no-sync", "--no-dev", "python", "test/e2e/mock_mcp_server.py"]
+    networks:
+      - app-network
+    restart: "no"
+
   api:
     build:
       context: .
@@ -95,6 +113,10 @@ services:
       retries: 8
       start_period: 180s
     depends_on:
+      openai-mock:
+        condition: service_started
+      mcp-mock:
+        condition: service_started
       postgres:
         condition: service_healthy
       redis:

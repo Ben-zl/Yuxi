@@ -38,8 +38,18 @@ async def db_session():
     pg_manager.initialize()
     await pg_manager.ensure_business_schema()
     async with pg_manager.get_async_session_context() as session:
-        await cleanup_fixture_agents(session, CHATBOT_SLUG)
+        await cleanup_fixture_agents(session, CHATBOT_SLUG, SUBAGENT_SLUG)
         await seed_test_users(session, USER_ID)
+        session.add(
+            Agent(
+                slug=SUBAGENT_SLUG,
+                name="团队子智能体",
+                backend_id="SubAgentBackend",
+                is_subagent=True,
+                config_json={"context": {"model": f"{PROVIDER_ID}:mock-chat-model", "system_prompt": "e2e 团队子智能体模板提示"}},
+                share_config={},
+            )
+        )
         session.add(
             Agent(
                 slug=CHATBOT_SLUG,
@@ -49,6 +59,7 @@ async def db_session():
                     "context": {
                         "model": f"{PROVIDER_ID}:mock-chat-model",
                         "mcps": [],
+                        "subagents": [SUBAGENT_SLUG],
                         "system_prompt": "你是团队主智能体。",
                     }
                 },
@@ -57,7 +68,7 @@ async def db_session():
         )
         await upsert_mock_provider(session)
         yield session
-        await cleanup_fixture_agents(session, CHATBOT_SLUG)
+        await cleanup_fixture_agents(session, CHATBOT_SLUG, SUBAGENT_SLUG)
         await cleanup_test_users(session, USER_ID)
     await close_async_redis_client()
     await pg_manager.close()
@@ -81,19 +92,10 @@ async def test_team_choreography_with_custom_template(db_session):
     assert result.parked is None
     assert result.text.startswith(TEAM_DONE_TEXT)
 
-    # TeamDelete 只执行一次并正常结束；保留模式下 worker runtime 仍存在。
+    # AgentScope Team runtime 按当前 Yuxi 契约保留到父线程删除，不要求旧 TeamDelete 工具。
     tool_starts = [ev for ev in result.events if str(ev.get("type", "")).upper() == "TOOL_CALL_START"]
     called = {ev.get("tool_call_name") for ev in tool_starts}
-    assert {"TeamCreate", "AgentCreate", "TeamDelete"} <= called, called
-    delete_starts = [ev for ev in tool_starts if ev.get("tool_call_name") == "TeamDelete"]
-    assert len(delete_starts) == 1
-    delete_call_id = delete_starts[0]["tool_call_id"]
-    delete_ends = [
-        ev
-        for ev in result.events
-        if str(ev.get("type", "")).upper() == "TOOL_RESULT_END" and ev.get("tool_call_id") == delete_call_id
-    ]
-    assert len(delete_ends) == 1
+    assert {"TeamCreate", "AgentCreate"} <= called, called
 
     # worker 以独立 team 会话落地，系统提示来自 yuxi 模板投影
     import asyncpg
