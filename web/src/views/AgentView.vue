@@ -6,9 +6,14 @@
         <AgentChatComponent
           ref="chatComponentRef"
           :single-mode="false"
+          :project-id="selectedProjectId"
           @thread-change="handleThreadChange"
         >
           <template #input-actions-left="{ hasActiveThread, isCreatingThread }">
+            <ProjectSelectionSection
+              v-model="selectedProjectId"
+              :disabled="hasActiveThread || isCreatingThread"
+            />
             <a-dropdown
               v-if="selectedAgentId"
               v-model:open="agentDropdownOpen"
@@ -125,6 +130,8 @@ import { isBuiltinAgent, useAgentStore } from '@/stores/agent'
 import { handleChatError } from '@/utils/errorHandler'
 import { generatePixelAvatar } from '@/utils/pixelAvatar'
 import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
+import ProjectSelectionSection from '@/components/ProjectSelectionSection.vue'
+import { AUTO_PROJECT_ID } from '@/utils/projectSelection'
 
 import { storeToRefs } from 'pinia'
 
@@ -141,6 +148,7 @@ const router = useRouter()
 const { agents, selectedAgentId, isLoadingConfig } = storeToRefs(agentStore)
 
 const syncingRouteThread = ref(false)
+const selectedProjectId = ref(AUTO_PROJECT_ID)
 
 const getRouteThreadId = () => {
   const value = route.params.thread_id

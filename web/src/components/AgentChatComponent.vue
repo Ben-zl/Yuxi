@@ -810,7 +810,8 @@ const props = defineProps({
   agentId: { type: String, default: '' },
   singleMode: { type: Boolean, default: true },
   sendDisabled: { type: Boolean, default: false },
-  runSource: { type: String, default: '' }
+  runSource: { type: String, default: '' },
+  projectId: { type: String, default: '' }
 })
 const emit = defineEmits(['thread-change'])
 
@@ -2471,6 +2472,8 @@ const createThread = async (agentId, title = '新的对话') => {
   try {
     const thread = await chatThreadsStore.createThread(agentId, title, {
       tool_approval_mode: currentToolApprovalMode.value
+    }, {
+      projectId: props.projectId
     })
     if (thread) {
       threadMessages.value[thread.id] = []
