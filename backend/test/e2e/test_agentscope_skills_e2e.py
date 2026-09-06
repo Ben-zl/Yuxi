@@ -46,13 +46,13 @@ async def db_session():
         skill_dir = get_skill_data_dir() / "shared" / SKILL_NAME
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(
-            "---\nslug: e2e-skill-demo\nname: E2E Skill\ndescription: 用于渐进披露验证的技能\n---\n\n用于渐进披露验证的技能。\n",
+            "---\nslug: e2e-skill-demo\nname: e2e-skill-demo\ndescription: 用于渐进披露验证的技能\n---\n\n用于渐进披露验证的技能。\n",
             encoding="utf-8",
         )
         session.add(
             Skill(
                 slug=SKILL_NAME,
-                name="E2E Skill",
+                name=SKILL_NAME,
                 description="用于渐进披露验证的技能",
                 source_type="upload",
                 dir_path=f"shared/{SKILL_NAME}",
