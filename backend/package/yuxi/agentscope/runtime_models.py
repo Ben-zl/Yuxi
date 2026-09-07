@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any, Literal
 
@@ -27,13 +28,21 @@ class YuxiOpenAIChatModel(OpenAIChatModel):
     def __init__(self, credential, model: str, parameters=None, **kwargs) -> None:
         if credential.context_size:
             kwargs["context_size"] = credential.context_size
+        client_kwargs = dict(kwargs.pop("client_kwargs", {}) or {})
+        headers = dict(client_kwargs.pop("default_headers", {}) or {})
+        headers.update(credential.default_headers)
+        if headers:
+            client_kwargs["default_headers"] = headers
+        if "timeout" not in client_kwargs:
+            timeout = float(os.getenv("LLM_TIMEOUT", "600"))
+            if timeout <= 0:
+                raise ValueError("LLM_TIMEOUT 必须大于 0")
+            client_kwargs["timeout"] = timeout
         super().__init__(
             credential=credential,
             model=model,
             parameters=parameters,
-            client_kwargs={"default_headers": credential.default_headers}
-            if credential.default_headers
-            else None,
+            client_kwargs=client_kwargs,
             extra_body=credential.request_body_overrides or None,
             **kwargs,
         )

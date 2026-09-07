@@ -780,6 +780,7 @@ import { useConfigStore } from '@/stores/config'
 import { storeToRefs } from 'pinia'
 import { MessageProcessor } from '@/utils/messageProcessor'
 import { agentApi, threadApi } from '@/apis'
+import { normalizeGeneratedTitle } from '@/utils/conversationTitle'
 import HumanApprovalModal from '@/components/HumanApprovalModal.vue'
 import { extractPendingInterrupt, useApproval } from '@/composables/useApproval'
 import { useAgentThreadState, IDLE_QUEUE_SNAPSHOT } from '@/composables/useAgentThreadState'
@@ -796,6 +797,7 @@ import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
 import { enrichTaskToolCalls, parseToolCallArgs } from '@/components/ToolCallingResult/toolRegistry'
 import { getConversationDisplayItems } from '@/utils/messageGrouping'
 import { makeChildThreadId } from '@/utils/subagentThread'
+import { AUTO_PROJECT_ID } from '@/utils/projectSelection'
 import {
   isRunInterruptedConflict,
   isThreadWaitingForUserAction,
@@ -2473,7 +2475,7 @@ const createThread = async (agentId, title = '新的对话') => {
     const thread = await chatThreadsStore.createThread(agentId, title, {
       tool_approval_mode: currentToolApprovalMode.value
     }, {
-      projectId: props.projectId
+      projectId: props.projectId === AUTO_PROJECT_ID ? null : props.projectId
     })
     if (thread) {
       threadMessages.value[thread.id] = []
@@ -2968,13 +2970,11 @@ const handleSendMessage = async ({ image, queuePolicy = 'enqueue' } = {}) => {
         try {
           const generatedTitle = await agentApi.generateTitle(
             autoTitle,
-            configStore.config?.fast_model
+            modelSpec || configStore.config?.fast_model
           )
-          if (generatedTitle) {
-            const finalTitle = generatedTitle.slice(0, 30).replace(/\s+/g, ' ').trim()
-            if (finalTitle) {
-              void chatThreadsStore.updateThread(threadId, finalTitle).catch(() => {})
-            }
+          const finalTitle = normalizeGeneratedTitle(generatedTitle, autoTitle).slice(0, 30)
+          if (finalTitle) {
+            void chatThreadsStore.updateThread(threadId, finalTitle).catch(() => {})
           }
         } catch (e) {
           console.error('Title generation failed:', e)

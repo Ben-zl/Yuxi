@@ -326,7 +326,7 @@
             </template>
 
             <template v-if="column.key === 'status'">
-              <a-tag v-if="record.status === 'active'" color="green">进行中</a-tag>
+              <a-tag v-if="record.status === 'active'" color="green">活跃</a-tag>
               <a-tag v-else-if="record.status === 'archived'" color="default">已归档</a-tag>
               <a-tag v-else-if="record.status === 'deleted'" class="history-tag">已删除</a-tag>
               <a-tag v-else-if="record.status === 'subagent'" color="blue">子智能体</a-tag>

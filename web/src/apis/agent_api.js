@@ -1,5 +1,6 @@
 import { apiGet, apiPost, apiDelete, apiPut, apiRequest } from './base'
 import { useUserStore } from '@/stores/user'
+export { normalizeGeneratedTitle } from '@/utils/conversationTitle'
 
 /**
  * 智能体API模块

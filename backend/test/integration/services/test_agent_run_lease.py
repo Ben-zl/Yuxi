@@ -961,3 +961,45 @@ async def test_cancel_execution_tree_locks_root_before_descendants(lease_databas
             cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)
         await _cleanup_runs(session_factory, [root_thread, child_thread])
+
+async def test_lock_run_refreshes_lease_renewed_by_heartbeat_session(lease_database):
+    """长执行会话必须读取独立 heartbeat 会话续租后的 PostgreSQL 事实。"""
+    _, session_factory = lease_database
+    owner = "worker-long-run"
+    now = utc_now_naive()
+    run_id, thread_id, _ = await _create_run(session_factory)
+
+    try:
+        async with session_factory() as execution_db:
+            repository = AgentRunRepository(execution_db)
+            run, acquired = await repository.mark_running(
+                run_id,
+                worker_id=owner,
+                lease_seconds=1,
+                now=now,
+            )
+            await execution_db.commit()
+            assert acquired is True
+            assert run.lease_expires_at == now + timedelta(seconds=1)
+
+            async with session_factory() as heartbeat_db:
+                renewed = await AgentRunRepository(heartbeat_db).renew_lease(
+                    run_id,
+                    worker_id=owner,
+                    lease_seconds=60,
+                    now=now + timedelta(milliseconds=500),
+                )
+                await heartbeat_db.commit()
+            assert renewed is True
+
+            locked = await repository.lock_output_persistence(
+                run_id,
+                worker_id=owner,
+                conversation_thread_id=run.conversation_thread_id,
+                request_id=run.request_id,
+                now=now + timedelta(seconds=2),
+            )
+            assert locked is not None
+            assert locked.lease_expires_at == now + timedelta(seconds=60, milliseconds=500)
+    finally:
+        await _cleanup_runs(session_factory, [thread_id])

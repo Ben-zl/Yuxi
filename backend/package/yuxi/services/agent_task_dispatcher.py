@@ -155,6 +155,10 @@ class AgentTaskDispatcher:
         """
         execution = await self.executions.get_by_run_id(run_id)
         if execution is None:
+            run = await AgentRunRepository(self.db).get_run(run_id)
+            if run is not None and run.run_type == "resume" and run.created_by_run_id:
+                execution = await self.executions.get_by_run_id(run.created_by_run_id)
+        if execution is None:
             return False
         final = RUN_STATUS_TO_EXECUTION.get(run_status)
         if final is None:  # interrupted：等待审批，保持占槽
@@ -231,7 +235,4 @@ async def notify_agent_task_finished(run_id: str, run_status: str) -> bool:
     from yuxi.storage.postgres.manager import pg_manager
 
     async with pg_manager.get_async_session_context() as db:
-        dispatcher = AgentTaskDispatcher(db)
-        if await dispatcher.executions.get_by_run_id(run_id) is None:
-            return False
-        return await dispatcher.notify_run_finished(run_id, run_status)
+        return await AgentTaskDispatcher(db).notify_run_finished(run_id, run_status)

@@ -139,12 +139,17 @@ const handleSelect = (selectedKeys, info) => {
   emit('select', selectedKeys, info)
 }
 
-const handleNodeClick = (data) => {
+const handleNodeClick = async (data) => {
   emit('nodeClick', data)
 
   const isFolder = data.isLeaf === false || (data.children && Array.isArray(data.children))
 
   if (isFolder) {
+    const isExpanded = props.expandedKeys.includes(data.key)
+    if (!isExpanded && props.loadData) {
+      await internalLoadData(data)
+    }
+
     const key = data.key
     const newExpandedKeys = [...props.expandedKeys]
     const index = newExpandedKeys.indexOf(key)

@@ -968,5 +968,12 @@ class AgentRunRepository:
             raise ValueError(f"只有当前有效 AgentRun lease owner 可以{action}")
 
     async def _lock_run(self, run_id: str) -> AgentRun | None:
-        result = await self.db.execute(select(AgentRun).where(AgentRun.id == run_id).with_for_update())
+        """加锁并以 PostgreSQL 当前行刷新长会话中的陈旧 Run 状态。"""
+        statement = (
+            select(AgentRun)
+            .where(AgentRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        result = await self.db.execute(statement)
         return result.scalar_one_or_none()

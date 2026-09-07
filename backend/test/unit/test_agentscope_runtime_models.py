@@ -60,6 +60,7 @@ def test_openai_adapter_forwards_credential_extensions(monkeypatch):
         captured.update(kwargs)
 
     monkeypatch.setattr(OpenAIChatModel, "__init__", fake_init)
+    monkeypatch.setenv("LLM_TIMEOUT", "7.5")
     register_yuxi_credentials()
     credential = CredentialFactory.from_dict(
         {
@@ -73,9 +74,27 @@ def test_openai_adapter_forwards_credential_extensions(monkeypatch):
 
     YuxiOpenAIChatModel(credential=credential, model="test-model")
 
-    assert captured["client_kwargs"] == {"default_headers": {"X-Test": "value"}}
+    assert captured["client_kwargs"] == {
+        "default_headers": {"X-Test": "value"},
+        "timeout": 7.5,
+    }
     assert captured["extra_body"] == {"enable_thinking": True}
     assert captured["context_size"] == 32768
+
+
+def test_openai_adapter_rejects_non_positive_timeout(monkeypatch):
+    """超时配置无效时显式失败，不以无限等待替代配置错误。"""
+    monkeypatch.setenv("LLM_TIMEOUT", "0")
+    register_yuxi_credentials()
+    credential = CredentialFactory.from_dict(
+        {
+            "type": "yuxi_openai_credential",
+            "api_key": "test-key",
+        }
+    )
+
+    with pytest.raises(ValueError, match="LLM_TIMEOUT 必须大于 0"):
+        YuxiOpenAIChatModel(credential=credential, model="test-model")
 
 
 def test_projection_carries_catalog_context_length_in_custom_credential():

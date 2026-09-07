@@ -626,6 +626,7 @@ async def _resume_and_collect(client, run, mapping, confirm_event, approved: lis
         agent_id=mapping.agentscope_agent_id,
         session_id=mapping.agentscope_session_id,
         run_id=run.id,
+        event_queue=queue,
     )
     # 停滞自愈：并行多工具审批时，REQUIRE 事件与会话落库存在时序差，
     # 个别 tool_call 可能在确认后才进入 asking。事件流停滞期间周期性
@@ -726,6 +727,7 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
         agent_id=mapping.agentscope_agent_id,
         session_id=mapping.agentscope_session_id,
         run_id=run.id,
+        event_queue=queue,
     )
     try:
         await asyncio.sleep(SUBSCRIBE_SETTLE_SECONDS)

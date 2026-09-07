@@ -19,7 +19,7 @@ from yuxi.services.agent_task_crud_service import AgentTaskCRUDService, can_mana
 from yuxi.services.agent_task_dispatcher import AgentTaskDispatcher
 from yuxi.services.agent_task_trigger_service import AgentTaskTriggerService, manual_idempotency_key
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Agent, AgentTask, TaskExecution, User
+from yuxi.storage.postgres.models_business import Agent, AgentRun, AgentTask, TaskExecution, User
 from yuxi.utils.datetime_utils import utc_now_naive
 
 pytestmark = pytest.mark.integration
@@ -297,6 +297,79 @@ async def test_agent_delete_blocked_by_active_task(db_session):
 # ================================================================
 # 工单 11：TaskExecution 与 AgentRun 的幂等崩溃恢复
 # ================================================================
+
+
+async def test_resume_run_completion_finishes_interrupted_task_execution(db_session):
+    """恢复 Run 完成后，任务执行必须从 interrupted 收敛为 succeeded。"""
+    user = await _user(db_session)
+    task = await AgentTaskCRUDService(db_session).create_task(
+        user=user, payload=_payload("IT-恢复终态投影")
+    )
+    execution_id = str(uuid.uuid4())
+    parent_run_id = str(uuid.uuid4())
+    resume_run_id = str(uuid.uuid4())
+    thread_id = f"task-exec-{execution_id}"
+
+    parent = AgentRun(
+        id=parent_run_id,
+        conversation_thread_id=thread_id,
+        runtime_scope_id=thread_id,
+        agent_slug=TEST_AGENT_SLUG,
+        uid=str(user.uid),
+        status="interrupted",
+        request_id=execution_id,
+        source="agent_task",
+        channel="internal",
+        origin_metadata={},
+        run_type="chat",
+        input_payload={},
+        token_usage={},
+    )
+    resume = AgentRun(
+        id=resume_run_id,
+        conversation_thread_id=thread_id,
+        runtime_scope_id=thread_id,
+        agent_slug=TEST_AGENT_SLUG,
+        uid=str(user.uid),
+        status="completed",
+        request_id=str(uuid.uuid4()),
+        source="chat",
+        channel="web",
+        origin_metadata={},
+        created_by_run_id=parent_run_id,
+        run_type="resume",
+        input_payload={},
+        token_usage={},
+    )
+    db_session.add_all([parent, resume])
+    await db_session.flush()
+    await TaskExecutionRepository(db_session).create(
+        id=execution_id,
+        task_id=task.id,
+        trigger_type="manual",
+        triggered_by_uid=str(user.uid),
+        execution_principal_uid=str(user.uid),
+        agent_id=task.agent_id,
+        agent_slug=TEST_AGENT_SLUG,
+        prompt="等待用户回答后继续",
+        tool_approval_mode="always_trust",
+        idempotency_key=f"manual:{uuid.uuid4().hex}",
+        agent_run_id=parent_run_id,
+        thread_id=thread_id,
+        status="interrupted",
+        started_at=utc_now_naive(),
+    )
+    await db_session.commit()
+
+    handled = await AgentTaskDispatcher(db_session).notify_run_finished(
+        resume_run_id, "completed"
+    )
+
+    await db_session.rollback()
+    execution = await TaskExecutionRepository(db_session).get(execution_id)
+    assert handled is True
+    assert execution.status == "succeeded"
+    assert execution.finished_at is not None
 
 
 async def test_execution_id_used_as_run_request_id(db_session):

@@ -577,3 +577,30 @@ async def test_client_preserves_mixed_confirmation_decisions(monkeypatch):
     assert [item["confirmed"] for item in results] == [True, False]
     with pytest.raises(ValueError, match="数量不一致"):
         await client.resume_confirm("u", "a", "s", reply_id="r", tool_calls=calls, confirmed=[True])
+
+async def test_cancel_watcher_unblocks_event_collection_without_reply_end(monkeypatch):
+    """AgentScope 中断不回 REPLY_END 时，取消监听仍须立即唤醒收集器。"""
+    from unittest.mock import AsyncMock
+
+    from yuxi.services import run_queue_service
+
+    monkeypatch.setattr(run_queue_service, "has_cancel_signal", AsyncMock(return_value=True))
+    client = _StubClient([])
+    queue = asyncio.Queue()
+    watcher = gateway.start_cancel_watcher(
+        client,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        run_id="run-cancel",
+        poll_seconds=0.001,
+        event_queue=queue,
+    )
+    try:
+        event = await asyncio.wait_for(queue.get(), timeout=0.1)
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+
+    assert isinstance(event, RuntimeError)
+    assert str(event) == "运行任务已取消"

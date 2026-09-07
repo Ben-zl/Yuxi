@@ -70,6 +70,7 @@ def start_cancel_watcher(
     session_id: str,
     run_id: str,
     poll_seconds: float = 1.0,
+    event_queue: asyncio.Queue | None = None,
 ) -> asyncio.Task:
     """监听 run 取消信号，收到即中断会话使事件流尽快终止。
 
@@ -83,7 +84,15 @@ def start_cancel_watcher(
             await asyncio.sleep(poll_seconds)
             try:
                 if await has_cancel_signal(run_id):
-                    await client.interrupt_session(uid, agent_id, session_id)
+                    try:
+                        await client.interrupt_session(uid, agent_id, session_id)
+                    except Exception as exc:  # noqa: BLE001 - 由事件消费者统一写入终态
+                        if event_queue is None:
+                            raise RuntimeError("取消信号监听失败") from exc
+                        await event_queue.put(RuntimeError("取消信号监听失败"))
+                        return
+                    if event_queue is not None:
+                        await event_queue.put(RuntimeError("运行任务已取消"))
                     return
             except asyncio.CancelledError:
                 raise
@@ -354,7 +363,14 @@ async def stream_round_to_run_events(
         session_id=session_id,
         read_timeout=read_timeout,
     )
-    cancel_task = start_cancel_watcher(client, uid=uid, agent_id=agent_id, session_id=session_id, run_id=run_id)
+    cancel_task = start_cancel_watcher(
+        client,
+        uid=uid,
+        agent_id=agent_id,
+        session_id=session_id,
+        run_id=run_id,
+        event_queue=queue,
+    )
     try:
         await asyncio.sleep(SUBSCRIBE_SETTLE_SECONDS)
         await client.trigger_chat(uid, agent_id, session_id, text, image_content=image_content)

@@ -402,7 +402,12 @@ export function useAgentRunStream({
         }
       }
     } catch (error) {
-      if (error?.name !== 'AbortError') {
+      if (error?.name === 'AbortError') {
+        if (!runController.signal.aborted) {
+          streamSmoother?.flushThread(threadId)
+          scheduleRunReconnect(threadId, runId)
+        }
+      } else {
         streamSmoother?.flushThread(threadId)
         console.error('Run SSE stream error:', error)
         handleChatError(error, 'stream')

@@ -387,3 +387,46 @@ test('旧 Run 终态清理保留排队 Request SSE', async () => {
     agentApi.streamAgentRunEvents = originalStreamAgentRunEvents
   }
 })
+
+test('SSE 以 AbortError 中断但未被本地取消时会重连', async () => {
+  const threadState = {
+    activeRunId: null,
+    activeRunSteerable: false,
+    runLastSeq: '0-0',
+    runStreamAbortController: null,
+    replyLoadingVisible: true,
+    pendingRequestId: 'request-1',
+    onGoingConv: { msgChunks: {} }
+  }
+  const originalStreamAgentRunEvents = agentApi.streamAgentRunEvents
+  let attempts = 0
+  agentApi.streamAgentRunEvents = async () => {
+    attempts += 1
+    if (attempts === 1) {
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(new DOMException('connection lost', 'AbortError'))
+          }
+        }),
+        { headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    }
+    return new Response('event: end\ndata: {"payload":{"status":"completed"}}\n\n', {
+      headers: { 'Content-Type': 'text/event-stream' }
+    })
+  }
+
+  try {
+    const runStream = createRunStream({
+      threadState,
+      handleStreamChunk: () => {},
+      resetOnGoingConv: () => {}
+    })
+    await runStream.startRunStream('thread-1', 'run-1')
+    await new Promise((resolve) => setTimeout(resolve, 750))
+    assert.equal(attempts, 2)
+  } finally {
+    agentApi.streamAgentRunEvents = originalStreamAgentRunEvents
+  }
+})

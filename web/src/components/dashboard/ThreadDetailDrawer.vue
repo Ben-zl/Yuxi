@@ -8,7 +8,7 @@
     @close="handleClose"
   >
     <template #extra>
-      <a-tag v-if="detail?.status === 'active'" color="green">进行中</a-tag>
+      <a-tag v-if="detail?.status === 'active'" color="green">活跃</a-tag>
       <a-tag v-else-if="detail?.status === 'archived'" color="blue">已归档</a-tag>
       <a-tag v-else color="default">{{ detail?.status || '未知' }}</a-tag>
     </template>
