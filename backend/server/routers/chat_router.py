@@ -27,10 +27,10 @@ from yuxi.services.conversation_service import (
     upload_thread_attachment_view,
     upload_tmp_attachment_view,
 )
+from yuxi.services.artifact_service import resolve_thread_artifact_view
 from yuxi.services.thread_files_service import (
     list_thread_files_view,
     read_thread_file_content_view,
-    resolve_thread_artifact_view,
     save_thread_artifact_to_workspace_view,
 )
 from yuxi.services.feedback_service import get_message_feedback_view, submit_message_feedback_view

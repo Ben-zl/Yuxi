@@ -82,6 +82,7 @@ def live_files(monkeypatch, tmp_path):
         return binding
 
     monkeypatch.setattr(svc, "resolve_authorized_workdir", resolve)
+    monkeypatch.setattr(svc, "resolve_thread_workspace", lambda *_args, **_kwargs: _async_value(None))
     monkeypatch.setattr(
         svc,
         "UserRepository",
@@ -147,6 +148,40 @@ async def test_artifact_preview_uses_shared_file_renderer(live_files, monkeypatc
         "path": path,
         "raw_content": b"docx bytes",
         "office_cache_key": f"artifact:user-1:{path}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_agentscope_artifact_preview_reads_the_mapped_session_file(monkeypatch):
+    from yuxi.services import thread_files_service
+
+    monkeypatch.setattr(svc, "resolve_thread_workspace", lambda *_args, **_kwargs: _async_value((object(), object())))
+
+    async def resolve_from_agentscope(**_kwargs):
+        return thread_files_service.InMemoryArtifact(name="report.html", content=b"<h1>ok</h1>")
+
+    monkeypatch.setattr(thread_files_service, "resolve_thread_artifact_by_owner", resolve_from_agentscope)
+    captured = {}
+
+    async def render_preview(path, raw_content, *, office_cache_key):
+        captured.update(path=path, raw_content=raw_content, office_cache_key=office_cache_key)
+        return {"preview_type": "html", "supported": True}
+
+    monkeypatch.setattr(svc, "render_file_preview", render_preview)
+
+    response = await svc.resolve_thread_artifact_view(
+        thread_id="thread-1",
+        current_uid="user-1",
+        db=object(),
+        path="/home/gem/user-data/outputs/report.html",
+        preview=True,
+    )
+
+    assert response == {"preview_type": "html", "supported": True}
+    assert captured == {
+        "path": "/home/gem/user-data/outputs/report.html",
+        "raw_content": b"<h1>ok</h1>",
+        "office_cache_key": "artifact:user-1:/home/gem/user-data/outputs/report.html",
     }
 
 

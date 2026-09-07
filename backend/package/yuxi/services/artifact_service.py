@@ -7,6 +7,7 @@ import contextlib
 import os
 import tempfile
 from pathlib import PurePosixPath
+from urllib.parse import quote
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
@@ -21,6 +22,7 @@ from yuxi.agents.backends.paths import (
 from yuxi.agents.skills.service import ResolvedSkill, list_accessible_skills
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.services.file_preview import render_file_preview
+from yuxi.services.thread_workspace_service import resolve_thread_workspace
 from yuxi.services.workdir_service import resolve_authorized_workdir
 from yuxi.utils.filepreview import (
     MAX_BINARY_PREVIEW_SIZE_BYTES,
@@ -137,6 +139,33 @@ async def resolve_thread_artifact_view(
     preview: bool = False,
 ) -> FileResponse | StreamingResponse | dict:
     """把实时授权文件导出为自动清理的 HTTP 文件响应。"""
+    # AgentScope Session 的 outputs/uploads 不在本地 Project Workdir，必须从同一
+    # Session 读取，避免把旧 Workdir 当成执行产物来源。
+    if await resolve_thread_workspace(db, uid=str(current_uid), thread_id=thread_id) is not None:
+        from yuxi.services.thread_files_service import resolve_thread_artifact_by_owner
+
+        source = await resolve_thread_artifact_by_owner(
+            thread_id=thread_id,
+            owner_uid=str(current_uid),
+            db=db,
+            path=path,
+        )
+        if not hasattr(source, "content"):
+            raise HTTPException(status_code=500, detail="AgentScope artifact source is invalid")
+        file_name = source.name or PurePosixPath(path).name or "artifact"
+        is_preview = preview and not download
+        if is_preview:
+            return await render_file_preview(
+                path,
+                source.content,
+                office_cache_key=f"artifact:{current_uid}:{path}",
+            )
+        return StreamingResponse(
+            iter([source.content]),
+            media_type=detect_media_type(file_name, source.content[: 16 * 1024]),
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(file_name)}"},
+        )
+
     access = await resolve_authorized_workdir(thread_id=thread_id, uid=current_uid, db=db)
     normalized = _normalize_artifact_path(runtime_user_data_path(access.workdir.root_path), path)
     skill_source = await _require_skill_artifact_access(normalized_path=normalized, current_uid=current_uid, db=db)

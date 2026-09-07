@@ -66,7 +66,10 @@
     </div>
 
     <div class="tab-content">
-      <div v-show="activeSectionKey === 'file-tree'" class="tree-pane">
+      <div
+        v-show="viewMode !== 'preview' && activeSectionKey === 'file-tree'"
+        class="tree-pane"
+      >
         <div class="tree-toolbar">
           <div class="tree-scope-tabs" role="tablist" aria-label="文件树目录">
             <template v-for="(scope, index) in treeScopes" :key="scope.key">
@@ -190,7 +193,10 @@
           </div>
         </div>
       </div>
-      <div v-show="activeSection?.type === 'file'" class="preview-pane">
+      <div
+        v-show="viewMode === 'preview' || activeSection?.type === 'file'"
+        class="preview-pane"
+      >
         <AgentFilePreview
           v-if="currentFile"
           containerClass="side-preview-shell"

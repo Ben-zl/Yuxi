@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ from server.routers import chat_router
 
 @pytest.mark.asyncio
 async def test_artifact_route_returns_realtime_workdir_response(monkeypatch):
+    assert {"download", "preview"} <= set(inspect.signature(chat_router.resolve_thread_artifact_view).parameters)
     sentinel = object()
     captured = {}
 
