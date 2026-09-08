@@ -2,14 +2,24 @@
  * 清理模型标题响应，避免把内部推理写入会话标题。
  */
 export const normalizeGeneratedTitle = (value, fallback = '') => {
-  let title = String(value || '')
-    .replace(/<think>[\s\S]*?<\/think>/gi, ' ')
-    .replace(/<analysis>[\s\S]*?<\/analysis>/gi, ' ')
-    .replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, ' ')
+  let title = String(value || '').trim()
+  const closeRegex = /<\/(?:(?:mm:)?think|analysis|reasoning)>/gi
+  const openRegex = /<(?:(?:mm:)?think|analysis|reasoning)>/gi
+  const closeMatches = [...title.matchAll(closeRegex)]
 
-  // 某些模型只返回未闭合的推理块，不能把内部判断写入标题。
-  title = title.replace(/<(?:think|analysis|reasoning)>[\s\S]*$/i, ' ')
+  // 标题响应可能把推理、正文和 MiniMax 的异常结束标记混在一起；
+  // 最后一个结束标记之后才是用户可见标题。
+  if (closeMatches.length) {
+    const lastClose = closeMatches.at(-1)
+    title = title.slice(lastClose.index + lastClose[0].length)
+  } else {
+    const opening = openRegex.exec(title)
+    if (opening) title = title.slice(0, opening.index)
+  }
+
   title = title
+    .replace(closeRegex, ' ')
+    .replace(openRegex, ' ')
     .replace(/^```(?:text|markdown)?\s*|\s*```$/gi, '')
     .replace(/^\s*(?:标题|title)\s*[:：]\s*/i, '')
     .replace(/["“”'']/g, '')

@@ -338,18 +338,32 @@ export class MessageProcessor {
   static parseAssistantMessageBody(message) {
     let content = typeof message?.content === 'string' ? message.content.trim() : ''
     let reasoningContent = message?.additional_kwargs?.reasoning_content || ''
+    const openRegex = /<(?:(?:mm:)?think)>/gi
+    const closeRegex = /<\/(?:(?:mm:)?think)>/gi
+    const closeMatches = [...content.matchAll(closeRegex)]
 
-    if (!reasoningContent && content) {
-      const thinkRegex = /<think>(.*?)<\/think>|<think>(.*?)$/s
-      const thinkMatch = content.match(thinkRegex)
-
-      if (thinkMatch) {
-        reasoningContent = (thinkMatch[1] || thinkMatch[2] || '').trim()
-        content = content.replace(thinkMatch[0], '').trim()
+    if (closeMatches.length) {
+      // MiniMax 可能将多个 reasoning 片段和正文混在 content 中，且部分片段
+      // 只带 </mm:think>。最终关闭标记后的内容才是面向用户的正文。
+      const lastClose = closeMatches.at(-1)
+      const embeddedReasoning = content.slice(0, lastClose.index)
+      content = content.slice(lastClose.index + lastClose[0].length).trim()
+      const cleanedReasoning = embeddedReasoning.replace(openRegex, '\n\n').replace(closeRegex, '\n\n').trim()
+      if (cleanedReasoning) {
+        reasoningContent = [reasoningContent, cleanedReasoning].filter(Boolean).join('\n\n')
+      }
+    } else if (openRegex.test(content)) {
+      openRegex.lastIndex = 0
+      const opening = openRegex.exec(content)
+      const embeddedReasoning = content.slice(opening.index + opening[0].length)
+      content = content.slice(0, opening.index).trim()
+      const cleanedReasoning = embeddedReasoning.replace(openRegex, '\n\n').replace(closeRegex, '\n\n').trim()
+      if (cleanedReasoning) {
+        reasoningContent = [reasoningContent, cleanedReasoning].filter(Boolean).join('\n\n')
       }
     }
 
-    return { content, reasoningContent }
+    return { content, reasoningContent: String(reasoningContent || '').trim() }
   }
 
   /**

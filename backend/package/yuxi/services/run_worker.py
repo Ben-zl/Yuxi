@@ -15,6 +15,7 @@ from yuxi.agents.mcp.service import ensure_builtin_mcp_servers_in_db
 from yuxi.agents.skills.service import init_builtin_skills
 from yuxi.config import config as sys_config
 from yuxi.config.runtime import lite_mode_enabled
+from yuxi.services.agent_cleanup_service import reconcile_deleted_agent_memories
 from yuxi.services.agent_request_queue_service import recover_pending_dispatches
 from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.storage.postgres.manager import pg_manager
@@ -39,6 +40,27 @@ def _agent_task_scan_job():
         scan_agent_task_schedules,
         minute=set(range(60)),
         second={0},
+        unique=True,
+        max_tries=1,
+    )
+
+
+async def reconcile_deleted_agent_memories_job(ctx):
+    """独立收敛已删除 Agent 的外部长期记忆，避免阻塞 Run lease。"""
+    del ctx
+    cleaned_agents = await reconcile_deleted_agent_memories()
+    if cleaned_agents:
+        logger.warning("Reconciled deleted Agent memory scope(s): %s", ",".join(cleaned_agents))
+
+
+def _agent_cleanup_reconciliation_job():
+    """每分钟执行一次唯一的 Agent memory 补偿任务。"""
+    from arq import cron
+
+    return cron(
+        reconcile_deleted_agent_memories_job,
+        minute=set(range(60)),
+        second={15},
         unique=True,
         max_tries=1,
     )
@@ -200,11 +222,13 @@ async def _worker_startup(ctx):
     from yuxi.agentscope.client import AgentScopeServiceClient
     from yuxi.agentscope.recovery import reconcile_stale_running_runs
 
-    recovered = await reconcile_stale_running_runs(
-        AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
-    )
+    agentscope_client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
+    recovered = await reconcile_stale_running_runs(agentscope_client)
     if recovered:
         logger.warning("Recovered %s stale AgentScope run(s) from persisted replies", recovered)
+    cleaned_agents = await reconcile_deleted_agent_memories()
+    if cleaned_agents:
+        logger.warning("Reconciled deleted Agent memory scope(s) at startup: %s", ",".join(cleaned_agents))
     await recover_pending_dispatches()
     await _publish_reconciliation_health()
     global _reconciliation_task
@@ -226,7 +250,7 @@ async def _worker_shutdown(ctx):
 
 class WorkerSettings:
     functions = [process_agent_run]
-    cron_jobs = [_agent_task_scan_job()]
+    cron_jobs = [_agent_task_scan_job(), _agent_cleanup_reconciliation_job()]
     max_tries = 2
     retry_jobs = True
     health_check_interval = WORKER_HEALTH_INTERVAL_SECONDS

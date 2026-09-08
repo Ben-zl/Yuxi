@@ -16,7 +16,10 @@ from yuxi.repositories.agent_repository import (
     user_can_access_agent,
     user_can_manage_agent,
 )
-from yuxi.repositories.agent_task_repository import AgentTaskRepository
+from yuxi.services.agent_cleanup_service import (
+    AgentDeletionBlocked,
+    delete_agent_with_memory_cleanup,
+)
 from yuxi.services.agent_request_queue_service import (
     cancel_queued_request as cancel_queued_request_svc,
     continue_thread_queue,
@@ -327,22 +330,18 @@ async def delete_agent(
         raise HTTPException(status_code=403, detail="不能删除非自己创建的智能体")
     if is_builtin_agent(item):
         raise HTTPException(status_code=409, detail="内置智能体不能删除")
-    # 任务中心工单 10：未归档任务引用时阻断删除；允许删除时置空引用保留快照。
-    task_repo = AgentTaskRepository(db)
-    referencing_count = await task_repo.count_active_references(item.id)
-    if referencing_count:
+    try:
+        result = await delete_agent_with_memory_cleanup(
+            db=db,
+            agent=item,
+            caller_uid=str(current_user.uid),
+        )
+    except AgentDeletionBlocked as exc:
         raise HTTPException(
             status_code=409,
-            detail=f"该智能体被 {referencing_count} 个未归档任务引用，请先归档相关任务再删除",
-        )
-    try:
-        await _memory_client().clear_memory_agent(str(current_user.uid), agent_slug)
-    except AgentScopeServiceError as exc:
-        _raise_memory_service_error(exc)
-    # 归档后允许删除：置空引用，保留 slug 快照供历史展示。
-    await task_repo.detach_agent_references(item.id)
-    await repo.delete(agent=item)
-    return {"success": True}
+            detail=f"该智能体被 {exc.referencing_count} 个未归档任务引用，请先归档相关任务再删除",
+        ) from exc
+    return {"success": True, "cleanup_pending": result.cleanup_pending}
 
 
 @agent_router.post("/{agent_id}/set_default")
@@ -393,8 +392,8 @@ async def create_agent_run(
     meta = dict(payload.meta or {})
     request_id = meta.get("request_id") or str(uuid.uuid4())
     meta["request_id"] = request_id
-    # 前端可通过 meta.source 指定来源（如 agent_task），否则默认 chat
-    run_source = str(meta.pop("source", "") or "").strip() or "chat"
+    # Web Chat 的来源由服务端固定，不能由客户端污染 Run provenance。
+    run_source = "chat"
 
     input_message = build_chat_input_message(payload.query or "", payload.image_content)
 

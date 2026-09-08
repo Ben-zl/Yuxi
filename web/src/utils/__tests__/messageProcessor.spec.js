@@ -119,3 +119,12 @@ const run = () => {
 }
 
 run()
+
+const malformedThinkingBody = MessageProcessor.parseAssistantMessageBody({
+  type: 'ai',
+  content: '<think>内部计划</think>任务已委派。 </mm:think>最终报告'
+})
+assert.deepEqual(malformedThinkingBody, {
+  content: '最终报告',
+  reasoningContent: '内部计划\n\n任务已委派。'
+})

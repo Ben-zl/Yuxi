@@ -27,3 +27,10 @@ test('模型只返回未闭合 think 时回退到用户请求', () => {
 test('标题清理不会把标题前缀和 Markdown 标记带入会话列表', () => {
   assert.equal(normalizeGeneratedTitle('```text\n标题：性能分析\n```'), '性能分析')
 })
+
+test('MiniMax 异常结束标记后的标题才展示给用户', () => {
+  assert.equal(
+    normalizeGeneratedTitle('<think>内部判断</think>任务已委派。 </mm:think>性能监控日报'),
+    '性能监控日报'
+  )
+})

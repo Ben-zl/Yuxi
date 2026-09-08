@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from yuxi import storage_migration
 from yuxi.storage.postgres.manager import BUSINESS_SCHEMA_VERSION, PostgresManager
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -105,6 +107,85 @@ async def test_schema_version_is_persisted_and_runtime_validation_fails_closed()
         await manager.record_schema_version("business", BUSINESS_SCHEMA_VERSION)
         await manager.require_current_schema(include_knowledge=False)
         assert await manager.get_schema_versions() == {"business": BUSINESS_SCHEMA_VERSION}
+    finally:
+        if scoped_engine is not None:
+            await scoped_engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+async def test_business_schema_v3_upgrades_to_v4_idempotently_on_real_postgres(monkeypatch) -> None:
+    """真实迁移入口在 PostgreSQL 上将 v3 幂等升级到 v4。"""
+    schema = f"pytest_business_v4_{uuid.uuid4().hex[:16]}"
+    admin_engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
+    scoped_engine = None
+
+    try:
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+
+        scoped_engine = create_async_engine(
+            os.environ["POSTGRES_URL"],
+            pool_pre_ping=True,
+            connect_args={"server_settings": {"search_path": schema}},
+        )
+        manager = _scoped_manager(scoped_engine)
+        manager.AsyncSession = async_sessionmaker(scoped_engine, expire_on_commit=False)
+        await manager.create_business_tables()
+        await manager.create_schema_version_table()
+
+        async with scoped_engine.begin() as connection:
+            await connection.execute(text("DROP INDEX IF EXISTS ix_agents_deletion_pending_at"))
+            await connection.execute(text("ALTER TABLE agents DROP COLUMN IF EXISTS deletion_pending_at"))
+        await manager.record_schema_version("business", 3)
+
+        async def no_op_async(*args, **kwargs) -> None:
+            return None
+
+        async def no_workdir_plan(*args, **kwargs):
+            return SimpleNamespace(requires_cutover=False, workdirs=[], conversations=[])
+
+        monkeypatch.setattr(storage_migration, "pg_manager", manager)
+        monkeypatch.setattr(manager, "initialize", lambda: None)
+        monkeypatch.setattr(manager, "close", no_op_async)
+        monkeypatch.setattr(storage_migration, "read_v071_workdir_plan", no_workdir_plan)
+        monkeypatch.setattr(storage_migration, "_legacy_skill_roots_exist", lambda: False)
+        monkeypatch.setattr(storage_migration, "_legacy_system_config_exists", lambda: False)
+        monkeypatch.setattr(storage_migration, "runtime_storage_requires_quiescence", lambda: False)
+        monkeypatch.setattr(storage_migration, "lite_mode_enabled", lambda: True)
+        monkeypatch.setattr(storage_migration, "_converge_database_state", no_op_async)
+        monkeypatch.setattr(storage_migration, "migrate_shared_skills", no_op_async)
+        monkeypatch.setattr(storage_migration, "mark_v071_skills_migrated", lambda: None)
+        monkeypatch.setattr(storage_migration, "migrate_runtime_storage_identity", lambda: None)
+
+        await storage_migration.main()
+        await storage_migration.main()
+
+        async with scoped_engine.connect() as connection:
+            column_exists = await connection.scalar(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = :schema
+                          AND table_name = 'agents'
+                          AND column_name = 'deletion_pending_at'
+                    )
+                    """
+                ),
+                {"schema": schema},
+            )
+            index_exists = await connection.scalar(
+                text("SELECT to_regclass(:index_name) IS NOT NULL"),
+                {"index_name": f"{schema}.ix_agents_deletion_pending_at"},
+            )
+
+        assert column_exists is True
+        assert index_exists is True
+        assert await manager.get_schema_versions() == {"business": BUSINESS_SCHEMA_VERSION}
+        await manager.require_current_schema(include_knowledge=False)
     finally:
         if scoped_engine is not None:
             await scoped_engine.dispose()

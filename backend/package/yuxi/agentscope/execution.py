@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
 from yuxi.agentscope.gateway import GatewayRoundResult, stream_round_to_run_events
+from yuxi.agentscope.protocol import split_embedded_reasoning
 from yuxi.agentscope.runner import ensure_thread_session, recover_untracked_pending_session
 from yuxi.agentscope.thread_guard import has_pending_confirm
 from yuxi.repositories.agentscope_thread_sessions import AgentScopeThreadSession
@@ -83,19 +84,20 @@ async def execute_run(
 async def persist_run_output(db: AsyncSession, run: AgentRun, result: GatewayRoundResult):
     """将一个 AgentScope 回合的助手输出绑定到同一 Run。"""
 
-    if not (result.text or result.reasoning or result.tool_calls):
+    output_text, output_reasoning = split_embedded_reasoning(result.text, result.reasoning)
+    if not (output_text or output_reasoning or result.tool_calls):
         return None
 
     output_message = await ConversationRepository(db).add_message_by_thread_id(
         thread_id=run.conversation_thread_id,
         role="assistant",
-        content=result.text,
+        content=output_text,
         message_type="text",
         extra_metadata={
             "request_id": run.request_id,
             "run_id": run.id,
             "token_usage": result.usage or {},
-            "additional_kwargs": {"reasoning_content": result.reasoning} if result.reasoning else {},
+            "additional_kwargs": {"reasoning_content": output_reasoning} if output_reasoning else {},
         },
         run_id=run.id,
         request_id=run.request_id,

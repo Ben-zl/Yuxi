@@ -6,7 +6,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from yuxi.storage.postgres.models_business import AgentMemoryScope
+from yuxi.storage.postgres.models_business import Agent, AgentMemoryScope
 from yuxi.utils.datetime_utils import utc_now
 
 
@@ -27,7 +27,17 @@ class AgentMemoryScopeRepository:
         return result.scalar_one_or_none()
 
     async def ensure(self, uid: str, agent_slug: str, workspace_id: str) -> AgentMemoryScope:
-        """幂等创建 scope catalog，不把尚未写入的 reply 记作已有记忆。"""
+        """幂等创建 scope catalog，并与 Agent 删除屏障串行。"""
+        active_agent = await self.db.scalar(
+            select(Agent)
+            .where(
+                Agent.slug == agent_slug,
+                Agent.deletion_pending_at.is_(None),
+            )
+            .with_for_update()
+        )
+        if active_agent is None:
+            raise RuntimeError("Agent 已删除或正在删除，不能创建长期记忆 scope")
         now = utc_now()
         await self.db.execute(
             insert(AgentMemoryScope)

@@ -8,7 +8,7 @@
       @dblclick.stop="renameChat"
       @click.middle="$emit('delete-chat', chat.id)"
     >
-      <span class="conversation-title">{{ chat.title || '新的对话' }}</span>
+      <span class="conversation-title">{{ displayTitle }}</span>
       <span class="actions-mask"></span>
       <span
         v-if="chat.thread_status === 'loading'"
@@ -63,6 +63,8 @@
 import { h } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { Loader2, MoreVertical, Pin, PinOff, SquarePen, Trash2 } from '@lucide/vue'
+import { computed } from 'vue'
+import { normalizeGeneratedTitle } from '@/utils/conversationTitle'
 
 const props = defineProps({
   chat: { type: Object, required: true },
@@ -71,6 +73,8 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['select-chat', 'delete-chat', 'rename-chat', 'toggle-pin'])
+
+const displayTitle = computed(() => normalizeGeneratedTitle(props.chat.title, '新的对话'))
 
 const renameChat = () => {
   let newTitle = props.chat.title || ''

@@ -8,9 +8,42 @@
 """
 
 import json
+import re
 from dataclasses import dataclass
 
 ASSISTANT_MSG_TYPE = "AIMessageChunk"
+
+_THINK_OPEN_RE = re.compile(r"<(?:(?:mm:)?think)>", re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</(?:(?:mm:)?think)>", re.IGNORECASE)
+
+
+def split_embedded_reasoning(text: str, reasoning: str = "") -> tuple[str, str]:
+    """把模型误放入正文的 thinking 标记和内容移回 reasoning。
+
+    MiniMax 某些响应会把推理与正文混在 TEXT_BLOCK_DELTA 中，甚至只发送
+    ``</mm:think>`` 结束标记。这里在 Yuxi 持久化边界收敛为正文和 reasoning，
+    不改变 AgentScope 框架或建立第二套消息事实源。
+    """
+    content = str(text or "")
+    explicit_reasoning = str(reasoning or "").strip()
+    closing_matches = list(_THINK_CLOSE_RE.finditer(content))
+    has_markers = bool(_THINK_OPEN_RE.search(content) or closing_matches)
+    if not has_markers:
+        return content, explicit_reasoning
+
+    if closing_matches:
+        last_close = closing_matches[-1]
+        embedded = content[: last_close.start()]
+        visible = content[last_close.end() :]
+    else:
+        opening = _THINK_OPEN_RE.search(content)
+        embedded = content[opening.end() :] if opening else content
+        visible = content[: opening.start()] if opening else ""
+
+    embedded = _THINK_OPEN_RE.sub("\n\n", embedded)
+    embedded = _THINK_CLOSE_RE.sub("\n\n", embedded).strip()
+    reasoning_parts = [part for part in (explicit_reasoning, embedded) if part]
+    return visible.strip(), "\n\n".join(reasoning_parts)
 
 
 def sanitize_persisted_value(value):

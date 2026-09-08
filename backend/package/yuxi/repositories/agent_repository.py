@@ -310,7 +310,7 @@ class AgentRepository:
 
     async def list_visible(self, *, user: User, include_subagent_definitions: bool = False) -> list[Agent]:
         """列出用户可见的主智能体，只有显式请求时才包含子智能体定义。"""
-        stmt = select(Agent)
+        stmt = select(Agent).where(Agent.deletion_pending_at.is_(None))
         if not include_subagent_definitions:
             stmt = stmt.where(Agent.is_subagent.is_(False))
         result = await self.db.execute(stmt.order_by(Agent.is_default.desc(), Agent.id.asc()))
@@ -321,7 +321,9 @@ class AgentRepository:
 
     async def list_visible_subagents(self, *, user: User) -> list[Agent]:
         result = await self.db.execute(
-            select(Agent).where(Agent.is_subagent.is_(True)).order_by(Agent.name.asc(), Agent.id.asc())
+            select(Agent)
+            .where(Agent.is_subagent.is_(True), Agent.deletion_pending_at.is_(None))
+            .order_by(Agent.name.asc(), Agent.id.asc())
         )
         agents = list(result.scalars().all())
         if user.role == "superadmin":
@@ -329,12 +331,33 @@ class AgentRepository:
         return [agent for agent in agents if user_can_access_agent(user, agent)]
 
     async def get_by_slug(self, slug: str) -> Agent | None:
-        result = await self.db.execute(select(Agent).where(Agent.slug == slug))
+        result = await self.db.execute(select(Agent).where(Agent.slug == slug, Agent.deletion_pending_at.is_(None)))
         return result.scalar_one_or_none()
 
     async def list_by_slugs(self, slugs: list[str]) -> list[Agent]:
-        result = await self.db.execute(select(Agent).where(Agent.slug.in_(slugs)))
+        result = await self.db.execute(select(Agent).where(Agent.slug.in_(slugs), Agent.deletion_pending_at.is_(None)))
         return list(result.scalars().all())
+
+    async def get_for_update_by_slug(self, slug: str) -> Agent | None:
+        """锁定一个仍活动的 Agent，供创建引用或提交 Run 的事务使用。"""
+        return await self.db.scalar(
+            select(Agent).where(Agent.slug == slug, Agent.deletion_pending_at.is_(None)).with_for_update()
+        )
+
+    async def get_visible_for_update_by_slug(
+        self, *, slug: str, user: User, kind: Literal["main", "subagent", "any"] = "main"
+    ) -> Agent | None:
+        """锁定并校验用户可见 Agent，直到调用事务提交。"""
+        agent = await self.get_for_update_by_slug(slug)
+        if agent is None or not user_can_access_agent(user, agent):
+            return None
+        if kind == "any":
+            return agent
+        if kind == "main":
+            return None if agent.is_subagent else agent
+        if kind == "subagent":
+            return agent if agent.is_subagent else None
+        raise ValueError(f"未知智能体入口类型: {kind}")
 
     async def get_visible_by_slug(
         self, *, slug: str, user: User, kind: Literal["main", "subagent", "any"] = "main"
@@ -354,7 +377,9 @@ class AgentRepository:
         raise ValueError(f"未知智能体入口类型: {kind}")
 
     async def get_default(self) -> Agent | None:
-        result = await self.db.execute(select(Agent).where(Agent.is_default.is_(True)))
+        result = await self.db.execute(
+            select(Agent).where(Agent.is_default.is_(True), Agent.deletion_pending_at.is_(None))
+        )
         return result.scalar_one_or_none()
 
     async def set_default(self, *, agent: Agent, updated_by: str | None = None) -> Agent:
@@ -377,8 +402,33 @@ class AgentRepository:
         return agent
 
     async def _slug_exists(self, slug: str) -> bool:
-        result = await self.db.execute(select(Agent.id).where(Agent.slug == slug))
-        return result.scalar_one_or_none() is not None
+        """检查 slug 是否仍被活动或待清理 Agent 占用。"""
+        return bool(await self.db.scalar(select(Agent.id).where(Agent.slug == slug)))
+
+    async def mark_deletion_pending(self, agent_id: int) -> Agent | None:
+        """锁定 Agent 行并建立阻止新执行和 slug 复用的删除屏障。"""
+        agent = await self.db.scalar(select(Agent).where(Agent.id == agent_id).with_for_update())
+        if agent is None:
+            return None
+        agent.deletion_pending_at = agent.deletion_pending_at or utc_now_naive()
+        await self.db.flush()
+        return agent
+
+    async def claim_pending_deletions(self, *, limit: int = 50) -> list[Agent]:
+        """领取最久未尝试的 tombstone，并把失败项轮转到队尾。"""
+        result = await self.db.execute(
+            select(Agent)
+            .where(Agent.deletion_pending_at.is_not(None))
+            .order_by(Agent.updated_at, Agent.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        agents = list(result.scalars().all())
+        attempted_at = utc_now_naive()
+        for agent in agents:
+            agent.updated_at = attempted_at
+        await self.db.flush()
+        return agents
 
     async def _unique_slug(self, desired: str | None, name: str) -> str:
         base = _slugify(desired or name)

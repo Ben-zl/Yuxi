@@ -299,6 +299,7 @@ import {
   searchWorkspaceFiles
 } from '@/apis/workspace_api'
 import { normalizePreviewResponse } from '@/utils/file_preview'
+import { createThreadPreviewKey, isAgentPanelPreviewOwnedByThread } from '@/utils/agentPanelSections'
 import { threadApi } from '@/apis/agent_api'
 
 const props = defineProps({
@@ -325,6 +326,14 @@ const props = defineProps({
   activePreviewPath: {
     type: String,
     default: ''
+  },
+  activePreviewKey: {
+    type: String,
+    default: ''
+  },
+  workspaceOwnerId: {
+    type: [String, Number],
+    default: 'current'
   },
   viewMode: {
     type: String,
@@ -440,7 +449,10 @@ const normalizedPreviewTabs = computed(() =>
     }))
 )
 const activePreviewTab = computed(
-  () => normalizedPreviewTabs.value.find((file) => file.path === props.activePreviewPath) || null
+  () =>
+    normalizedPreviewTabs.value.find((file) => file.previewKey === props.activePreviewKey) ||
+    normalizedPreviewTabs.value.find((file) => file.path === props.activePreviewPath) ||
+    null
 )
 const fileTreeData = computed(() => dynamicTreeData.value)
 
@@ -725,7 +737,7 @@ const refreshWorkspaceTree = async ({ force = false, refreshPreview = false } = 
         workspaceLoaded.value = true
 
         if (shouldRefreshPreview && props.activePreviewPath && activePreviewTab.value?.workspace) {
-          const cacheKey = workspacePreviewCacheKey(props.activePreviewPath)
+          const cacheKey = activePreviewTab.value?.previewKey || workspacePreviewCacheKey(props.activePreviewPath)
           const entry = props.previewCache.get(cacheKey)
           if (entry?.file?.previewUrl) window.URL.revokeObjectURL(entry.file.previewUrl)
           props.previewCache.delete(cacheKey)
@@ -801,8 +813,8 @@ const revokeCurrentPreviewUrl = () => {
   }
 }
 
-const previewCacheKey = (filePath, threadId = props.threadId) => `${threadId}:${filePath}`
-const workspacePreviewCacheKey = (filePath) => `workspace:${filePath}`
+const previewCacheKey = (filePath, threadId = props.threadId) => createThreadPreviewKey(threadId, filePath)
+const workspacePreviewCacheKey = (filePath) => `workspace:${String(props.workspaceOwnerId)}:${filePath}`
 
 const prunePreviewCache = (activeKey) => {
   const readyEntries = [...props.previewCache.entries()]
@@ -826,10 +838,15 @@ const loadActivePreview = async ({ baseFileOverride = null } = {}) => {
     requestedThreadId === props.threadId &&
     filePath === props.activePreviewPath
 
-  const isWorkspaceFile = Boolean(activePreviewTab.value?.workspace || baseFileOverride?.workspace)
+  const previewTab = baseFileOverride || activePreviewTab.value
+  const isWorkspaceFile = Boolean(previewTab?.workspace)
+  const previewOwnedByThread = isAgentPanelPreviewOwnedByThread({
+    tab: previewTab,
+    threadId: requestedThreadId
+  })
 
-  // 用户目录文件不依赖当前对话；对话文件必须先有线程。
-  if (!filePath || (!requestedThreadId && !isWorkspaceFile)) {
+  // 用户目录文件不依赖当前对话；其余预览必须由当前线程创建，防止切换线程时请求旧路径。
+  if (!filePath || !previewOwnedByThread) {
     revokeCurrentPreviewUrl()
     currentFile.value = null
     currentFilePath.value = ''
@@ -856,9 +873,8 @@ const loadActivePreview = async ({ baseFileOverride = null } = {}) => {
     loading: true
   }
 
-  const cacheKey = isWorkspaceFile
-    ? workspacePreviewCacheKey(filePath)
-    : previewCacheKey(filePath, requestedThreadId)
+  const cacheKey = activePreviewTab.value?.previewKey ||
+    (isWorkspaceFile ? workspacePreviewCacheKey(filePath) : previewCacheKey(filePath, requestedThreadId))
   const cachedEntry = props.previewCache.get(cacheKey)
   if (cachedEntry?.status === 'ready') {
     cachedEntry.lastAccessed = Date.now()
@@ -993,7 +1009,7 @@ const refreshActivePreviewIfChanged = async (nodes, requestedThreadId) => {
     return
   }
   const nextTab = { ...tab, ...(latestFile || {}) }
-  const cacheKey = previewCacheKey(tab.path, requestedThreadId)
+  const cacheKey = tab.previewKey || previewCacheKey(tab.path, requestedThreadId)
   await reloadPreviewAfterOrderedCacheEntryInvalidation({
     previewCache: props.previewCache,
     cacheKey,
@@ -1012,7 +1028,7 @@ const onFileSelect = (nextSelectedKeys, { node }) => {
 const pruneTreeStateAfterDelete = (targetPath) => {
   selectedKeys.value = selectedKeys.value.filter((key) => !isSameOrChildPath(key, targetPath))
   expandedKeys.value = expandedKeys.value.filter((key) => !isSameOrChildPath(key, targetPath))
-  emit('close-preview-path', targetPath)
+  emit('close-preview-path', targetPath, props.threadId)
 }
 
 const confirmDeleteNode = (node) => {
@@ -1088,10 +1104,10 @@ const emitRefresh = async () => {
     return
   }
   for (const [key, entry] of props.previewCache) {
-    if (key.startsWith(`${props.threadId}:`) && entry.file?.previewUrl) {
+    if (key.startsWith(`thread:${props.threadId}:`) && entry.file?.previewUrl) {
       window.URL.revokeObjectURL(entry.file.previewUrl)
     }
-    if (key.startsWith(`${props.threadId}:`)) props.previewCache.delete(key)
+    if (key.startsWith(`thread:${props.threadId}:`)) props.previewCache.delete(key)
   }
   await refreshFileSystem()
   if (props.activePreviewPath) await loadActivePreview()
@@ -1198,11 +1214,12 @@ onUnmounted(() => {
 
 watch(
   () => props.threadId,
-  (threadId) => {
+  (threadId, previousThreadId) => {
     filesystemRefreshGeneration += 1
     previewRequestSeq += 1
+    const staleThreadId = previousThreadId || threadId
     for (const [key, entry] of props.previewCache) {
-      if (!key.startsWith(`${threadId}:`)) continue
+      if (!key.startsWith(`thread:${staleThreadId}:`)) continue
       if (entry.file?.previewUrl) window.URL.revokeObjectURL(entry.file.previewUrl)
       props.previewCache.delete(key)
     }
@@ -1221,6 +1238,7 @@ watch(
   [
     () => props.threadId,
     () => props.activePreviewPath,
+    () => props.activePreviewKey,
     () => activePreviewTab.value?.workdir,
     () => activePreviewTab.value?.workspace
   ],
@@ -1264,7 +1282,7 @@ watch(
   () => {
     void ensureActiveSectionVisible()
     if (activeSection.value?.type === 'file' && activePreviewTab.value?.workspace) {
-      const cacheKey = workspacePreviewCacheKey(activePreviewTab.value.path)
+      const cacheKey = activePreviewTab.value.previewKey || workspacePreviewCacheKey(activePreviewTab.value.path)
       const entry = props.previewCache.get(cacheKey)
       if (entry?.file?.previewUrl) window.URL.revokeObjectURL(entry.file.previewUrl)
       props.previewCache.delete(cacheKey)

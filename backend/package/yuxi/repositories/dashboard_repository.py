@@ -319,7 +319,15 @@ class DashboardRepository:
 
     async def get_agent_analytics(self) -> dict[str, Any]:
         """汇总仍存在 Agent 在有效用户与非删除会话中的使用情况。"""
-        agents = list((await self.db_session.execute(select(Agent).order_by(Agent.name.asc()))).scalars().all())
+        agents = list(
+            (
+                await self.db_session.execute(
+                    select(Agent).where(Agent.deletion_pending_at.is_(None)).order_by(Agent.name.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
         valid_filters = [Conversation.status.notin_(("deleted", "subagent")), User.is_deleted == 0]
 
         conversation_rows = (

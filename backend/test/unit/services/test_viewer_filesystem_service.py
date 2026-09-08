@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -33,7 +34,7 @@ def _patch_mapped_agentscope_thread(monkeypatch) -> None:
 
 def test_resolve_local_user_data_path_blocks_upload_symlink_escape(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(sandbox_paths.conf, "save_dir", str(tmp_path))
-    thread_id = "thread-1"
+    thread_id = f"symlink-{uuid4().hex}"
     uid = "user-1"
     sandbox_paths.ensure_thread_dirs(thread_id, uid)
 
@@ -50,7 +51,7 @@ def test_resolve_local_user_data_path_blocks_upload_symlink_escape(tmp_path: Pat
 
 def test_list_local_entries_skips_symlink_escape(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(sandbox_paths.conf, "save_dir", str(tmp_path))
-    thread_id = "thread-1"
+    thread_id = f"symlink-{uuid4().hex}"
     uid = "user-1"
     sandbox_paths.ensure_thread_dirs(thread_id, uid)
 

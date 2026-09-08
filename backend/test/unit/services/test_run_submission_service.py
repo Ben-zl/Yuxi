@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -73,6 +74,10 @@ async def test_submit_run_command_shares_conversation_intake_and_finalize(monkey
             assert user is current_user
             assert kind == "main"
             return SimpleNamespace(slug=slug, backend_id="ChatbotAgent")
+
+        async def get_visible_for_update_by_slug(self, *, slug: str, user, kind="main"):
+            calls["agent_locked"] = slug
+            return await self.get_visible_by_slug(slug=slug, user=user, kind=kind)
 
     class ConvRepo:
         def __init__(self, db):
@@ -154,6 +159,7 @@ async def test_submit_run_command_shares_conversation_intake_and_finalize(monkey
 
     result = await svc.submit_run_command(command=command, current_user=current_user, db=Db())
 
+    assert calls["agent_locked"] == "translator"
     assert calls["conversation"]["metadata"] == {
         "source": "agent_call",
         "channel": "api",
@@ -229,3 +235,68 @@ async def test_submit_run_command_requires_existing_conversation_for_web_chat(
         await svc.submit_run_command(command=command, current_user=current_user, db=object())
 
     assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_final_agent_lock_failure_rolls_back_persisted_attachments(monkeypatch: pytest.MonkeyPatch):
+    """附件落盘后 Agent 被删除时必须补偿附件副作用。"""
+    current_user = SimpleNamespace(uid="user-1", role="user")
+    conversation = SimpleNamespace(id=1, thread_id="thread-1", project_id="project-1")
+    rollback = []
+
+    class Db:
+        rollback = AsyncMock()
+
+    class AgentRepo:
+        def __init__(self, _db):
+            pass
+
+        async def get_visible_by_slug(self, **_kwargs):
+            return SimpleNamespace(slug="translator", backend_id="ChatbotAgent")
+
+        async def get_visible_for_update_by_slug(self, **_kwargs):
+            return None
+
+    class ConvRepo:
+        def __init__(self, _db):
+            pass
+
+        async def get_conversation_by_thread_id(self, _thread_id):
+            return conversation
+
+    async def persist(**_kwargs):
+        return [{"file_id": "file-1"}]
+
+    async def rollback_attachments(**kwargs):
+        rollback.append(kwargs)
+
+    async def resolve_binding(**_kwargs):
+        return "projects/project-1", SimpleNamespace(directory_mode="managed")
+
+    import yuxi.services.attachment_service as attachment_service
+
+    monkeypatch.setattr(svc, "AgentRepository", AgentRepo)
+    monkeypatch.setattr(svc, "AgentRunRequestRepository", _EmptyRequestRepo)
+    monkeypatch.setattr(svc, "AgentRunRepository", _EmptyRunRepo)
+    monkeypatch.setattr(svc, "ConversationRepository", ConvRepo)
+    monkeypatch.setattr(svc, "resolve_conversation_workdir_binding", resolve_binding)
+    monkeypatch.setattr(svc.agent_manager, "get_agent", lambda _backend_id: object())
+    monkeypatch.setattr(attachment_service, "persist_run_submission_attachments", persist)
+    monkeypatch.setattr(attachment_service, "rollback_run_submission_attachments", rollback_attachments)
+    db = Db()
+
+    command = svc.RunSubmissionCommand(
+        agent_slug="translator",
+        thread_id="thread-1",
+        request_id="req-attachment",
+        input_message=build_chat_input_message("hello"),
+        origin=svc.RunOrigin(source="chat", channel="web"),
+        attachments=(svc.RunSubmissionAttachment(file_name="a.txt", media_type="text/plain", content=b"a"),),
+    )
+
+    with pytest.raises(HTTPException, match="智能体不存在"):
+        await svc.submit_run_command(command=command, current_user=current_user, db=db)
+
+    db.rollback.assert_awaited_once()
+    assert rollback[0]["records"] == [{"file_id": "file-1"}]
+    assert rollback[0]["workdir_path"] == "projects/project-1"

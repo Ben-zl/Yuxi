@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from server.utils.auth_middleware import get_db, get_required_user
 from yuxi.agentscope.client import AgentScopeServiceError
+from yuxi.services.agent_cleanup_service import AgentDeletionBlocked, AgentDeletionResult
 
 agent_router_module = importlib.import_module("server.routers.agent_router")
 
@@ -201,29 +202,53 @@ def test_invalid_memory_filters_and_pagination_are_rejected_locally(monkeypatch)
     assert memory_client.events == []
 
 
-def test_agent_delete_cleans_memory_before_business_record(monkeypatch):
-    """Agent 删除必须先清理所有用户 scope，再删除业务记录。"""
+def test_agent_delete_reports_completed_external_cleanup(monkeypatch):
+    """本地删除和外部清理都完成时公开结果不应标记待补偿。"""
     _FakeRepo.visible = True
-    _FakeRepo.events = []
-    memory_client = _FakeMemoryClient()
-    client = _build_client(monkeypatch, memory_client)
+    calls = []
+
+    async def delete_with_cleanup(**kwargs):
+        calls.append(kwargs)
+        return AgentDeletionResult(cleanup_pending=False)
+
+    monkeypatch.setattr(agent_router_module, "delete_agent_with_memory_cleanup", delete_with_cleanup)
+    client = _build_client(monkeypatch, _FakeMemoryClient())
 
     response = client.delete("/api/agent/custom-agent")
 
     assert response.status_code == 200
-    assert memory_client.events == ["memory_cleared"]
-    assert _FakeRepo.events == ["agent_deleted"]
+    assert response.json() == {"success": True, "cleanup_pending": False}
+    assert calls[0]["agent"].slug == "custom-agent"
+    assert calls[0]["caller_uid"] == "user-1"
 
 
-def test_agent_delete_stops_when_memory_cleanup_fails(monkeypatch):
-    """长期记忆清理失败时不得继续删除 Agent。"""
+def test_agent_delete_reports_pending_external_cleanup(monkeypatch):
+    """外部清理失败时必须如实返回本地删除成功和待补偿状态。"""
     _FakeRepo.visible = True
-    _FakeRepo.events = []
-    memory_client = _FakeMemoryClient()
-    memory_client.error = AgentScopeServiceError("unavailable", status_code=500)
-    client = _build_client(monkeypatch, memory_client)
+
+    async def delete_with_cleanup(**_kwargs):
+        return AgentDeletionResult(cleanup_pending=True)
+
+    monkeypatch.setattr(agent_router_module, "delete_agent_with_memory_cleanup", delete_with_cleanup)
+    client = _build_client(monkeypatch, _FakeMemoryClient())
 
     response = client.delete("/api/agent/custom-agent")
 
-    assert response.status_code == 502
-    assert _FakeRepo.events == []
+    assert response.status_code == 200
+    assert response.json() == {"success": True, "cleanup_pending": True}
+
+
+def test_agent_delete_maps_active_task_reference_to_conflict(monkeypatch):
+    """未归档任务引用仍由删除用例阻断并映射为稳定 409。"""
+    _FakeRepo.visible = True
+
+    async def delete_with_cleanup(**_kwargs):
+        raise AgentDeletionBlocked(3)
+
+    monkeypatch.setattr(agent_router_module, "delete_agent_with_memory_cleanup", delete_with_cleanup)
+    client = _build_client(monkeypatch, _FakeMemoryClient())
+
+    response = client.delete("/api/agent/custom-agent")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "该智能体被 3 个未归档任务引用，请先归档相关任务再删除"

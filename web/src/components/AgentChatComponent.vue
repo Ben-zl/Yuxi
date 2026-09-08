@@ -4,6 +4,7 @@
       class="chat"
       :class="{
         'has-file-panel': isFilePanelOpen,
+        'has-maximized-panel': isFilePanelOpen && isAgentPanelMaximized,
         'is-resizing-file-panel': isResizing
       }"
       :style="{ '--file-panel-width': filePanelWidthStyle }"
@@ -19,6 +20,16 @@
           </div>
         </div>
         <div class="header__right">
+          <button
+            v-if="messageDebugEnabled"
+            type="button"
+            class="agent-nav-btn agent-debug-mode-btn"
+            title="调试模式已开启：点击打开消息时序调试面板"
+            @click.stop="toggleMessageDebugPanel"
+          >
+            <Bug size="15" class="nav-btn-icon debug-icon" />
+            <span class="hide-text">Debug</span>
+          </button>
           <button
             v-if="showStateEntry"
             type="button"
@@ -84,9 +95,17 @@
                   >
                   </AgentMessageComponent>
                   <ToolCallsGroupComponent
-                    v-else
+                    v-else-if="displayItem.type === 'tool-group'"
                     :tool-calls="displayItem.toolCalls"
                     :is-active="isToolGroupActive(row.conv, itemIndex, row.displayItems)"
+                  />
+                  <ConversationProcessGroupComponent
+                    v-else
+                    :items="displayItem.items"
+                    :message-count="displayItem.messageCount"
+                    :tool-call-count="displayItem.toolCallCount"
+                    :duration-ms="displayItem.durationMs"
+                    :mention="mentionConfig"
                   />
                 </template>
                 <AgentArtifactsCard
@@ -119,10 +138,11 @@
                   <div></div>
                 </div>
                 <span class="generating-text">{{ replyLoadingText }}</span>
+                <span v-if="replyElapsedLabel" class="generating-elapsed">{{ replyElapsedLabel }}</span>
               </div>
             </div>
           </div>
-          <div class="bottom" :class="{ 'start-screen': !conversations.length }">
+          <div ref="messageInputDockRef" class="bottom" :class="{ 'start-screen': !conversations.length }">
             <div class="message-input-wrapper">
               <!-- 加载状态：加载消息 -->
               <div v-if="isLoadingMessages" class="chat-loading">
@@ -250,6 +270,13 @@
                         <CornerDownRight :size="14" aria-hidden="true" />
                         引导
                       </button>
+                      <ContextUsageRing
+                        v-if="showStateEntry"
+                        :used-tokens="tokenUsageStackTotal"
+                        :limit-tokens="tokenUsageStackLimit"
+                        :ratio="tokenUsageContextRatio"
+                        @click="toggleStatePanel"
+                      />
                       <div class="input-model-selector">
                         <ModelSelectorComponent
                           :model_spec="currentModelSpec"
@@ -293,7 +320,11 @@
             flexBasis: statePanelDocked ? `${statePanelDockWidth}px` : '0px'
           }"
         >
-          <div v-if="statePanelOpen" class="state-panel">
+          <div
+            v-if="statePanelOpen"
+            class="state-panel"
+            :style="{ maxHeight: statePanelMaxHeightStyle }"
+          >
             <div class="side-panel__header state-panel-header">
               <span class="state-panel-title">状态</span>
               <div class="state-panel-header-actions">
@@ -531,7 +562,14 @@
                     文件较多，仅显示前 500 项
                   </div>
                   <div class="state-list">
-                    <div v-for="file in currentStateFiles" :key="file.key" class="state-list-item">
+                    <button
+                      v-for="file in currentStateFiles"
+                      :key="file.key"
+                      type="button"
+                      class="state-list-item state-list-item--button"
+                      :title="`打开 ${file.name}`"
+                      @click="openPanelPreview(file)"
+                    >
                       <Folder
                         v-if="file.isDir"
                         :size="18"
@@ -547,7 +585,7 @@
                         <div class="state-list-item-title">{{ file.name }}</div>
                         <div class="state-list-item-meta">{{ file.meta || file.path }}</div>
                       </div>
-                    </div>
+                    </button>
                   </div>
                 </div>
               </section>
@@ -696,11 +734,19 @@
           v-if="isFilePanelOpen"
           :agent-state="currentAgentState"
           :thread-id="currentChatId"
+          :messages="currentDebugMessages"
           :panel-ratio="panelRatio"
           :preview-tabs="agentPanelPreviewTabs"
           :preview-cache="agentPanelPreviewCache"
           :active-preview-path="agentPanelActivePreviewPath"
+          :active-preview-key="agentPanelActivePreviewKey"
           :view-mode="agentPanelViewMode"
+          :maximized="isAgentPanelMaximized"
+          :sections="agentPanelSections"
+          :active-section-key="agentPanelActiveSectionKey"
+          :filesystem-visible="agentPanelFilesystemVisible"
+          :filesystem-polling-active="agentPanelFilesystemPollingActive"
+          :filesystem-refresh-version="agentPanelFilesystemRefreshVersion"
           @close="closeFilePanel"
           @refresh="handleAgentStateRefresh"
           @resize="handlePanelResize"
@@ -710,23 +756,13 @@
           @close-preview-tab="closePanelPreviewTab"
           @close-preview-path="closePanelPreviewPath"
           @view-mode-change="setAgentPanelViewMode"
+          @toggle-maximize="toggleAgentPanelMaximized"
+          @activate-section="activateAgentPanelSection"
+          @close-section="closeAgentPanelSection"
         />
       </div>
     </div>
 
-    <a-modal
-      v-model:open="subagentThreadModal.open"
-      :title="activeSubagentThreadName"
-      :footer="null"
-      :width="720"
-      destroy-on-close
-    >
-      <SubagentThreadView
-        v-if="subagentThreadModal.childThreadId"
-        :thread-id="subagentThreadModal.childThreadId"
-        active
-      />
-    </a-modal>
   </div>
 </template>
 
@@ -745,6 +781,7 @@ import {
 } from 'vue'
 import { message } from 'ant-design-vue'
 import {
+  Bug,
   ChevronDown,
   CornerDownRight,
   Folder,
@@ -777,6 +814,8 @@ import { useAgentStore } from '@/stores/agent'
 import { useChatThreadsStore } from '@/stores/chatThreads'
 import { useChatUIStore } from '@/stores/chatUI'
 import { useConfigStore } from '@/stores/config'
+import { useInfoStore } from '@/stores/info'
+import { useUserStore } from '@/stores/user'
 import { storeToRefs } from 'pinia'
 import { MessageProcessor } from '@/utils/messageProcessor'
 import { agentApi, threadApi } from '@/apis'
@@ -790,14 +829,30 @@ import { useStreamSmoother } from '@/composables/useStreamSmoother'
 import { useAgentRequestQueue } from '@/composables/useAgentRequestQueue'
 import { useAgentMentionConfig } from '@/composables/useAgentMentionConfig'
 import AgentArtifactsCard from '@/components/AgentArtifactsCard.vue'
+import ContextUsageRing from '@/components/ContextUsageRing.vue'
+import ConversationProcessGroupComponent from '@/components/ConversationProcessGroupComponent.vue'
 import AgentPanel from '@/components/AgentPanel.vue'
 import AttachmentTmpUploadModal from '@/components/AttachmentTmpUploadModal.vue'
-import SubagentThreadView from '@/components/SubagentThreadView.vue'
 import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
 import { enrichTaskToolCalls, parseToolCallArgs } from '@/components/ToolCallingResult/toolRegistry'
 import { getConversationDisplayItems } from '@/utils/messageGrouping'
 import { makeChildThreadId } from '@/utils/subagentThread'
+import { mergeMessageDebugMessages } from '@/utils/messageDebug'
+import {
+  getDockedStatePanelMaxHeight,
+  getFloatingStatePanelMaxHeight
+} from '@/utils/statePanelLayout'
+import { createThreadDraftSession, createThreadDraftStore, DRAFT_THREAD_ID } from '@/utils/thread_draft'
 import { AUTO_PROJECT_ID } from '@/utils/projectSelection'
+import {
+  FILE_TREE_SECTION,
+  MESSAGE_DEBUG_SECTION,
+  createThreadPreviewKey,
+  isThreadPreviewInPath,
+  closeAgentPanelSection as closePanelSectionState,
+  shouldPollAgentPanelFilesystem,
+  upsertAgentPanelSection
+} from '@/utils/agentPanelSections'
 import {
   isRunInterruptedConflict,
   isThreadWaitingForUserAction,
@@ -822,12 +877,18 @@ const agentStore = useAgentStore()
 const chatThreadsStore = useChatThreadsStore()
 const chatUIStore = useChatUIStore()
 const configStore = useConfigStore()
+const infoStore = useInfoStore()
+const userStore = useUserStore()
+const messageDebugEnabled = computed(() => infoStore.debugMode && userStore.isSuperAdmin)
 const { agents, selectedAgentId, agentConfig, configurableItems, availableKnowledgeBases } =
   storeToRefs(agentStore)
 const { threads, currentThreadId, currentThread } = storeToRefs(chatThreadsStore)
 
 // ==================== LOCAL CHAT & UI STATE ====================
-const userInput = ref('')
+const threadDraftStore = createThreadDraftStore()
+const threadDraftSession = createThreadDraftSession(threadDraftStore, currentThreadId.value)
+const userInput = ref(threadDraftStore.read(currentThreadId.value || DRAFT_THREAD_ID))
+watch(userInput, (text) => threadDraftSession.saveInput(text))
 const agentInputAreaRef = ref(null)
 const sendCooldownActive = ref(false)
 const cancellingRequestIds = reactive(new Set())
@@ -898,12 +959,15 @@ const configNoticeScrollVersion = ref(0)
 // 本地 UI 状态（仅在本组件使用）
 const localUIState = reactive({
   chatMainWidth: typeof window !== 'undefined' ? window.innerWidth : 0,
-  chatContentWidth: typeof window !== 'undefined' ? window.innerWidth : 0
+  chatContentWidth: typeof window !== 'undefined' ? window.innerWidth : 0,
+  statePanelDockedMaxHeight: null,
+  statePanelFloatingMaxHeight: null
 })
 
 // Agent Panel State
 const isFilePanelOpen = ref(false)
 const statePanelOpen = ref(false)
+const isAgentPanelMaximized = ref(false)
 const sideActive = computed(() => {
   if (isFilePanelOpen.value) return 'file'
   if (statePanelOpen.value) return 'state'
@@ -924,7 +988,12 @@ const filePanelDragWidth = ref(null)
 const agentPanelPreviewTabs = ref([])
 const agentPanelPreviewCache = reactive(new Map())
 const agentPanelActivePreviewPath = ref('')
+const agentPanelActivePreviewKey = ref('')
 const agentPanelViewMode = ref('tree')
+const agentPanelSections = ref([FILE_TREE_SECTION])
+const agentPanelActiveSectionKey = ref(FILE_TREE_SECTION.key)
+const agentPanelFilesystemRefreshVersion = ref(0)
+const pageVisible = ref(typeof document === 'undefined' || document.visibilityState === 'visible')
 const chatContentContainerRef = ref(null)
 const panelWrapperRef = ref(null) // 直接操作 DOM
 const TODO_NAME_MAX_LENGTH = 20
@@ -977,6 +1046,10 @@ const clampPanelRatio = (ratio, containerWidth = getPanelContainerWidth()) => {
 
 const filePanelWidthStyle = computed(() => {
   if (!isFilePanelOpen.value) return '0px'
+  if (isAgentPanelMaximized.value) {
+    const containerWidth = localUIState.chatContentWidth || getPanelContainerWidth()
+    return containerWidth ? `${containerWidth}px` : '100%'
+  }
   if (filePanelDragWidth.value !== null) return `${filePanelDragWidth.value}px`
 
   const containerWidth = localUIState.chatContentWidth || getPanelContainerWidth()
@@ -995,6 +1068,13 @@ const statePanelCanDock = computed(() => {
 })
 const statePanelDocked = computed(() => statePanelOpen.value && statePanelCanDock.value)
 const statePanelFloating = computed(() => statePanelOpen.value && !statePanelDocked.value)
+const statePanelMaxHeightStyle = computed(() => {
+  if (!statePanelFloating.value && !statePanelDocked.value) return undefined
+  const maxHeight = statePanelFloating.value
+    ? localUIState.statePanelFloatingMaxHeight
+    : localUIState.statePanelDockedMaxHeight
+  return maxHeight === null ? undefined : `${maxHeight}px`
+})
 
 const setPanelRatioForViewMode = () => {
   const hasPreview = Boolean(agentPanelActivePreviewPath.value)
@@ -1012,7 +1092,9 @@ const showFilePanel = (mode = 'tree') => {
 const showFileTreePanel = () => {
   isFilePanelOpen.value = true
   statePanelOpen.value = false
+  agentPanelActiveSectionKey.value = FILE_TREE_SECTION.key
   agentPanelActivePreviewPath.value = ''
+  agentPanelActivePreviewKey.value = ''
   agentPanelViewMode.value = 'tree'
   setPanelRatioForViewMode()
 }
@@ -1067,30 +1149,54 @@ const isSameOrChildPanelPath = (path, targetPath) => {
   )
 }
 
-const resetAgentPanelState = () => {
+const previewIdentity = (file) => {
+  const path = String(file?.path || '')
+  if (file?.workspace === true) return `workspace:${String(userStore.uid || 'current')}:${path}`
+  if (file?.artifact === true || file?.run_id) return `artifact:${String(file.run_id || '')}:${path}`
+  return createThreadPreviewKey(file?.threadId || currentChatId.value, path)
+}
+
+const resetAgentPanelState = (previousThreadId = '') => {
+  if (previousThreadId) {
+    const staleKeys = new Set(
+      agentPanelPreviewTabs.value
+        .filter((tab) => tab.workspace !== true && tab.threadId === previousThreadId)
+        .map((tab) => tab.previewKey)
+    )
+    for (const [key, entry] of agentPanelPreviewCache) {
+      if (!staleKeys.has(key) && !key.startsWith(`thread:${previousThreadId}:`) && !key.startsWith(`${previousThreadId}:`)) continue
+      if (entry.file?.previewUrl) window.URL.revokeObjectURL(entry.file.previewUrl)
+      agentPanelPreviewCache.delete(key)
+    }
+  }
   isFilePanelOpen.value = false
   statePanelOpen.value = false
   panelRatio.value = defaultPanelRatio
+  isAgentPanelMaximized.value = false
   agentPanelPreviewTabs.value = []
   agentPanelActivePreviewPath.value = ''
+  agentPanelActivePreviewKey.value = ''
   agentPanelViewMode.value = 'tree'
+  agentPanelSections.value = [FILE_TREE_SECTION]
+  agentPanelActiveSectionKey.value = FILE_TREE_SECTION.key
 }
 
-const previewCacheKey = (path, threadId = currentChatId.value) => `${threadId}:${path}`
-
-const releasePreviewCacheEntry = (path, threadId = currentChatId.value) => {
-  const key = previewCacheKey(path, threadId)
+const releasePreviewCacheEntry = (previewKey) => {
+  const key = String(previewKey || '')
+  if (!key) return
   const entry = agentPanelPreviewCache.get(key)
   if (entry?.file?.previewUrl) window.URL.revokeObjectURL(entry.file.previewUrl)
   agentPanelPreviewCache.delete(key)
 }
 
 const invalidatePreviewCachePath = (targetPath, threadId = currentChatId.value) => {
-  for (const key of agentPanelPreviewCache.keys()) {
-    const separatorIndex = key.indexOf(':')
-    if (separatorIndex < 0 || key.slice(0, separatorIndex) !== String(threadId)) continue
-    const path = key.slice(separatorIndex + 1)
-    if (isSameOrChildPanelPath(path, targetPath)) releasePreviewCacheEntry(path, threadId)
+  const staleKeys = agentPanelPreviewTabs.value
+    .filter((tab) => tab.workspace !== true && tab.threadId === threadId && isSameOrChildPanelPath(tab.path, targetPath))
+    .map((tab) => tab.previewKey)
+  for (const key of staleKeys) {
+    const entry = agentPanelPreviewCache.get(key)
+    if (entry?.file?.previewUrl) window.URL.revokeObjectURL(entry.file.previewUrl)
+    agentPanelPreviewCache.delete(key)
   }
 }
 
@@ -1100,26 +1206,39 @@ const setAgentPanelViewMode = (mode) => {
   setPanelRatioForViewMode()
 }
 
-const activatePanelPreview = (path) => {
+const activatePanelPreview = (path, previewKey = '') => {
   if (!path) return
+  const key = previewKey || previewIdentity({ path })
+  agentPanelActiveSectionKey.value = `file:${key}`
   agentPanelActivePreviewPath.value = path
+  agentPanelActivePreviewKey.value = key
   showFilePanel('preview')
 }
 
 const openPanelPreview = (file, keepTreeOpen = false) => {
   if (!file?.path) return
 
+  const workspace = file.workspace === true
   const tab = {
     ...file,
+    threadId: workspace ? null : currentChatId.value,
+    workspace,
+    workdir: !workspace && file.workdir === true,
     path: String(file.path),
     name: getPanelFileName(file)
   }
-  const existingIndex = agentPanelPreviewTabs.value.findIndex((item) => item.path === tab.path)
+  tab.previewKey = previewIdentity(tab)
+  const existingIndex = agentPanelPreviewTabs.value.findIndex((item) => item.previewKey === tab.previewKey)
 
   if (existingIndex >= 0) {
     const existingTab = agentPanelPreviewTabs.value[existingIndex]
-    if (existingTab.modified_at !== tab.modified_at || existingTab.size !== tab.size) {
-      releasePreviewCacheEntry(tab.path)
+    if (
+      existingTab.modified_at !== tab.modified_at ||
+      existingTab.size !== tab.size ||
+      Boolean(existingTab.workdir) !== Boolean(tab.workdir) ||
+      Boolean(existingTab.workspace) !== Boolean(tab.workspace)
+    ) {
+      releasePreviewCacheEntry(tab.previewKey)
     }
     agentPanelPreviewTabs.value = agentPanelPreviewTabs.value.map((item, index) =>
       index === existingIndex ? { ...item, ...tab } : item
@@ -1129,42 +1248,82 @@ const openPanelPreview = (file, keepTreeOpen = false) => {
   }
 
   agentPanelActivePreviewPath.value = tab.path
-  showFilePanel(keepTreeOpen ? 'tree' : 'preview')
+  agentPanelActivePreviewKey.value = tab.previewKey
+  agentPanelSections.value = upsertAgentPanelSection(agentPanelSections.value, {
+    key: `file:${tab.previewKey}`,
+    type: 'file',
+    title: tab.name,
+    path: tab.path,
+    previewKey: tab.previewKey,
+    workspace: tab.workspace,
+    threadId: tab.threadId
+  })
+  agentPanelActiveSectionKey.value = keepTreeOpen ? FILE_TREE_SECTION.key : `file:${tab.previewKey}`
+  showFilePanel('preview')
 }
 
-const closePanelPreviewTab = (path) => {
-  if (!path) return
+const closePanelPreviewTab = (path, previewKey = '') => {
+  if (!path && !previewKey) return
+  const target = agentPanelPreviewTabs.value.find((item) => item.previewKey === previewKey) ||
+    agentPanelPreviewTabs.value.find((item) => item.path === path)
+  const targetPath = target?.path || path
+  const targetKey = target?.previewKey || previewKey || previewIdentity({ path: targetPath })
+  const cacheKey = target?.previewKey || targetKey
+  const entry = agentPanelPreviewCache.get(cacheKey)
+  if (entry?.file?.previewUrl) window.URL.revokeObjectURL(entry.file.previewUrl)
+  agentPanelPreviewCache.delete(cacheKey)
 
-  releasePreviewCacheEntry(path)
-
-  const closingIndex = agentPanelPreviewTabs.value.findIndex((item) => item.path === path)
-  const nextTabs = agentPanelPreviewTabs.value.filter((item) => item.path !== path)
+  const nextTabs = agentPanelPreviewTabs.value.filter((item) => item.previewKey !== targetKey)
   agentPanelPreviewTabs.value = nextTabs
+  const nextSectionState = closePanelSectionState(
+    agentPanelSections.value,
+    agentPanelActiveSectionKey.value,
+    `file:${targetKey}`
+  )
+  agentPanelSections.value = nextSectionState.sections
+  agentPanelActiveSectionKey.value = nextSectionState.activeKey || FILE_TREE_SECTION.key
 
-  if (agentPanelActivePreviewPath.value !== path) return
+  if (agentPanelActivePreviewKey.value !== targetKey) return
 
-  const nextActiveTab = nextTabs[Math.min(closingIndex, nextTabs.length - 1)]
-  agentPanelActivePreviewPath.value = nextActiveTab?.path || ''
-  agentPanelViewMode.value = nextActiveTab ? 'preview' : 'tree'
+  const activeSection = agentPanelSections.value.find(
+    (section) => section.key === agentPanelActiveSectionKey.value
+  )
+  agentPanelActivePreviewPath.value = activeSection?.type === 'file' ? activeSection.path : ''
+  agentPanelActivePreviewKey.value = activeSection?.type === 'file' ? activeSection.previewKey || '' : ''
+  agentPanelViewMode.value = activeSection?.type === 'file' ? 'preview' : 'tree'
   setPanelRatioForViewMode()
 }
 
-const closePanelPreviewPath = (targetPath) => {
-  if (!targetPath) return
+const closePanelPreviewPath = (targetPath, threadId = currentChatId.value) => {
+  if (!targetPath || !threadId) return
 
-  invalidatePreviewCachePath(targetPath)
+  invalidatePreviewCachePath(targetPath, threadId)
+  const belongsToDeletedThreadPath = (item) =>
+    isThreadPreviewInPath(item, threadId, targetPath)
 
-  const nextTabs = agentPanelPreviewTabs.value.filter(
-    (item) => !isSameOrChildPanelPath(item.path, targetPath)
+  const nextTabs = agentPanelPreviewTabs.value.filter((item) => !belongsToDeletedThreadPath(item))
+  const shouldCloseActive = agentPanelPreviewTabs.value.some(
+    (item) => item.previewKey === agentPanelActivePreviewKey.value && belongsToDeletedThreadPath(item)
   )
-  const shouldCloseActive = isSameOrChildPanelPath(agentPanelActivePreviewPath.value, targetPath)
   agentPanelPreviewTabs.value = nextTabs
+  const removedPaths = agentPanelSections.value
+    .filter((section) => section.type === 'file' && belongsToDeletedThreadPath(section))
+    .map((section) => section.key)
+  agentPanelSections.value = agentPanelSections.value.filter(
+    (section) => !removedPaths.includes(section.key)
+  )
+  if (removedPaths.includes(agentPanelActiveSectionKey.value)) {
+    agentPanelActiveSectionKey.value = FILE_TREE_SECTION.key
+  }
 
   if (!shouldCloseActive) return
 
-  const nextActiveTab = nextTabs[0]
-  agentPanelActivePreviewPath.value = nextActiveTab?.path || ''
-  agentPanelViewMode.value = nextActiveTab ? 'preview' : 'tree'
+  const activeSection = agentPanelSections.value.find(
+    (section) => section.key === agentPanelActiveSectionKey.value
+  )
+  agentPanelActivePreviewPath.value = activeSection?.type === 'file' ? activeSection.path : ''
+  agentPanelActivePreviewKey.value = activeSection?.type === 'file' ? activeSection.previewKey || '' : ''
+  agentPanelViewMode.value = activeSection?.type === 'file' ? 'preview' : 'tree'
   setPanelRatioForViewMode()
 }
 
@@ -1613,17 +1772,93 @@ const currentSubagentOptionBySlug = computed(() => {
   return optionBySlug
 })
 
-const subagentThreadModal = reactive({
-  open: false,
-  childThreadId: '',
-  subagentName: ''
-})
 const openSubagentThread = (run) => {
   if (!run?.child_thread_id) return
-  subagentThreadModal.childThreadId = String(run.child_thread_id)
-  subagentThreadModal.subagentName = getSubagentRunName(run)
-  subagentThreadModal.open = true
+  const threadId = String(run.child_thread_id)
+  const key = `subagent:${threadId}`
+  agentPanelSections.value = upsertAgentPanelSection(agentPanelSections.value, {
+    key,
+    type: 'subagent',
+    title: getSubagentRunName(run),
+    threadId,
+    avatar: getSubagentIconSrc(run),
+    defaultAvatar: getSubagentDefaultIconSrc(run)
+  })
+  agentPanelActiveSectionKey.value = key
+  agentPanelActivePreviewPath.value = ''
+  agentPanelActivePreviewKey.value = ''
+  agentPanelViewMode.value = 'tree'
+  isFilePanelOpen.value = true
+  statePanelOpen.value = false
 }
+const activateAgentPanelSection = (key) => {
+  const section = agentPanelSections.value.find((item) => item.key === key)
+  if (!section) return
+  agentPanelActiveSectionKey.value = key
+  if (section.type === 'file') {
+    agentPanelActivePreviewPath.value = section.path
+    agentPanelActivePreviewKey.value = section.previewKey || ''
+    agentPanelViewMode.value = 'preview'
+    setPanelRatioForViewMode()
+  } else if (section.type === 'file-tree') {
+    agentPanelActivePreviewPath.value = ''
+    agentPanelViewMode.value = 'tree'
+    setPanelRatioForViewMode()
+  }
+}
+
+const closeAgentPanelSection = (key) => {
+  const section = agentPanelSections.value.find((item) => item.key === key)
+  if (section?.type === 'file') {
+    closePanelPreviewTab(section.path, section.previewKey)
+    return
+  }
+  const next = closePanelSectionState(
+    agentPanelSections.value,
+    agentPanelActiveSectionKey.value,
+    key
+  )
+  agentPanelSections.value = next.sections
+  agentPanelActiveSectionKey.value = next.activeKey || FILE_TREE_SECTION.key
+}
+
+const toggleMessageDebugPanel = () => {
+  if (isFilePanelOpen.value && agentPanelActiveSectionKey.value === MESSAGE_DEBUG_SECTION.key) {
+    closeFilePanel()
+    return
+  }
+  agentPanelSections.value = upsertAgentPanelSection(
+    agentPanelSections.value,
+    MESSAGE_DEBUG_SECTION
+  )
+  agentPanelActiveSectionKey.value = MESSAGE_DEBUG_SECTION.key
+  agentPanelActivePreviewPath.value = ''
+  agentPanelViewMode.value = 'tree'
+  showFilePanel('tree')
+}
+
+watch(messageDebugEnabled, (enabled) => {
+  const hadDebugSection = agentPanelSections.value.some(
+    (section) => section.key === MESSAGE_DEBUG_SECTION.key
+  )
+  if (enabled || !hadDebugSection) return
+  const next = closePanelSectionState(
+    agentPanelSections.value,
+    agentPanelActiveSectionKey.value,
+    MESSAGE_DEBUG_SECTION.key
+  )
+  agentPanelSections.value = next.sections
+  agentPanelActiveSectionKey.value = next.activeKey || FILE_TREE_SECTION.key
+})
+
+const currentDebugMessages = computed(() =>
+  mergeMessageDebugMessages(
+    currentThreadMessages.value,
+    currentThreadState.value?.onGoingConv?.messages || [],
+    currentThreadState.value?.activeRunId || null
+  )
+)
+
 const isStateSectionExpanded = (key) => !collapsedStateSections[key]
 const toggleStateSection = (key) => {
   collapsedStateSections[key] = !collapsedStateSections[key]
@@ -1646,6 +1881,7 @@ const currentStateFiles = computed(() => {
       path,
       name,
       isDir: Boolean(entry?.is_dir),
+      workdir: !entry?.is_dir,
       meta: [status, sizeLabel === '-' ? '' : sizeLabel, path].filter(Boolean).join(' · ')
     })
   }
@@ -1880,9 +2116,6 @@ const displaySubagentRuns = computed(() => {
   return merged
 })
 
-const activeSubagentThreadName = computed(() =>
-  subagentThreadModal.subagentName || '子智能体'
-)
 
 // 首次运行的子智能体：前端按后端同样的哈希推算 child_thread_id，缓存到映射里供面板/轨迹定位。
 watch(
@@ -2120,6 +2353,30 @@ const canCancelQueuedRequest = (request) =>
 const shouldRefreshStateWhileStreaming = computed(
   () => Boolean(currentChatId.value) && isStreaming.value && statePanelOpen.value
 )
+const activeAgentPanelSection = computed(() =>
+  agentPanelSections.value.find((section) => section.key === agentPanelActiveSectionKey.value)
+)
+const activeAgentPanelPreview = computed(() =>
+  agentPanelPreviewTabs.value.find((file) => file.previewKey === agentPanelActivePreviewKey.value) ||
+  agentPanelPreviewTabs.value.find((file) => file.path === agentPanelActivePreviewPath.value)
+)
+const agentPanelFilesystemVisible = computed(
+  () =>
+    isFilePanelOpen.value &&
+    (activeAgentPanelSection.value?.type === 'file-tree' ||
+      (activeAgentPanelSection.value?.type === 'file' &&
+        activeAgentPanelPreview.value?.workdir === true))
+)
+const agentPanelFilesystemPollingActive = computed(() =>
+  shouldPollAgentPanelFilesystem({
+    panelOpen: isFilePanelOpen.value,
+    pageVisible: pageVisible.value,
+    streaming: isStreaming.value,
+    activeSection: activeAgentPanelSection.value,
+    activePreview: activeAgentPanelPreview.value
+  })
+)
+
 const isProcessing = computed(
   () =>
     isStreaming.value || (hasQueuedRequests.value && currentQueueSnapshot.value.status !== 'paused')
@@ -2134,6 +2391,47 @@ const replyLoadingText = computed(() => {
   if (hasQueuedRequests.value) return `排队中（${queuedRequestCount.value} 条）...`
   return '正在生成回复...'
 })
+const replyElapsedSeconds = ref(0)
+let replyElapsedTimer = null
+let replyStartedAt = null
+const replyElapsedLabel = computed(() => {
+  const seconds = replyElapsedSeconds.value
+  if (!seconds) return ''
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes}分${seconds % 60}s`
+})
+const updateReplyElapsedSeconds = () => {
+  const startedAt = currentThreadState.value?.activeRunStartedAt || replyStartedAt
+  if (!startedAt) return
+  const timestamp = typeof startedAt === 'number' ? startedAt : Date.parse(startedAt)
+  if (!Number.isFinite(timestamp)) return
+  replyElapsedSeconds.value = Math.floor((Date.now() - timestamp) / 1000)
+}
+const stopReplyElapsedTimer = ({ reset = false } = {}) => {
+  if (replyElapsedTimer) {
+    window.clearInterval(replyElapsedTimer)
+    replyElapsedTimer = null
+  }
+  if (reset) {
+    replyStartedAt = null
+    replyElapsedSeconds.value = 0
+  }
+}
+const startReplyElapsedTimer = ({ reset = false } = {}) => {
+  stopReplyElapsedTimer()
+  if (reset || !replyStartedAt) replyStartedAt = currentThreadState.value?.activeRunStartedAt || Date.now()
+  updateReplyElapsedSeconds()
+  replyElapsedTimer = window.setInterval(updateReplyElapsedSeconds, 1000)
+}
+watch(
+  [isReplyLoading, () => currentChatId.value, () => currentThreadState.value?.activeRunId],
+  ([loading]) => {
+    if (loading) startReplyElapsedTimer({ reset: true })
+    else stopReplyElapsedTimer({ reset: true })
+  },
+  { immediate: true }
+)
 const isSendButtonDisabled = computed(() => {
   return (
     sendCooldownActive.value ||
@@ -2341,6 +2639,7 @@ const maybeInsertThreadConfigNotice = () => {
 // ==================== SCROLL & RESIZE HANDLING ====================
 const scrollController = new ScrollController('.chat-main')
 const chatMainRef = ref(null)
+const messageInputDockRef = ref(null)
 let chatMainResizeObserver = null
 // 初始化延迟标志，避免首次挂载时 ResizeObserver 立即触发导致侧边栏意外关闭
 let isResizeObserverReady = false
@@ -2396,6 +2695,13 @@ const startChatMainResizeObserver = () => {
     localUIState.chatMainWidth = chatMainRef.value?.clientWidth || window.innerWidth
     localUIState.chatContentWidth =
       chatContentContainerRef.value?.clientWidth || localUIState.chatMainWidth
+    const containerRect = chatContentContainerRef.value?.getBoundingClientRect()
+    const inputDockRect = messageInputDockRef.value?.getBoundingClientRect()
+    localUIState.statePanelDockedMaxHeight = getDockedStatePanelMaxHeight(containerRect)
+    localUIState.statePanelFloatingMaxHeight = getFloatingStatePanelMaxHeight(
+      containerRect,
+      inputDockRect
+    )
   }
 
   syncLayoutWidths()
@@ -2409,6 +2715,9 @@ const startChatMainResizeObserver = () => {
   chatMainResizeObserver.observe(chatMainRef.value)
   if (chatContentContainerRef.value) {
     chatMainResizeObserver.observe(chatContentContainerRef.value)
+  }
+  if (messageInputDockRef.value) {
+    chatMainResizeObserver.observe(messageInputDockRef.value)
   }
   armResizeObserver()
 }
@@ -2446,6 +2755,7 @@ onUnmounted(() => {
   scrollController.cleanup()
   stopChatMainResizeObserver()
   stopStreamingStateRefresh()
+  stopReplyElapsedTimer({ reset: true })
   if (sendCooldownTimer) {
     clearTimeout(sendCooldownTimer)
     sendCooldownTimer = null
@@ -2804,7 +3114,8 @@ const resumeCurrentRunForVisiblePage = async () => {
 }
 
 const handlePageVisibilityChange = () => {
-  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+  pageVisible.value = typeof document === 'undefined' || document.visibilityState === 'visible'
+  if (!pageVisible.value) return
   void resumeCurrentRunForVisiblePage()
 }
 
@@ -2836,7 +3147,7 @@ const selectChat = async (chatId) => {
   }
 
   if (previousThreadId !== chatId) {
-    resetAgentPanelState()
+    resetAgentPanelState(previousThreadId)
   }
 
   try {
@@ -3217,6 +3528,13 @@ const toggleStatePanel = async () => {
 
 const closeFilePanel = () => {
   isFilePanelOpen.value = false
+  isAgentPanelMaximized.value = false
+  filePanelDragWidth.value = null
+}
+
+const toggleAgentPanelMaximized = () => {
+  if (isResizing.value) return
+  isAgentPanelMaximized.value = !isAgentPanelMaximized.value
   filePanelDragWidth.value = null
 }
 
@@ -3292,7 +3610,10 @@ const getMessageToolCalls = (message) => {
 }
 
 const getDisplayItems = (conv) =>
-  getConversationDisplayItems(conv, { enrichToolCalls: getMessageToolCalls })
+  getConversationDisplayItems(conv, {
+    enrichToolCalls: getMessageToolCalls,
+    collapseIntermediate: conv?.status !== 'streaming' && isConversationSettled(conv)
+  })
 
 const isDisplayMessageProcessing = (conv, displayItem) => {
   return (
@@ -3485,6 +3806,8 @@ watch(
 
 watch(currentChatId, (threadId, oldThreadId) => {
   if (threadId === oldThreadId) return
+  const keepInput = !oldThreadId || threads.value.some((thread) => thread.id === oldThreadId)
+  userInput.value = threadDraftSession.switchThread(threadId, keepInput ? userInput.value : '')
   if (!threadId || approvalState.threadId !== threadId) {
     hideApprovalState()
   }

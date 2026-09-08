@@ -54,8 +54,11 @@ class AgentScopeServiceClient:
         return {"X-User-ID": quote(uid)}
 
     async def _request(self, method: str, path: str, uid: str, **kwargs) -> httpx.Response:
-        async with httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout) as client:
-            resp = await client.request(method, path, headers=self._headers(uid), **kwargs)
+        try:
+            async with httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout) as client:
+                resp = await client.request(method, path, headers=self._headers(uid), **kwargs)
+        except httpx.HTTPError as exc:
+            raise AgentScopeServiceError(f"{method} {path} transport failure: {type(exc).__name__}") from exc
         if resp.status_code >= 400:
             raise AgentScopeServiceError(
                 f"{method} {path} 失败：{resp.status_code} {resp.text[:300]}",

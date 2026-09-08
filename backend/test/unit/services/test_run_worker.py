@@ -70,3 +70,14 @@ def test_worker_settings_publish_arq_health_lease():
     """ARQ health lease 的刷新周期必须匹配 readiness 的 TTL 上限。"""
     assert run_worker.WorkerSettings.health_check_interval == run_worker.WORKER_HEALTH_INTERVAL_SECONDS
     assert run_worker.WorkerSettings.health_check_key == run_worker.WORKER_HEALTH_KEY
+
+
+async def test_deleted_agent_memory_reconciliation_runs_as_independent_job(monkeypatch):
+    """Agent memory 补偿必须独立于 Run lease reconciliation。"""
+    reconcile = AsyncMock(return_value=["retired-agent"])
+    monkeypatch.setattr(run_worker, "reconcile_deleted_agent_memories", reconcile)
+
+    await run_worker.reconcile_deleted_agent_memories_job({})
+
+    reconcile.assert_awaited_once()
+    assert len(run_worker.WorkerSettings.cron_jobs) == 2

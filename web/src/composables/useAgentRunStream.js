@@ -199,6 +199,7 @@ export function useAgentRunStream({
       saveActiveRunSnapshot(threadId, runId, ts.runLastSeq)
     } else {
       ts.activeRunId = null
+      ts.activeRunStartedAt = null
       clearActiveRunSnapshot(threadId)
       touchedThreadIds.forEach((id) => clearPendingInterruptForRun(id, runId))
     }
@@ -226,6 +227,7 @@ export function useAgentRunStream({
 
     streamSmoother?.flushThread(threadId)
     ts.activeRunId = run.id
+    ts.activeRunStartedAt = run.started_at || null
     ts.activeRunSteerable = false
     ts.runLastSeq = normalizeRunSeq(snapshot?.last_seq || ts.runLastSeq || '0-0')
     ts.lastRetryableJobTry = null
@@ -266,6 +268,7 @@ export function useAgentRunStream({
     const runController = new AbortController()
     ts.runStreamAbortController = runController
     ts.activeRunId = runId
+    ts.activeRunStartedAt = options.startedAt || ts.activeRunStartedAt || Date.now()
     ts.activeRunSteerable = initialSteerable
     ts.runLastSeq = normalizeRunSeq(afterSeq)
     ts.lastRetryableJobTry = null
@@ -297,6 +300,8 @@ export function useAgentRunStream({
 
         const payload = data.payload || {}
         if (event === 'metadata') {
+          const startedAt = payload.started_at || payload.run_started_at || payload.run?.started_at
+          if (startedAt) ts.activeRunStartedAt = startedAt
           ts.activeRunSteerable = isSteerableMainChatRun({
             status: 'running',
             run_type: payload.run_type,
@@ -447,6 +452,7 @@ export function useAgentRunStream({
         } else if (run && RUN_TERMINAL_STATUSES.has(run.status)) {
           stopRunStreamSubscription(threadId)
           ts.activeRunId = null
+          ts.activeRunStartedAt = null
           ts.activeRunSteerable = false
           ts.isStreaming = false
           ts.replyLoadingVisible = false
@@ -485,6 +491,7 @@ export function useAgentRunStream({
               resetOnGoingConv(threadId)
             }
             await startRunStream(threadId, run.id, afterSeq, {
+              startedAt: run.started_at,
               steerable: await resolveRunSteerable(run)
             })
             return
@@ -506,13 +513,14 @@ export function useAgentRunStream({
         }
         resetOnGoingConv(threadId)
         await startRunStream(threadId, run.id, '0-0', {
+          startedAt: run.started_at,
           steerable: await resolveRunSteerable(run)
         })
         return
       }
       if (run && !RUN_TERMINAL_STATUSES.has(run.status)) {
         resetOnGoingConv(threadId)
-        await startRunStream(threadId, run.id, '0-0')
+        await startRunStream(threadId, run.id, '0-0', { startedAt: run.started_at })
         return
       }
     } catch (e) {
@@ -520,6 +528,7 @@ export function useAgentRunStream({
     }
 
     ts.activeRunId = null
+    ts.activeRunStartedAt = null
     ts.activeRunSteerable = false
     ts.runLastSeq = '0-0'
     ts.isStreaming = false

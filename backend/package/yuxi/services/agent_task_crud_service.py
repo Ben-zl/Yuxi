@@ -97,7 +97,9 @@ class AgentTaskCRUDService:
         """创建个人/部门任务；固定智能体名称与 slug 展示快照。"""
         from yuxi.services.agent_task_schedule_service import apply_schedule_fields
 
-        agent = self._load_agent(await AgentRepository(self.db).get_by_slug(str(payload.get("agent_slug") or "")))
+        agent = self._load_agent(
+            await AgentRepository(self.db).get_for_update_by_slug(str(payload.get("agent_slug") or ""))
+        )
         if resolve_agent_permission(user, agent) == ResourcePermission.NONE:
             raise HTTPException(status_code=403, detail="无权使用该智能体")
         share_config = _normalize_share_config(payload.get("share_config"), owner_uid=str(user.uid))
@@ -143,6 +145,12 @@ class AgentTaskCRUDService:
         """编辑任务；只影响未来触发，不改写既有 TaskExecution。"""
         from yuxi.services.agent_task_schedule_service import apply_schedule_fields
 
+        replacement_agent = None
+        if "agent_slug" in payload:
+            replacement_agent = self._load_agent(
+                await AgentRepository(self.db).get_for_update_by_slug(str(payload["agent_slug"]))
+            )
+
         task = await self.tasks.get_for_update(task_id)
         if task is None or not can_manage_task(user, task):
             raise HTTPException(status_code=404, detail="任务不存在")
@@ -165,7 +173,7 @@ class AgentTaskCRUDService:
                 raise HTTPException(status_code=422, detail="任务可见范围不能超过智能体可见范围")
             task.share_config = share_config
         if "agent_slug" in payload:
-            agent = self._load_agent(await AgentRepository(self.db).get_by_slug(str(payload["agent_slug"])))
+            agent = replacement_agent
             if resolve_agent_permission(user, agent) == ResourcePermission.NONE:
                 raise HTTPException(status_code=403, detail="无权使用该智能体")
             existing_scope = (task.share_config or {}).get("read_scope") or {}

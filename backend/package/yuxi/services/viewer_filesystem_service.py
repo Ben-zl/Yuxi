@@ -48,6 +48,7 @@ from yuxi.services.workspace_service import (
 from yuxi.services.workspace_service import (
     upload_workspace_files as upload_workspace_files_entry,
 )
+from yuxi.services.thread_workspace_service import list_visible_files, resolve_thread_workspace
 from yuxi.services.workdir_service import resolve_authorized_workdir
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.datetime_utils import utc_isoformat_from_timestamp
@@ -436,6 +437,32 @@ async def search_viewer_files(
     if not normalized_query:
         return {"entries": []}
 
+    # 已迁移线程的可见文件由 AgentScope Session Workspace 拥有；未迁移历史线程才回退到
+    # Project Workdir。这样文件树与搜索始终使用同一个文件事实源。
+    thread_context = await resolve_thread_workspace(db, uid=str(current_user.uid), thread_id=thread_id)
+    if thread_context is not None:
+        thread_listing = await list_visible_files(db, uid=str(current_user.uid), thread_id=thread_id, max_entries=600)
+        entries = []
+        for item in thread_listing.items:
+            virtual_path = str(item.get("path") or "")
+            name = str(item.get("name") or PurePosixPath(virtual_path.rstrip("/")).name)
+            if normalized_query not in name.lower() and normalized_query not in virtual_path.lower():
+                continue
+            is_dir = bool(item.get("is_dir"))
+            entries.append(
+                {
+                    "path": virtual_path + ("/" if is_dir and not virtual_path.endswith("/") else ""),
+                    "name": name,
+                    "is_dir": is_dir,
+                    "size": int(item.get("size") or 0),
+                    "modified_at": str(item.get("modified_at") or ""),
+                    "artifact_url": (
+                        None if is_dir else f"/api/chat/thread/{thread_id}/artifacts/{virtual_path.lstrip('/')}"
+                    ),
+                }
+            )
+        return {"entries": _sort_entries(entries)}
+
     access = await resolve_authorized_workdir(
         thread_id=thread_id,
         uid=str(current_user.uid),
@@ -467,7 +494,7 @@ async def search_viewer_files(
                 ),
             }
         )
-    return {"entries": entries}
+    return {"entries": _sort_entries(entries)}
 
 
 async def read_viewer_file_content(

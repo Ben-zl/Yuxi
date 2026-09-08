@@ -292,3 +292,16 @@ async def test_normal_user_can_update_agent_with_equivalent_v2_share_config():
         "department_ids": [],
         "user_uids": ["manager"],
     }
+
+
+@pytest.mark.asyncio
+async def test_unique_slug_treats_pending_memory_cleanup_as_occupied():
+    """待清理 Agent tombstone 存在时不得复用原 slug。"""
+    db = AsyncMock()
+    db.scalar = AsyncMock(side_effect=[True, False])
+    repo = AgentRepository(db)
+
+    slug = await repo._unique_slug("retired-agent", "Retired Agent")
+
+    assert slug == "retired-agent-2"
+    assert db.scalar.await_count == 2

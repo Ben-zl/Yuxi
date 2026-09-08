@@ -273,3 +273,24 @@ def test_trigger_chat_with_image_builds_data_block():
     assert _sniff_image_media_type("UklGRhheAAB") == "image/webp"
     assert _sniff_image_media_type("R0lGODlhAQAB") == "image/gif"
     assert _sniff_image_media_type("unknown") == "image/png"
+
+
+def test_split_embedded_reasoning_keeps_final_answer_and_moves_thinking():
+    from yuxi.agentscope.protocol import split_embedded_reasoning
+
+    content, reasoning = split_embedded_reasoning('<think>内部计划</think>最终答案')
+
+    assert content == '最终答案'
+    assert reasoning == '内部计划'
+
+
+def test_split_embedded_reasoning_handles_minimax_mm_close_markers():
+    from yuxi.agentscope.protocol import split_embedded_reasoning
+
+    raw = '<think>先创建团队。</think>任务已委派。 </mm:think>最终报告'
+    content, reasoning = split_embedded_reasoning(raw)
+
+    assert content == '最终报告'
+    assert reasoning == '先创建团队。\n\n任务已委派。'
+    assert '<think>' not in reasoning
+    assert '</mm:think>' not in reasoning

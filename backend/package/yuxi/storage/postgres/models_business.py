@@ -314,6 +314,7 @@ class Agent(Base):
     updated_by = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=utc_now_naive)
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
+    deletion_pending_at = Column(DateTime, nullable=True, index=True)
 
     __table_args__ = (
         Index(

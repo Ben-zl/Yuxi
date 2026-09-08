@@ -5,6 +5,9 @@ import test from 'node:test'
 import {
   FILE_TREE_SECTION,
   closeAgentPanelSection,
+  createThreadPreviewKey,
+  isAgentPanelPreviewOwnedByThread,
+  isThreadPreviewInPath,
   shouldPollAgentPanelFilesystem,
   upsertAgentPanelSection
 } from '../../src/utils/agentPanelSections.js'
@@ -28,6 +31,62 @@ test('关闭活动 Tab 后激活相邻项', () => {
     sections: [sections[0], sections[2]],
     activeKey: 'subagent:b'
   })
+})
+
+test('同一路径的不同作用域预览必须使用独立身份键', () => {
+  const threadKey = createThreadPreviewKey('thread-a', '/outputs/report.md')
+  const workspaceKey = 'workspace:user-1:/outputs/report.md'
+  assert.equal(threadKey, 'thread:thread-a:/outputs/report.md')
+  assert.notEqual(threadKey, workspaceKey)
+})
+
+test('删除线程目录只匹配该线程作用域，不关闭同路径 Workspace 或 Artifact 预览', () => {
+  const targetPath = '/outputs'
+  assert.equal(
+    isThreadPreviewInPath(
+      { previewKey: createThreadPreviewKey('thread-a', '/outputs/report.md'), path: '/outputs/report.md' },
+      'thread-a',
+      targetPath
+    ),
+    true
+  )
+  assert.equal(
+    isThreadPreviewInPath(
+      { previewKey: createThreadPreviewKey('thread-b', '/outputs/report.md'), path: '/outputs/report.md' },
+      'thread-a',
+      targetPath
+    ),
+    false
+  )
+  assert.equal(
+    isThreadPreviewInPath(
+      { previewKey: 'workspace:user-1:/outputs/report.md', path: '/outputs/report.md' },
+      'thread-a',
+      targetPath
+    ),
+    false
+  )
+  assert.equal(
+    isThreadPreviewInPath(
+      { previewKey: 'artifact:run-1:/outputs/report.md', path: '/outputs/report.md' },
+      'thread-a',
+      targetPath
+    ),
+    false
+  )
+})
+
+test('文件预览只能由创建它的线程读取，个人空间文件不绑定线程', () => {
+  const tab = { path: '/outputs/report.md', threadId: 'thread-a', workdir: true }
+  assert.equal(isAgentPanelPreviewOwnedByThread({ tab, threadId: 'thread-a' }), true)
+  assert.equal(isAgentPanelPreviewOwnedByThread({ tab, threadId: 'thread-b' }), false)
+  assert.equal(
+    isAgentPanelPreviewOwnedByThread({
+      tab: { path: '/workspace/report.md', workspace: true },
+      threadId: 'thread-b'
+    }),
+    true
+  )
 })
 
 test('normalizePreviewResponse 正确解析 JSON 预览结构而不把 raw payload 当纯文本', async () => {

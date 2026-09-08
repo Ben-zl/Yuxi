@@ -1,3 +1,16 @@
+export const createThreadPreviewKey = (threadId, path) =>
+  `thread:${String(threadId || '')}:${String(path || '')}`
+
+export const isThreadPreviewInPath = ({ previewKey, path }, threadId, targetPath) => {
+  if (!threadId || !targetPath) return false
+  const normalizedPath = String(path || '').replace(/\/+$/, '') || '/'
+  const normalizedTargetPath = String(targetPath || '').replace(/\/+$/, '') || '/'
+  return (
+    String(previewKey || '').startsWith(`thread:${threadId}:`) &&
+    (normalizedPath === normalizedTargetPath || normalizedPath.startsWith(`${normalizedTargetPath}/`))
+  )
+}
+
 export const upsertAgentPanelSection = (sections, section) => {
   const current = Array.isArray(sections) ? sections : []
   const index = current.findIndex((item) => item.key === section.key)
@@ -25,6 +38,12 @@ export const shouldPollAgentPanelFilesystem = ({
   if (!panelOpen || !pageVisible || !streaming) return false
   if (activeSection?.type === 'file-tree') return true
   return activeSection?.type === 'file' && activePreview?.workdir === true
+}
+
+export const isAgentPanelPreviewOwnedByThread = ({ tab, threadId }) => {
+  if (!tab?.path) return false
+  if (tab.workspace === true) return true
+  return Boolean(threadId) && tab.threadId === threadId
 }
 
 export const FILE_TREE_SECTION = { key: 'file-tree', type: 'file-tree', title: '文件' }

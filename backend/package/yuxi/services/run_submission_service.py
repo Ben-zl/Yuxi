@@ -184,6 +184,17 @@ async def submit_run_command(
         request_metadata["attachment_file_ids"] = [item["file_id"] for item in stored_attachments]
 
     try:
+        agent_item = await agent_repo.get_visible_for_update_by_slug(
+            slug=command.agent_slug,
+            user=current_user,
+            kind=command.agent_kind,
+        )
+        if not agent_item:
+            raise HTTPException(status_code=404, detail="智能体不存在")
+        agent_backend = agent_manager.get_agent(agent_item.backend_id)
+        if not agent_backend:
+            raise HTTPException(status_code=404, detail=f"智能体后端 {agent_item.backend_id} 不存在")
+
         intake = await intake_request(
             db=db,
             request_id=command.request_id,
