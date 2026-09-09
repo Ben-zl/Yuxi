@@ -10,6 +10,12 @@ from server.utils import knowledge_permissions
 from yuxi.permissions import ResourcePermission
 
 
+@pytest.fixture(autouse=True)
+def _pin_builtin_backend(monkeypatch):
+    """本文件验证 builtin 时代权限语义,钉住后端选择,不受容器部署模式影响。"""
+    monkeypatch.setenv("KNOWLEDGE_BACKEND", "builtin")
+
+
 @pytest.mark.asyncio
 async def test_dataset_only_manage_route_checks_the_dataset_knowledge_base(monkeypatch):
     calls = []

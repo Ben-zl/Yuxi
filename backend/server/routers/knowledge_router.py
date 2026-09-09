@@ -36,6 +36,7 @@ from yuxi.knowledge.utils.url_fetcher import fetch_url_content
 from yuxi.permissions import (
     ResourcePermission,
     resolve_knowledge_base_permission,
+    resolve_knowledge_content_write,
 )
 from yuxi.services.knowledge_folder_service import knowledge_folder_service
 from yuxi.services.ocr_service import parse_document
@@ -50,6 +51,7 @@ from server.utils.auth_middleware import get_admin_user, get_db, get_required_us
 from sqlalchemy.ext.asyncio import AsyncSession
 from server.utils.knowledge_response import serialize_knowledge_base, serialize_knowledge_base_list
 from server.utils.knowledge_permissions import (
+    require_knowledge_viewer,
     ensure_knowledge_base_permission as _ensure_database_permission,
     require_knowledge_base_manage,
     require_knowledge_base_read,
@@ -258,7 +260,7 @@ def _resolve_owning_department(current_user: User, requested_department_id: int 
 
 
 @knowledge.get("/databases")
-async def get_databases(current_user: User = Depends(get_admin_user)):
+async def get_databases(current_user: User = Depends(require_knowledge_viewer)):
     """获取所有知识库（根据用户权限过滤）"""
     try:
         return serialize_knowledge_base_list(await knowledge_base.get_databases_by_uid(current_user.uid))
@@ -427,11 +429,14 @@ async def get_database_info(
     if database is None:
         raise HTTPException(status_code=404, detail="Database not found")
     permission = resolve_knowledge_base_permission(current_user, database)
-    return serialize_knowledge_base(
+    response = serialize_knowledge_base(
         database,
         permission=permission,
         redact_secrets=permission != ResourcePermission.MANAGE,
     )
+    if database.kb_type == "weknora":
+        response["can_write_content"] = resolve_knowledge_content_write(current_user, database)
+    return response
 
 
 @knowledge.post("/databases/{kb_id}/stats/repair")
@@ -474,6 +479,7 @@ async def update_database_info(
                 share_config=data.share_config,
                 operator_uid=current_user.uid,
                 operator_department_id=current_user.department_id,
+                operator_role=current_user.role,
             )
         else:
             database = await knowledge_base.update_database(

@@ -25,7 +25,12 @@ from yuxi.knowledge.read_models import (
 )
 from yuxi.knowledge.schemas import FindOutputSchema, OpenOutputSchema
 from yuxi.knowledge.utils.security import redact_sensitive_params
-from yuxi.permissions import ResourcePermission, normalize_permission_config, resolve_knowledge_base_permission
+from yuxi.permissions import (
+    ResourcePermission,
+    normalize_permission_config,
+    resolve_knowledge_base_permission,
+    resolve_knowledge_content_write,
+)
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils import logger
 from yuxi.utils.datetime_utils import utc_isoformat
@@ -436,11 +441,15 @@ class KnowledgeBaseManager:
             additional_params = database.additional_params
             if permission == ResourcePermission.READ:
                 additional_params = redact_sensitive_params(additional_params)
+            can_write_content = (
+                resolve_knowledge_content_write(user_info, database) if database.kb_type == "weknora" else None
+            )
             filtered_databases.append(
                 replace(
                     database,
                     additional_params=additional_params,
                     effective_permission=permission,
+                    can_write_content=can_write_content,
                 )
             )
 

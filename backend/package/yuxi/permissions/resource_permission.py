@@ -216,6 +216,25 @@ def resolve_knowledge_base_permission(user: Any, resource: ShareableResource) ->
     )
 
 
+def resolve_knowledge_content_write(user: Any, resource: Any) -> bool:
+    """解析 WeKnora 托管知识库的内容维护权,与整库 can_manage 分开。
+
+    仅归属部门成员与管理员可维护内容;额外授权部门只读;超级管理员可维护全部托管内容;
+    创建者身份不绕过固定部门边界。内置知识库没有 owning_department_id,恒为 False。
+    """
+
+    if _value(user, "role") == "superadmin":
+        return True
+    owning = _value(resource, "owning_department_id")
+    if owning is None:
+        return False
+    user_department = _value(user, "department_id")
+    try:
+        return user_department is not None and int(user_department) == int(owning)
+    except (TypeError, ValueError):
+        return False
+
+
 def require_knowledge_base_permission(
     user: Any,
     resource: ShareableResource,

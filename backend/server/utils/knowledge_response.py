@@ -75,6 +75,8 @@ def serialize_knowledge_base(
     if effective_permission is not None:
         response["effective_permission"] = effective_permission.value
         response["can_manage"] = effective_permission == ResourcePermission.MANAGE
+    if database.can_write_content is not None:
+        response["can_write_content"] = database.can_write_content
 
     if isinstance(database, KnowledgeBaseDetail):
         response["mindmap"] = database.mindmap

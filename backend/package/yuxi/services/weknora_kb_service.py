@@ -229,6 +229,41 @@ async def delete_weknora_database(kb_id: str, *, client: WeKnoraClient | None = 
     return {"message": "删除成功", "kb_id": kb_id}
 
 
+def validate_weknora_share_config_change(
+    *,
+    operator_role: str | None,
+    owning_department_id: int,
+    share_config: dict | None,
+) -> None:
+    """校验 WeKnora 知识库共享配置变更边界。
+
+    跨部门授权仅超级管理员可配置;归属部门必须始终保持可读(内容维护蕴含读取);
+    整库管理范围不得超出归属部门,防止把其他部门管理员提升为本库管理者。
+    """
+
+    if share_config is None:
+        return
+    if operator_role != "superadmin":
+        raise KBOperationError("跨部门共享配置仅超级管理员可修改")
+    normalized = normalize_permission_config(share_config, strict=True)
+    read_scope = normalized.get("read_scope") or {}
+    if read_scope.get("access_level") == "user":
+        raise KBOperationError("WeKnora 知识库读取范围必须为部门或全局范围")
+    if read_scope.get("access_level") == "department":
+        department_ids = {int(value) for value in read_scope.get("department_ids", [])}
+        if int(owning_department_id) not in department_ids:
+            raise KBOperationError("读取范围必须始终包含归属部门")
+    manage_scope = normalized.get("manage_scope") or {}
+    if manage_scope.get("access_level") == "global":
+        raise KBOperationError("整库管理范围不能设为全局")
+    if manage_scope.get("access_level") == "user":
+        raise KBOperationError("整库管理范围必须为部门范围")
+    if manage_scope.get("access_level") == "department":
+        manage_ids = {int(value) for value in manage_scope.get("department_ids", [])}
+        if manage_ids - {int(owning_department_id)}:
+            raise KBOperationError("整库管理范围不得超出归属部门")
+
+
 async def update_weknora_database(
     kb_id: str,
     *,
@@ -239,13 +274,19 @@ async def update_weknora_database(
     update_llm_model_spec: bool = False,
     operator_uid: str | None = None,
     operator_department_id: int | str | None = None,
+    operator_role: str | None = None,
     client: WeKnoraClient | None = None,
 ):
     """更新托管知识库:名称/描述先同步远端,再落本地;更新幂等,失败可直接重试。"""
 
     from yuxi.knowledge.runtime import knowledge_base
 
-    _, binding, settings = await _load_confirmed_binding(kb_id, action="更新")
+    detail, binding, settings = await _load_confirmed_binding(kb_id, action="更新")
+    validate_weknora_share_config_change(
+        operator_role=operator_role,
+        owning_department_id=int(detail.owning_department_id or 0),
+        share_config=share_config,
+    )
 
     if name or description:
         remote_payload: dict[str, Any] = {}

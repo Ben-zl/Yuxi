@@ -229,6 +229,7 @@ def _confirmed_binding_detail():
     return SimpleNamespace(
         kb_id="kb_bound",
         kb_type="weknora",
+        owning_department_id=2,
         remote_binding={
             "instance": weknora_kb_service.weknora_instance_fingerprint(SETTINGS),
             "remote_kb_id": "remote-1",
@@ -389,3 +390,62 @@ def _recorder(calls):
         return SimpleNamespace(kb_id="kb_bound")
 
     return record
+
+
+def test_admin_cannot_modify_share_config() -> None:
+    """归属部门管理员不能配置跨部门共享(仅超级管理员)。"""
+    from yuxi.knowledge.base import KBOperationError
+    from yuxi.services.weknora_kb_service import validate_weknora_share_config_change
+
+    with pytest.raises(KBOperationError, match="仅超级管理员"):
+        validate_weknora_share_config_change(
+            operator_role="admin",
+            owning_department_id=2,
+            share_config={"version": 2, "read_scope": {"access_level": "global"}, "manage_scope": None},
+        )
+
+
+def test_read_scope_must_keep_owning_department() -> None:
+    from yuxi.knowledge.base import KBOperationError
+    from yuxi.services.weknora_kb_service import validate_weknora_share_config_change
+
+    with pytest.raises(KBOperationError, match="包含归属部门"):
+        validate_weknora_share_config_change(
+            operator_role="superadmin",
+            owning_department_id=2,
+            share_config={
+                "version": 2,
+                "read_scope": {"access_level": "department", "department_ids": [4], "user_uids": []},
+                "manage_scope": None,
+            },
+        )
+
+
+def test_manage_scope_cannot_exceed_owning_department() -> None:
+    from yuxi.knowledge.base import KBOperationError
+    from yuxi.services.weknora_kb_service import validate_weknora_share_config_change
+
+    with pytest.raises(KBOperationError, match="整库管理"):
+        validate_weknora_share_config_change(
+            operator_role="superadmin",
+            owning_department_id=2,
+            share_config={
+                "version": 2,
+                "read_scope": {"access_level": "department", "department_ids": [2, 3, 4], "user_uids": []},
+                "manage_scope": {"access_level": "department", "department_ids": [2, 3], "user_uids": []},
+            },
+        )
+
+
+def test_superadmin_granting_extra_read_department_is_allowed() -> None:
+    from yuxi.services.weknora_kb_service import validate_weknora_share_config_change
+
+    validate_weknora_share_config_change(
+        operator_role="superadmin",
+        owning_department_id=2,
+        share_config={
+            "version": 2,
+            "read_scope": {"access_level": "department", "department_ids": [2, 4], "user_uids": []},
+            "manage_scope": {"access_level": "department", "department_ids": [2], "user_uids": []},
+        },
+    )

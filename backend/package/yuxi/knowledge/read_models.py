@@ -53,6 +53,7 @@ class KnowledgeBaseSummary:
     pending_index_count: int = 0
     processing_count: int = 0
     effective_permission: ResourcePermission | None = None
+    can_write_content: bool | None = None
 
     @property
     def can_manage(self) -> bool:
