@@ -174,3 +174,117 @@ async def delete_weknora_file(
             raise KBOperationError(f"WeKnora 删除未确认,文档 {file_id} 保留: {error}") from error
         logger.warning(f"WeKnora knowledge already gone: file_id={file_id}, remote={remote_knowledge_id}")
     return {"file_id": file_id, "remote_knowledge_id": remote_knowledge_id}
+
+
+async def import_weknora_url(kb_id: str, *, url: str, client: WeKnoraClient | None = None) -> dict:
+    """URL 导入交由远端执行(SSRF 校验在远端),返回 weknora 引用。"""
+
+    from yuxi.services.weknora_kb_service import load_confirmed_binding
+
+    _, binding, settings = await load_confirmed_binding(kb_id, action="导入 URL")
+    remote_client = client or WeKnoraClient(settings)
+    try:
+        response = await remote_client.request(
+            "POST",
+            f"knowledge-bases/{binding['remote_kb_id']}/knowledge/url",
+            json={"url": url},
+        )
+    except WeKnoraClientError as error:
+        raise KBOperationError(f"WeKnora URL 导入失败: {error}") from error
+
+    data = _extract_data(response)
+    remote_id = str(data.get("id") or "")
+    if not remote_id:
+        raise KBOperationError("WeKnora URL 导入响应缺少文档 ID,结果不确定,请核对远端后处理")
+    title = str(data.get("title") or url)
+    return {
+        "remote_knowledge_id": remote_id,
+        "ref": build_weknora_file_ref(remote_id, title),
+        "remote_status": str(data.get("parse_status") or "pending"),
+        "filename": title,
+        "size": int(data.get("file_size") or 0),
+        "content_hash": data.get("file_hash"),
+    }
+
+
+async def create_weknora_manual(
+    kb_id: str,
+    *,
+    title: str,
+    markdown: str,
+    client: WeKnoraClient | None = None,
+) -> dict:
+    """创建手工 Markdown 文档,返回 weknora 引用供本地登记。"""
+
+    from yuxi.services.weknora_kb_service import load_confirmed_binding
+
+    _, binding, settings = await load_confirmed_binding(kb_id, action="创建手工文档")
+    remote_client = client or WeKnoraClient(settings)
+    try:
+        response = await remote_client.request(
+            "POST",
+            f"knowledge-bases/{binding['remote_kb_id']}/knowledge/manual",
+            json={"title": title, "content": markdown},
+        )
+    except WeKnoraClientError as error:
+        raise KBOperationError(f"WeKnora 手工文档创建失败: {error}") from error
+
+    data = _extract_data(response)
+    remote_id = str(data.get("id") or "")
+    if not remote_id:
+        raise KBOperationError("WeKnora 手工文档响应缺少文档 ID,结果不确定,请核对远端后处理")
+    return {
+        "remote_knowledge_id": remote_id,
+        "ref": build_weknora_file_ref(remote_id, title),
+        "remote_status": str(data.get("parse_status") or "pending"),
+        "filename": title,
+        "content_hash": data.get("file_hash"),
+    }
+
+
+async def update_weknora_document(
+    kb_id: str,
+    file_id: str,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    markdown: str | None = None,
+    client: WeKnoraClient | None = None,
+) -> dict:
+    """更新托管文档:标题/描述同步远端元信息,Markdown 正文走手工文档接口。
+
+    更新幂等,失败时本地不落任何变更。
+    """
+
+    from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
+    from yuxi.services.weknora_kb_service import load_confirmed_binding
+
+    repo = KnowledgeFileRepository()
+    record = await repo.get_by_file_id(file_id)
+    if record is None or record.kb_id != kb_id:
+        raise KBOperationError(f"文档 {file_id} 不属于知识库 {kb_id}")
+    remote_knowledge_id = getattr(record, "remote_knowledge_id", None)
+    if not remote_knowledge_id:
+        raise KBOperationError(f"文档 {file_id} 缺少远端绑定")
+
+    _, binding, settings = await load_confirmed_binding(kb_id, action="更新文档")
+    remote_client = client or WeKnoraClient(settings)
+    try:
+        if title or description:
+            payload: dict[str, Any] = {}
+            if title:
+                payload["title"] = title
+            if description:
+                payload["description"] = description
+            await remote_client.request("PUT", f"knowledge/{remote_knowledge_id}", json=payload)
+        if markdown is not None:
+            manual_payload: dict[str, Any] = {"content": markdown}
+            if title:
+                manual_payload["title"] = title
+            await remote_client.request("PUT", f"knowledge/manual/{remote_knowledge_id}", json=manual_payload)
+    except WeKnoraClientError as error:
+        raise KBOperationError(f"WeKnora 文档更新失败,本地未变更: {error}") from error
+
+    if title and title != record.filename:
+        await repo.update_fields(file_id=file_id, data={"filename": title}, kb_id=kb_id)
+    return {"file_id": file_id, "title": title or record.filename, "markdown_updated": markdown is not None}

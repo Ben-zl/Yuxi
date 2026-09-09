@@ -2110,17 +2110,154 @@ async def move_document(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def _import_weknora_url(url: str, kb_id: str | None, current_user: User) -> dict:
+    """WeKnora 模式 URL 导入:交由远端抓取(SSRF 校验在远端)。"""
+
+    from yuxi.knowledge.base import KBOperationError
+    from yuxi.services.weknora_knowledge_service import import_weknora_url
+
+    if not kb_id:
+        raise HTTPException(status_code=400, detail="WeKnora 模式 URL 导入必须指定知识库")
+    await require_knowledge_base_content_write(kb_id, current_user)
+    try:
+        imported = await import_weknora_url(kb_id, url=url)
+    except KBOperationError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "status": "success",
+        "file_path": imported["ref"],
+        "minio_url": imported["ref"],
+        "content_hash": imported["content_hash"],
+        "filename": imported["filename"],
+        "final_url": url,
+        "size": imported["size"],
+        "has_same_name": False,
+        "same_name_files": [],
+        "remote_knowledge_id": imported["remote_knowledge_id"],
+        "remote_status": imported["remote_status"],
+    }
+
+
+async def _import_weknora_workspace_files(kb_id: str, paths: list[str], current_user: User) -> dict:
+    """WeKnora 模式工作区导入:沿用工作区来源权限读取文件,直传远端。"""
+
+    from yuxi.knowledge.base import KBOperationError
+    from yuxi.services.weknora_knowledge_service import upload_weknora_file
+
+    await require_knowledge_base_content_write(kb_id, current_user)
+    results = []
+    for workspace_path in paths:
+        filename, file_bytes = await read_workspace_file_bytes(path=workspace_path, current_user=current_user)
+        content_hash = await calculate_content_hash(file_bytes)
+        try:
+            uploaded = await upload_weknora_file(kb_id, filename=filename, content=file_bytes)
+        except KBOperationError as e:
+            raise HTTPException(status_code=400, detail=f"工作区文件 {workspace_path} 导入失败: {e}") from e
+        basename, ext = os.path.splitext(filename)
+        results.append(
+            {
+                "status": "success",
+                "file_path": uploaded["ref"],
+                "minio_path": uploaded["ref"],
+                "content_hash": content_hash,
+                "filename": f"{basename}{ext}".lower(),
+                "original_filename": basename,
+                "size": uploaded["size"],
+                "workspace_path": workspace_path,
+                "remote_knowledge_id": uploaded["remote_knowledge_id"],
+                "remote_status": uploaded["remote_status"],
+            }
+        )
+    return {"status": "success", "items": results}
+
+
+class WeKnoraManualDocumentRequest(BaseModel):
+    title: str = Field(min_length=1)
+    markdown: str = ""
+    parent_id: str | None = None
+
+
+class UpdateWeKnoraDocumentRequest(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    markdown: str | None = None
+
+
+@knowledge.post("/databases/{kb_id}/documents/manual")
+async def create_manual_document(
+    kb_id: str,
+    payload: WeKnoraManualDocumentRequest,
+    current_user: User = Depends(require_document_write),
+):
+    """创建手工 Markdown 文档(WeKnora 模式)。"""
+    if not _weknora_backend_selected():
+        raise HTTPException(status_code=400, detail="手工文档仅 WeKnora 模式支持")
+    from yuxi.knowledge.base import KBOperationError
+    from yuxi.services.weknora_knowledge_service import create_weknora_manual
+
+    try:
+        created = await create_weknora_manual(kb_id, title=payload.title, markdown=payload.markdown)
+        file_meta = await knowledge_base.add_file_record(
+            kb_id,
+            created["ref"],
+            params={
+                "filename": payload.title,
+                "parent_id": payload.parent_id,
+                "remote_status": created["remote_status"],
+                "content_hashes": {created["ref"]: created["content_hash"]} if created["content_hash"] else {},
+                "file_sizes": {},
+            },
+            operator_id=current_user.uid,
+        )
+    except HTTPException:
+        raise
+    except KBOperationError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.error(f"创建手工文档失败 {e}, {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"创建手工文档失败: {e}")
+    return {"message": "创建成功", "file": file_meta}
+
+
+@knowledge.put("/databases/{kb_id}/documents/{doc_id}")
+async def update_document(
+    kb_id: str,
+    doc_id: str,
+    payload: UpdateWeKnoraDocumentRequest,
+    current_user: User = Depends(require_document_write),
+):
+    """更新托管文档标题、描述或手工 Markdown 正文(WeKnora 模式)。"""
+    if not _weknora_backend_selected():
+        raise HTTPException(status_code=400, detail="文档更新仅 WeKnora 模式支持")
+    from yuxi.knowledge.base import KBOperationError
+    from yuxi.services.weknora_knowledge_service import update_weknora_document
+
+    try:
+        result = await update_weknora_document(
+            kb_id,
+            doc_id,
+            title=payload.title,
+            description=payload.description,
+            markdown=payload.markdown,
+        )
+    except KBOperationError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"message": "更新成功", **result}
+
+
 @knowledge.post("/files/fetch-url")
 async def fetch_url(
     url: str = Body(..., embed=True),
     kb_id: str | None = Body(None, embed=True),
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(require_knowledge_viewer),
 ):
     """
     抓取 URL 内容并上传到 MinIO
     """
     logger.debug(f"Fetching URL: {url} for kb_id: {kb_id}")
     try:
+        if _weknora_backend_selected():
+            return await _import_weknora_url(url, kb_id, current_user)
         await _require_manage_permission_if_kb_id(kb_id, current_user)
         # 1. 下载内容 (包含白名单校验、大小限制、类型检查)
         content_bytes, final_url = await fetch_url_content(url)
@@ -2184,7 +2321,7 @@ async def fetch_url(
 @knowledge.post("/files/import-workspace")
 async def import_workspace_files(
     payload: WorkspaceImportRequest,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(require_knowledge_viewer),
 ):
     """将当前用户工作区文件导入 MinIO，返回与普通文件上传一致的预处理结果。"""
     kb_id = payload.kb_id.strip()
@@ -2194,6 +2331,8 @@ async def import_workspace_files(
     if not paths:
         raise HTTPException(status_code=400, detail="请选择至少一个工作区文件")
 
+    if _weknora_backend_selected():
+        return await _import_weknora_workspace_files(kb_id, paths, current_user)
     await _require_manage_permission_if_kb_id(kb_id, current_user)
     await _ensure_database_supports_documents(kb_id, "文档添加/解析/入库")
 

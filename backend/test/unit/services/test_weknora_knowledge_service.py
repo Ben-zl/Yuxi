@@ -363,3 +363,104 @@ def test_source_paths_product_payload_preserves_tree(monkeypatch) -> None:
 
     assert item_params["source_path"] == "子目录/细则.md"
     assert item_params["content_hashes"] == {ref: "h1"}
+
+
+@pytest.mark.asyncio
+async def test_import_url_returns_ref(monkeypatch, confirmed_kb) -> None:
+    _settings_env(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/knowledge-bases/remote-kb-1/knowledge/url"
+        return httpx.Response(200, json={"data": {"id": "rk-u", "title": "示例页面", "parse_status": "pending"}})
+
+    from yuxi.services.weknora_knowledge_service import import_weknora_url
+
+    result = await import_weknora_url("kb_w", url="https://example.com", client=_client(handler))
+
+    assert result["remote_knowledge_id"] == "rk-u"
+    assert result["filename"] == "示例页面"
+    assert result["ref"] == build_weknora_file_ref("rk-u", "示例页面")
+
+
+@pytest.mark.asyncio
+async def test_create_manual_returns_ref(monkeypatch, confirmed_kb) -> None:
+    _settings_env(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/knowledge-bases/remote-kb-1/knowledge/manual"
+        return httpx.Response(200, json={"data": {"id": "rk-m", "parse_status": "draft"}})
+
+    from yuxi.services.weknora_knowledge_service import create_weknora_manual
+
+    result = await create_weknora_manual("kb_w", title="值班规范", markdown="# 内容", client=_client(handler))
+
+    assert result["remote_knowledge_id"] == "rk-m"
+    assert result["remote_status"] == "draft"
+
+
+@pytest.mark.asyncio
+async def test_update_document_syncs_title_locally(monkeypatch, confirmed_kb) -> None:
+    _settings_env(monkeypatch)
+    record = SimpleNamespace(file_id="f1", kb_id="kb_w", filename="旧标题", remote_knowledge_id="rk-1")
+    local_updates = []
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(200, json={"data": {}})
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    async def fake_update_fields(self, *, file_id, data, kb_id=None):
+        local_updates.append((file_id, dict(data)))
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.update_fields",
+        fake_update_fields,
+    )
+
+    from yuxi.services.weknora_knowledge_service import update_weknora_document
+
+    result = await update_weknora_document("kb_w", "f1", title="新标题", markdown="# 新正文", client=_client(handler))
+
+    assert requests == [("PUT", "/api/v1/knowledge/rk-1"), ("PUT", "/api/v1/knowledge/manual/rk-1")]
+    assert local_updates == [("f1", {"filename": "新标题"})]
+    assert result["title"] == "新标题"
+    assert result["markdown_updated"] is True
+
+
+@pytest.mark.asyncio
+async def test_update_document_remote_failure_keeps_local(monkeypatch, confirmed_kb) -> None:
+    _settings_env(monkeypatch)
+    record = SimpleNamespace(file_id="f1", kb_id="kb_w", filename="旧标题", remote_knowledge_id="rk-1")
+    local_updates = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"error": "conflict"})
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    async def fake_update_fields(self, *, file_id, data, kb_id=None):
+        local_updates.append((file_id, dict(data)))
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.update_fields",
+        fake_update_fields,
+    )
+
+    from yuxi.services.weknora_knowledge_service import update_weknora_document
+
+    with pytest.raises(KBOperationError, match="本地未变更"):
+        await update_weknora_document("kb_w", "f1", title="新标题", client=_client(handler))
+
+    assert local_updates == []
