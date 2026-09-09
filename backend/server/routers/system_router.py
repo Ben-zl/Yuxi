@@ -9,7 +9,13 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi import get_version
 from yuxi.config.options import invalidate_option_cache, system_options, update_option_value
-from yuxi.config.runtime import knowledge_capability_enabled
+from yuxi.config.runtime import (
+    knowledge_api_enabled,
+    knowledge_backend,
+    knowledge_backend_ready,
+    knowledge_capability_enabled,
+    weknora_backend_config_missing,
+)
 from yuxi.services.readiness_service import get_readiness
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.logging_config import LOG_FILE, logger
@@ -45,13 +51,23 @@ async def readiness_check(request: Request):
 @system.get("/discovery")
 async def discovery():
     """系统能力发现接口（公开接口）"""
-    knowledge_enabled = knowledge_capability_enabled()
+    backend = knowledge_backend()
+    backend_ready = knowledge_backend_ready()
+    knowledge_enabled = knowledge_api_enabled()
+    features = {
+        "knowledge": knowledge_enabled,
+        "knowledge_backend": backend,
+        "knowledge_backend_ready": backend_ready,
+    }
+    if knowledge_capability_enabled() and not backend_ready:
+        missing = ", ".join(weknora_backend_config_missing())
+        features["knowledge_backend_config_error"] = f"WeKnora 后端配置不完整,缺少: {missing}"
     return {
         "name": "Yuxi",
         "version": get_version(),
         "api_prefix": "/api",
         "capabilities": {
-            "features": {"knowledge": knowledge_enabled},
+            "features": features,
             "cli": {
                 "min_cli_version": "0.1.0",
                 "browser_login": True,

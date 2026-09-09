@@ -3,14 +3,15 @@
 import os
 
 from yuxi.config import get_runtime_dir
-from yuxi.config.runtime import knowledge_capability_enabled
+from yuxi.config.runtime import KNOWLEDGE_BACKEND_BUILTIN, knowledge_backend, knowledge_capability_enabled
 from yuxi.knowledge.factory import KnowledgeBaseFactory
 from yuxi.knowledge.implementations.dify import DifyKB
 from yuxi.knowledge.implementations.milvus import MilvusKB
 from yuxi.knowledge.implementations.notion import NotionKB
 from yuxi.knowledge.manager import KnowledgeBaseManager
 
-if knowledge_capability_enabled():
+if knowledge_capability_enabled() and knowledge_backend() == KNOWLEDGE_BACKEND_BUILTIN:
+    # weknora 模式不初始化内置执行器,也不执行本地解析、Embedding 或向量索引。
     KnowledgeBaseFactory.register(MilvusKB)
 KnowledgeBaseFactory.register(DifyKB)
 KnowledgeBaseFactory.register(NotionKB)

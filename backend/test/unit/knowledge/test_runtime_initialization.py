@@ -39,6 +39,72 @@ def test_knowledge_runtime_preserves_lite_mode(tmp_path):
     assert loaded == {"manager": "KnowledgeBaseManager", "types": ["dify", "notion"]}
 
 
+def _run_factory_types_subprocess(tmp_path, env_updates: dict[str, str | None]) -> str:
+    """以独立进程读取执行器注册表,避免污染当前进程的 factory 单例。
+
+    必须导入 yuxi.knowledge.runtime:执行器注册与后端值校验都发生在该模块装配期。
+    """
+
+    env = os.environ.copy()
+    env.pop("LITE_MODE", None)
+    for key, value in env_updates.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; import yuxi.knowledge.runtime; "
+                "from yuxi.knowledge.factory import KnowledgeBaseFactory; "
+                "print(json.dumps(sorted(KnowledgeBaseFactory.get_available_types())))"
+            ),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.splitlines()[-1]
+
+
+def test_weknora_backend_does_not_register_builtin_executor(tmp_path):
+    """weknora 模式不得注册内置执行器,即使部署配置完整。"""
+
+    loaded = json.loads(
+        _run_factory_types_subprocess(
+            tmp_path,
+            {
+                "KNOWLEDGE_BACKEND": "weknora",
+                "WEKNORA_BASE_URL": "http://weknora-app:8080/api/v1",
+                "WEKNORA_API_KEY": "sk-local",
+            },
+        )
+    )
+
+    assert loaded == ["dify", "notion"]
+
+
+def test_builtin_backend_registers_builtin_executor(tmp_path):
+    """builtin 模式执行器注册保持现状,milvus 可用。"""
+
+    loaded = json.loads(_run_factory_types_subprocess(tmp_path, {"KNOWLEDGE_BACKEND": "builtin"}))
+
+    assert loaded == ["dify", "milvus", "notion"]
+
+
+def test_invalid_backend_fails_fast_at_assembly(tmp_path):
+    """非法后端值必须在装配期抛错,不能静默落回 builtin。"""
+
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_factory_types_subprocess(tmp_path, {"KNOWLEDGE_BACKEND": "dify"})
+
+    assert "KNOWLEDGE_BACKEND" in exc_info.value.stderr
+
+
 @pytest.mark.asyncio
 async def test_initialize_creates_executors_without_loading_all_configs(monkeypatch):
     """initialize() 只创建已使用类型的执行器，不加载全部 KB 配置。"""

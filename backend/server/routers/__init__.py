@@ -1,7 +1,5 @@
-import os
-
 from fastapi import APIRouter
-from yuxi.config.runtime import knowledge_capability_enabled
+from yuxi.config.runtime import knowledge_api_enabled
 
 from server.routers.agent_invocation_call_router import agent_invocation_call_router
 from server.routers.agent_invocation_channel_router import agent_invocation_channel_router
@@ -25,7 +23,7 @@ from server.routers.user_router import user_router
 from server.routers.agent_task_router import agent_task_router, executions_router
 from server.routers.workspace_router import workspace, workspace_knowledge
 
-_KNOWLEDGE_ENABLED = knowledge_capability_enabled()
+_KNOWLEDGE_ENABLED = knowledge_api_enabled()
 
 router = APIRouter()
 
