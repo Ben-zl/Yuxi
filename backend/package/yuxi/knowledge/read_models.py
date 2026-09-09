@@ -18,6 +18,7 @@ class KnowledgeBaseConfig:
     embedding_model_spec: str | None = None
     query_params: dict[str, Any] = field(default_factory=dict)
     additional_params: dict[str, Any] = field(default_factory=dict)
+    remote_binding: dict[str, Any] | None = None
 
     @property
     def query_options(self) -> dict[str, Any]:

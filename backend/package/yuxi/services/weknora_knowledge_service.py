@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os
+
 from typing import Any
 
 from yuxi.knowledge.base import KBOperationError
@@ -288,3 +290,85 @@ async def update_weknora_document(
     if title and title != record.filename:
         await repo.update_fields(file_id=file_id, data={"filename": title}, kb_id=kb_id)
     return {"file_id": file_id, "title": title or record.filename, "markdown_updated": markdown is not None}
+
+
+async def download_weknora_document_stream(kb_id: str, file_id: str, *, variant: str = "original"):
+    """代理远端文档字节流:统一 Key 不出 WeKnora 同源边界。
+
+    返回 (字节异步迭代器, 文件名, media_type)。远端 3xx 时仅允许同源
+    (或部署显式配置的下载域) Location,且第二跳不携带 API Key。
+    """
+
+    import mimetypes
+    from urllib.parse import urljoin, urlparse
+
+    from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
+    from yuxi.services.weknora_kb_service import load_confirmed_binding
+
+    if variant not in {"original", "parsed"}:
+        raise KBOperationError("不支持的下载变体")
+
+    repo = KnowledgeFileRepository()
+    record = await repo.get_by_file_id(file_id)
+    if record is None or record.kb_id != kb_id:
+        raise KBOperationError(f"文档 {file_id} 不属于知识库 {kb_id}")
+    remote_knowledge_id = getattr(record, "remote_knowledge_id", None)
+    if not remote_knowledge_id:
+        raise KBOperationError(f"文档 {file_id} 缺少远端绑定")
+
+    filename = record.filename or file_id
+    if variant == "parsed":
+        content = await _load_remote_parsed_content(kb_id, file_id)
+
+        async def _parsed_bytes():
+            yield content.encode("utf-8")
+
+        return _parsed_bytes(), f"{filename}.parsed.md", "text/markdown; charset=utf-8"
+
+    _, binding, settings = await load_confirmed_binding(kb_id, action="下载文档")
+    client = WeKnoraClient(settings, timeout=120.0)
+    base_host = urlparse(settings.base_url).hostname or ""
+    allowed_hosts = {base_host}
+    for extra in filter(None, (os.environ.get("WEKNORA_DOWNLOAD_HOSTS") or "").split(",")):
+        allowed_hosts.add(extra.strip())
+
+    download_path = f"knowledge/{remote_knowledge_id}/download"
+    first = await client.request("GET", download_path, raw_redirects=True)
+    if 300 <= first.status_code < 400:
+        location = first.headers.get("location") or ""
+        target = urljoin(settings.base_url, location)
+        target_host = urlparse(target).hostname or ""
+        if target_host not in allowed_hosts:
+            raise KBOperationError(f"远端下载重定向目标不在允许域(拒绝越界): {target_host}")
+        # 第二跳为对象存储签名地址,不携带统一 API Key
+        second = await client.request("GET", target, authenticated=False)
+        content_bytes = second.content
+    else:
+        content_bytes = first.content
+
+    media_type = record.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    async def _bytes():
+        yield content_bytes
+
+    return _bytes(), filename, media_type
+
+
+async def _load_remote_parsed_content(kb_id: str, file_id: str) -> str:
+    """读取远端解析文本(服务层视图,供下载 parsed 变体复用)。"""
+
+    from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
+
+    record = await KnowledgeFileRepository().get_by_file_id(file_id)
+    if record is None or record.kb_id != kb_id:
+        raise KBOperationError(f"文档 {file_id} 不属于知识库 {kb_id}")
+    remote_knowledge_id = getattr(record, "remote_knowledge_id", None)
+    if not remote_knowledge_id:
+        raise KBOperationError(f"文档 {file_id} 缺少远端绑定")
+    client = _client_for_kb()
+    try:
+        response = await client.request("GET", f"knowledge/{remote_knowledge_id}")
+    except WeKnoraClientError as error:
+        raise KBOperationError(f"远端文档读取失败: {error}") from error
+    data = response.json().get("data") or {}
+    return str(data.get("description") or "")

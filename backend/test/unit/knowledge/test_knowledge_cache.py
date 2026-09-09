@@ -68,6 +68,7 @@ async def test_cache_round_trip(monkeypatch):
         "embedding_model_spec",
         "query_params",
         "additional_params",
+        "remote_binding",
     }
     assert snapshot["query_params"] == {"options": {"top_k": 5}}
     assert "stats" not in snapshot["additional_params"]

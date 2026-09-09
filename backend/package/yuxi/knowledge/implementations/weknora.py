@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from yuxi.knowledge.base import KBOperationError, KnowledgeBase
+from yuxi.utils import logger
 from yuxi.knowledge.read_models import KnowledgeBaseConfig
 
 
@@ -58,6 +59,27 @@ class WeKnoraKB(KnowledgeBase):
         del kb_id
         return {"message": "WeKnora 资源清理由删除用例协调"}
 
+    def _remote_client(self):
+        from yuxi.knowledge.weknora import WeKnoraClient, load_weknora_settings
+
+        settings = load_weknora_settings()
+        if not settings.ready:
+            raise KBOperationError("WeKnora 部署配置不完整,无法执行检索")
+        return WeKnoraClient(settings)
+
+    def _require_remote_kb_id(self, config: KnowledgeBaseConfig) -> str:
+        """校验实例指纹一致后返回远端库 ID;换址后旧绑定立即失效。"""
+
+        from yuxi.knowledge.weknora import weknora_instance_fingerprint
+
+        binding = config.remote_binding or {}
+        remote_kb_id = str(binding.get("remote_kb_id") or "")
+        if binding.get("status") != "confirmed" or not remote_kb_id:
+            raise KBOperationError("知识库远端绑定未确认,暂不可检索")
+        if binding.get("instance") != weknora_instance_fingerprint():
+            raise KBOperationError("当前 WeKnora 服务地址与绑定时不同,该知识库暂不可访问")
+        return remote_kb_id
+
     async def aquery(
         self,
         query_text: str,
@@ -67,8 +89,97 @@ class WeKnoraKB(KnowledgeBase):
         agent_call: bool = False,
         **kwargs,
     ) -> list[dict]:
-        del query_text, kb_id, config, agent_call, kwargs
-        raise _weknora_operation_error("检索")
+        """远端混合检索;命中只映射到本项目绑定文档,未绑定对象不进入结果。"""
+        del agent_call
+        from yuxi.knowledge.weknora import WeKnoraClientError
+        from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
+
+        remote_kb_id = self._require_remote_kb_id(config)
+        merged = {**config.query_options, **kwargs}
+        if merged.get("file_name"):
+            raise KBOperationError("WeKnora 检索暂不支持按文件名过滤,请直接检索后按来源筛选")
+        try:
+            top_k = max(int(merged.get("final_top_k", 10) or 10), 1)
+        except (TypeError, ValueError):
+            top_k = 10
+
+        try:
+            response = await self._remote_client().request(
+                "POST",
+                f"knowledge-bases/{remote_kb_id}/hybrid-search",
+                json={"query_text": query_text, "match_count": top_k},
+            )
+        except WeKnoraClientError as error:
+            raise KBOperationError(f"WeKnora 检索失败: {error}") from error
+
+        items = response.json().get("data") or []
+        if not isinstance(items, list):
+            items = []
+        repo = KnowledgeFileRepository()
+        results: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            remote_knowledge_id = str(item.get("knowledge_id") or item.get("id") or "")
+            record = await repo.get_by_remote_knowledge_id(kb_id, remote_knowledge_id) if remote_knowledge_id else None
+            if record is None:
+                continue
+            results.append(
+                {
+                    "content": str(item.get("content") or ""),
+                    "score": float(item.get("score") or 0.0),
+                    "metadata": {
+                        "source": record.filename,
+                        "file_id": record.file_id,
+                        "chunk_id": item.get("id"),
+                        "remote_knowledge_id": remote_knowledge_id,
+                    },
+                }
+            )
+        return results
+
+    async def _remote_parsed_content(self, kb_id: str, file_id: str) -> str:
+        """读取远端解析文本(远端详情的 description);明确为解析内容而非原件。"""
+
+        from yuxi.knowledge.weknora import WeKnoraClientError
+
+        file_meta = await self._load_file_meta(kb_id, file_id)
+        if file_meta.get("is_folder"):
+            raise Exception(f"文件 {file_id} 是文件夹")
+        remote_knowledge_id = file_meta.get("remote_knowledge_id")
+        if not remote_knowledge_id:
+            raise Exception(f"文件 {file_id} 缺少远端绑定")
+        try:
+            response = await self._remote_client().request("GET", f"knowledge/{remote_knowledge_id}")
+        except WeKnoraClientError as error:
+            raise Exception(f"远端文档读取失败: {error}") from error
+        data = response.json().get("data") or {}
+        return str(data.get("description") or "")
+
+    async def open_file_content(self, kb_id: str, file_id: str, offset: int = 0, limit: int = 800) -> dict:
+        content = await self._remote_parsed_content(kb_id, file_id)
+        return self._build_open_file_window(content, offset=offset, limit=limit)
+
+    async def find_file_content(
+        self,
+        kb_id: str,
+        file_id: str,
+        patterns: list[str],
+        *,
+        use_regex: bool = False,
+        case_sensitive: bool = False,
+        max_windows: int = 5,
+        window_size: int = 80,
+    ) -> dict:
+        content = await self._remote_parsed_content(kb_id, file_id)
+        return self._build_find_file_windows(
+            content,
+            patterns=patterns,
+            use_regex=use_regex,
+            case_sensitive=case_sensitive,
+            max_windows=max_windows,
+            window_size=window_size,
+        )
 
     # 文件与目录用例在文档管理工单接入;在此之前显式拒绝,不落入内置本地解析链路。
     async def add_file_record(
@@ -176,12 +287,52 @@ class WeKnoraKB(KnowledgeBase):
         return {"meta": await self._load_file_meta(kb_id, file_id)}
 
     async def get_file_content(self, kb_id: str, file_id: str) -> dict:
-        del kb_id, file_id
-        raise _weknora_operation_error("文件内容读取")
+        """分块视图来自远端;content 为远端解析文本,明确标注非完整原文。"""
+
+        from yuxi.knowledge.weknora import WeKnoraClientError
+
+        file_meta = await self._load_file_meta(kb_id, file_id)
+        content = await self._remote_parsed_content(kb_id, file_id)
+        remote_knowledge_id = file_meta.get("remote_knowledge_id")
+        chunks: list[dict] = []
+        try:
+            response = await self._remote_client().request("GET", f"chunks/{remote_knowledge_id}")
+            raw = response.json().get("data") or []
+            if isinstance(raw, dict):
+                raw = raw.get("items") or []
+            chunks = [
+                {"chunk_index": index, "content": str(item.get("content") or "")}
+                for index, item in enumerate(raw)
+                if isinstance(item, dict)
+            ]
+        except WeKnoraClientError as error:
+            # 分块视图缺失不阻塞详情,但不得静默伪装为全文
+            logger.warning(f"WeKnora chunks unavailable: file_id={file_id}: {error}")
+        return {
+            "meta": file_meta,
+            "content": content,
+            "content_source": "weknora-parsed",
+            "chunks": chunks,
+        }
+
+    async def get_file_download(self, kb_id: str, file_id: str, variant: str = "original") -> dict:
+        """Agent/CLI 下载:远端原件或解析文本,统一 Key 不出服务端。"""
+
+        from yuxi.services.weknora_knowledge_service import download_weknora_document_stream
+
+        file_meta = await self._load_file_meta(kb_id, file_id)
+        if file_meta.get("is_folder"):
+            raise ValueError("Cannot download a folder")
+        stream, filename, media_type = await download_weknora_document_stream(kb_id, file_id, variant=variant)
+        chunks = []
+        async for chunk in stream:
+            chunks.append(chunk)
+        return {"filename": filename, "content": b"".join(chunks), "media_type": media_type}
 
     async def get_file_info(self, kb_id: str, file_id: str) -> dict:
-        del kb_id, file_id
-        raise _weknora_operation_error("文件信息读取")
+        base_info = await self.get_file_basic_info(kb_id, file_id)
+        content_info = await self.get_file_content(kb_id, file_id)
+        return {**base_info, **content_info}
 
     def get_query_params_config(self, kb_id: str, **kwargs) -> dict:
         """检索参数配置;远端检索参数在检索工单接入后细化。"""

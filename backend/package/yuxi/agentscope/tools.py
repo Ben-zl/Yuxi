@@ -54,6 +54,11 @@ async def _ensure_kb_manager_ready() -> bool:
     global _kb_initialized
     if is_lite_mode():
         return False
+    from yuxi.config.runtime import knowledge_api_enabled
+
+    # weknora 模式部署配置不完整时,工具链路同样 fail-closed
+    if not knowledge_api_enabled():
+        return False
     if not _kb_initialized:
         from yuxi.knowledge.runtime import knowledge_base
 
@@ -156,15 +161,18 @@ async def build_kb_tools(*, uid: str, knowledge_slugs: list[str] | None) -> list
 
     from agentscope.tool import FunctionTool
 
-    # 全部为只读检索类工具，无需人工审批（与旧栈 KB 工具语义一致）
+    from yuxi.config.runtime import KNOWLEDGE_BACKEND_WEKNORA, knowledge_backend
+
     definitions = [
         (list_kbs, "list_kbs", "列出当前用户可见的知识库"),
         (query_kb, "query_kb", "在知识库中检索相关内容片段"),
         (open_kb_document, "open_kb_document", "分页读取知识库文档内容"),
         (find_kb_document, "find_kb_document", "在文档中查找匹配文本"),
         (search_file, "search_file", "按文件名搜索知识库文件"),
-        (get_mindmap, "get_mindmap", "读取知识库思维导图"),
     ]
+    # 思维导图为内置能力;WeKnora 模式不提供
+    if knowledge_backend() != KNOWLEDGE_BACKEND_WEKNORA:
+        definitions.append((get_mindmap, "get_mindmap", "读取知识库思维导图"))
     return [
         FunctionTool(func, name=name, description=description, is_read_only=True)
         for func, name, description in definitions

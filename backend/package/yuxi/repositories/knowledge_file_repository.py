@@ -205,6 +205,22 @@ class KnowledgeFileRepository:
             result = await session.execute(select(KnowledgeFile))
             return list(result.scalars().all())
 
+    async def get_by_remote_knowledge_id(self, kb_id: str, remote_knowledge_id: str) -> KnowledgeFile | None:
+        """按远端文档 ID 查找本库绑定行;检索命中映射与引用绑定使用。"""
+        if not remote_knowledge_id:
+            return None
+        async with pg_manager.get_async_session_context() as session:
+            result = await session.execute(
+                select(KnowledgeFile)
+                .where(
+                    KnowledgeFile.kb_id == kb_id,
+                    KnowledgeFile.remote_knowledge_id == remote_knowledge_id,
+                )
+                .limit(1)
+            )
+            # 展示语义取任一绑定行;重复登记不影响检索可用性
+            return result.scalars().first()
+
     async def get_by_file_id(self, file_id: str) -> KnowledgeFile | None:
         async with pg_manager.get_async_session_context() as session:
             result = await session.execute(select(KnowledgeFile).where(KnowledgeFile.file_id == file_id))

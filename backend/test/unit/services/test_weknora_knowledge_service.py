@@ -13,6 +13,7 @@ from yuxi.knowledge.weknora import (
     WEKNORA_TERMINAL_STATUSES,
     build_weknora_file_ref,
     parse_weknora_file_ref,
+    weknora_instance_fingerprint,
     weknora_status_label,
 )
 from yuxi.services.weknora_knowledge_service import (
@@ -464,3 +465,83 @@ async def test_update_document_remote_failure_keeps_local(monkeypatch, confirmed
         await update_weknora_document("kb_w", "f1", title="新标题", client=_client(handler))
 
     assert local_updates == []
+
+
+def _config(remote_binding):
+    from yuxi.knowledge.read_models import KnowledgeBaseConfig
+
+    return KnowledgeBaseConfig(
+        kb_id="kb_w", kb_type="weknora", query_params={}, additional_params={}, remote_binding=remote_binding
+    )
+
+
+@pytest.mark.asyncio
+async def test_aquery_maps_hits_to_bound_documents_only(monkeypatch) -> None:
+    """检索命中只映射到本项目绑定文档;未绑定远端对象被过滤。"""
+
+    from yuxi.knowledge.implementations.weknora import WeKnoraKB
+
+    monkeypatch.setenv("WEKNORA_BASE_URL", "http://weknora-app:8080/api/v1")
+    monkeypatch.setenv("WEKNORA_API_KEY", "sk-test")
+    kb = WeKnoraKB("/tmp/yuxi-weknora-test")
+    binding = {
+        "instance": weknora_instance_fingerprint(),
+        "remote_kb_id": "rkb-1",
+        "status": "confirmed",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/knowledge-bases/rkb-1/hybrid-search"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "c1", "knowledge_id": "rk-1", "content": "片段一", "score": 0.9},
+                    {"id": "c2", "knowledge_id": "rk-unbound", "content": "未绑定对象", "score": 0.8},
+                ]
+            },
+        )
+
+    async def fake_get_by_remote(self, kb_id, remote_knowledge_id):
+        if remote_knowledge_id == "rk-1":
+            return SimpleNamespace(file_id="f1", filename="绑定文档.md")
+        return None
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_remote_knowledge_id",
+        fake_get_by_remote,
+    )
+    monkeypatch.setattr(kb, "_remote_client", lambda: _client(handler))
+
+    results = await kb.aquery("查询", "kb_w", config=_config(binding))
+
+    assert len(results) == 1
+    assert results[0]["content"] == "片段一"
+    assert results[0]["metadata"]["file_id"] == "f1"
+    assert results[0]["metadata"]["source"] == "绑定文档.md"
+    assert results[0]["metadata"]["remote_knowledge_id"] == "rk-1"
+
+
+@pytest.mark.asyncio
+async def test_aquery_rejects_stale_instance_binding(monkeypatch) -> None:
+    from yuxi.knowledge.implementations.weknora import WeKnoraKB
+
+    monkeypatch.setenv("WEKNORA_BASE_URL", "http://weknora-app:8080/api/v1")
+    monkeypatch.setenv("WEKNORA_API_KEY", "sk-test")
+    kb = WeKnoraKB("/tmp/yuxi-weknora-test")
+    binding = {"instance": "0000000000000000", "remote_kb_id": "rkb-1", "status": "confirmed"}
+
+    with pytest.raises(KBOperationError, match="服务地址与绑定时不同"):
+        await kb.aquery("查询", "kb_w", config=_config(binding))
+
+
+@pytest.mark.asyncio
+async def test_aquery_rejects_unconfirmed_binding(monkeypatch) -> None:
+    from yuxi.knowledge.implementations.weknora import WeKnoraKB
+
+    monkeypatch.setenv("WEKNORA_BASE_URL", "http://weknora-app:8080/api/v1")
+    monkeypatch.setenv("WEKNORA_API_KEY", "sk-test")
+    kb = WeKnoraKB("/tmp/yuxi-weknora-test")
+
+    with pytest.raises(KBOperationError, match="绑定未确认"):
+        await kb.aquery("查询", "kb_w", config=_config({"status": "pending_review", "remote_kb_id": None}))

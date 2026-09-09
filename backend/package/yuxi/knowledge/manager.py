@@ -183,6 +183,7 @@ class KnowledgeBaseManager:
             embedding_model_spec=snapshot.get("embedding_model_spec"),
             query_params=snapshot.get("query_params") or executor.get_default_query_params(kb_id),
             additional_params=additional_params,
+            remote_binding=snapshot.get("remote_binding"),
         )
 
     async def get_kb_executor(self, kb_id: str) -> KnowledgeBase:

@@ -7,7 +7,7 @@ import traceback
 from urllib.parse import quote, unquote
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from yuxi.config.options import system_options
@@ -1751,6 +1751,37 @@ async def delete_document(kb_id: str, doc_id: str, current_user: User = Depends(
         raise HTTPException(status_code=400, detail=f"删除文档失败: {e}")
 
 
+async def _download_weknora_document(kb_id: str, doc_id: str, file_meta: dict):
+    """WeKnora 模式下载:经 Yuxi 鉴权后由服务端代理远端原件字节,不暴露 API Key。"""
+
+    from yuxi.knowledge.weknora import WeKnoraClient, WeKnoraClientError, load_weknora_settings
+
+    remote_knowledge_id = file_meta.get("remote_knowledge_id")
+    if not remote_knowledge_id:
+        raise HTTPException(status_code=400, detail="文档缺少远端绑定,无法下载")
+    settings = load_weknora_settings()
+    if not settings.ready:
+        raise HTTPException(status_code=503, detail="WeKnora 部署配置不完整")
+    client = WeKnoraClient(settings, timeout=120.0)
+    try:
+        response = await client.request("GET", f"knowledge/{remote_knowledge_id}/download", follow_redirects=True)
+    except WeKnoraClientError as e:
+        raise HTTPException(status_code=502, detail=f"远端下载失败: {e}") from e
+
+    filename = file_meta.get("filename") or "download"
+    try:
+        decoded_filename = unquote(filename, encoding="utf-8")
+    except Exception:
+        decoded_filename = filename
+    _, ext = os.path.splitext(decoded_filename)
+    disposition = "attachment; filename*=UTF-8''" + quote(decoded_filename)
+    return Response(
+        content=response.content,
+        media_type=media_types.get(ext.lower(), "application/octet-stream"),
+        headers={"Content-Disposition": disposition},
+    )
+
+
 @knowledge.get("/databases/{kb_id}/documents/{doc_id}/download")
 async def download_document(kb_id: str, doc_id: str, current_user: User = Depends(require_knowledge_base_read)):
     """下载原始文件"""
@@ -1759,6 +1790,9 @@ async def download_document(kb_id: str, doc_id: str, current_user: User = Depend
     try:
         file_info = await knowledge_base.get_file_basic_info(kb_id, doc_id)
         file_meta = file_info.get("meta", {})
+
+        if _weknora_backend_selected():
+            return await _download_weknora_document(kb_id, doc_id, file_meta)
 
         # 获取文件类型、路径和文件名
         file_type = file_meta.get("file_type", "file")

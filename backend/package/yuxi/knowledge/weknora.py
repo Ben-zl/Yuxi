@@ -110,6 +110,9 @@ class WeKnoraClient:
         data: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
+        follow_redirects: bool = False,
+        raw_redirects: bool = False,
+        authenticated: bool = True,
     ) -> httpx.Response:
         """执行一次远端请求;传输失败与非 2xx 统一转为 WeKnoraClientError。
 
@@ -129,7 +132,8 @@ class WeKnoraClient:
                     content=content,
                     files=files,
                     data=data,
-                    headers=self._headers(headers),
+                    headers=self._headers(headers) if authenticated else (headers or {}),
+                    follow_redirects=follow_redirects,
                 )
         except httpx.HTTPError as error:
             raise WeKnoraClientError(f"WeKnora 请求失败: {method} {path}: {type(error).__name__}") from error
