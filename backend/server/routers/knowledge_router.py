@@ -232,14 +232,13 @@ async def _register_weknora_documents(kb_id: str, items: list[str], params: dict
 
     if not items:
         raise HTTPException(status_code=400, detail="文档列表不能为空")
-    normalized_params = dict(params or {})
     results: list[dict] = []
     for item in items:
         try:
             file_meta = await knowledge_base.add_file_record(
                 kb_id,
                 item,
-                params=normalized_params,
+                params=_params_for_uploaded_document_item(item, params),
                 operator_id=operator_uid,
             )
             results.append(file_meta)
@@ -1670,7 +1669,7 @@ async def get_document_content(kb_id: str, doc_id: str, current_user: User = Dep
 
 @knowledge.delete("/databases/{kb_id}/documents/batch")
 async def batch_delete_documents(
-    kb_id: str, file_ids: list[str] = Body(...), current_user: User = Depends(require_knowledge_base_manage)
+    kb_id: str, file_ids: list[str] = Body(...), current_user: User = Depends(require_document_write)
 ):
     """批量删除文档或文件夹"""
     logger.debug(f"BATCH DELETE documents {file_ids} in {kb_id}")
@@ -1723,7 +1722,7 @@ async def batch_delete_documents(
 
 
 @knowledge.delete("/databases/{kb_id}/documents/{doc_id}")
-async def delete_document(kb_id: str, doc_id: str, current_user: User = Depends(require_knowledge_base_manage)):
+async def delete_document(kb_id: str, doc_id: str, current_user: User = Depends(require_document_write)):
     """删除文档或文件夹"""
     logger.debug(f"DELETE document {doc_id} info in {kb_id}")
     await _ensure_database_supports_documents(kb_id, "文档删除")
@@ -1992,7 +1991,7 @@ async def create_folder(
     kb_id: str,
     folder_name: str = Body(..., embed=True),
     parent_id: str | None = Body(None, embed=True),
-    current_user: User = Depends(require_knowledge_base_manage),
+    current_user: User = Depends(require_document_write),
 ):
     """创建文件夹"""
     try:
@@ -2075,7 +2074,7 @@ async def rename_folder(
     kb_id: str,
     folder_id: str,
     folder_name: str = Body(..., embed=True),
-    current_user: User = Depends(require_knowledge_base_manage),
+    current_user: User = Depends(require_document_write),
 ):
     """重命名真实文件夹。"""
     try:
@@ -2095,7 +2094,7 @@ async def move_document(
     kb_id: str,
     doc_id: str,
     request: MoveDocumentRequest,
-    current_user: User = Depends(require_knowledge_base_manage),
+    current_user: User = Depends(require_document_write),
 ):
     """移动文件或文件夹"""
     logger.debug(f"Move document {doc_id} to {request.new_parent_id} in {kb_id}")

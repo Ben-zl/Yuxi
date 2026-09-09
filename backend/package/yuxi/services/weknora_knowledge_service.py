@@ -142,3 +142,35 @@ async def reparse_weknora_file(kb_id: str, file_id: str, *, client: WeKnoraClien
         file_id=file_id, data={"status": remote_status, "error_message": None}, kb_id=kb_id
     )
     return {"file_id": file_id, "status": remote_status}
+
+
+async def delete_weknora_file(
+    kb_id: str,
+    file_id: str,
+    *,
+    record=None,
+    client: WeKnoraClient | None = None,
+) -> dict:
+    """删除托管文档:远端确认删除(404 视为已删);失败保留本地行并显式报错。"""
+
+    from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
+    from yuxi.services.weknora_kb_service import load_confirmed_binding
+
+    repo = KnowledgeFileRepository()
+    if record is None:
+        record = await repo.get_by_file_id(file_id)
+    if record is None or record.kb_id != kb_id:
+        raise KBOperationError(f"文档 {file_id} 不属于知识库 {kb_id}")
+    remote_knowledge_id = getattr(record, "remote_knowledge_id", None)
+    if not remote_knowledge_id:
+        raise KBOperationError(f"文档 {file_id} 缺少远端绑定")
+
+    _, binding, settings = await load_confirmed_binding(kb_id, action="删除文档")
+    remote_client = client or WeKnoraClient(settings)
+    try:
+        await remote_client.request("DELETE", f"knowledge/{remote_knowledge_id}")
+    except WeKnoraClientError as error:
+        if error.status_code != 404:
+            raise KBOperationError(f"WeKnora 删除未确认,文档 {file_id} 保留: {error}") from error
+        logger.warning(f"WeKnora knowledge already gone: file_id={file_id}, remote={remote_knowledge_id}")
+    return {"file_id": file_id, "remote_knowledge_id": remote_knowledge_id}

@@ -92,11 +92,14 @@ class WeKnoraKB(KnowledgeBase):
         from yuxi.utils import hashstr
         from yuxi.utils.datetime_utils import utc_isoformat
 
+        from yuxi.knowledge.utils.kb_utils import _normalize_source_path
+
         remote_knowledge_id, ref_filename = parse_weknora_file_ref(item)
         params = dict(params or {})
         content_hashes = params.get("content_hashes") if isinstance(params.get("content_hashes"), dict) else {}
         file_sizes = params.get("file_sizes") if isinstance(params.get("file_sizes"), dict) else {}
-        filename = str(params.get("filename") or ref_filename)
+        # source_path 仅作展示层级,与 builtin 相同的归一化边界(拒绝绝对路径与 .. 等)
+        filename = str(_normalize_source_path(params.get("source_path")) or params.get("filename") or ref_filename)
         file_type = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
         metadata = {
@@ -142,8 +145,19 @@ class WeKnoraKB(KnowledgeBase):
         raise _weknora_operation_error("向量索引")
 
     async def delete_file(self, kb_id: str, file_id: str) -> None:
-        del kb_id, file_id
-        raise _weknora_operation_error("文档删除")
+        """删除托管文档:远端确认(404 视为已删)后删除本地行;文件夹仅本地删除。"""
+
+        from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
+        from yuxi.services.weknora_knowledge_service import delete_weknora_file
+
+        repo = KnowledgeFileRepository()
+        record = await repo.get_by_file_id(file_id)
+        if record is not None and record.kb_id != kb_id:
+            # 跨库 file_id 拒绝删除,防止绕过前置校验的调用方误删其他知识库的行
+            raise KBOperationError(f"文档 {file_id} 不属于知识库 {kb_id}")
+        if record is not None and not record.is_folder:
+            await delete_weknora_file(kb_id, file_id, record=record)
+        await repo.delete(file_id)
 
     async def update_content(
         self,
@@ -158,8 +172,8 @@ class WeKnoraKB(KnowledgeBase):
         raise _weknora_operation_error("文档内容更新")
 
     async def get_file_basic_info(self, kb_id: str, file_id: str) -> dict:
-        del kb_id, file_id
-        raise _weknora_operation_error("文件信息读取")
+        """返回本地文件元数据;内容与分块视图由文档详情工单接入。"""
+        return {"meta": await self._load_file_meta(kb_id, file_id)}
 
     async def get_file_content(self, kb_id: str, file_id: str) -> dict:
         del kb_id, file_id

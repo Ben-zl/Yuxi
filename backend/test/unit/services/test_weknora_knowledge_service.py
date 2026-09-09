@@ -217,3 +217,149 @@ async def test_reparse_rejects_foreign_document(monkeypatch, confirmed_kb) -> No
     with pytest.raises(KBOperationError, match="不属于"):
         await reparse_weknora_file("kb_w", "f2", client=_client(lambda request: httpx.Response(200)))
 
+
+@pytest.mark.asyncio
+async def test_delete_file_confirms_remote_then_local(monkeypatch, confirmed_kb) -> None:
+    _settings_env(monkeypatch)
+    record = SimpleNamespace(file_id="f1", kb_id="kb_w", is_folder=False, remote_knowledge_id="rk-1")
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(200, json={"data": {}})
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+
+    from yuxi.services.weknora_knowledge_service import delete_weknora_file
+
+    result = await delete_weknora_file("kb_w", "f1", client=_client(handler))
+
+    assert result["remote_knowledge_id"] == "rk-1"
+    assert requests == [("DELETE", "/api/v1/knowledge/rk-1")]
+
+
+@pytest.mark.asyncio
+async def test_delete_file_tolerates_remote_404(monkeypatch, confirmed_kb) -> None:
+    _settings_env(monkeypatch)
+    record = SimpleNamespace(file_id="f1", kb_id="kb_w", is_folder=False, remote_knowledge_id="rk-gone")
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "gone"})
+
+    from yuxi.services.weknora_knowledge_service import delete_weknora_file
+
+    result = await delete_weknora_file("kb_w", "f1", client=_client(handler))
+    assert result["file_id"] == "f1"
+
+
+@pytest.mark.asyncio
+async def test_delete_file_timeout_keeps_remote_contract_error(monkeypatch, confirmed_kb) -> None:
+    _settings_env(monkeypatch)
+    record = SimpleNamespace(file_id="f1", kb_id="kb_w", is_folder=False, remote_knowledge_id="rk-1")
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("down", request=request)
+
+    from yuxi.services.weknora_knowledge_service import delete_weknora_file
+
+    with pytest.raises(KBOperationError, match="删除未确认"):
+        await delete_weknora_file("kb_w", "f1", client=_client(handler))
+
+
+def test_add_file_record_uses_source_path_for_tree(monkeypatch) -> None:
+    """登记时 source_path 优先生效,保留目录层级(builtin 虚拟目录行为对齐)。"""
+
+    from yuxi.knowledge.implementations.weknora import WeKnoraKB
+
+    kb = WeKnoraKB("/tmp/yuxi-weknora-test")
+    persisted = {}
+
+    async def fake_persist(file_id, meta):
+        persisted.update(meta)
+
+    monkeypatch.setattr(kb, "_persist_file_meta", fake_persist)
+    import asyncio
+
+    meta = asyncio.run(
+        kb.add_file_record(
+            "kb_w",
+            "weknora://rk-9/%E7%BB%86%E5%88%99.md",
+            params={"source_path": "子目录/细则.md", "content_hashes": {}, "file_sizes": {}},
+            operator_id="u1",
+            additional_params={},
+        )
+    )
+
+    assert meta["filename"] == "子目录/细则.md"
+    assert meta["remote_knowledge_id"] == "rk-9"
+    assert meta["created_by"] == "u1"
+
+
+@pytest.mark.asyncio
+async def test_executor_delete_file_rejects_cross_kb_file_id(monkeypatch) -> None:
+    """跨库 file_id 不得静默删除本地行。"""
+
+    from yuxi.knowledge.implementations.weknora import WeKnoraKB
+
+    kb = WeKnoraKB("/tmp/yuxi-weknora-test")
+    deleted = []
+
+    async def fake_get_by_file_id(self, file_id):
+        return SimpleNamespace(file_id=file_id, kb_id="kb_other", is_folder=False, remote_knowledge_id="rk-x")
+
+    async def fake_repo_delete(self, file_id):
+        deleted.append(file_id)
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.delete",
+        fake_repo_delete,
+    )
+
+    with pytest.raises(KBOperationError, match="不属于"):
+        await kb.delete_file("kb_w", "f1")
+
+    assert deleted == []
+
+
+def test_source_paths_product_payload_preserves_tree(monkeypatch) -> None:
+    """前端真实载荷 source_paths(复数 dict)经注册分支翻译为逐项 source_path。"""
+
+    from server.routers.knowledge_router import _params_for_uploaded_document_item
+
+    ref = build_weknora_file_ref("rk-9", "细则.md")
+    params = {
+        "source_paths": {ref: "子目录/细则.md"},
+        "content_hashes": {ref: "h1"},
+        "parent_id": None,
+    }
+
+    item_params = _params_for_uploaded_document_item(ref, params)
+
+    assert item_params["source_path"] == "子目录/细则.md"
+    assert item_params["content_hashes"] == {ref: "h1"}
