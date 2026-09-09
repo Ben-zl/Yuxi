@@ -7,6 +7,13 @@ from fastapi import HTTPException, UploadFile
 from server.routers import knowledge_router
 from yuxi.knowledge.read_models import KnowledgeBaseDetail
 
+
+@pytest.fixture(autouse=True)
+def _pin_builtin_backend(monkeypatch):
+    """本文件验证 builtin 时代上传/登记行为,钉住后端选择,不受容器部署模式影响。"""
+    monkeypatch.setenv("KNOWLEDGE_BACKEND", "builtin")
+
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -657,12 +664,8 @@ async def test_parse_documents_accepts_payload_with_params(monkeypatch):
 
     assert result["status"] == "queued"
     assert captured["payload"]["params"] == params
-    assert captured["updated"] == [
-        {"kb_id": "kb_1", "file_id": "file_1", "params": params, "operator_id": "uid-user"}
-    ]
-    assert captured["parsed"] == [
-        {"kb_id": "kb_1", "file_id": "file_1", "operator_id": "uid-user"}
-    ]
+    assert captured["updated"] == [{"kb_id": "kb_1", "file_id": "file_1", "params": params, "operator_id": "uid-user"}]
+    assert captured["parsed"] == [{"kb_id": "kb_1", "file_id": "file_1", "operator_id": "uid-user"}]
 
 
 async def test_parse_pending_documents_uses_params(monkeypatch):
@@ -717,6 +720,4 @@ async def test_parse_pending_documents_uses_params(monkeypatch):
     assert captured["updated"] == [
         {"kb_id": "kb_1", "file_id": "file_pending_1", "params": params, "operator_id": "uid-user"}
     ]
-    assert captured["parsed"] == [
-        {"kb_id": "kb_1", "file_id": "file_pending_1", "operator_id": "uid-user"}
-    ]
+    assert captured["parsed"] == [{"kb_id": "kb_1", "file_id": "file_pending_1", "operator_id": "uid-user"}]

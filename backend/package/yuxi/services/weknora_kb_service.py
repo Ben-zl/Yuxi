@@ -184,7 +184,7 @@ async def create_weknora_database(
     return database
 
 
-async def _load_confirmed_binding(kb_id: str, *, action: str):
+async def load_confirmed_binding(kb_id: str, *, action: str):
     """加载并校验已确认的托管绑定;所有远端写操作前共用。"""
 
     from yuxi.knowledge.runtime import knowledge_base
@@ -213,7 +213,7 @@ async def delete_weknora_database(kb_id: str, *, client: WeKnoraClient | None = 
 
     from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
 
-    _, binding, settings = await _load_confirmed_binding(kb_id, action="删除")
+    _, binding, settings = await load_confirmed_binding(kb_id, action="删除")
 
     remote_client = client or WeKnoraClient(settings)
     remote_kb_id = str(binding["remote_kb_id"])
@@ -281,7 +281,7 @@ async def update_weknora_database(
 
     from yuxi.knowledge.runtime import knowledge_base
 
-    detail, binding, settings = await _load_confirmed_binding(kb_id, action="更新")
+    detail, binding, settings = await load_confirmed_binding(kb_id, action="更新")
     validate_weknora_share_config_change(
         operator_role=operator_role,
         owning_department_id=int(detail.owning_department_id or 0),

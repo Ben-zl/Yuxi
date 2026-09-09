@@ -51,6 +51,8 @@ from server.utils.auth_middleware import get_admin_user, get_db, get_required_us
 from sqlalchemy.ext.asyncio import AsyncSession
 from server.utils.knowledge_response import serialize_knowledge_base, serialize_knowledge_base_list
 from server.utils.knowledge_permissions import (
+    require_document_write,
+    require_knowledge_base_content_write,
     require_knowledge_viewer,
     ensure_knowledge_base_permission as _ensure_database_permission,
     require_knowledge_base_manage,
@@ -221,6 +223,51 @@ def _params_for_uploaded_document_item(item: str, params: dict) -> dict:
     if isinstance(source_paths, dict) and source_paths.get(item):
         item_params["source_path"] = source_paths[item]
     return item_params
+
+
+async def _register_weknora_documents(kb_id: str, items: list[str], params: dict, operator_uid: str) -> dict:
+    """登记 WeKnora 托管文档:本地创建目录位置与远端绑定的文件记录。"""
+
+    from yuxi.services.weknora_knowledge_service import sync_weknora_file_statuses
+
+    if not items:
+        raise HTTPException(status_code=400, detail="文档列表不能为空")
+    normalized_params = dict(params or {})
+    results: list[dict] = []
+    for item in items:
+        try:
+            file_meta = await knowledge_base.add_file_record(
+                kb_id,
+                item,
+                params=normalized_params,
+                operator_id=operator_uid,
+            )
+            results.append(file_meta)
+        except Exception as add_error:  # noqa: BLE001
+            logger.error(f"WeKnora 文档登记失败 {item}: {add_error}")
+            results.append(
+                {
+                    "item": item,
+                    "status": "failed",
+                    "error": f"登记失败: {add_error}",
+                    "error_type": "add_failed",
+                }
+            )
+
+    file_metas = [item for item in results if item.get("file_id")]
+    synced = await sync_weknora_file_statuses(kb_id, file_metas)
+    synced_by_file_id = {str(meta.get("file_id")): meta for meta in synced}
+    final_items = [synced_by_file_id.get(str(item.get("file_id")), item) for item in results]
+    failed_count = len([item for item in final_items if _is_failed_item(item)])
+
+    summary = {
+        "kb_id": kb_id,
+        "item_type": "文件",
+        "submitted": len(items),
+        "failed": failed_count,
+        "status": "success",
+    }
+    return summary | {"items": final_items}
 
 
 async def _has_running_graph_build_task(kb_id: str) -> bool:
@@ -750,7 +797,7 @@ async def list_documents(
     """分页获取知识库文件列表。"""
     await _ensure_database_supports_documents(kb_id, "文档查看")
     try:
-        return await knowledge_base.list_document_files(
+        result = await knowledge_base.list_document_files(
             kb_id,
             parent_id=parent_id,
             path_prefix=path_prefix,
@@ -759,6 +806,12 @@ async def list_documents(
             page_size=page_size,
             recursive=recursive,
         )
+        if _weknora_backend_selected():
+            from yuxi.services.weknora_knowledge_service import sync_weknora_file_statuses
+
+            items = result.get("items") or []
+            result["items"] = await sync_weknora_file_statuses(kb_id, items)
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -813,11 +866,15 @@ async def add_documents(
     kb_id: str,
     items: list[str] = Body(...),
     params: dict = Body(...),
-    current_user: User = Depends(require_knowledge_base_manage),
+    current_user: User = Depends(require_document_write),
 ):
     """添加文档到知识库（上传 -> 解析 -> 可选入库）"""
     logger.debug(f"Add documents for kb_id {kb_id}: {items} {params=}")
     await _ensure_database_supports_documents(kb_id, "文档添加/解析/入库")
+
+    if _weknora_backend_selected():
+        # 远端已在上传时收到内容并自动处理;本地仅登记目录位置与远端绑定
+        return await _register_weknora_documents(kb_id, items, params, current_user.uid)
 
     params = _ensure_document_params(params)
     content_type = params.get("content_type", "file")
@@ -1491,7 +1548,7 @@ async def _enqueue_index_pending_task(
 async def parse_documents(
     kb_id: str,
     payload: ParseDocumentsRequest | list[str] = Body(...),
-    current_user: User = Depends(require_knowledge_base_manage),
+    current_user: User = Depends(require_document_write),
 ):
     """手动触发文档解析"""
     if isinstance(payload, list):
@@ -1503,6 +1560,23 @@ async def parse_documents(
     file_ids = _validate_direct_document_action_file_ids(file_ids)
     logger.debug(f"Parse documents for kb_id {kb_id}: {file_ids} {params=}")
     db_info = await _ensure_database_supports_documents(kb_id, "文档解析")
+    if _weknora_backend_selected():
+        # WeKnora 模式:重新解析并重建索引,旧分块由远端重建
+        from yuxi.knowledge.base import KBOperationError
+        from yuxi.services.weknora_knowledge_service import reparse_weknora_file
+
+        results = []
+        for file_id in file_ids:
+            try:
+                results.append(await reparse_weknora_file(kb_id, file_id))
+            except KBOperationError as error:
+                results.append({"file_id": file_id, "status": "failed", "error": str(error)})
+        failed = len([item for item in results if item.get("status") == "failed"])
+        return {
+            "message": "已触发重新解析并重建索引" if not failed else f"重新解析失败 {failed} 个",
+            "status": "success" if not failed else "partial_failed",
+            "items": results,
+        }
     return await _enqueue_parse_task(kb_id, file_ids, current_user.uid, db_info, params=params)
 
 
@@ -2171,15 +2245,62 @@ async def import_workspace_files(
     return {"status": "success", "items": results}
 
 
+async def _upload_weknora_file(file: UploadFile, kb_id: str | None, current_user: User) -> dict:
+    """WeKnora 模式上传:直传远端托管库,返回 weknora:// 引用供 /documents 登记。"""
+
+    from yuxi.knowledge.base import KBOperationError
+    from yuxi.services.weknora_knowledge_service import upload_weknora_file
+
+    if not kb_id:
+        raise HTTPException(status_code=400, detail="WeKnora 模式上传必须指定知识库")
+    await require_knowledge_base_content_write(kb_id, current_user)
+    try:
+        file_bytes = await read_upload_with_limit(
+            file,
+            max_size_bytes=MAX_UPLOAD_SIZE_BYTES,
+            too_large_message="文件过大，当前仅支持 100 MB 以内的文件",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    content_hash = await calculate_content_hash(file_bytes)
+    try:
+        uploaded = await upload_weknora_file(
+            kb_id,
+            filename=file.filename,
+            content=file_bytes,
+            content_type=file.content_type,
+        )
+    except KBOperationError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    basename, ext = os.path.splitext(file.filename)
+    return {
+        "message": "File successfully uploaded",
+        "file_path": uploaded["ref"],
+        "minio_path": uploaded["ref"],
+        "kb_id": kb_id,
+        "content_hash": content_hash,
+        "filename": f"{basename}{ext}".lower(),
+        "original_filename": basename,
+        "size": uploaded["size"],
+        "remote_knowledge_id": uploaded["remote_knowledge_id"],
+        "remote_status": uploaded["remote_status"],
+    }
+
+
 @knowledge.post("/files/upload")
 async def upload_file(
     file: UploadFile = File(...),
     kb_id: str | None = Query(None),
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(require_knowledge_viewer),
 ):
     """上传文件"""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No selected file")
+
+    if _weknora_backend_selected():
+        return await _upload_weknora_file(file, kb_id, current_user)
 
     if kb_id:
         await _require_manage_permission_if_kb_id(kb_id, current_user)

@@ -145,7 +145,7 @@ async def main() -> None:
                     "knowledge",
                     versions.get("knowledge"),
                     KNOWLEDGE_SCHEMA_VERSION,
-                    upgrade_from=(1,),
+                    upgrade_from=(1, 2),
                 )
 
             if business_version is None:
@@ -169,7 +169,7 @@ async def main() -> None:
                     await pg_manager.ensure_knowledge_schema()
                     await pg_manager.record_schema_version("knowledge", KNOWLEDGE_SCHEMA_VERSION)
                 elif knowledge_version < KNOWLEDGE_SCHEMA_VERSION:
-                    # v1 -> v2: 新增 WeKnora 托管字段(owning_department_id、remote_binding)
+                    # 逐版本升级:新增 WeKnora 托管字段(owning_department_id、remote_binding、remote_knowledge_id)
                     await pg_manager.ensure_knowledge_schema()
                     await pg_manager.record_schema_version("knowledge", KNOWLEDGE_SCHEMA_VERSION)
 

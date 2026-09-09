@@ -138,3 +138,52 @@ async def test_read_dependency_allows_member_only_in_weknora_mode(monkeypatch) -
     with pytest.raises(HTTPException) as exc_info:
         await knowledge_permissions.require_knowledge_base_read("kb_w", member)
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_document_write_rejects_non_admin_in_builtin_mode(monkeypatch) -> None:
+    monkeypatch.setenv("KNOWLEDGE_BACKEND", "builtin")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await knowledge_permissions.require_document_write("kb_w", _user(role="user", department_id=2))
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "需要管理员权限"
+
+
+@pytest.mark.asyncio
+async def test_document_write_rejects_member_outside_owning_department(monkeypatch) -> None:
+    monkeypatch.setenv("KNOWLEDGE_BACKEND", "weknora")
+    monkeypatch.setenv("WEKNORA_BASE_URL", "http://weknora-app:8080/api/v1")
+    monkeypatch.setenv("WEKNORA_API_KEY", "sk-local")
+
+    detail = SimpleNamespace(
+        kb_id="kb_w",
+        kb_type="weknora",
+        owning_department_id=2,
+        share_config={"version": 2, "read_scope": {"access_level": "global"}, "manage_scope": None},
+        created_by="owner",
+    )
+
+    async def fake_info(kb_id):
+        return detail
+
+    monkeypatch.setattr(knowledge_permissions.knowledge_base, "get_database_info", fake_info)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await knowledge_permissions.require_document_write("kb_w", _user(role="user", department_id=3))
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "无权维护该知识库内容"
+
+
+@pytest.mark.asyncio
+async def test_weknora_upload_requires_kb_id(monkeypatch) -> None:
+    from server.routers import knowledge_router
+
+    monkeypatch.setenv("KNOWLEDGE_BACKEND", "weknora")
+    monkeypatch.setenv("WEKNORA_BASE_URL", "http://weknora-app:8080/api/v1")
+    monkeypatch.setenv("WEKNORA_API_KEY", "sk-local")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await knowledge_router._upload_weknora_file(file=None, kb_id=None, current_user=_user(department_id=2))
+    assert exc_info.value.status_code == 400
+    assert "必须指定知识库" in exc_info.value.detail

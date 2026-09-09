@@ -35,8 +35,13 @@ class WeKnoraKB(KnowledgeBase):
 
     @classmethod
     def validate_additional_params(cls, additional_params: dict | None) -> dict:
-        """WeKnora 模型与解析配置由部署统一提供,拒绝任何类型级附加参数。"""
-        if additional_params:
+        """WeKnora 模型与解析配置由部署统一提供,拒绝类型级附加参数。
+
+        stats 是 Manager 维护的统计投影,不是类型配置,允许透传。
+        """
+        params = dict(additional_params or {})
+        foreign_keys = [key for key in params if key != "stats"]
+        if foreign_keys:
             raise ValueError("WeKnora 知识库不接受类型级附加参数,模型与解析配置由部署统一提供")
         return {}
 
@@ -75,8 +80,42 @@ class WeKnoraKB(KnowledgeBase):
         *,
         additional_params: dict[str, Any],
     ) -> dict:
-        del kb_id, item, params, operator_id, additional_params
-        raise _weknora_operation_error("文档登记")
+        """登记 WeKnora 托管文档:远端已持有内容,本地仅保存目录位置与远端绑定。
+
+        item 必须是 weknora:// 引用(由上传用例生成);content_hash、file_size 经
+        params.content_hashes / params.file_sizes 按引用传入,状态取远端当前值。
+        """
+        del additional_params
+        import time
+
+        from yuxi.knowledge.weknora import parse_weknora_file_ref
+        from yuxi.utils import hashstr
+        from yuxi.utils.datetime_utils import utc_isoformat
+
+        remote_knowledge_id, ref_filename = parse_weknora_file_ref(item)
+        params = dict(params or {})
+        content_hashes = params.get("content_hashes") if isinstance(params.get("content_hashes"), dict) else {}
+        file_sizes = params.get("file_sizes") if isinstance(params.get("file_sizes"), dict) else {}
+        filename = str(params.get("filename") or ref_filename)
+        file_type = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+        metadata = {
+            "kb_id": kb_id,
+            "filename": filename,
+            "path": item,
+            "file_type": file_type,
+            "status": params.get("remote_status") or "pending",
+            "created_at": utc_isoformat(),
+            "file_id": f"file_{hashstr(str(item) + str(time.time()), 6)}",
+            "content_hash": content_hashes.get(item),
+            "size": file_sizes.get(item),
+            "parent_id": params.get("parent_id"),
+            "remote_knowledge_id": remote_knowledge_id,
+        }
+        if operator_id:
+            metadata["created_by"] = operator_id
+        await self._persist_file_meta(metadata["file_id"], metadata)
+        return metadata
 
     async def parse_file(
         self,
@@ -131,5 +170,6 @@ class WeKnoraKB(KnowledgeBase):
         raise _weknora_operation_error("文件信息读取")
 
     def get_query_params_config(self, kb_id: str, **kwargs) -> dict:
+        """检索参数配置;远端检索参数在检索工单接入后细化。"""
         del kb_id, kwargs
-        raise _weknora_operation_error("检索参数配置")
+        return {"type": "weknora", "options": []}

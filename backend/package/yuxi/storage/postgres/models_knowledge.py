@@ -74,6 +74,8 @@ class KnowledgeFile(Base):
     content_type = Column(String(64))
     processing_params = Column(JSON_VALUE)
     is_folder = Column(Boolean, default=False)
+    # WeKnora 托管文档的远端 ID;内置知识库文件恒为空
+    remote_knowledge_id = Column(String(64), index=True)
     error_message = Column(Text)
     created_by = Column(String(64))
     updated_by = Column(String(64))

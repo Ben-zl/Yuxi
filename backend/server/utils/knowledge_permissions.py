@@ -95,3 +95,17 @@ async def require_knowledge_base_content_write(
     if not resolve_knowledge_content_write(current_user, db_info):
         raise HTTPException(status_code=403, detail="无权维护该知识库内容")
     return db_info
+
+
+async def require_document_write(
+    kb_id: str,
+    current_user: User = Depends(get_required_user),
+) -> User:
+    """文档写操作身份:weknora 模式允许归属部门成员(内容维护),内置模式保持整库管理。"""
+
+    if _weknora_backend_selected():
+        await require_knowledge_base_content_write(kb_id, current_user)
+        return current_user
+    _require_admin_in_builtin_mode(current_user)
+    await ensure_knowledge_base_permission(kb_id, current_user, ResourcePermission.MANAGE)
+    return current_user

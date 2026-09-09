@@ -149,3 +149,49 @@ class WeKnoraClient:
         if api_key and api_key in body:
             return body.replace(api_key, "***")
         return body
+
+
+# 远端 parse_status 展示映射;未知状态显式暴露,不得默认映射为完成
+WEKNORA_STATUS_LABELS = {
+    "pending": "排队",
+    "processing": "处理中",
+    "finalizing": "后处理中",
+    "completed": "完成",
+    "failed": "失败",
+    "deleting": "删除中",
+    "cancelled": "已取消",
+}
+WEKNORA_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
+def weknora_status_label(raw_status: str | None) -> str:
+    """返回远端处理状态的展示标签;未知状态原样透出并标注。"""
+
+    status = str(raw_status or "").strip()
+    if status in WEKNORA_STATUS_LABELS:
+        return WEKNORA_STATUS_LABELS[status]
+    return f"未知状态({status or '缺失'})"
+
+
+def build_weknora_file_ref(remote_knowledge_id: str, filename: str) -> str:
+    """构造 weknora 文件引用,作为 /documents 登记的 item 载荷。"""
+
+    from urllib.parse import quote
+
+    return f"weknora://{remote_knowledge_id}/{quote(filename or 'unnamed')}"
+
+
+def parse_weknora_file_ref(item: str) -> tuple[str, str]:
+    """解析 weknora 文件引用为 (remote_knowledge_id, filename);非法引用显式报错。"""
+
+    from urllib.parse import unquote
+
+    value = str(item or "").strip()
+    prefix = "weknora://"
+    if not value.startswith(prefix):
+        raise ValueError(f"非 WeKnora 文件引用: {item!r}")
+    payload = value[len(prefix) :]
+    remote_id, _, filename = payload.partition("/")
+    if not remote_id:
+        raise ValueError(f"WeKnora 文件引用缺少远端文档 ID: {item!r}")
+    return remote_id, unquote(filename or "unnamed")
