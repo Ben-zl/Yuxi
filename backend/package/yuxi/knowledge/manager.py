@@ -70,6 +70,9 @@ class KnowledgeBaseManager:
         unsupported_types = set()
         for row in rows:
             kb_type = row.kb_type or "milvus"
+            if not self._kb_type_visible_in_current_backend(kb_type):
+                # 两套后端数据分别保留:另一后端的知识库不参与本模式初始化,也不算失败
+                continue
             if KnowledgeBaseFactory.is_type_supported(kb_type):
                 kb_types_in_use.add(kb_type)
             else:
@@ -301,8 +304,19 @@ class KnowledgeBaseManager:
             "share_config": self._normalize_share_config(row.share_config),
             "created_by": row.created_by,
             "created_at": row.created_at,
+            "owning_department_id": getattr(row, "owning_department_id", None),
+            "remote_binding": dict(row.remote_binding) if getattr(row, "remote_binding", None) else None,
             **normalized_stats,
         }
+
+    @staticmethod
+    def _kb_type_visible_in_current_backend(kb_type: str) -> bool:
+        """两套后端数据不混用:当前模式只暴露本模式的知识库。"""
+        from yuxi.config.runtime import KNOWLEDGE_BACKEND_WEKNORA, knowledge_backend
+
+        if knowledge_backend() == KNOWLEDGE_BACKEND_WEKNORA:
+            return kb_type == "weknora"
+        return kb_type != "weknora"
 
     async def get_databases(self) -> list[KnowledgeBaseSummary]:
         """获取所有知识库摘要。"""
@@ -315,6 +329,8 @@ class KnowledgeBaseManager:
             kb_type = row.kb_type or "milvus"
             if not KnowledgeBaseFactory.is_type_supported(kb_type):
                 logger.warning(f"Skip unsupported database: kb_id={row.kb_id}, kb_type={kb_type}")
+                continue
+            if not self._kb_type_visible_in_current_backend(kb_type):
                 continue
 
             # 单条记录元数据不合法时只跳过该条，避免一条坏记录隐藏整个列表。
@@ -340,16 +356,17 @@ class KnowledgeBaseManager:
         Returns:
             bool: 是否有权限
         """
-        # 超级管理员有权访问所有
-        if user.get("role") == "superadmin":
-            return True
-
+        # 跨后端的知识库对当前模式视同不存在;后端内超级管理员有权访问所有
         from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
 
         kb_repo = KnowledgeBaseRepository()
         kb = await kb_repo.get_by_kb_id(kb_id)
         if kb is None:
             return False
+        if not self._kb_type_visible_in_current_backend(kb.kb_type or "milvus"):
+            return False
+        if user.get("role") == "superadmin":
+            return True
 
         return self._database_info_accessible(user, kb)
 
@@ -441,7 +458,8 @@ class KnowledgeBaseManager:
         kb_repo = KnowledgeBaseRepository()
         rows = await kb_repo.get_all()
         for row in rows:
-            if (row.name or "").lower() == database_name.lower():
+            kb_type = row.kb_type or "milvus"
+            if (row.name or "").lower() == database_name.lower() and self._kb_type_visible_in_current_backend(kb_type):
                 return True
         return False
 
@@ -711,6 +729,9 @@ class KnowledgeBaseManager:
         kb_repo = KnowledgeBaseRepository()
         kb = await kb_repo.get_by_kb_id(kb_id)
         if kb is None:
+            return None
+        if not self._kb_type_visible_in_current_backend(kb.kb_type or "milvus"):
+            # 两套后端数据不混用:当前模式下另一后端的知识库视同不存在
             return None
 
         files = None

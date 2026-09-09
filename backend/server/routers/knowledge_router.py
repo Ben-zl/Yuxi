@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from yuxi.config.options import system_options
+from yuxi.config.runtime import KNOWLEDGE_BACKEND_WEKNORA, knowledge_backend
 from yuxi.knowledge.base import KBNameConflictError, KBNotFoundError
 from yuxi.knowledge.chunking.ragflow_like.presets import get_chunk_preset_options
 from yuxi.knowledge.graphs.milvus_graph_service import GRAPH_TASK_TYPE, MilvusGraphService
@@ -236,6 +237,26 @@ async def _has_running_graph_build_task(kb_id: str) -> bool:
 # =============================================================================
 
 
+def _weknora_backend_selected() -> bool:
+    """当前进程是否运行在 WeKnora 知识库后端模式。"""
+
+    return knowledge_backend() == KNOWLEDGE_BACKEND_WEKNORA
+
+
+def _resolve_owning_department(current_user: User, requested_department_id: int | None) -> int:
+    """确定 WeKnora 知识库归属部门:普通管理员固定本部门,超级管理员显式选择。"""
+
+    if current_user.role == "superadmin":
+        if not requested_department_id:
+            raise HTTPException(status_code=400, detail="超级管理员创建 WeKnora 知识库时必须选择归属部门")
+        return int(requested_department_id)
+    if requested_department_id:
+        raise HTTPException(status_code=400, detail="部门管理员创建的知识库固定归属本部门,不能指定其他部门")
+    if not current_user.department_id:
+        raise HTTPException(status_code=400, detail="当前管理员未绑定部门,无法确定知识库归属")
+    return int(current_user.department_id)
+
+
 @knowledge.get("/databases")
 async def get_databases(current_user: User = Depends(get_admin_user)):
     """获取所有知识库（根据用户权限过滤）"""
@@ -255,6 +276,7 @@ async def create_database(
     additional_params: dict | None = Body(None),
     llm_model_spec: str | None = Body(None),
     share_config: dict | None = Body(None),
+    owning_department_id: int | None = Body(None),
     current_user: User = Depends(get_admin_user),
 ):
     """创建知识库"""
@@ -264,17 +286,28 @@ async def create_database(
         f"embedding_model_spec {embedding_model_spec}, share_config {share_config}"
     )
     try:
-        database_info = await knowledge_base.create_database(
-            database_name,
-            description,
-            kb_type=kb_type,
-            embedding_model_spec=embedding_model_spec,
-            llm_model_spec=llm_model_spec,
-            share_config=share_config,
-            created_by=current_user.uid,
-            created_by_department_id=current_user.department_id,
-            **(additional_params or {}),
-        )
+        if _weknora_backend_selected():
+            # WeKnora 模式:简化表单,模型与解析配置由部署提供,归属部门固定
+            from yuxi.services.weknora_kb_service import create_weknora_database
+
+            database_info = await create_weknora_database(
+                database_name=database_name,
+                description=description,
+                owning_department_id=_resolve_owning_department(current_user, owning_department_id),
+                created_by=current_user.uid,
+            )
+        else:
+            database_info = await knowledge_base.create_database(
+                database_name,
+                description,
+                kb_type=kb_type,
+                embedding_model_spec=embedding_model_spec,
+                llm_model_spec=llm_model_spec,
+                share_config=share_config,
+                created_by=current_user.uid,
+                created_by_department_id=current_user.department_id,
+                **(additional_params or {}),
+            )
 
         # 需要重新加载所有智能体，因为工具刷新了
         from yuxi.agents.buildin import agent_manager
@@ -428,17 +461,32 @@ async def update_database_info(
     try:
         update_llm_model_spec = "llm_model_spec" in data.model_fields_set
 
-        database = await knowledge_base.update_database(
-            kb_id,
-            data.name,
-            data.description,
-            data.llm_model_spec,
-            update_llm_model_spec=update_llm_model_spec,
-            additional_params=data.additional_params,
-            share_config=data.share_config,
-            operator_uid=current_user.uid,
-            operator_department_id=current_user.department_id,
-        )
+        if _weknora_backend_selected():
+            # WeKnora 模式:名称/描述先同步远端,再落本地;share_config 为纯本地授权
+            from yuxi.services.weknora_kb_service import update_weknora_database
+
+            database = await update_weknora_database(
+                kb_id,
+                name=data.name,
+                description=data.description,
+                llm_model_spec=data.llm_model_spec,
+                update_llm_model_spec=update_llm_model_spec,
+                share_config=data.share_config,
+                operator_uid=current_user.uid,
+                operator_department_id=current_user.department_id,
+            )
+        else:
+            database = await knowledge_base.update_database(
+                kb_id,
+                data.name,
+                data.description,
+                data.llm_model_spec,
+                update_llm_model_spec=update_llm_model_spec,
+                additional_params=data.additional_params,
+                share_config=data.share_config,
+                operator_uid=current_user.uid,
+                operator_department_id=current_user.department_id,
+            )
         return {"message": "更新成功", "database": serialize_knowledge_base(database)}
     except HTTPException:
         raise
@@ -452,7 +500,13 @@ async def delete_database(kb_id: str, current_user: User = Depends(require_knowl
     """删除知识库"""
     logger.debug(f"Delete database {kb_id}")
     try:
-        await knowledge_base.delete_database(kb_id)
+        if _weknora_backend_selected():
+            # WeKnora 模式:远端确认删除后才本地收尾
+            from yuxi.services.weknora_kb_service import delete_weknora_database
+
+            await delete_weknora_database(kb_id)
+        else:
+            await knowledge_base.delete_database(kb_id)
 
         # 需要重新加载所有智能体，因为工具刷新了
         from yuxi.agents.buildin import agent_manager
@@ -460,6 +514,8 @@ async def delete_database(kb_id: str, current_user: User = Depends(require_knowl
         await agent_manager.reload_all()
 
         return {"message": "删除成功"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"删除数据库失败 {e}, {traceback.format_exc()}")
         raise HTTPException(status_code=400, detail=f"删除数据库失败: {e}")

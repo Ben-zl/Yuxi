@@ -41,6 +41,8 @@ class KnowledgeBaseSummary:
     share_config: dict[str, Any]
     created_by: str | None
     created_at: datetime | None
+    owning_department_id: int | None = None
+    remote_binding: dict[str, Any] | None = None
     file_count: int = 0
     folder_count: int = 0
     row_count: int = 0

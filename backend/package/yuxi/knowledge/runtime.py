@@ -3,7 +3,13 @@
 import os
 
 from yuxi.config import get_runtime_dir
-from yuxi.config.runtime import KNOWLEDGE_BACKEND_BUILTIN, knowledge_backend, knowledge_capability_enabled
+from yuxi.config.runtime import (
+    KNOWLEDGE_BACKEND_BUILTIN,
+    KNOWLEDGE_BACKEND_WEKNORA,
+    knowledge_backend,
+    knowledge_backend_ready,
+    knowledge_capability_enabled,
+)
 from yuxi.knowledge.factory import KnowledgeBaseFactory
 from yuxi.knowledge.implementations.dify import DifyKB
 from yuxi.knowledge.implementations.milvus import MilvusKB
@@ -15,5 +21,9 @@ if knowledge_capability_enabled() and knowledge_backend() == KNOWLEDGE_BACKEND_B
     KnowledgeBaseFactory.register(MilvusKB)
 KnowledgeBaseFactory.register(DifyKB)
 KnowledgeBaseFactory.register(NotionKB)
+if knowledge_capability_enabled() and knowledge_backend() == KNOWLEDGE_BACKEND_WEKNORA and knowledge_backend_ready():
+    from yuxi.knowledge.implementations.weknora import WeKnoraKB
+
+    KnowledgeBaseFactory.register(WeKnoraKB)
 
 knowledge_base = KnowledgeBaseManager(os.path.join(get_runtime_dir(), "knowledge_base_data"))

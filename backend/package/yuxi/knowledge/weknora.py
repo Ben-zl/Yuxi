@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -10,6 +11,10 @@ import httpx
 
 WEKNORA_MODEL_ENV_KEYS = ("WEKNORA_EMBEDDING_MODEL_ID", "WEKNORA_SUMMARY_MODEL_ID")
 DEFAULT_TIMEOUT_SECONDS = 30.0
+
+# 托管绑定状态:confirmed = 双侧确认;pending_review = 远端结果不确定,保留核对
+BINDING_CONFIRMED = "confirmed"
+BINDING_PENDING_REVIEW = "pending_review"
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,17 @@ def load_weknora_settings() -> WeKnoraSettings:
         embedding_model_id=os.environ.get("WEKNORA_EMBEDDING_MODEL_ID", "").strip(),
         summary_model_id=os.environ.get("WEKNORA_SUMMARY_MODEL_ID", "").strip(),
     )
+
+
+def weknora_instance_fingerprint(settings: WeKnoraSettings | None = None) -> str:
+    """以规范化部署地址哈希作为远端实例指纹。
+
+    绑定校验用:变更服务地址后旧绑定立即失效,API Key 轮换(地址不变)不影响绑定。
+    """
+
+    effective = settings or load_weknora_settings()
+    normalized = effective.base_url.strip().rstrip("/").lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
 class WeKnoraClientError(Exception):

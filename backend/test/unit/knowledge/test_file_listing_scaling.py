@@ -8,6 +8,13 @@ from yuxi.permissions import ResourcePermission
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def _pin_builtin_backend(monkeypatch):
+    """本文件验证 builtin 时代行为,钉住后端选择,不受容器部署模式影响。"""
+    monkeypatch.setenv("KNOWLEDGE_BACKEND", "builtin")
+
+
+
 class FakeKnowledgeBaseClass:
     @classmethod
     def normalize_additional_params(cls, additional_params):

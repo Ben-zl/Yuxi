@@ -43,6 +43,9 @@ class KnowledgeBase(Base):
     mindmap_metadata = Column(JSON_VALUE)
     sample_questions = Column(JSON_VALUE)
     created_by = Column(String(64))
+    # WeKnora 托管库专用:固定归属部门与远端绑定(含实例指纹与核对状态);内置库两者恒为空
+    owning_department_id = Column(Integer)
+    remote_binding = Column(JSON_VALUE)
     created_at = Column(DateTime(timezone=True), default=utc_now_naive)
     updated_at = Column(DateTime(timezone=True), default=utc_now_naive, onupdate=utc_now_naive)
 

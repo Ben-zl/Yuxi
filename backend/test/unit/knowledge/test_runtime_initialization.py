@@ -12,6 +12,13 @@ from yuxi.knowledge.manager import KnowledgeBaseManager
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _pin_builtin_backend(monkeypatch):
+    """本文件验证 builtin 时代行为,钉住后端选择,不受容器部署模式影响。"""
+    monkeypatch.setenv("KNOWLEDGE_BACKEND", "builtin")
+
+
+
 def test_knowledge_runtime_preserves_lite_mode(tmp_path):
     env = os.environ.copy()
     env["LITE_MODE"] = "1"
@@ -85,7 +92,7 @@ def test_weknora_backend_does_not_register_builtin_executor(tmp_path):
         )
     )
 
-    assert loaded == ["dify", "notion"]
+    assert loaded == ["dify", "notion", "weknora"]
 
 
 def test_builtin_backend_registers_builtin_executor(tmp_path):
