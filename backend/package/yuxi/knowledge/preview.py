@@ -34,9 +34,9 @@ async def read_knowledge_file_preview(kb_id: str, file_id: str) -> dict:
     remote_knowledge_id = getattr(file_record, "remote_knowledge_id", None)
     if remote_knowledge_id:
         # WeKnora 托管文档:预览返回远端解析文本,明确标注非原件
-        from yuxi.services.weknora_knowledge_service import _load_remote_parsed_content
+        from yuxi.services.weknora_knowledge_service import load_remote_parsed_content
 
-        content = await _load_remote_parsed_content(kb_id, file_id)
+        content = await load_remote_parsed_content(kb_id, file_id)
         return {
             **response,
             "content": content,

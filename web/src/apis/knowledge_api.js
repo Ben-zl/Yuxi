@@ -282,7 +282,8 @@ export const documentApi = {
    * @returns {Promise} - Response对象
    */
   downloadDocument: async (kbId, docId) => {
-    return apiGet(`/api/knowledge/databases/${kbId}/documents/${docId}/download`, {}, 'blob')
+    // apiGet 第 3 参是 requiresAuth,responseType 必须作为第 4 参传入
+    return apiGet(`/api/knowledge/databases/${kbId}/documents/${docId}/download`, {}, true, 'blob')
   },
 
   /**

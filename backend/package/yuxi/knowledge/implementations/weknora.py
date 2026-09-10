@@ -139,22 +139,16 @@ class WeKnoraKB(KnowledgeBase):
         return results
 
     async def _remote_parsed_content(self, kb_id: str, file_id: str) -> str:
-        """读取远端解析文本(远端详情的 description);明确为解析内容而非原件。"""
+        """读取远端解析文本;description 为空时由服务层回退拼接分块。"""
 
-        from yuxi.knowledge.weknora import WeKnoraClientError
+        from yuxi.services.weknora_knowledge_service import load_remote_parsed_content
 
         file_meta = await self._load_file_meta(kb_id, file_id)
         if file_meta.get("is_folder"):
             raise Exception(f"文件 {file_id} 是文件夹")
-        remote_knowledge_id = file_meta.get("remote_knowledge_id")
-        if not remote_knowledge_id:
+        if not file_meta.get("remote_knowledge_id"):
             raise Exception(f"文件 {file_id} 缺少远端绑定")
-        try:
-            response = await self._remote_client().request("GET", f"knowledge/{remote_knowledge_id}")
-        except WeKnoraClientError as error:
-            raise Exception(f"远端文档读取失败: {error}") from error
-        data = response.json().get("data") or {}
-        return str(data.get("description") or "")
+        return await load_remote_parsed_content(kb_id, file_id)
 
     async def open_file_content(self, kb_id: str, file_id: str, offset: int = 0, limit: int = 800) -> dict:
         content = await self._remote_parsed_content(kb_id, file_id)

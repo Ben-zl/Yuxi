@@ -318,7 +318,7 @@ async def download_weknora_document_stream(kb_id: str, file_id: str, *, variant:
 
     filename = record.filename or file_id
     if variant == "parsed":
-        content = await _load_remote_parsed_content(kb_id, file_id)
+        content = await load_remote_parsed_content(kb_id, file_id)
 
         async def _parsed_bytes():
             yield content.encode("utf-8")
@@ -354,8 +354,12 @@ async def download_weknora_document_stream(kb_id: str, file_id: str, *, variant:
     return _bytes(), filename, media_type
 
 
-async def _load_remote_parsed_content(kb_id: str, file_id: str) -> str:
-    """读取远端解析文本(服务层视图,供下载 parsed 变体复用)。"""
+async def load_remote_parsed_content(kb_id: str, file_id: str) -> str:
+    """读取远端解析文本;description 为空时回退按序拼接分块。
+
+    分块拼接内容标注于调用方(content_source);远端仅能返回分块时
+    不宣称完整原文,分块视图与解析文本分别呈现。
+    """
 
     from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
 
@@ -371,4 +375,29 @@ async def _load_remote_parsed_content(kb_id: str, file_id: str) -> str:
     except WeKnoraClientError as error:
         raise KBOperationError(f"远端文档读取失败: {error}") from error
     data = response.json().get("data") or {}
-    return str(data.get("description") or "")
+    description = str(data.get("description") or "").strip()
+    if description:
+        return description
+    return await _concat_remote_chunks(client, remote_knowledge_id)
+
+
+async def _concat_remote_chunks(client: WeKnoraClient, remote_knowledge_id: str) -> str:
+    """按远端顺序拼接分块内容,作为解析文本回退。"""
+
+    try:
+        response = await client.request("GET", f"chunks/{remote_knowledge_id}")
+    except WeKnoraClientError as error:
+        logger.warning(f"WeKnora chunks fallback failed: remote={remote_knowledge_id}: {error}")
+        return ""
+    raw = response.json().get("data") or []
+    if isinstance(raw, dict):
+        raw = raw.get("items") or []
+
+    def _order(item: dict) -> tuple:
+        seq = item.get("seq")
+        index = item.get("chunk_index")
+        return (int(seq) if isinstance(seq, (int, float)) else 0, int(index) if isinstance(index, (int, float)) else 0)
+
+    chunks = [item for item in raw if isinstance(item, dict)]
+    chunks.sort(key=_order)
+    return "\n\n".join(str(item.get("content") or "") for item in chunks).strip()
