@@ -149,8 +149,8 @@ test('WeKnora 知识库详情页签只保留文件管理与检索测试', () => 
   )
   assert.match(weknoraTabsBlock, /key: 'filetable', label: '文件管理'/)
   assert.match(weknoraTabsBlock, /key: 'query', label: '检索测试'/)
-  // 实体图谱页签开放(读取 WeKnora 远端图谱);评估仍隐藏
-  assert.match(weknoraTabsBlock, /key: 'graph', label: '知识图谱'/)
+  // 图谱待 WeKnora 正式部署后开放;评估仍隐藏
+  assert.doesNotMatch(weknoraTabsBlock, /key: 'graph'/)
   assert.doesNotMatch(weknoraTabsBlock, /key: 'evaluation'/)
 
   // 文件面板对 WeKnora 托管库开放渲染

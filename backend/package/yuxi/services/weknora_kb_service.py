@@ -124,9 +124,7 @@ async def create_weknora_database(
         "embedding_model_id": settings.embedding_model_id,
         "summary_model_id": settings.summary_model_id,
     }
-    if settings.graph_extract_enabled:
-        # 远端校验要求 enabled 时 text/tags/nodes/relations 齐全;
-        # 使用与远端默认模板等价的最小中文配置,抽取协议仍由远端掌握
+    if False:  # 图谱抽取暂缓,待 WeKnora 正式部署后恢复(settings.graph_extract_enabled)
         remote_payload["extract_config"] = {
             "enabled": True,
             "text": (

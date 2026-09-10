@@ -3,16 +3,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from server.utils.auth_middleware import get_admin_user
 from server.utils.knowledge_permissions import require_knowledge_base_read
 from server.utils.knowledge_response import serialize_knowledge_base
-from yuxi.config.runtime import KNOWLEDGE_BACKEND_WEKNORA, knowledge_backend
 from yuxi.knowledge.graphs.milvus_graph_service import MilvusGraphService
 from yuxi.knowledge.runtime import knowledge_base
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.logging_config import logger
-
-
-def _weknora_backend_selected() -> bool:
-    """当前进程是否运行在 WeKnora 知识库后端模式。"""
-    return knowledge_backend() == KNOWLEDGE_BACKEND_WEKNORA
 
 
 graph = APIRouter(prefix="/graph", tags=["graph"])
@@ -24,9 +18,6 @@ async def _get_graph_service(kb_id: str) -> MilvusGraphService:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
 
     kb_type = db_info.kb_type.lower()
-    if kb_type == "weknora" and _weknora_backend_selected():
-        # WeKnora 托管库走远端图谱,不构造内置 Milvus 服务
-        return None
     if kb_type != "milvus":
         raise HTTPException(status_code=404, detail="Graph API only supports Milvus knowledge bases")
 
@@ -41,10 +32,7 @@ async def get_graphs(current_user: User = Depends(get_admin_user)):
         graphs = []
         for db in databases:
             kb_type = db.kb_type.lower()
-            if _weknora_backend_selected():
-                if kb_type != "weknora":
-                    continue
-            elif kb_type != "milvus":
+            if kb_type != "milvus":
                 continue
             serialized = serialize_knowledge_base(db)
             graphs.append(
@@ -77,15 +65,6 @@ async def get_subgraph(
     try:
         logger.info(f"Querying subgraph - kb_id: {kb_id}, label: {node_label}")
         service = await _get_graph_service(kb_id)
-        if service is None:
-            from yuxi.knowledge.base import KBOperationError
-            from yuxi.services.weknora_knowledge_service import query_weknora_graph
-
-            try:
-                result_data = await query_weknora_graph(kb_id, keyword=node_label, max_nodes=max_nodes)
-            except KBOperationError as error:
-                raise HTTPException(status_code=400, detail=str(error)) from error
-            return {"success": True, "data": result_data}
         result_data = await service.query_nodes(
             keyword=node_label,
             max_depth=max_depth,
@@ -108,15 +87,6 @@ async def get_graph_labels(
     """获取 Milvus 知识库图谱的所有标签"""
     try:
         service = await _get_graph_service(kb_id)
-        if service is None:
-            from yuxi.knowledge.base import KBOperationError
-            from yuxi.services.weknora_knowledge_service import get_weknora_graph_labels
-
-            try:
-                labels = await get_weknora_graph_labels(kb_id)
-            except KBOperationError as error:
-                raise HTTPException(status_code=400, detail=str(error)) from error
-            return {"success": True, "data": {"labels": labels}}
         labels = await service.get_labels()
         return {"success": True, "data": {"labels": labels}}
     except HTTPException:
@@ -134,15 +104,6 @@ async def get_graph_stats(
     """获取 Milvus 知识库图谱统计信息"""
     try:
         service = await _get_graph_service(kb_id)
-        if service is None:
-            from yuxi.knowledge.base import KBOperationError
-            from yuxi.services.weknora_knowledge_service import get_weknora_graph_stats
-
-            try:
-                stats_data = await get_weknora_graph_stats(kb_id)
-            except KBOperationError as error:
-                raise HTTPException(status_code=400, detail=str(error)) from error
-            return {"success": True, "data": stats_data}
         stats_data = await service.get_stats()
         return {"success": True, "data": stats_data}
     except HTTPException:

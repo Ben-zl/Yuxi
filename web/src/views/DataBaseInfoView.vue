@@ -216,7 +216,7 @@
       </template>
 
       <template #panel-graph>
-        <div v-if="(isMilvus || isWeknoraKb) && activeTab === 'graph'" class="tab-panel">
+        <div v-if="isMilvus && activeTab === 'graph'" class="tab-panel">
           <KnowledgeGraphSection
             :visible="true"
             :active="activeTab === 'graph'"
@@ -518,10 +518,10 @@ const bindingPendingReview = computed(
 )
 const tabs = computed(() => {
   if (isWeknoraKb.value) {
+    // 知识图谱待 WeKnora 正式部署图谱查询 API 后开放(当前为 fork 验证态)
     return [
       { key: 'filetable', label: '文件管理', icon: FileText },
-      { key: 'query', label: '检索测试', icon: Search, forceRender: true },
-      { key: 'graph', label: '知识图谱', icon: Network }
+      { key: 'query', label: '检索测试', icon: Search, forceRender: true }
     ]
   }
   if (isMilvus.value) {
