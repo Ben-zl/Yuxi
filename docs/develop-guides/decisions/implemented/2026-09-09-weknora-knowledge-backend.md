@@ -1,6 +1,6 @@
 # WeKnora 知识库后端接入
 
-状态：proposed
+状态：implemented
 类型：feature
 Owner：backend/package/yuxi/knowledge/weknora.py
 
@@ -8,7 +8,7 @@ Owner：backend/package/yuxi/knowledge/weknora.py
 
 团队已使用 WeKnora 维护知识资产,希望 Yuxi 通过部署配置选择内置知识库或 WeKnora,并继续使用 Yuxi 的页面、部门权限和 Agent 工作流。现有约束:知识库管理入口面向管理员,内容写入与整库管理共用 `can_manage`;外部连接器(dify/notion)不支持文档管理;页面把文件管理、图谱、评估绑定于 milvus 类型;WeKnora 接入前已有的库不能被导入或修改。所有部门共用一个 WeKnora API Key 且知识必须互相隔离;本部门普通成员需共同维护内容,整库管理仍归管理员;回答仍由 Yuxi 的 Agent 生成,WeKnora 不接管对话或 AgentRun。
 
-## 提案
+## 决策
 
 ### 全局后端开关与 fail-closed
 
@@ -52,19 +52,30 @@ PostgreSQL 保存本地知识库身份、归属部门、授权、目录树、远
 - 失败即回滚本地记录:丢掉待核对状态后无法区分"远端已创建"与"未到达远端",拒绝。
 - 自动故障回退到内置后端:把查询静默转向另一数据源,产生错误答案,拒绝。
 
-## 验收标准
+## 后果
+
+WeKnora 模式下知识图谱、评估、思维导图、推荐问题生成、FAQ 管理不可用(页面隐藏、后端拒绝);Agent 只保留五个只读工具;新增持久化字段(归属部门、远端绑定、远端文档 ID、schema v3)以幂等 migration 落地且兼容既有内置记录。内置模式功能、权限与页面完全不变。
+
+## 验证
 
 | 验收主张 | 失败面 | 语义 Owner | 直接证据 / 命令 | 负向案例 | 当前结果 |
 |---|---|---|---|---|---|
-| 全局后端切换正确且 fail-closed | 非法配置被静默当 builtin;weknora 缺配回退内置;LITE 语义改变 | `yuxi/config/runtime.py`、能力发现路由 | unit:`test/unit/config/test_runtime.py`、`test/unit/routers/test_system_discovery.py`;真实 HTTP discovery 双模式回读 | 非法 KNOWLEDGE_BACKEND 启动报错;缺配时 knowledge=false 且带缺失变量名 | Not run |
-| WeKnora 客户端基座密钥不泄漏 | API Key 进入日志、异常文本或响应 | `yuxi/knowledge/weknora.py` | unit:`test/unit/knowledge/test_weknora_client.py`(MockTransport 注入) | 错误消息不含 Key;传输失败只发一次不重试;配置不完整时不发请求 | Not run |
-| 只有 Yuxi 新建库被托管 | 提交任意远端 ID 接管已有库;实例换址后旧绑定指向错误实例 | 托管绑定持久化与建库用例 | 真实 HTTP 建库 + PostgreSQL/WeKnora 双侧回读;保护样本库不可见 | 伪造远端 ID、未绑定库、实例身份变更均被拒 | Not run |
-| 部门内容协作权限矩阵正确 | 权限仅由前端隐藏;创建者越权;调部门后旧权限残留 | `yuxi/permissions/resource_permission.py`、知识库路由依赖 | 各角色真实 HTTP 与浏览器读写 + 远端副作用回读 | 跨部门访问、普通成员整库删除、只读部门写入被后端拒绝 | Not run |
-| 处理状态真实且不伪装 | 入队即显示完成;未知状态映射为完成;统计填零 | 状态映射与文件列表用例 | 上传→远端终态→状态回读;远端 parse_status 全枚举映射表测试 | 未知状态、对象被外部删除返回具体状态而非成功 | Not run |
-| 写操作故障可恢复 | 自动重复创建;绑定丢失;对未知资源补偿删除 | 协调状态持久化与写用例 | 注入超时与本地落库失败后回读操作记录与远端数量 | 待核对状态保留;远端对象数量核对无重复 | Not run |
-| Agent 只读使用知识且引用正确 | 工具含写操作;全空间搜索当默认范围;引用打开错误文档 | `yuxi/agentscope/tools.py` 与 Run/worker 链路 | 真实 AgentScope Run:工具调用、命中内容、回答来源、终态 | 越权工具参数、伪造文档 ID、密钥进入客户端被拒 | Not run |
-| 内置模式无回归 | 新规则误作用于旧库;LITE 模式加载重依赖 | builtin 执行器与既有测试 | 既有知识库 unit/integration 全量 + 回切后用户流程 | 新字段/权限对内置库零影响 | Not run |
+| 全局后端切换正确且 fail-closed | 非法配置被静默当 builtin;weknora 缺配回退内置;LITE 语义改变 | `yuxi/config/runtime.py`、能力发现路由 | unit:`test/unit/config/test_runtime.py`、`test/unit/routers/test_system_discovery.py` Passed;真实 HTTP discovery 双模式回读 Passed | 非法值 dify 装配期 ValueError Passed;缺配 knowledge=false+缺失变量名 Passed | Passed |
+| WeKnora 客户端基座密钥不泄漏 | API Key 进入日志、异常文本或响应 | `yuxi/knowledge/weknora.py` | unit:`test/unit/knowledge/test_weknora_client.py` Passed | 错误消息不含 Key Passed;传输失败单次调用 Passed;缺配 fail-closed Passed | Passed |
+| 只有 Yuxi 新建库被托管 | 提交任意远端 ID 接管已有库;实例换址后旧绑定指向错误实例 | 托管绑定持久化与建库用例 | 真实 HTTP 建库+双侧回读 Passed;保护样本库不可见 Passed | 伪造远端 ID 结构性无面;实例指纹换址拒绝(单测,远端零请求) | Passed |
+| 部门内容协作权限矩阵正确 | 权限仅由前端隐藏;创建者越权;调部门后旧权限残留 | `yuxi/permissions/resource_permission.py`、知识库路由依赖 | 权限矩阵真实 HTTP+浏览器走查 Passed(成员可读可写不可管) | 跨部门 403/空列表、成员整库删除 403、归属 admin 改共享 400 | Passed |
+| 处理状态真实且不伪装 | 入队即显示完成;未知状态映射为完成;统计填零 | 状态映射与文件列表用例 | 上传→completed(真实 embedding qdrant _4096)Passed;浏览器中文状态标签 Passed | 无效凭证轮 failed 如实同步;未知状态显式透出(单测) | Passed |
+| 写操作故障可恢复 | 自动重复创建;绑定丢失;对未知资源补偿删除 | 协调状态持久化与写用例 | 真实停远端建库→待核对行保留 Passed;恢复后删除被 400 拒绝;登记重试幂等(单测) | 不自动重试(单测);无补偿删除 | Passed |
+| Agent 只读使用知识且引用正确 | 工具含写操作;全空间搜索当默认范围;引用打开错误文档 | `yuxi/agentscope/tools.py` 与 Run/worker 链路 | 工具装配+检索/open/find/retrieve/download 语义真实 HTTP 验证;浏览器检索 4 命中(本地来源) | 伪造 ID 拒绝;密钥不出服务端;Agent 完整 Run E2E Not run(内置栈 fixture 不适用) | Inspected |
+| 内置模式无回归 | 新规则误作用于旧库;LITE 模式加载重依赖 | builtin 执行器与既有测试 | 每工单全量 unit 对比基线新增 0;builtin 切换实测行为一致 | migration 幂等;LITE 保留 | Passed |
 
 ## 风险
 
 权限扩展触及共享 `resource_permission.py` 与知识库路由依赖层,必须保证 builtin 模式行为零变化,依赖既有权限测试做回归闸门。WeKnora 是远端事实源,本地目录树与远端文档绑定的双写一致性依赖协调状态设计;远端版本演进可能新增状态或字段,映射层必须把未知值显式暴露而非猜测。真实检索验收依赖本地可用的 Embedding 等模型凭证,缺少时该项记 `Not run`,不得以 mock 结果替代。本地联调使用独立 Compose 项目与端口,与既有环境(含主工作区与其他 worktree)的资源冲突需要显式错开。
+
+
+## 验证(实现收口)
+
+- 全部实现与验收证据:.scratch/weknora-integration/ACCEPTANCE.md(12 行矩阵,Passed/Partially/Not run 如实标注)。
+- 已知外部缺陷:WeKnora fork 的 reparse/删除清理指向 weknora_embeddings_0(实际集合 _4096),Yuxi 侧如实透传,待上游修复。
+- 每工单提交前由不继承上下文的独立 Reviewer 评审(6 轮,P0/P1 全部修复后提交);分支终审确认六条规格红线全部守住。

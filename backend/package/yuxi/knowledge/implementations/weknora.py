@@ -206,6 +206,21 @@ class WeKnoraKB(KnowledgeBase):
         from yuxi.knowledge.utils.kb_utils import _normalize_source_path
 
         remote_knowledge_id, ref_filename = parse_weknora_file_ref(item)
+
+        # 登记幂等:同一远端文档重复登记(如上传后登记失败重试)复用既有行,
+        # 不产生第二行绑定,这是孤儿远端对象的恢复路径
+        from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
+
+        existing = await KnowledgeFileRepository().get_by_remote_knowledge_id(kb_id, remote_knowledge_id)
+        if existing is not None:
+            existing_meta = self._file_record_to_meta(existing)
+            if operator_id and not existing_meta.get("created_by"):
+                await KnowledgeFileRepository().update_fields(
+                    file_id=existing.file_id, data={"created_by": operator_id}, kb_id=kb_id
+                )
+                existing_meta["created_by"] = operator_id
+            return existing_meta
+
         params = dict(params or {})
         content_hashes = params.get("content_hashes") if isinstance(params.get("content_hashes"), dict) else {}
         file_sizes = params.get("file_sizes") if isinstance(params.get("file_sizes"), dict) else {}

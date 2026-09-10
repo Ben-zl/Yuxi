@@ -289,7 +289,8 @@ async def test_delete_file_timeout_keeps_remote_contract_error(monkeypatch, conf
         await delete_weknora_file("kb_w", "f1", client=_client(handler))
 
 
-def test_add_file_record_uses_source_path_for_tree(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_add_file_record_uses_source_path_for_tree(monkeypatch) -> None:
     """登记时 source_path 优先生效,保留目录层级(builtin 虚拟目录行为对齐)。"""
 
     from yuxi.knowledge.implementations.weknora import WeKnoraKB
@@ -300,17 +301,20 @@ def test_add_file_record_uses_source_path_for_tree(monkeypatch) -> None:
     async def fake_persist(file_id, meta):
         persisted.update(meta)
 
-    monkeypatch.setattr(kb, "_persist_file_meta", fake_persist)
-    import asyncio
+    async def fake_get_by_remote(self, kb_id, remote_knowledge_id):
+        return None
 
-    meta = asyncio.run(
-        kb.add_file_record(
-            "kb_w",
-            "weknora://rk-9/%E7%BB%86%E5%88%99.md",
-            params={"source_path": "子目录/细则.md", "content_hashes": {}, "file_sizes": {}},
-            operator_id="u1",
-            additional_params={},
-        )
+    monkeypatch.setattr(kb, "_persist_file_meta", fake_persist)
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_remote_knowledge_id",
+        fake_get_by_remote,
+    )
+    meta = await kb.add_file_record(
+        "kb_w",
+        "weknora://rk-9/%E7%BB%86%E5%88%99.md",
+        params={"source_path": "子目录/细则.md", "content_hashes": {}, "file_sizes": {}},
+        operator_id="u1",
+        additional_params={},
     )
 
     assert meta["filename"] == "子目录/细则.md"
@@ -545,3 +549,71 @@ async def test_aquery_rejects_unconfirmed_binding(monkeypatch) -> None:
 
     with pytest.raises(KBOperationError, match="绑定未确认"):
         await kb.aquery("查询", "kb_w", config=_config({"status": "pending_review", "remote_kb_id": None}))
+
+
+@pytest.mark.asyncio
+async def test_register_same_ref_twice_returns_existing_row(monkeypatch) -> None:
+    """同一 weknora 引用重复登记必须幂等:复用既有行,不产生第二行(孤儿恢复路径)。"""
+
+    from yuxi.knowledge.implementations.weknora import WeKnoraKB
+
+    monkeypatch.setenv("WEKNORA_BASE_URL", "http://weknora-app:8080/api/v1")
+    monkeypatch.setenv("WEKNORA_API_KEY", "sk-test")
+    kb = WeKnoraKB("/tmp/yuxi-weknora-test")
+    persisted = []
+    existing_row = SimpleNamespace(
+        file_id="file_existing",
+        kb_id="kb_w",
+        parent_id=None,
+        filename="规范.md",
+        original_filename=None,
+        file_type="md",
+        path="weknora://rk-9/x",
+        minio_url=None,
+        markdown_file=None,
+        status="completed",
+        content_hash="h1",
+        file_size=10,
+        chunk_count=0,
+        token_count=0,
+        content_type=None,
+        processing_params=None,
+        is_folder=False,
+        error_message=None,
+        created_by=None,
+        updated_by=None,
+        created_at=None,
+        updated_at=None,
+        remote_knowledge_id="rk-9",
+    )
+
+    async def fake_get_by_remote(self, kb_id, remote_knowledge_id):
+        return existing_row if remote_knowledge_id == "rk-9" else None
+
+    async def fake_persist(file_id, meta):
+        persisted.append(file_id)
+
+    async def fake_update_fields(self, *, file_id, data, kb_id=None):
+        existing_row.created_by = data.get("created_by")
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_remote_knowledge_id",
+        fake_get_by_remote,
+    )
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.update_fields",
+        fake_update_fields,
+    )
+    monkeypatch.setattr(kb, "_persist_file_meta", fake_persist)
+
+    meta = await kb.add_file_record(
+        "kb_w",
+        "weknora://rk-9/%E8%A7%84%E8%8C%83.md",
+        params={"filename": "规范.md"},
+        operator_id="u1",
+        additional_params={},
+    )
+
+    assert meta["file_id"] == "file_existing"
+    assert meta["created_by"] == "u1"
+    assert persisted == []  # 未新建行
