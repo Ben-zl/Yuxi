@@ -93,6 +93,34 @@
       />
     </a-modal>
 
+    <!-- WeKnora 模式:编辑文档标题/描述/Markdown 正文 -->
+    <a-modal
+      v-model:open="docEditModalVisible"
+      title="编辑文档"
+      :confirm-loading="docEditSaving"
+      @ok="handleDocEditSubmit"
+    >
+      <div class="doc-edit-form">
+        <div class="setting-item">
+          <div class="setting-label">标题 <b>*</b></div>
+          <a-input v-model:value="docEditForm.title" placeholder="请输入文档标题" />
+        </div>
+        <div class="setting-item">
+          <div class="setting-label">描述</div>
+          <a-input v-model:value="docEditForm.description" placeholder="请输入文档描述" />
+        </div>
+        <div class="setting-item">
+          <div class="setting-label">Markdown 正文</div>
+          <a-textarea
+            v-model:value="docEditForm.markdown"
+            :auto-size="{ minRows: 10, maxRows: 20 }"
+            placeholder="请输入 Markdown 正文"
+          />
+          <p class="param-description">保存修改后的正文会以手工文档方式重建远端内容。</p>
+        </div>
+      </div>
+    </a-modal>
+
     <FileBrowserTable
       class="knowledge-file-browser"
       :rows="files"
@@ -119,7 +147,9 @@
 
       <template #toolbar-actions>
         <div class="panel-actions">
+          <!-- WeKnora 模式不提供思维导图入口 -->
           <button
+            v-if="!weknoraMode"
             type="button"
             class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-table-mindmap-button"
             @click="emit('mindmap')"
@@ -233,7 +263,9 @@
             <span>{{ selectedRowKeys.length }} 项</span>
           </div>
           <div style="display: flex; gap: 2px">
+            <!-- WeKnora 模式由远端自动处理,隐藏本地待解析/待入库双阶段批量入口 -->
             <a-button
+              v-if="!weknoraMode"
               type="link"
               @click="handleBatchParse"
               :loading="batchParsing"
@@ -243,6 +275,7 @@
               批量解析
             </a-button>
             <a-button
+              v-if="!weknoraMode"
               type="link"
               @click="handleBatchIndex"
               :loading="batchIndexing"
@@ -405,15 +438,15 @@
                     type="text"
                     block
                     @click="handleDownloadFile(row)"
-                    :disabled="lock || !canDownloadFile(row)"
+                    :disabled="lock || !resolveCanDownload(row)"
                   >
                     <template #icon><component :is="h(Download)" size="14" /></template>
                     下载文件
                   </a-button>
 
-                  <!-- Parse Action -->
+                  <!-- Parse Action (内置模式) -->
                   <a-button
-                    v-if="!readonly && canParseFile(row)"
+                    v-if="!readonly && !weknoraMode && canParseFile(row)"
                     type="text"
                     block
                     @click="handleParseFile(row)"
@@ -423,9 +456,13 @@
                     {{ getFilePrimaryAction(row)?.label || '解析文件' }}
                   </a-button>
 
-                  <!-- Index Action -->
+                  <!-- Index Action (内置模式) -->
                   <a-button
-                    v-if="!readonly && getFilePrimaryAction(row)?.type === FILE_ACTIONS.INDEX"
+                    v-if="
+                      !readonly &&
+                      !weknoraMode &&
+                      getFilePrimaryAction(row)?.type === FILE_ACTIONS.INDEX
+                    "
                     type="text"
                     block
                     @click="handleIndexFile(row)"
@@ -435,9 +472,9 @@
                     {{ getFilePrimaryAction(row)?.label || '入库' }}
                   </a-button>
 
-                  <!-- Reindex Action -->
+                  <!-- Reindex Action (内置模式) -->
                   <a-button
-                    v-if="!readonly && canReindexFile(row)"
+                    v-if="!readonly && !weknoraMode && canReindexFile(row)"
                     type="text"
                     block
                     @click="handleReindexFile(row)"
@@ -445,6 +482,30 @@
                   >
                     <template #icon><component :is="h(RotateCw)" size="14" /></template>
                     重新入库
+                  </a-button>
+
+                  <!-- WeKnora 模式:失败/完成文档可重新解析并重建索引 -->
+                  <a-button
+                    v-if="!readonly && weknoraMode && canWeknoraReparseFile(row)"
+                    type="text"
+                    block
+                    @click="handleWeknoraReparse(row)"
+                    :disabled="lock"
+                  >
+                    <template #icon><component :is="h(RotateCw)" size="14" /></template>
+                    重新解析并重建索引
+                  </a-button>
+
+                  <!-- WeKnora 模式:编辑文档标题/描述/Markdown 正文 -->
+                  <a-button
+                    v-if="!readonly && weknoraMode && !row.is_folder"
+                    type="text"
+                    block
+                    @click="showDocEditModal(row)"
+                    :disabled="lock"
+                  >
+                    <template #icon><component :is="h(Pencil)" size="14" /></template>
+                    编辑文档
                   </a-button>
 
                   <a-button
@@ -471,15 +532,17 @@
 </template>
 
 <script setup>
-import { ref, computed, h, watch } from 'vue'
+import { ref, reactive, computed, h, watch } from 'vue'
 import { useDatabaseStore } from '@/stores/database'
 import { useConfigStore } from '@/stores/config'
+import { useRuntimeCapabilitiesStore } from '@/stores/runtimeCapabilities'
 import OCRSelector from '@/components/OCRSelector.vue'
 import { message, Modal } from 'ant-design-vue'
 import { documentApi } from '@/apis/knowledge_api'
 import {
   FILE_ACTIONS,
   FILE_STATUS_FILTER_OPTIONS,
+  WEKNORA_FILE_STATUS_FILTER_OPTIONS,
   canDeleteFile,
   canDownloadFile,
   canIndexFile,
@@ -487,9 +550,13 @@ import {
   canParseFile,
   canReindexFile,
   canSelectFile,
+  canWeknoraDownloadFile,
+  canWeknoraPreviewFile,
+  canWeknoraReparseFile,
   getFilePrimaryAction,
   getFileStatusSortWeight,
-  getFileStatusView
+  getFileStatusView,
+  getWeknoraFileStatusView
 } from '@/utils/knowledge_file_policy'
 import {
   canDragKnowledgeFile,
@@ -521,6 +588,7 @@ import {
 } from '@lucide/vue'
 
 const store = useDatabaseStore()
+const runtimeCapabilitiesStore = useRuntimeCapabilitiesStore()
 
 const emit = defineEmits(['mindmap', 'search'])
 
@@ -529,6 +597,9 @@ const props = defineProps({
 })
 
 const readonly = computed(() => props.readonly)
+
+// WeKnora 模式:状态展示远端原文映射,隐藏本地双阶段动作
+const weknoraMode = computed(() => runtimeCapabilitiesStore.weknoraBackendEnabled)
 
 const applyFilters = async (overrides = {}) => {
   const nextStatus = overrides.status ?? statusFilter.value
@@ -561,12 +632,23 @@ const statusIconMap = {
   file: FileTextFilled
 }
 
-const getStatusText = (status) => getFileStatusView(status).label
+// 状态视图按当前知识库后端选择:WeKnora 用远端状态映射,未知状态保留原文
+const resolveStatusView = (status) =>
+  weknoraMode.value ? getWeknoraFileStatusView(status) : getFileStatusView(status)
 
-const getStatusTone = (status) => getFileStatusView(status).tone
+// 文件详情与下载入口同样按后端切换策略:WeKnora 依据远端状态裁决
+const resolveCanOpenDetail = (record) =>
+  weknoraMode.value ? canWeknoraPreviewFile(record) : canOpenFileDetail(record)
+
+const resolveCanDownload = (record) =>
+  weknoraMode.value ? canWeknoraDownloadFile(record) : canDownloadFile(record)
+
+const getStatusText = (status) => resolveStatusView(status).label
+
+const getStatusTone = (status) => resolveStatusView(status).tone
 
 const getStatusIcon = (status) => {
-  const icon = getFileStatusView(status).icon
+  const icon = resolveStatusView(status).icon
   return statusIconMap[icon] || null
 }
 
@@ -607,7 +689,7 @@ const overflowMenuOpen = ref(false)
 
 const currentStatusLabel = computed(() => {
   if (statusFilter.value === 'all') return ''
-  const opt = statusOptions.find((o) => o.value === statusFilter.value)
+  const opt = statusOptions.value.find((o) => o.value === statusFilter.value)
   return opt ? opt.label : ''
 })
 
@@ -912,7 +994,9 @@ const handleTablePageChange = ({ page, pageSize }) => {
 }
 
 const statusFilter = ref('all')
-const statusOptions = FILE_STATUS_FILTER_OPTIONS
+const statusOptions = computed(() =>
+  weknoraMode.value ? WEKNORA_FILE_STATUS_FILTER_OPTIONS : FILE_STATUS_FILTER_OPTIONS
+)
 
 // 紧凑表格列定义
 const columnsCompact = [
@@ -1152,8 +1236,13 @@ const startPendingIndex = (count = 0) => {
 }
 
 const openFileDetail = (record) => {
-  if (!canOpenFileDetail(record)) {
-    message.error('文件未处理完成，请稍后再试')
+  if (!resolveCanOpenDetail(record)) {
+    // WeKnora 终态失败/取消文档不是"处理中",提示需要区分
+    message.error(
+      weknoraMode.value && ['failed', 'cancelled'].includes(record.status)
+        ? '文档处理未完成，暂不可预览'
+        : '文件未处理完成，请稍后再试'
+    )
     return
   }
   store.openFileDetail(record.file_id)
@@ -1278,6 +1367,83 @@ const handleStatusAction = async (record) => {
 
   if (action?.type === FILE_ACTIONS.INDEX) {
     await handleIndexFile(record)
+  }
+}
+
+// WeKnora 模式:重新解析并重建索引,旧分块由远端重建覆盖
+const handleWeknoraReparse = (record) => {
+  closePopover(record.file_id)
+  Modal.confirm({
+    title: '重新解析并重建索引',
+    content: `将重新解析“${record.displayName || record.filename}”并重建索引，旧的分块和向量会被重建覆盖。`,
+    okText: '开始重建',
+    cancelText: '取消',
+    onOk: async () => {
+      await store.parseFiles([record.file_id], {})
+    }
+  })
+}
+
+// WeKnora 模式:编辑文档标题/描述/Markdown 正文
+const docEditModalVisible = ref(false)
+const docEditSaving = ref(false)
+const docEditTarget = ref(null)
+// 初值为回读的远端解析文本;null 表示回读失败,提交时按"正文未修改"处理
+const docEditOriginalMarkdown = ref(null)
+const docEditForm = reactive({
+  title: '',
+  description: '',
+  markdown: ''
+})
+
+const showDocEditModal = async (record) => {
+  closePopover(record.file_id)
+  docEditTarget.value = record
+  docEditForm.title = record.displayName || record.filename || ''
+  docEditForm.description = record.description || ''
+  docEditForm.markdown = ''
+  docEditOriginalMarkdown.value = null
+  docEditModalVisible.value = true
+  try {
+    const content = await documentApi.getDocumentContent(store.kbId, record.file_id)
+    docEditOriginalMarkdown.value = String(content?.content ?? '')
+    docEditForm.markdown = docEditOriginalMarkdown.value
+  } catch (error) {
+    console.error('读取文档正文失败:', error)
+  }
+}
+
+const handleDocEditSubmit = async () => {
+  if (!docEditTarget.value || docEditSaving.value) return
+  if (!docEditForm.title.trim()) {
+    message.warning('请输入文档标题')
+    return
+  }
+
+  const payload = { title: docEditForm.title.trim() }
+  if (docEditForm.description.trim()) {
+    payload.description = docEditForm.description.trim()
+  }
+  // 正文仅在相对初值实际变化时提交,避免回读失败时误清空远端内容
+  const markdownChanged =
+    docEditOriginalMarkdown.value === null
+      ? docEditForm.markdown.trim() !== ''
+      : docEditForm.markdown !== docEditOriginalMarkdown.value
+  if (markdownChanged) {
+    payload.markdown = docEditForm.markdown
+  }
+
+  docEditSaving.value = true
+  try {
+    await documentApi.updateDocument(store.kbId, docEditTarget.value.file_id, payload)
+    message.success('文档已更新')
+    docEditModalVisible.value = false
+    await refreshAfterMutation()
+  } catch (error) {
+    console.error('更新文档失败:', error)
+    message.error(error.message || '更新文档失败')
+  } finally {
+    docEditSaving.value = false
   }
 }
 
@@ -1523,6 +1689,16 @@ import { generatePixelAvatar } from '@/utils/pixelAvatar'
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+.doc-edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+
+  .setting-label b {
+    color: var(--color-error-500);
+  }
 }
 
 .parse-pending-alert {

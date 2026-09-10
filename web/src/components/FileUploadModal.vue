@@ -30,7 +30,8 @@
             class="custom-segmented"
           />
         </div>
-        <div class="auto-index-toggle">
+        <!-- WeKnora 模式解析与入库由远端自动处理,不提供自动入库开关 -->
+        <div class="auto-index-toggle" v-if="!weknoraMode">
           <a-checkbox v-model:checked="autoIndex">上传后自动入库</a-checkbox>
         </div>
       </div>
@@ -64,7 +65,8 @@
             </div>
             <p class="param-description">选择文件保存的目标文件夹</p>
           </div>
-          <div class="col-item" v-if="uploadMode !== 'url'">
+          <!-- WeKnora 模式 OCR 由部署统一配置,不提供引擎选择 -->
+          <div class="col-item" v-if="uploadMode !== 'url' && !weknoraMode">
             <div class="setting-label">OCR 引擎（仅应用于 PDF/图片文件）</div>
             <div class="setting-content">
               <OCRSelector
@@ -78,7 +80,7 @@
         </div>
 
         <!-- 第二行：自动入库配置 (仅在开启时显示) -->
-        <div class="setting-row" v-if="autoIndex">
+        <div class="setting-row" v-if="autoIndex && !weknoraMode">
           <div class="col-item">
             <div class="setting-label">入库参数配置</div>
             <div class="setting-content">
@@ -98,7 +100,7 @@
       </div>
 
       <!-- PDF/图片OCR提醒 (Alert样式优化) -->
-      <div v-if="hasPdfOrImageFiles && !isOcrEnabled" class="inline-alert warning">
+      <div v-if="hasPdfOrImageFiles && !isOcrEnabled && !weknoraMode" class="inline-alert warning">
         <Info :size="16" />
         <span>检测到PDF或图片文件，建议启用 OCR 以提取文本内容</span>
       </div>
@@ -189,6 +191,23 @@
           :is-file-selectable="isWorkspaceFileSelectable"
           @loading-change="workspaceLoading = $event"
         />
+      </div>
+
+      <!-- 手工 Markdown 文档区域 (仅 WeKnora 模式) -->
+      <div class="manual-area" v-if="uploadMode === 'manual'">
+        <div class="setting-item">
+          <div class="setting-label">文档标题 <b>*</b></div>
+          <a-input v-model:value="manualTitle" placeholder="例如：团队协作规范" />
+        </div>
+        <div class="setting-item">
+          <div class="setting-label">Markdown 正文</div>
+          <a-textarea
+            v-model:value="manualMarkdown"
+            :auto-size="{ minRows: 10, maxRows: 20 }"
+            class="manual-markdown-input"
+            placeholder="支持 Markdown 语法，保存后由 WeKnora 解析并建立索引"
+          />
+        </div>
       </div>
 
       <!-- URL 输入区域 -->
@@ -288,11 +307,13 @@ import { message, Upload, Modal } from 'ant-design-vue'
 import { useUserStore } from '@/stores/user'
 import { useConfigStore } from '@/stores/config'
 import { useDatabaseStore } from '@/stores/database'
+import { useRuntimeCapabilitiesStore } from '@/stores/runtimeCapabilities'
 import { fileApi, documentApi } from '@/apis/knowledge_api'
 import {
   FileUp,
   FolderUp,
   FolderOpen,
+  PenLine,
   RotateCw,
   CircleHelp,
   Info,
@@ -335,6 +356,9 @@ const emit = defineEmits(['update:visible', 'success'])
 
 const store = useDatabaseStore()
 const configStore = useConfigStore()
+const runtimeCapabilitiesStore = useRuntimeCapabilitiesStore()
+// WeKnora 模式:OCR/分块/自动入库由部署与远端统一处理,表单只保留来源与目标目录
+const weknoraMode = computed(() => runtimeCapabilitiesStore.weknoraBackendEnabled)
 const DEFAULT_OCR_ENGINE = 'rapid_ocr'
 const defaultOcrEngine = ref(DEFAULT_OCR_ENGINE)
 
@@ -449,6 +473,11 @@ const isSupportedUploadFile = (file) => {
 }
 
 const loadSupportedFileTypes = async () => {
+  // WeKnora 模式下该端点仍为管理员门禁,普通成员直接使用默认类型,避免无谓的失败提示
+  if (weknoraMode.value) {
+    applySupportedFileTypes(DEFAULT_SUPPORTED_TYPES)
+    return
+  }
   try {
     const data = await fileApi.getSupportedFileTypes()
     applySupportedFileTypes(data?.file_types)
@@ -554,6 +583,9 @@ const canSubmit = computed(() => {
   if (uploadMode.value === 'workspace') {
     return selectedWorkspacePaths.value.length > 0 && !workspaceLoading.value
   }
+  if (uploadMode.value === 'manual') {
+    return manualTitle.value.trim().length > 0
+  }
   return successUploadCount.value > 0 && !hasPendingUploads.value
 })
 
@@ -585,7 +617,19 @@ const uploadModeOptions = computed(() => [
       h(FolderOpen, { size: 16, class: 'option-icon' }),
       h('span', { class: 'option-text' }, '个人空间')
     ])
-  }
+  },
+  // WeKnora 模式提供手工 Markdown 文档来源
+  ...(weknoraMode.value
+    ? [
+        {
+          value: 'manual',
+          label: h('div', { class: 'segmented-option' }, [
+            h(PenLine, { size: 16, class: 'option-icon' }),
+            h('span', { class: 'option-text' }, '手工文档')
+          ])
+        }
+      ]
+    : [])
 ])
 
 watch(uploadMode, (val) => {
@@ -596,6 +640,8 @@ watch(uploadMode, (val) => {
   urlList.value = []
   newUrl.value = ''
   selectedWorkspacePaths.value = []
+  manualTitle.value = ''
+  manualMarkdown.value = ''
   for (const task of uploadQueue.value) {
     task.canceled = true
   }
@@ -631,6 +677,10 @@ const urlList = ref([])
 const newUrl = ref('')
 const fetchingUrls = ref(false)
 const CONTENT_EXISTS_ERROR_TEXT = '内容已存在于知识库中'
+
+// 手工 Markdown 文档(仅 WeKnora 模式):标题 + 正文,保存到目标目录
+const manualTitle = ref('')
+const manualMarkdown = ref('')
 
 // 同名文件列表（用于显示提示）
 const sameNameFiles = ref([])
@@ -742,6 +792,10 @@ const buildAutoIndexParams = () => {
     includeSizeOverlap: true
   })
 }
+
+// WeKnora 模式不提交本地 OCR 等解析参数,由远端按部署配置处理
+const buildSubmitParams = (extras = {}) =>
+  weknoraMode.value ? { ...extras } : { ...processingParams.value, ...extras }
 
 const isFolderUpload = ref(false)
 
@@ -1148,8 +1202,36 @@ const chunkData = async () => {
     return
   }
 
-  // 验证OCR服务可用性（非 URL 模式下）
-  if (uploadMode.value !== 'url' && !validateOcrService()) {
+  // 验证OCR服务可用性（非 URL 模式下;WeKnora 模式无本地 OCR 选择）
+  if (uploadMode.value !== 'url' && !weknoraMode.value && !validateOcrService()) {
+    return
+  }
+
+  // 手工 Markdown 文档模式(WeKnora):提交标题与正文到目标目录
+  if (uploadMode.value === 'manual') {
+    if (!manualTitle.value.trim()) {
+      message.error('请输入文档标题')
+      return
+    }
+
+    try {
+      store.state.chunkLoading = true
+      await documentApi.createManualDocument(kbId.value, {
+        title: manualTitle.value.trim(),
+        markdown: manualMarkdown.value,
+        parentId: selectedFolderId.value
+      })
+      message.success('手工文档已创建，等待远端处理')
+      emit('success')
+      handleCancel()
+      manualTitle.value = ''
+      manualMarkdown.value = ''
+    } catch (error) {
+      console.error('创建手工文档失败:', error)
+      message.error('创建手工文档失败: ' + (error.message || '未知错误'))
+    } finally {
+      store.state.chunkLoading = false
+    }
     return
   }
 
@@ -1181,7 +1263,7 @@ const chunkData = async () => {
         mergeSameNameFiles(item.same_name_files)
 
         const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase()
-        if (imageExtensions.includes(ext) && !isOcrEnabled.value) {
+        if (!weknoraMode.value && imageExtensions.includes(ext) && !isOcrEnabled.value) {
           message.error({
             content: '检测到图片文件，必须启用 OCR 才能提取文本内容。',
             duration: 5
@@ -1190,8 +1272,8 @@ const chunkData = async () => {
         }
       }
 
-      const params = { ...processingParams.value, content_hashes, file_sizes }
-      if (autoIndex.value) {
+      const params = buildSubmitParams({ content_hashes, file_sizes })
+      if (autoIndex.value && !weknoraMode.value) {
         params.auto_index = true
         Object.assign(params, buildAutoIndexParams())
       }
@@ -1249,8 +1331,8 @@ const chunkData = async () => {
 
     try {
       store.state.chunkLoading = true
-      const params = { ...processingParams.value }
-      if (autoIndex.value) {
+      const params = buildSubmitParams({})
+      if (autoIndex.value && !weknoraMode.value) {
         params.auto_index = true
         Object.assign(params, buildAutoIndexParams())
       }
@@ -1319,7 +1401,7 @@ const chunkData = async () => {
 
     // 检查是否需要OCR
     const ext = file_path.substring(file_path.lastIndexOf('.')).toLowerCase()
-    if (imageExtensions.includes(ext) && !isOcrEnabled.value) {
+    if (!weknoraMode.value && imageExtensions.includes(ext) && !isOcrEnabled.value) {
       message.error({
         content: '检测到图片文件，必须启用 OCR 才能提取文本内容。',
         duration: 5
@@ -1335,11 +1417,11 @@ const chunkData = async () => {
 
   try {
     store.state.chunkLoading = true
-    const params = { ...processingParams.value, content_hashes, file_sizes }
+    const params = buildSubmitParams({ content_hashes, file_sizes })
     if (Object.keys(source_paths).length > 0) {
       params.source_paths = source_paths
     }
-    if (autoIndex.value) {
+    if (autoIndex.value && !weknoraMode.value) {
       params.auto_index = true
       Object.assign(params, buildAutoIndexParams())
     }
@@ -1803,6 +1885,28 @@ const chunkData = async () => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+/* Manual Markdown Area (WeKnora) */
+.manual-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.manual-area .setting-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.manual-area .setting-label b {
+  color: var(--color-error-500);
+}
+
+.manual-markdown-input {
+  width: 100%;
 }
 
 .workspace-import-summary {

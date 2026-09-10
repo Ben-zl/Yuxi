@@ -222,7 +222,10 @@ router.beforeEach(async (to) => {
   }
 
   // 如果路由需要管理员权限但用户不是管理员
-  if (requiresAdmin && !isAdmin) {
+  // WeKnora 模式下知识库详情向普通成员开放;其余管理员路由维持原门禁
+  const knowledgeDetailOpenToMembers =
+    runtimeCapabilitiesStore.weknoraBackendEnabled && to.name === 'ExtensionKnowledgeBaseDetail'
+  if (requiresAdmin && !isAdmin && !knowledgeDetailOpenToMembers) {
     // 如果是普通用户，跳转到聊天页空态
     try {
       const agentStore = useAgentStore()

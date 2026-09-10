@@ -57,8 +57,38 @@ export const FILE_STATUS_FILTER_OPTIONS = [
   { label: '重试入库', value: 'error_indexing' }
 ]
 
+// WeKnora 文档状态为远端原文,按远端语义展示;未知状态不得默认映射为完成
+const WEKNORA_STATUS_VIEW = {
+  pending: { label: '排队', tone: 'status-warning', icon: 'clock' },
+  processing: { label: '处理中', tone: 'status-info', icon: 'progress' },
+  finalizing: { label: '后处理中', tone: 'status-info', icon: 'progress' },
+  completed: { label: '完成', tone: 'status-success', icon: 'success' },
+  failed: { label: '失败', tone: 'status-error', icon: 'error' },
+  deleting: { label: '删除中', tone: 'status-warning', icon: 'progress' },
+  cancelled: { label: '已取消', tone: 'status-warning', icon: 'clock' },
+  draft: { label: '草稿', tone: 'status-warning', icon: 'file' }
+}
+
+export const WEKNORA_FILE_STATUS_FILTER_OPTIONS = [
+  { label: '排队', value: 'pending' },
+  { label: '处理中', value: 'processing' },
+  { label: '后处理中', value: 'finalizing' },
+  { label: '完成', value: 'completed' },
+  { label: '失败', value: 'failed' },
+  { label: '删除中', value: 'deleting' },
+  { label: '已取消', value: 'cancelled' },
+  { label: '草稿', value: 'draft' }
+]
+
 export const getFileStatusView = (status) =>
   STATUS_VIEW[status] || { label: status || '', tone: '', icon: null }
+
+export const getWeknoraFileStatusView = (status) =>
+  WEKNORA_STATUS_VIEW[status] || {
+    label: `未知状态(${status || ''})`,
+    tone: '',
+    icon: null
+  }
 
 export const getFilePrimaryAction = (record) => {
   if (!record || record.is_folder) return null
@@ -73,6 +103,23 @@ export const canIndexFile = (record) =>
 
 export const canReindexFile = (record) =>
   Boolean(record && !record.is_folder && (record.status === 'done' || record.status === 'indexed'))
+
+// WeKnora 模式:失败/完成文档可"重新解析并重建索引",由远端重建旧分块
+export const canWeknoraReparseFile = (record) =>
+  Boolean(
+    record && !record.is_folder && (record.status === 'failed' || record.status === 'completed')
+  )
+
+// WeKnora 文件详情/下载策略:completed/draft 可预览解析内容并下载原件;
+// failed/cancelled 仅可下载原件;处理中/删除中两者皆不可;未知状态 fail-closed
+const WEKNORA_PREVIEW_STATUSES = new Set(['completed', 'draft'])
+const WEKNORA_DOWNLOAD_STATUSES = new Set(['completed', 'draft', 'failed', 'cancelled'])
+
+export const canWeknoraPreviewFile = (record) =>
+  Boolean(record && !record.is_folder && WEKNORA_PREVIEW_STATUSES.has(record.status))
+
+export const canWeknoraDownloadFile = (record) =>
+  Boolean(record && !record.is_folder && WEKNORA_DOWNLOAD_STATUSES.has(record.status))
 
 export const canDownloadFile = (record) =>
   Boolean(

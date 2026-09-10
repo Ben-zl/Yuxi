@@ -71,4 +71,19 @@ export const buildDatabaseRequest = (form, typeInfo, shareConfig, defaultEmbeddi
   }
   return request
 }
+
+/**
+ * 构建 WeKnora 模式简化建库请求:只提交名称、描述,超级管理员额外提交归属部门;
+ * kb_type/embedding/分块等字段由部署配置决定,不在请求中出现。
+ */
+export const buildWeknoraDatabaseRequest = (name, description, owningDepartmentId = null) => {
+  const request = {
+    database_name: String(name || '').trim(),
+    description: String(description || '').trim()
+  }
+  if (owningDepartmentId !== null && owningDepartmentId !== undefined && owningDepartmentId !== '') {
+    request.owning_department_id = owningDepartmentId
+  }
+  return request
+}
 import { DEFAULT_CHUNK_PRESET_ID } from './chunkUtils.js'
