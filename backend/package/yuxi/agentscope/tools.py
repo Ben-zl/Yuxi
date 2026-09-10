@@ -570,9 +570,20 @@ async def build_dependency_tools(
 
     resolved = {tool.name for tool in result}
     missing = [slug for slug in tool_slugs if slug not in resolved]
-    if missing:
-        raise ValueError("Skill 工具依赖当前不可用: " + ", ".join(missing))
+    # WeKnora 模式不提供思维导图;依赖该工具的 Skill 按依赖降级跳过,
+    # 不阻断整个会话的工具装配(能力不可用只影响该 Skill)
+    weknora_unavailable = {"get_mindmap"} if _weknora_backend_selected() else set()
+    blocking = [slug for slug in missing if slug not in weknora_unavailable]
+    if blocking:
+        raise ValueError("Skill 工具依赖当前不可用: " + ", ".join(blocking))
     return result
+
+
+def _weknora_backend_selected() -> bool:
+    """当前进程是否运行在 WeKnora 知识库后端模式。"""
+    from yuxi.config.runtime import KNOWLEDGE_BACKEND_WEKNORA, knowledge_backend
+
+    return knowledge_backend() == KNOWLEDGE_BACKEND_WEKNORA
 
 
 async def build_skill_dependency_gateway(
