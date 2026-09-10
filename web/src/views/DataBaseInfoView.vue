@@ -216,7 +216,7 @@
       </template>
 
       <template #panel-graph>
-        <div v-if="isMilvus && activeTab === 'graph'" class="tab-panel">
+        <div v-if="(isMilvus || isWeknoraKb) && activeTab === 'graph'" class="tab-panel">
           <KnowledgeGraphSection
             :visible="true"
             :active="activeTab === 'graph'"
@@ -520,7 +520,8 @@ const tabs = computed(() => {
   if (isWeknoraKb.value) {
     return [
       { key: 'filetable', label: '文件管理', icon: FileText },
-      { key: 'query', label: '检索测试', icon: Search, forceRender: true }
+      { key: 'query', label: '检索测试', icon: Search, forceRender: true },
+      { key: 'graph', label: '知识图谱', icon: Network }
     ]
   }
   if (isMilvus.value) {

@@ -1751,24 +1751,20 @@ async def delete_document(kb_id: str, doc_id: str, current_user: User = Depends(
         raise HTTPException(status_code=400, detail=f"删除文档失败: {e}")
 
 
-async def _download_weknora_document(kb_id: str, doc_id: str, file_meta: dict):
+async def _download_weknora_document(kb_id: str, doc_id: str):
     """WeKnora 模式下载:经 Yuxi 鉴权后由服务端代理远端原件字节,不暴露 API Key。"""
 
-    from yuxi.knowledge.weknora import WeKnoraClient, WeKnoraClientError, load_weknora_settings
+    from yuxi.knowledge.base import KBOperationError
+    from yuxi.services.weknora_knowledge_service import download_weknora_document_stream
 
-    remote_knowledge_id = file_meta.get("remote_knowledge_id")
-    if not remote_knowledge_id:
-        raise HTTPException(status_code=400, detail="文档缺少远端绑定,无法下载")
-    settings = load_weknora_settings()
-    if not settings.ready:
-        raise HTTPException(status_code=503, detail="WeKnora 部署配置不完整")
-    client = WeKnoraClient(settings, timeout=120.0)
     try:
-        response = await client.request("GET", f"knowledge/{remote_knowledge_id}/download", follow_redirects=True)
-    except WeKnoraClientError as e:
+        stream, filename, media_type = await download_weknora_document_stream(kb_id, doc_id, variant="original")
+        content = bytearray()
+        async for chunk in stream:
+            content.extend(chunk)
+    except KBOperationError as e:
         raise HTTPException(status_code=502, detail=f"远端下载失败: {e}") from e
 
-    filename = file_meta.get("filename") or "download"
     try:
         decoded_filename = unquote(filename, encoding="utf-8")
     except Exception:
@@ -1776,8 +1772,8 @@ async def _download_weknora_document(kb_id: str, doc_id: str, file_meta: dict):
     _, ext = os.path.splitext(decoded_filename)
     disposition = "attachment; filename*=UTF-8''" + quote(decoded_filename)
     return Response(
-        content=response.content,
-        media_type=media_types.get(ext.lower(), "application/octet-stream"),
+        content=bytes(content),
+        media_type=media_type or media_types.get(ext.lower(), "application/octet-stream"),
         headers={"Content-Disposition": disposition},
     )
 
@@ -1792,7 +1788,7 @@ async def download_document(kb_id: str, doc_id: str, current_user: User = Depend
         file_meta = file_info.get("meta", {})
 
         if _weknora_backend_selected():
-            return await _download_weknora_document(kb_id, doc_id, file_meta)
+            return await _download_weknora_document(kb_id, doc_id)
 
         # 获取文件类型、路径和文件名
         file_type = file_meta.get("file_type", "file")
@@ -2154,7 +2150,7 @@ async def _import_weknora_url(url: str, kb_id: str | None, current_user: User) -
         raise HTTPException(status_code=400, detail="WeKnora 模式 URL 导入必须指定知识库")
     await require_knowledge_base_content_write(kb_id, current_user)
     try:
-        imported = await import_weknora_url(kb_id, url=url)
+        imported = await import_weknora_url(kb_id, url=url, operator_id=current_user.uid)
     except KBOperationError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {
@@ -2167,7 +2163,6 @@ async def _import_weknora_url(url: str, kb_id: str | None, current_user: User) -
         "size": imported["size"],
         "has_same_name": False,
         "same_name_files": [],
-        "remote_knowledge_id": imported["remote_knowledge_id"],
         "remote_status": imported["remote_status"],
     }
 
@@ -2184,7 +2179,13 @@ async def _import_weknora_workspace_files(kb_id: str, paths: list[str], current_
         filename, file_bytes = await read_workspace_file_bytes(path=workspace_path, current_user=current_user)
         content_hash = await calculate_content_hash(file_bytes)
         try:
-            uploaded = await upload_weknora_file(kb_id, filename=filename, content=file_bytes)
+            uploaded = await upload_weknora_file(
+                kb_id,
+                filename=filename,
+                content=file_bytes,
+                operator_id=current_user.uid,
+                content_hash=content_hash,
+            )
         except KBOperationError as e:
             raise HTTPException(status_code=400, detail=f"工作区文件 {workspace_path} 导入失败: {e}") from e
         basename, ext = os.path.splitext(filename)
@@ -2198,7 +2199,6 @@ async def _import_weknora_workspace_files(kb_id: str, paths: list[str], current_
                 "original_filename": basename,
                 "size": uploaded["size"],
                 "workspace_path": workspace_path,
-                "remote_knowledge_id": uploaded["remote_knowledge_id"],
                 "remote_status": uploaded["remote_status"],
             }
         )
@@ -2230,7 +2230,13 @@ async def create_manual_document(
     from yuxi.services.weknora_knowledge_service import create_weknora_manual
 
     try:
-        created = await create_weknora_manual(kb_id, title=payload.title, markdown=payload.markdown)
+        created = await create_weknora_manual(
+            kb_id,
+            title=payload.title,
+            markdown=payload.markdown,
+            operator_id=current_user.uid,
+            parent_id=payload.parent_id,
+        )
         file_meta = await knowledge_base.add_file_record(
             kb_id,
             created["ref"],
@@ -2418,7 +2424,7 @@ async def import_workspace_files(
 
 
 async def _upload_weknora_file(file: UploadFile, kb_id: str | None, current_user: User) -> dict:
-    """WeKnora 模式上传:直传远端托管库,返回 weknora:// 引用供 /documents 登记。"""
+    """WeKnora 模式上传:直传远端托管库,返回仅含本地文档 ID 的引用供 /documents 登记。"""
 
     from yuxi.knowledge.base import KBOperationError
     from yuxi.services.weknora_knowledge_service import upload_weknora_file
@@ -2442,6 +2448,8 @@ async def _upload_weknora_file(file: UploadFile, kb_id: str | None, current_user
             filename=file.filename,
             content=file_bytes,
             content_type=file.content_type,
+            operator_id=current_user.uid,
+            content_hash=content_hash,
         )
     except KBOperationError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -2456,7 +2464,6 @@ async def _upload_weknora_file(file: UploadFile, kb_id: str | None, current_user
         "filename": f"{basename}{ext}".lower(),
         "original_filename": basename,
         "size": uploaded["size"],
-        "remote_knowledge_id": uploaded["remote_knowledge_id"],
         "remote_status": uploaded["remote_status"],
     }
 

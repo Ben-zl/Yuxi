@@ -185,60 +185,45 @@ class WeKnoraKB(KnowledgeBase):
         *,
         additional_params: dict[str, Any],
     ) -> dict:
-        """登记 WeKnora 托管文档:远端已持有内容,本地仅保存目录位置与远端绑定。
+        """确认服务端预登记的文档意向并更新目录位置。
 
-        item 必须是 weknora:// 引用(由上传用例生成);content_hash、file_size 经
-        params.content_hashes / params.file_sizes 按引用传入,状态取远端当前值。
+        item 只携带不可预测的本地 file_id。远端 ID 必须已由上传用例写入该行,
+        客户端不能提交或替换远端资源绑定。
         """
         del additional_params
-        import time
 
         from yuxi.knowledge.weknora import parse_weknora_file_ref
-        from yuxi.utils import hashstr
-        from yuxi.utils.datetime_utils import utc_isoformat
 
         from yuxi.knowledge.utils.kb_utils import _normalize_source_path
 
-        remote_knowledge_id, ref_filename = parse_weknora_file_ref(item)
-
-        # 登记幂等:同一远端文档重复登记(如上传后登记失败重试)复用既有行,
-        # 不产生第二行绑定,这是孤儿远端对象的恢复路径
+        file_id, ref_filename = parse_weknora_file_ref(item)
         from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
 
-        existing = await KnowledgeFileRepository().get_by_remote_knowledge_id(kb_id, remote_knowledge_id)
-        if existing is not None:
-            existing_meta = self._file_record_to_meta(existing)
-            if operator_id and not existing_meta.get("created_by"):
-                await KnowledgeFileRepository().update_fields(
-                    file_id=existing.file_id, data={"created_by": operator_id}, kb_id=kb_id
-                )
-                existing_meta["created_by"] = operator_id
-            return existing_meta
+        repo = KnowledgeFileRepository()
+        existing = await repo.get_by_file_id(file_id)
+        if existing is None or existing.kb_id != kb_id:
+            raise KBOperationError("WeKnora 文档登记引用无效或不属于当前知识库")
+        if not existing.remote_knowledge_id:
+            raise KBOperationError(f"文档 {file_id} 的远端写入结果尚未确认")
 
         params = dict(params or {})
         content_hashes = params.get("content_hashes") if isinstance(params.get("content_hashes"), dict) else {}
         file_sizes = params.get("file_sizes") if isinstance(params.get("file_sizes"), dict) else {}
-        # source_path 仅作展示层级,与 builtin 相同的归一化边界(拒绝绝对路径与 .. 等)
         filename = str(_normalize_source_path(params.get("source_path")) or params.get("filename") or ref_filename)
-        file_type = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-
-        metadata = {
-            "kb_id": kb_id,
+        updates = {
             "filename": filename,
-            "path": item,
-            "file_type": file_type,
-            "status": params.get("remote_status") or "pending",
-            "created_at": utc_isoformat(),
-            "file_id": f"file_{hashstr(str(item) + str(time.time()), 6)}",
-            "content_hash": content_hashes.get(item),
-            "size": file_sizes.get(item),
             "parent_id": params.get("parent_id"),
-            "remote_knowledge_id": remote_knowledge_id,
         }
-        if operator_id:
-            metadata["created_by"] = operator_id
-        await self._persist_file_meta(metadata["file_id"], metadata)
-        return metadata
+        if content_hashes.get(item):
+            updates["content_hash"] = content_hashes[item]
+        if file_sizes.get(item) is not None:
+            updates["file_size"] = file_sizes[item]
+        if operator_id and not existing.created_by:
+            updates["created_by"] = operator_id
+        updated = await repo.update_fields(file_id=file_id, data=updates, kb_id=kb_id)
+        if updated is None:
+            raise KBOperationError(f"文档 {file_id} 登记失败")
+        return self._file_record_to_meta(updated)
 
     async def parse_file(
         self,
@@ -320,7 +305,7 @@ class WeKnoraKB(KnowledgeBase):
         return {
             "meta": file_meta,
             "content": content,
-            "content_source": "weknora-parsed",
+            "content_source": "weknora-manual-or-chunks",
             "chunks": chunks,
         }
 

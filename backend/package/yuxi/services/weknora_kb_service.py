@@ -118,18 +118,34 @@ async def create_weknora_database(
         }
     )
 
+    remote_payload = {
+        "name": database_name,
+        "description": description,
+        "embedding_model_id": settings.embedding_model_id,
+        "summary_model_id": settings.summary_model_id,
+    }
+    if settings.graph_extract_enabled:
+        # 远端校验要求 enabled 时 text/tags/nodes/relations 齐全;
+        # 使用与远端默认模板等价的最小中文配置,抽取协议仍由远端掌握
+        remote_payload["extract_config"] = {
+            "enabled": True,
+            "text": (
+                '"罗密欧与朱丽叶"是莎士比亚早期创作的一部悲剧,讲述了两个敌对家族'
+                "青年罗密欧与朱丽叶的爱情故事,也是莎士比亚生前最受欢迎的剧作之一。"
+            ),
+            "tags": ["作者", "别名", "属于", "负责", "领导", "部署", "运维", "包含", "相关"],
+            "nodes": [
+                {"name": "罗密欧与朱丽叶", "attributes": ["莎士比亚创作的悲剧", "生前最受欢迎剧作之一"]},
+                {"name": "威廉·莎士比亚", "attributes": ["剧作家", "早期创作了罗密欧与朱丽叶"]},
+            ],
+            "relations": [
+                {"node1": "罗密欧与朱丽叶", "node2": "威廉·莎士比亚", "type": "作者"},
+            ],
+        }
+
     remote_client = client or WeKnoraClient(settings)
     try:
-        response = await remote_client.request(
-            "POST",
-            "knowledge-bases",
-            json={
-                "name": database_name,
-                "description": description,
-                "embedding_model_id": settings.embedding_model_id,
-                "summary_model_id": settings.summary_model_id,
-            },
-        )
+        response = await remote_client.request("POST", "knowledge-bases", json=remote_payload)
     except WeKnoraClientError as error:
         if error.status_code is not None and 400 <= error.status_code < 500:
             # 远端明确拒绝,请求未创建资源,本地登记可安全撤销

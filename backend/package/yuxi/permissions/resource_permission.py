@@ -209,6 +209,20 @@ def require_resource_permission(
 def resolve_knowledge_base_permission(user: Any, resource: ShareableResource) -> ResourcePermission:
     """解析知识库权限，普通用户最多只能获得只读权限。"""
 
+    if (
+        str(_value(resource, "kb_type", "") or "").lower() == "weknora"
+        and _value(resource, "owning_department_id") is not None
+    ):
+        if _value(user, "role") == "superadmin":
+            return ResourcePermission.MANAGE
+        config = normalize_permission_config(_value(resource, "share_config"))
+        owns_department = resolve_knowledge_content_write(user, resource)
+        if owns_department and _value(user, "role") == "admin":
+            return ResourcePermission.MANAGE
+        if owns_department or scope_matches(user, config["read_scope"]):
+            return ResourcePermission.READ
+        return ResourcePermission.NONE
+
     return resolve_resource_permission(
         user,
         resource,

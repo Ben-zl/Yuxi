@@ -119,3 +119,53 @@ def test_settings_reports_missing_model_fields(monkeypatch) -> None:
         "WEKNORA_EMBEDDING_MODEL_ID",
         "WEKNORA_SUMMARY_MODEL_ID",
     ]
+
+
+@pytest.mark.asyncio
+async def test_raw_redirect_response_is_returned_without_following() -> None:
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://objects.example/file"})
+
+    client = WeKnoraClient(_ready_settings(), transport=httpx.MockTransport(handler))
+    response = await client.request("GET", "knowledge/doc/download", raw_redirects=True)
+
+    assert response.status_code == 302
+    assert calls == ["http://weknora-app:8080/api/v1/knowledge/doc/download"]
+
+
+@pytest.mark.asyncio
+async def test_absolute_unauthenticated_request_sends_no_api_key() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["api_key"] = request.headers.get("x-api-key")
+        return httpx.Response(200, content=b"file")
+
+    client = WeKnoraClient(_ready_settings(), transport=httpx.MockTransport(handler))
+    response = await client.request("GET", "https://objects.example/file", authenticated=False)
+
+    assert response.content == b"file"
+    assert captured == {"url": "https://objects.example/file", "api_key": None}
+
+
+@pytest.mark.asyncio
+async def test_absolute_authenticated_request_is_rejected_before_network() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - 不应被调用
+        raise AssertionError("绝对 URL 不得携带 WeKnora 统一凭证")
+
+    client = WeKnoraClient(_ready_settings(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(WeKnoraClientError, match="不能发送到绝对 URL"):
+        await client.request("GET", "https://objects.example/file")
+
+
+@pytest.mark.asyncio
+async def test_authenticated_request_cannot_enable_automatic_redirects() -> None:
+    client = WeKnoraClient(_ready_settings(), transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+
+    with pytest.raises(WeKnoraClientError, match="不能自动跟随重定向"):
+        await client.request("GET", "knowledge/doc/download", follow_redirects=True)

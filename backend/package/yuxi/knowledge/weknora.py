@@ -6,10 +6,12 @@ import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 WEKNORA_MODEL_ENV_KEYS = ("WEKNORA_EMBEDDING_MODEL_ID", "WEKNORA_SUMMARY_MODEL_ID")
+WEKNORA_GRAPH_EXTRACT_ENV = "WEKNORA_GRAPH_EXTRACT_ENABLED"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
 # 托管绑定状态:confirmed = 双侧确认;pending_review = 远端结果不确定,保留核对
@@ -34,6 +36,11 @@ class WeKnoraSettings:
     def missing_model_fields(self) -> list[str]:
         """返回缺失的模型配置变量名,供建库等需要模型标识的用例做前置校验。"""
         return [name for name in WEKNORA_MODEL_ENV_KEYS if not getattr(self, _env_key_to_attr(name))]
+
+    @property
+    def graph_extract_enabled(self) -> bool:
+        """部署是否为托管库启用远端实体图谱抽取。"""
+        return os.environ.get(WEKNORA_GRAPH_EXTRACT_ENV, "").strip().lower() in {"true", "1"}
 
 
 def _env_key_to_attr(name: str) -> str:
@@ -90,6 +97,8 @@ class WeKnoraClient:
         return self._settings
 
     def _endpoint(self, path: str) -> str:
+        if urlparse(path).scheme in {"http", "https"}:
+            return path
         return f"{self._settings.base_url.rstrip('/')}/{path.lstrip('/')}"
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -121,6 +130,11 @@ class WeKnoraClient:
 
         if not self._settings.ready:
             raise WeKnoraClientError("WeKnora 部署配置不完整,无法发起远端调用")
+        absolute_url = urlparse(path).scheme in {"http", "https"}
+        if absolute_url and authenticated:
+            raise WeKnoraClientError("带认证的 WeKnora 请求不能发送到绝对 URL")
+        if follow_redirects and authenticated:
+            raise WeKnoraClientError("带认证的 WeKnora 请求不能自动跟随重定向")
         url = self._endpoint(path)
         try:
             async with httpx.AsyncClient(timeout=timeout or self._timeout, transport=self._transport) as client:
@@ -137,8 +151,7 @@ class WeKnoraClient:
                 )
         except httpx.HTTPError as error:
             raise WeKnoraClientError(f"WeKnora 请求失败: {method} {path}: {type(error).__name__}") from error
-        # 非 2xx 一律视为错误:不跟随重定向,3xx 会以含混的解析错误泄漏到下游
-        if not 200 <= response.status_code < 300:
+        if not 200 <= response.status_code < 300 and not (raw_redirects and 300 <= response.status_code < 400):
             raise WeKnoraClientError(
                 f"WeKnora HTTP 错误: status={response.status_code}, {method} {path}",
                 status_code=response.status_code,
@@ -177,25 +190,25 @@ def weknora_status_label(raw_status: str | None) -> str:
     return f"未知状态({status or '缺失'})"
 
 
-def build_weknora_file_ref(remote_knowledge_id: str, filename: str) -> str:
-    """构造 weknora 文件引用,作为 /documents 登记的 item 载荷。"""
+def build_weknora_file_ref(file_id: str, filename: str) -> str:
+    """构造仅携带本地文件 ID 的登记引用;远端 ID 不进入客户端载荷。"""
 
     from urllib.parse import quote
 
-    return f"weknora://{remote_knowledge_id}/{quote(filename or 'unnamed')}"
+    return f"weknora-local://{file_id}/{quote(filename or 'unnamed')}"
 
 
 def parse_weknora_file_ref(item: str) -> tuple[str, str]:
-    """解析 weknora 文件引用为 (remote_knowledge_id, filename);非法引用显式报错。"""
+    """解析登记引用为 (file_id, filename);拒绝客户端提供远端资源 ID。"""
 
     from urllib.parse import unquote
 
     value = str(item or "").strip()
-    prefix = "weknora://"
+    prefix = "weknora-local://"
     if not value.startswith(prefix):
         raise ValueError(f"非 WeKnora 文件引用: {item!r}")
     payload = value[len(prefix) :]
-    remote_id, _, filename = payload.partition("/")
-    if not remote_id:
-        raise ValueError(f"WeKnora 文件引用缺少远端文档 ID: {item!r}")
-    return remote_id, unquote(filename or "unnamed")
+    file_id, _, filename = payload.partition("/")
+    if not file_id:
+        raise ValueError(f"WeKnora 文件引用缺少本地文件 ID: {item!r}")
+    return file_id, unquote(filename or "unnamed")
