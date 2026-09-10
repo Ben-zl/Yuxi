@@ -51,9 +51,13 @@
           :databases="databases"
           :loading-databases="loadingDatabases"
           :current-uid="userStore.uid"
+          :disabled="activeSourceKey !== 'personal' || isReadonlyWorkspacePath"
+          :uploading="uploadingFile"
           @select-personal="selectPersonalWorkspace"
           @select-database="selectDatabase"
           @select-path="selectWorkspacePath"
+          @upload-file="openUploadFilePicker"
+          @create-directory="openCreateDirectoryModal"
         />
       </div>
       <button

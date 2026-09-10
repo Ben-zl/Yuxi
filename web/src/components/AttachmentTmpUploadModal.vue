@@ -130,7 +130,9 @@ watch(
 )
 
 const getErrorMessage = (error, fallback = '操作失败') => {
-  return error?.response?.data?.detail || error?.message || fallback
+  if (typeof error?.message === 'string' && error.message) return error.message
+  const detail = error?.response?.data?.detail
+  return typeof detail === 'string' && detail ? detail : fallback
 }
 
 const getDefaultParseMethod = (parseMethods) => {
@@ -157,6 +159,7 @@ const normalizeTmpUpload = (response) => ({
   fileName: response.file_name,
   fileType: response.file_type,
   fileSize: response.file_size,
+  bucketName: response.bucket_name,
   objectName: response.object_name,
   parseSupported: response.parse_supported,
   parseMethods: response.parse_methods || [],
@@ -253,6 +256,8 @@ const handleParse = async (item) => {
   })
   try {
     const response = await threadApi.parseTmpAttachment({
+      file_name: item.fileName,
+      bucket_name: item.bucketName,
       object_name: item.objectName,
       parse_method: item.selectedParseMethod
     })
@@ -278,6 +283,8 @@ const handleConfirm = async () => {
   if (confirmDisabled.value) return
 
   const attachments = confirmableItems.value.map((item) => ({
+    file_name: item.fileName,
+    bucket_name: item.bucketName,
     file_type: item.fileType,
     object_name: item.objectName,
     parsed_object_name: item.parsedObjectName || null

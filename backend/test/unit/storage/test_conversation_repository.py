@@ -326,6 +326,50 @@ async def test_search_conversations_by_message_content_filters_user_status_and_t
 
 
 @pytest.mark.asyncio
+async def test_search_conversations_matches_title_and_preserves_prefix_subset(conversation_session):
+    now = utc_now_naive()
+    conversation = Conversation(
+        thread_id="thread-title-match",
+        project_id="project-thread-title-match",
+        uid="user-a",
+        agent_id="agent-a",
+        title="询问AI功能范围",
+        status="active",
+        created_at=now,
+        updated_at=now,
+    )
+    conversation_session.add(conversation)
+    await conversation_session.flush()
+    conversation_session.add(
+        Message(
+            conversation=conversation,
+            role="assistant",
+            content="我是智能助手，可以提供功能说明。",
+            message_type="text",
+            created_at=now,
+        )
+    )
+    await conversation_session.commit()
+
+    repo = ConversationRepository(conversation_session)
+    full_items, _ = await repo.search_conversations_by_message_content(
+        uid="user-a",
+        query="询问",
+    )
+    prefix_items, _ = await repo.search_conversations_by_message_content(
+        uid="user-a",
+        query="询",
+    )
+
+    assert [item["conversation"].thread_id for item in full_items] == ["thread-title-match"]
+    assert {item["conversation"].thread_id for item in full_items}.issubset(
+        {item["conversation"].thread_id for item in prefix_items}
+    )
+    assert full_items[0]["matched_count"] == 0
+    assert full_items[0]["snippets"][0]["content"] == "我是智能助手，可以提供功能说明。"
+
+
+@pytest.mark.asyncio
 async def test_search_conversations_by_message_content_excludes_hidden_user_sources(conversation_session):
     now = utc_now_naive()
     normal = Conversation(

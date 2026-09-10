@@ -275,6 +275,35 @@ def test_trigger_chat_with_image_builds_data_block():
     assert _sniff_image_media_type("unknown") == "image/png"
 
 
+@pytest.mark.asyncio
+async def test_trigger_chat_with_image_sends_base64_data_block(monkeypatch: pytest.MonkeyPatch):
+    from yuxi.agentscope.client import AgentScopeServiceClient
+
+    captured = {}
+
+    async def fake_request(self, method, path, uid, **kwargs):
+        captured.update(method=method, path=path, uid=uid, **kwargs)
+
+    monkeypatch.setattr(AgentScopeServiceClient, "_request", fake_request)
+
+    await AgentScopeServiceClient("http://agentscope").trigger_chat(
+        "user-1",
+        "agent-1",
+        "session-1",
+        "看图",
+        image_content="iVBORw0KGgo",
+    )
+
+    message = captured["json"]["input"]
+    assert message["content"][0] == {"type": "text", "text": "看图"}
+    assert message["content"][1]["type"] == "data"
+    assert message["content"][1]["source"] == {
+        "type": "base64",
+        "data": "iVBORw0KGgo",
+        "media_type": "image/png",
+    }
+
+
 def test_split_embedded_reasoning_keeps_final_answer_and_moves_thinking():
     from yuxi.agentscope.protocol import split_embedded_reasoning
 

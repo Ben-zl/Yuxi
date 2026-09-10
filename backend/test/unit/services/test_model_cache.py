@@ -78,6 +78,7 @@ def test_model_cache_loads_from_redis_and_uses_local_ttl(monkeypatch: pytest.Mon
                 "base_url": "https://example.com/v1",
                 "provider_type": "openai",
                 "request_body_overrides": {"enable_thinking": False},
+                "input_modalities": ["text", "image"],
             }
         }
     )
@@ -90,6 +91,7 @@ def test_model_cache_loads_from_redis_and_uses_local_ttl(monkeypatch: pytest.Mon
     assert cached_info is info
     assert info.base_url == "https://example.com/v1"
     assert info.request_body_overrides == {"enable_thinking": False}
+    assert info.input_modalities == ("text", "image")
     assert redis.get_calls == 1
 
 
@@ -106,6 +108,7 @@ def test_model_cache_save_writes_redis_json(monkeypatch: pytest.MonkeyPatch):
         base_url="https://example.com/v1",
         provider_type="openai",
         request_body_overrides={"enable_thinking": True},
+        input_modalities=("text", "image"),
     )
 
     cache._save_cache({info.spec: info})
@@ -113,3 +116,35 @@ def test_model_cache_save_writes_redis_json(monkeypatch: pytest.MonkeyPatch):
     payload = json.loads(redis.data[REDIS_CACHE_KEY])
     assert payload[info.spec]["base_url"] == "https://example.com/v1"
     assert payload[info.spec]["request_body_overrides"] == {"enable_thinking": True}
+    assert payload[info.spec]["input_modalities"] == ["text", "image"]
+
+
+def test_model_cache_detects_modalities_missing_from_old_redis_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    redis = _FakeRedis()
+    _patch_redis(monkeypatch, redis)
+    redis.data[REDIS_CACHE_KEY] = json.dumps(
+        {
+            "custom:glm-5": {
+                "provider_id": "custom",
+                "model_id": "glm-5",
+                "model_type": "chat",
+                "display_name": "GLM-5",
+                "api_key": "",
+                "base_url": "https://example.com/v1",
+                "provider_type": "openai",
+            }
+        }
+    )
+    provider = type(
+        "Provider",
+        (),
+        {
+            "is_enabled": True,
+            "provider_id": "custom",
+            "enabled_models": [{"id": "glm-5", "type": "chat", "input_modalities": ["text"]}],
+        },
+    )()
+
+    assert ModelCache().has_stale_input_modalities([provider]) is True

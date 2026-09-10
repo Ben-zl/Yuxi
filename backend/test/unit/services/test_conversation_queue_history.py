@@ -79,6 +79,8 @@ async def test_queue_history_keeps_each_request_with_its_reply(session):
         db=session,
     )
     assert [message["content"] for message in queued_history["history"]] == ["A", "A reply"]
+    assert queued_history["history"][0]["created_at"] == "2026-07-12T09:00:00Z"
+    assert queued_history["history"][1]["created_at"] == "2026-07-12T09:00:02Z"
 
     request_b = await session.get(Message, 2)
     request_b.run_id = "run-b"
@@ -222,6 +224,7 @@ async def test_history_exposes_failed_run_without_assistant_output(session):
 
     assert [message["type"] for message in response["history"]] == ["human", "ai"]
     error_reply = response["history"][1]
+    assert error_reply["created_at"] == "2026-08-28T08:05:42Z"
     assert error_reply["id"] == "run-error:run-failed"
     assert error_reply["run_id"] == "run-failed"
     assert error_reply["request_id"] == "request-failed"

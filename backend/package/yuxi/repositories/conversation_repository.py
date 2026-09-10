@@ -60,11 +60,16 @@ class ConversationRepository:
     def _escape_like_query(self, query: str) -> str:
         return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-    def _message_search_conditions(self, query: str):
-        pattern = f"%{self._escape_like_query(query)}%"
+    def _searchable_message_conditions(self):
         return [
             Message.role.in_(MESSAGE_SEARCH_ROLES),
             or_(Message.message_type.is_(None), Message.message_type.notin_(MESSAGE_SEARCH_EXCLUDED_TYPES)),
+        ]
+
+    def _message_search_conditions(self, query: str):
+        pattern = f"%{self._escape_like_query(query)}%"
+        return [
+            *self._searchable_message_conditions(),
             Message.content.ilike(pattern, escape="\\"),
         ]
 
@@ -459,6 +464,8 @@ class ConversationRepository:
             conversation_conditions.append(Conversation.agent_id == agent_id)
         conversation_conditions.extend(self._exclude_source_conditions(exclude_sources))
 
+        escaped_query = self._escape_like_query(normalized_query)
+        title_condition = Conversation.title.ilike(f"%{escaped_query}%", escape="\\")
         message_conditions = self._message_search_conditions(normalized_query)
         summary = (
             select(
@@ -475,8 +482,16 @@ class ConversationRepository:
         result = await self.db.execute(
             select(Conversation, summary.c.matched_count, summary.c.latest_match_at)
             .options(joinedload(Conversation.project))
-            .join(summary, Conversation.id == summary.c.conversation_id)
-            .order_by(summary.c.latest_match_at.desc(), Conversation.updated_at.desc(), Conversation.id.desc())
+            .outerjoin(summary, Conversation.id == summary.c.conversation_id)
+            .where(
+                *conversation_conditions,
+                or_(title_condition, summary.c.conversation_id.is_not(None)),
+            )
+            .order_by(
+                func.coalesce(summary.c.latest_match_at, Conversation.updated_at).desc(),
+                Conversation.updated_at.desc(),
+                Conversation.id.desc(),
+            )
             .limit(limit + 1)
             .offset(offset)
         )
@@ -486,9 +501,10 @@ class ConversationRepository:
 
         items: list[dict] = []
         for conversation, matched_count, latest_match_at in rows:
+            snippet_conditions = message_conditions if matched_count else self._searchable_message_conditions()
             snippet_result = await self.db.execute(
                 select(Message.id, Message.content, Message.created_at)
-                .where(Message.conversation_id == conversation.id, *message_conditions)
+                .where(Message.conversation_id == conversation.id, *snippet_conditions)
                 .order_by(Message.created_at.desc(), Message.id.desc())
                 .limit(MESSAGE_SEARCH_SNIPPETS_PER_THREAD)
             )

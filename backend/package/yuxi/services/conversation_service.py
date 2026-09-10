@@ -91,8 +91,8 @@ async def _serialize_thread(
         "project_id": conversation.project_id,
         "workdir_path": workdir_path
         or await resolve_conversation_workdir_path(conversation=conversation, uid=str(conversation.uid), db=db),
-        "created_at": conversation.created_at.isoformat(),
-        "updated_at": conversation.updated_at.isoformat(),
+        "created_at": format_utc_datetime(conversation.created_at),
+        "updated_at": format_utc_datetime(conversation.updated_at),
         "metadata": conversation.extra_metadata or {},
         "thread_status": thread_status,
     }
@@ -1188,7 +1188,7 @@ async def get_thread_history_view(
                         "id": feedback.id,
                         "rating": feedback.rating,
                         "reason": feedback.reason,
-                        "created_at": feedback.created_at.isoformat() if feedback.created_at else None,
+                        "created_at": format_utc_datetime(feedback.created_at),
                     }
                     break
 
@@ -1201,7 +1201,7 @@ async def get_thread_history_view(
             "id": msg.id,
             "type": role_type_map.get(msg.role, msg.role),
             "content": msg.content,
-            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            "created_at": format_utc_datetime(msg.created_at),
             "run_id": msg.run_id,
             "request_id": msg.request_id,
             "delivery_status": msg.delivery_status,
@@ -1246,7 +1246,7 @@ async def get_thread_history_view(
                     "id": f"run-error:{msg.run_id}",
                     "type": "ai",
                     "content": "",
-                    "created_at": (run.get("finished_at") or msg.created_at).isoformat(),
+                    "created_at": format_utc_datetime(run.get("finished_at") or msg.created_at),
                     "run_id": msg.run_id,
                     "request_id": msg.request_id,
                     "delivery_status": "failed",

@@ -142,24 +142,32 @@ watch(
 
 const canShareDepartment = computed(() => userStore.isAdmin || userStore.isSuperAdmin)
 
+const previewLoading = ref(false)
+const previewError = ref('')
+let previewRequestId = 0
+
 async function doPreview() {
-  if (!form.schedule_enabled) {
-    previewTimes.value = []
-    return
-  }
+  const requestId = ++previewRequestId
+  previewTimes.value = []
+  previewError.value = ''
+  previewLoading.value = false
+  if (!props.open || !form.schedule_enabled ||
+      (form.schedule_mode === 'weekly' && !form.schedule_weekdays.length)) return
+
+  previewLoading.value = true
   try {
-    const payload = buildSchedulePayload()
-    if (!payload.schedule?.enabled) return
-    const data = await store.previewSchedule(payload)
-    previewTimes.value = data.preview || []
+    const data = await store.previewSchedule(buildSchedulePayload())
+    if (requestId === previewRequestId) previewTimes.value = data.preview || []
   } catch {
-    previewTimes.value = []
+    if (requestId === previewRequestId) previewError.value = '无法预览，请检查定时配置后重试'
+  } finally {
+    if (requestId === previewRequestId) previewLoading.value = false
   }
 }
 
 watch(
-  () => [form.schedule_enabled, form.schedule_mode, form.schedule_time, form.schedule_weekdays, form.schedule_cron, form.schedule_timezone],
-  () => { if (form.schedule_enabled) doPreview() }
+  () => [props.open, form.schedule_enabled, form.schedule_mode, form.schedule_time, [...form.schedule_weekdays], form.schedule_cron, form.schedule_timezone],
+  doPreview
 )
 
 function buildSchedulePayload() {
@@ -286,7 +294,13 @@ function handleClose() {
         </div>
         <div v-if="form.schedule_mode === 'daily'" class="form-row">
           <label>执行时间</label>
-          <input v-model="form.schedule_time" type="time" class="form-input form-time" />
+          <a-time-picker
+            v-model:value="form.schedule_time"
+            format="HH:mm"
+            value-format="HH:mm"
+            :allow-clear="false"
+            class="form-time"
+          />
         </div>
         <div v-if="form.schedule_mode === 'weekly'" class="form-row">
           <label>星期</label>
@@ -304,7 +318,13 @@ function handleClose() {
         </div>
         <div v-if="form.schedule_mode === 'weekly'" class="form-row">
           <label>执行时间</label>
-          <input v-model="form.schedule_time" type="time" class="form-input form-time" />
+          <a-time-picker
+            v-model:value="form.schedule_time"
+            format="HH:mm"
+            value-format="HH:mm"
+            :allow-clear="false"
+            class="form-time"
+          />
         </div>
         <div v-if="form.schedule_mode === 'cron'" class="form-row">
           <label>Cron 表达式</label>
@@ -317,8 +337,12 @@ function handleClose() {
             <a-select-option v-for="tz in TIMEZONES" :key="tz" :value="tz">{{ tz }}</a-select-option>
           </a-select>
         </div>
-        <div v-if="previewTimes.length" class="preview-box">
+        <div class="preview-box" aria-live="polite">
           <div class="preview-label">未来 5 次执行时间</div>
+          <div v-if="form.schedule_mode === 'weekly' && !form.schedule_weekdays.length" class="preview-item">请选择至少一个星期</div>
+          <div v-else-if="previewLoading" class="preview-item">正在计算...</div>
+          <div v-else-if="previewError" class="preview-item">{{ previewError }}</div>
+          <div v-else-if="!previewTimes.length" class="preview-item">暂无可预览的执行时间</div>
           <div v-for="(t, i) in previewTimes" :key="i" class="preview-item">{{ t }}</div>
         </div>
       </div>
@@ -412,7 +436,8 @@ function handleClose() {
   }
 }
 .form-time {
-  max-width: 180px;
+  width: 180px;
+  max-width: 100%;
 }
 .form-textarea {
   flex: 1;

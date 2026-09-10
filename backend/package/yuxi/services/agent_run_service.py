@@ -37,6 +37,7 @@ from yuxi.agents.buildin import agent_manager
 from yuxi.agents.tool_approval import DEFAULT_TOOL_APPROVAL_MODE, normalize_tool_approval_mode
 from yuxi.config.options import system_options
 from yuxi.models.providers.cache import model_cache
+from yuxi.models.providers.service import get_model_provider_by_id
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_output_repository import AgentRunOutputRepository
 from yuxi.repositories.agent_run_repository import TERMINAL_RUN_STATUSES, AgentRunRepository
@@ -163,6 +164,39 @@ async def resolve_agent_run_config(
         getattr(context, "tool_approval_mode", None),
     )
     return resolved_model_spec, resolved_tool_approval_mode
+
+
+async def validate_agent_run_input_modalities(
+    input_message: AgentRunInputMessage,
+    model_spec: str,
+    db: AsyncSession | None = None,
+) -> None:
+    """拒绝把图片提交给明确声明为纯文本输入的模型。"""
+    if not input_message.image_content:
+        return
+    info = model_cache.get_model_info(model_spec)
+    modalities = tuple(getattr(info, "input_modalities", ()) or ())
+    provider_id = getattr(info, "provider_id", None)
+    model_id = getattr(info, "model_id", None)
+    if not modalities and provider_id and model_id and db is not None:
+        provider = await get_model_provider_by_id(db, provider_id)
+        configured_model = (
+            next(
+                (model for model in provider.enabled_models or [] if model.get("id") == model_id),
+                None,
+            )
+            if provider is not None
+            else None
+        )
+        modalities = tuple((configured_model or {}).get("input_modalities") or ())
+    if modalities and "image" not in modalities:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "model_image_input_unsupported",
+                "message": f"当前模型 {model_spec} 不支持图像输入，请选择支持图像输入的模型",
+            },
+        )
 
 
 def _build_run_response(run) -> dict:
@@ -497,6 +531,7 @@ async def create_agent_run_view(
         tool_approval_mode=resolved_tool_approval_mode,
         meta=meta,
     )
+    await validate_agent_run_input_modalities(run_input_message, resolved_model_spec, db)
 
     persisted_input_message = await create_agent_run_input_message(
         db=db,

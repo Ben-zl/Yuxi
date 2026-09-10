@@ -1560,6 +1560,76 @@ async def test_resolve_agent_run_model_spec_strips_explicit_chat_model(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_validate_agent_run_input_modalities_rejects_text_model(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        agent_run_service.model_cache,
+        "get_model_info",
+        lambda spec: SimpleNamespace(input_modalities=("text",)),
+    )
+
+    with pytest.raises(agent_run_service.HTTPException) as exc_info:
+        await agent_run_service.validate_agent_run_input_modalities(
+            _chat_input("看图", "base64-image"),
+            "provider:glm-5",
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail["code"] == "model_image_input_unsupported"
+
+
+@pytest.mark.parametrize("modalities", [("text", "image"), ()])
+@pytest.mark.asyncio
+async def test_validate_agent_run_input_modalities_allows_image_or_unknown_model(
+    monkeypatch: pytest.MonkeyPatch,
+    modalities: tuple[str, ...],
+):
+    monkeypatch.setattr(
+        agent_run_service.model_cache,
+        "get_model_info",
+        lambda spec: SimpleNamespace(input_modalities=modalities),
+    )
+
+    await agent_run_service.validate_agent_run_input_modalities(
+        _chat_input("看图", "base64-image"),
+        "provider:model",
+    )
+
+
+@pytest.mark.asyncio
+async def test_validate_agent_run_input_modalities_reads_database_when_cache_is_old(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        agent_run_service.model_cache,
+        "get_model_info",
+        lambda spec: SimpleNamespace(
+            provider_id="provider",
+            model_id="glm-5",
+            input_modalities=(),
+        ),
+    )
+
+    async def fake_get_provider(db, provider_id):
+        assert db == "db"
+        assert provider_id == "provider"
+        return SimpleNamespace(
+            enabled_models=[{"id": "glm-5", "input_modalities": ["text"]}],
+        )
+
+    monkeypatch.setattr(agent_run_service, "get_model_provider_by_id", fake_get_provider)
+
+    with pytest.raises(agent_run_service.HTTPException) as exc_info:
+        await agent_run_service.validate_agent_run_input_modalities(
+            _chat_input("看图", "base64-image"),
+            "provider:glm-5",
+            "db",
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail["code"] == "model_image_input_unsupported"
+
+
+@pytest.mark.asyncio
 async def test_resolve_agent_run_model_spec_uses_configured_model_without_loading_system_default(
     monkeypatch: pytest.MonkeyPatch,
 ):

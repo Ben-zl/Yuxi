@@ -13,6 +13,7 @@ import {
 const router = useRouter()
 
 const searchText = ref('')
+const searchInputRef = ref(null)
 const filterStatus = ref('all')
 const filterTrigger = ref('all')
 const filterScope = ref('all')
@@ -226,7 +227,15 @@ async function copyApiUrl(task) {
     <div class="toolbar">
       <div class="search-box">
         <Search :size="16" class="search-icon" />
-        <input v-model="searchText" placeholder="搜索任务名或智能体" class="search-input" />
+        <input ref="searchInputRef" v-model="searchText" placeholder="搜索任务名或智能体" class="search-input" />
+        <button
+          v-if="searchText"
+          type="button"
+          class="search-clear"
+          aria-label="清空搜索"
+          title="清空搜索"
+          @click="searchText = ''; searchInputRef?.focus()"
+        ><XCircle :size="16" /></button>
       </div>
       <a-select v-model:value="filterStatus" style="width: 120px" placeholder="全部状态" allow-clear>
         <a-select-option value="all">全部状态</a-select-option>
@@ -264,7 +273,7 @@ async function copyApiUrl(task) {
             <th>可见范围</th>
             <th>状态</th>
             <th>API 触发</th>
-            <th>操作</th>
+            <th class="th-actions">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -295,10 +304,12 @@ async function copyApiUrl(task) {
                 <span v-else class="cell-muted">-</span>
               </td>
               <td class="cell-actions" @click.stop>
-                <button v-if="!task.archived_at" class="action-btn" title="立即执行" @click="triggerTask(task)"><Play :size="15" /></button>
-                <button v-if="!task.archived_at" class="action-btn" :title="task.enabled ? '停用' : '启用'" @click="toggleEnabled(task)"><Power :size="15" /></button>
-                <button v-if="!task.archived_at" class="action-btn" title="编辑" @click="openEdit(task)"><SquarePen :size="15" /></button>
-                <button v-if="!task.archived_at" class="action-btn action-danger" title="归档" @click="archiveTask(task)"><Archive :size="15" /></button>
+                <div class="action-buttons">
+                  <button v-if="!task.archived_at" class="action-btn" title="立即执行" @click="triggerTask(task)"><Play :size="15" /></button>
+                  <button v-if="!task.archived_at" class="action-btn" :title="task.enabled ? '停用' : '启用'" @click="toggleEnabled(task)"><Power :size="15" /></button>
+                  <button v-if="!task.archived_at" class="action-btn" title="编辑" @click="openEdit(task)"><SquarePen :size="15" /></button>
+                  <button v-if="!task.archived_at" class="action-btn action-danger" title="归档" @click="archiveTask(task)"><Archive :size="15" /></button>
+                </div>
               </td>
             </tr>
             <!-- 展开的执行记录行 -->
@@ -363,6 +374,9 @@ async function copyApiUrl(task) {
 
 <style lang="less" scoped>
 .agent-tasks-page {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   padding: var(--page-padding);
   max-width: 1200px;
   margin: 0 auto;
@@ -394,12 +408,14 @@ async function copyApiUrl(task) {
 }
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 16px;
 }
 .search-box {
   position: relative;
-  flex: 1;
+  flex: 1 1 240px;
+  min-width: 0;
   .search-icon {
     position: absolute;
     left: 10px;
@@ -411,13 +427,32 @@ async function copyApiUrl(task) {
 .search-input {
   width: 100%;
   height: 36px;
-  padding: 0 10px 0 34px;
+  padding: 0 36px 0 34px;
   border: 1px solid var(--gray-200);
   border-radius: 8px;
   font-size: 13px;
   outline: none;
   background: var(--gray-0);
   &:focus { border-color: var(--main-color); }
+}
+.search-clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--gray-400);
+  cursor: pointer;
+  &:hover { color: var(--gray-700); }
+  &:focus-visible { outline: 2px solid var(--main-color); }
 }
 .filter-select {
   height: 36px;
@@ -433,10 +468,11 @@ async function copyApiUrl(task) {
   background: var(--gray-0);
   border-radius: 10px;
   border: 1px solid var(--gray-100);
-  overflow: hidden;
+  overflow-x: auto;
 }
 .task-table {
   width: 100%;
+  min-width: 980px;
   border-collapse: collapse;
   table-layout: fixed;
   thead th {
@@ -539,11 +575,22 @@ async function copyApiUrl(task) {
   min-width: 40px;
 }
 .cell-actions {
+  position: sticky;
+  right: 0;
+  background: var(--gray-0);
+}
+.task-table thead .th-actions {
+  width: 160px;
+  position: sticky;
+  right: 0;
+  z-index: 1;
+}
+.action-buttons {
   display: flex;
   gap: 4px;
-  margin-left: auto;
 }
 .action-btn {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;

@@ -39,6 +39,7 @@ class ModelInfo:
     # provider 级 extra_json，不是 OpenAI chat 的 extra_body。
     extra: dict[str, Any] = field(default_factory=dict)
     request_body_overrides: dict[str, Any] = field(default_factory=dict)
+    input_modalities: tuple[str, ...] = ()
 
     # Embedding 专属
     dimension: int | None = None
@@ -60,6 +61,7 @@ class ModelInfo:
             "headers": self.headers,
             "extra": self.extra,
             "request_body_overrides": self.request_body_overrides,
+            "input_modalities": list(self.input_modalities),
             "dimension": self.dimension,
             "batch_size": self.batch_size,
         }
@@ -77,6 +79,7 @@ class ModelInfo:
             headers=data.get("headers", {}),
             extra=data.get("extra", {}),
             request_body_overrides=data.get("request_body_overrides", {}),
+            input_modalities=tuple(data.get("input_modalities") or ()),
             dimension=data.get("dimension"),
             batch_size=data.get("batch_size", 40),
         )
@@ -135,6 +138,21 @@ class ModelCache:
             grouped.setdefault(info.provider_id, []).append(info)
         return grouped
 
+    def has_stale_input_modalities(self, providers: list[Any], model_type: str = "chat") -> bool:
+        """检测 Redis 旧缓存是否遗漏数据库已有的输入模态。"""
+        cache = self._load_cache()
+        for provider in providers:
+            if not provider.is_enabled:
+                continue
+            for model in provider.enabled_models or []:
+                if model.get("type", "chat") != model_type:
+                    continue
+                configured = tuple(model.get("input_modalities") or ())
+                cached = cache.get(f"{provider.provider_id}:{model.get('id')}")
+                if configured and cached is not None and cached.input_modalities != configured:
+                    return True
+        return False
+
     def rebuild(self, providers: list[Any]) -> None:
         from yuxi.models.providers.service import resolve_api_key
 
@@ -161,6 +179,7 @@ class ModelCache:
                     headers=dict(provider.headers_json or {}),
                     extra=dict(provider.extra_json or {}),
                     request_body_overrides=dict(model.get("request_body_overrides") or {}),
+                    input_modalities=tuple(model.get("input_modalities") or ()),
                     dimension=model.get("dimension"),
                     batch_size=model.get("batch_size", 40),
                 )

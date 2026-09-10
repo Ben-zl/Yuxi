@@ -214,8 +214,10 @@ async def get_v2_models(
     """
     from yuxi.models.providers.cache import model_cache
 
-    grouped = model_cache.get_specs_grouped_by_provider(model_type)
     providers = await get_all_model_providers(db)
+    if model_cache.has_stale_input_modalities(providers, model_type):
+        model_cache.rebuild(providers)
+    grouped = model_cache.get_specs_grouped_by_provider(model_type)
     provider_name_by_id = {
         provider.provider_id: provider.display_name or provider.provider_id for provider in providers
     }
@@ -230,11 +232,12 @@ async def get_v2_models(
                     "spec": m.spec,
                     "model_id": m.model_id,
                     "display_name": m.display_name,
+                    "input_modalities": list(m.input_modalities),
                     "dimension": m.dimension,
                     "batch_size": m.batch_size,
                 }
                 for m in models
-            ]
+            ],
         }
 
     return {"success": True, "data": result}

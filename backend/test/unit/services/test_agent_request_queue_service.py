@@ -107,6 +107,47 @@ async def test_channel_steer_is_accepted_for_active_message_run(
     assert result.queue_policy == "steer"
 
 
+@pytest.mark.asyncio
+async def test_intake_rejects_image_for_declared_text_model_before_persisting(
+    session,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+    from yuxi.services import agent_run_service, agent_request_queue_service
+    from yuxi.services.input_message_service import build_chat_input_message
+
+    monkeypatch.setattr(
+        agent_request_queue_service,
+        "resolve_agent_run_config",
+        lambda *args: ("provider:glm-5", "default"),
+    )
+    monkeypatch.setattr(
+        agent_run_service.model_cache,
+        "get_model_info",
+        lambda spec: MagicMock(input_modalities=("text",)),
+    )
+    await _seed_thread(session)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await intake_request(
+            db=session,
+            request_id="request-image-text-model",
+            uid="user-1",
+            agent_slug="main",
+            thread_id="t1",
+            input_message=build_chat_input_message("看图", "base64-image"),
+            agent_item=MagicMock(),
+            agent_backend=MagicMock(),
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail["code"] == "model_image_input_unsupported"
+    assert (
+        await session.scalar(select(AgentRunRequest).where(AgentRunRequest.request_id == "request-image-text-model"))
+        is None
+    )
+
+
 # ── AgentRunCreate request model ──
 
 

@@ -819,6 +819,8 @@ import { useUserStore } from '@/stores/user'
 import { storeToRefs } from 'pinia'
 import { MessageProcessor } from '@/utils/messageProcessor'
 import { agentApi, threadApi } from '@/apis'
+import { modelProviderApi } from '@/apis/system_api'
+import { loadModelImageCapability } from '@/utils/modelMetadata'
 import { normalizeGeneratedTitle } from '@/utils/conversationTitle'
 import HumanApprovalModal from '@/components/HumanApprovalModal.vue'
 import { extractPendingInterrupt, useApproval } from '@/composables/useApproval'
@@ -3240,6 +3242,23 @@ const handleSendMessage = async ({ image, queuePolicy = 'enqueue' } = {}) => {
   )
     return
 
+  if (imageContent) {
+    try {
+      const response = await modelProviderApi.getV2Models('chat')
+      const capability = await loadModelImageCapability(
+        response?.data || {},
+        currentModelSpec.value
+      )
+      if (capability.known && !capability.supported) {
+        agentInputAreaRef.value?.restoreImage?.(image)
+        message.error('当前模型不支持图像输入，请选择带图像能力标记的模型')
+        return
+      }
+    } catch (error) {
+      console.warn('检查模型图像能力失败:', error)
+    }
+  }
+
   // 发送后进入短暂冷却，防止连续触发停止
   startSendCooldown()
 
@@ -3362,6 +3381,11 @@ const handleSendMessage = async ({ image, queuePolicy = 'enqueue' } = {}) => {
       resetOnGoingConv(threadId)
     }
     rollbackAttachments(threadId, previousAttachments)
+    if (error?.status === 422 && image && currentChatId.value === threadId) {
+      const currentDraft = userInput.value
+      userInput.value = [text, currentDraft].filter(Boolean).join('\n')
+      agentInputAreaRef.value?.restoreImage?.(image)
+    }
     if (isRunInterruptedConflict(error)) {
       threadState.isStreaming = false
       threadState.activeRunSteerable = false

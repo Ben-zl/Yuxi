@@ -26,6 +26,7 @@ from yuxi.services.agent_run_service import (
     enqueue_agent_run,
     reenqueue_agent_run,
     resolve_agent_run_config,
+    validate_agent_run_input_modalities,
 )
 from yuxi.services.input_message_service import AgentRunInputMessage
 from yuxi.services.workdir_service import resolve_conversation_workdir_binding
@@ -220,6 +221,7 @@ async def intake_request(
         if inspect.isawaitable(resolved_config):
             resolved_config = await resolved_config
         resolved_model_spec, resolved_tool_approval_mode = resolved_config
+        await validate_agent_run_input_modalities(input_message, resolved_model_spec, db)
         input_payload = {
             "model_spec": resolved_model_spec,
             "tool_approval_mode": resolved_tool_approval_mode,

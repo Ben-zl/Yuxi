@@ -31,3 +31,10 @@ test('无效输入返回空字符串', () => {
   assert.equal(formatChatTime(null, NOW), '')
   assert.equal(formatChatTime('', NOW), '')
 })
+
+test('历史接口 UTC 时间在上海显示为 16:07，显式偏移不会重复换算', () => {
+  const now = '2026-09-09T16:09:00+08:00'
+  assert.equal(formatChatTime('2026-09-09T08:07:00Z', now), '16:07')
+  assert.equal(formatChatTime('2026-09-09T16:07:00+08:00', now), '16:07')
+  assert.equal(formatChatTime('2026-09-08T16:07:00Z', '2026-09-09T00:09:00+08:00'), '00:07')
+})

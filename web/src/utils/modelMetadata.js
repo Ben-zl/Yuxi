@@ -35,6 +35,40 @@ export const resolveModelDisplayMetadata = (providers, providerId, model = {}) =
   }
 }
 
+export const resolveModelImageCapability = (modelsByProvider, providers, modelSpec) => {
+  for (const [providerId, providerData] of Object.entries(modelsByProvider || {})) {
+    const model = (providerData.models || []).find((item) => item.spec === modelSpec)
+    if (!model) continue
+    const metadata = resolveModelDisplayMetadata(providers, providerId, model)
+    const declaredModalities = model.input_modalities || []
+    if (!declaredModalities.length && !metadata.matched) {
+      const catalogMatches = Object.values(providers || {})
+        .map((provider) => provider?.models?.[model.model_id])
+        .filter(Boolean)
+      const imageCapabilities = new Set(
+        catalogMatches.map((item) => (item.modalities?.input || []).includes('image'))
+      )
+      if (catalogMatches.length && imageCapabilities.size === 1) {
+        return { known: true, supported: imageCapabilities.has(true) }
+      }
+    }
+    return {
+      known: declaredModalities.length > 0 || metadata.matched,
+      supported: metadata.vision
+    }
+  }
+  return { known: false, supported: false }
+}
+
+export const loadModelImageCapability = async (modelsByProvider, modelSpec, loadCatalog = loadModelMetadataCatalog) => {
+  try {
+    const catalog = await loadCatalog()
+    return resolveModelImageCapability(modelsByProvider, catalog?.providers || {}, modelSpec)
+  } catch {
+    return resolveModelImageCapability(modelsByProvider, {}, modelSpec)
+  }
+}
+
 export const formatModelTokenCount = (value) => {
   if (!Number.isFinite(value)) return ''
   if (value >= 1_000_000) return `${trimTrailingZeros((value / 1_000_000).toFixed(1))}M`
