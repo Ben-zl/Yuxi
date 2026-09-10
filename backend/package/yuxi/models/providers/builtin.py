@@ -4,6 +4,17 @@ from typing import Any
 
 BUILTIN_PROVIDERS: list[dict[str, Any]] = [
     {
+        "provider_id": "ksyun",
+        "display_name": "金山云星流",
+        "provider_type": "openai",
+        "base_url": "https://kspmas.ksyun.com/v1",
+        "api_key_env": "KSC_API_KEY",
+        "capabilities": ["chat", "embedding", "rerank"],
+        "embedding_base_url": "https://kspmas.ksyun.com/v1/embeddings",
+        "rerank_base_url": "https://kspmas.ksyun.com/v1/rerank",
+        "models_endpoint": "https://kspmas.ksyun.com/v1/models",
+    },
+    {
         "provider_id": "openai",
         "display_name": "OpenAI",
         "base_url": "https://api.openai.com/v1",

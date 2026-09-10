@@ -358,6 +358,41 @@ async def delete_provider_config(db: AsyncSession, provider_id: str) -> bool:
     return True
 
 
+def _normalize_ksyun_model(raw_model: dict[str, Any]) -> dict[str, Any]:
+    """按星流模型用途与模态分类，并转换元数据单位。"""
+    architecture = _normalize_dict(raw_model.get("architecture"))
+    inputs = architecture.get("input_modalities") or []
+    outputs = architecture.get("output_modalities") or []
+    if any(
+        not isinstance(items, list) or any(not isinstance(item, str) for item in items) for items in (inputs, outputs)
+    ):
+        return {}
+    if not any(item in ("文字", "text") for item in outputs):
+        return {}
+    model = _normalize_remote_model(raw_model, "chat")
+    if not model:
+        return {}
+    # 星流这两个检索模型同样标记为文字输出，模态不能代表调用协议。
+    model["type"] = {
+        "qwen3-embedding-8b": "embedding",
+        "qwen3-reranker-8b": "rerank",
+    }.get(model["id"], model["type"])
+    if model["id"] == "qwen3-embedding-8b":
+        model["dimension"] = 4096
+    modalities = {"文字": "text", "图片": "image", "视频": "video", "音频": "audio", "文件": "file"}
+    for field in ("input_modalities", "output_modalities"):
+        model[field] = [modalities.get(item, item) for item in architecture.get(field) or []]
+    for field in ("context_length", "max_completion_tokens"):
+        model.pop(field, None)
+        value = raw_model.get(field)
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([km]?)", str(value or "").strip().lower())
+        if match:
+            count = float(match[1]) * {"": 1, "k": 1024, "m": 1024 * 1024}[match[2]]
+            if count > 0 and count.is_integer():
+                model[field] = int(count)
+    return model
+
+
 async def _fetch_models_from_endpoint(
     client: httpx.AsyncClient,
     provider: ModelProvider,
@@ -380,7 +415,11 @@ async def _fetch_models_from_endpoint(
     models = []
     for raw_model in raw_models:
         if isinstance(raw_model, dict):
-            normalized = _normalize_remote_model(raw_model, model_type)
+            normalized = (
+                _normalize_ksyun_model(raw_model)
+                if provider.provider_id == "ksyun"
+                else _normalize_remote_model(raw_model, model_type)
+            )
             if normalized:
                 models.append(normalized)
     return models

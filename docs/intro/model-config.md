@@ -36,6 +36,7 @@ docker compose up -d --force-recreate api worker
 | 展示名称 | Provider ID | 常见类型 | 凭证环境变量 |
 | --- | --- | --- | --- |
 | OpenAI | `openai` | chat | `OPENAI_API_KEY` |
+| 金山云星流 | `ksyun` | chat、embedding、rerank | `KSC_API_KEY` |
 | DeepSeek | `deepseek` | chat | `DEEPSEEK_API_KEY` |
 | DashScope（中国站） | `alibaba-cn` | chat、embedding、rerank | `DASHSCOPE_API_KEY` |
 | DashScope（国际站） | `alibaba` | chat | `DASHSCOPE_API_KEY` |
@@ -60,6 +61,10 @@ docker compose up -d --force-recreate api worker
 | SiliconFlow（国际站） | `siliconflow` | chat、embedding、rerank | `SILICONFLOW_GLOBAL_API_KEY` |
 
 其中 `alibaba-cn`、`openrouter`、`siliconflow-cn` 和 `siliconflow` 的模板明确包含嵌入或重排能力；其他供应商是否能添加某类模型，取决于当前供应商配置的能力和接口。不要把 `alibaba` 和 `alibaba-cn` 混用：前者是 DashScope 国际站模板，后者带有内置的嵌入和重排配置。
+
+### 金山云星流
+
+选择“金山云星流”，API 地址为 `https://kspmas.ksyun.com/v1`，协议为 OpenAI 兼容。填写 API Key，获取远程模型后启用需要的聊天模型。星流模型发现接口同时返回图片、视频和语音模型；模型列表按用途区分聊天与检索模型。`qwen3-embedding-8b` 使用 embedding 类型及 `/v1/embeddings` 端点，默认向量维度为 4096；`qwen3-reranker-8b` 使用 rerank 类型及 `/v1/rerank` 端点。它们的文字输出模态不代表 chat 能力。无模态元数据的模型可按星流控制台确认的聊天能力手动添加。具体可用模型以当前 Key 权限和连接测试为准。
 
 ## 添加和启用模型
 
