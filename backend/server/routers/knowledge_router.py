@@ -487,6 +487,9 @@ async def get_database_info(
 
 @knowledge.post("/databases/{kb_id}/stats/repair")
 async def repair_database_stats(kb_id: str, current_user: User = Depends(require_knowledge_base_manage)):
+    """修复知识库统计(仅内置库;托管库统计以远端为准)"""
+    if _weknora_backend_selected():
+        raise HTTPException(status_code=400, detail="WeKnora 托管知识库的统计以远端为准,不支持本地统计修复")
     """修复知识库历史文件缺失的 Chunk/Token 统计。"""
     await _ensure_database_supports_documents(kb_id, "统计修复")
     try:
@@ -1604,6 +1607,8 @@ async def index_documents(
     params = params or {}
     logger.debug(f"Index documents for kb_id {kb_id}: {file_ids} {params=}")
     db_info = await _ensure_database_supports_documents(kb_id, "文档入库")
+    if _weknora_backend_selected():
+        raise HTTPException(status_code=400, detail="WeKnora 托管知识库由远端自动处理索引,不支持手动入库")
     return await _enqueue_index_task(kb_id, file_ids, params, current_user.uid, db_info)
 
 
@@ -1617,6 +1622,8 @@ async def index_pending_documents(
     params = (payload.params if payload else None) or {}
     logger.debug(f"Index pending documents for kb_id {kb_id}: {params=}")
     db_info = await _ensure_database_supports_documents(kb_id, "文档入库")
+    if _weknora_backend_selected():
+        return {"status": "success", "message": "WeKnora 托管知识库由远端自动处理索引", "queued_count": 0}
     return await _enqueue_index_pending_task(kb_id, params, current_user.uid, db_info)
 
 
@@ -2555,6 +2562,8 @@ async def get_supported_file_types(current_user: User = Depends(get_admin_user))
 @knowledge.post("/files/markdown")
 async def mark_it_down(file: UploadFile = File(...), current_user: User = Depends(get_admin_user)):
     """调用统一 Parser 将文件解析为 markdown，需要管理员权限"""
+    if _weknora_backend_selected():
+        raise HTTPException(status_code=400, detail="WeKnora 模式不支持本地文件解析")
     import tempfile
 
     if not file.filename:

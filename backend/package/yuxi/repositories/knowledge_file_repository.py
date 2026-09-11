@@ -146,9 +146,14 @@ class KnowledgeFileRepository:
                 "last_file_id": records[-1].file_id,
             }
 
-    async def aggregate_dashboard_stats(self) -> list[tuple[str, int, int, int]]:
-        """按文件类型聚合真实文件数、大小与 Chunk 数。"""
+    async def aggregate_dashboard_stats(self, *, kb_ids: set[str] | None = None) -> list[tuple[str, int, int, int]]:
+        """按文件类型聚合真实文件数、大小与 Chunk 数;kb_ids 限定统计范围。"""
         async with pg_manager.get_async_session_context() as session:
+            filters = [or_(KnowledgeFile.is_folder.is_(False), KnowledgeFile.is_folder.is_(None))]
+            if kb_ids is not None:
+                if not kb_ids:
+                    return []
+                filters.append(KnowledgeFile.kb_id.in_(kb_ids))
             result = await session.execute(
                 select(
                     KnowledgeFile.file_type,
@@ -156,7 +161,7 @@ class KnowledgeFileRepository:
                     func.coalesce(func.sum(KnowledgeFile.file_size), 0),
                     func.coalesce(func.sum(KnowledgeFile.chunk_count), 0),
                 )
-                .where(or_(KnowledgeFile.is_folder.is_(False), KnowledgeFile.is_folder.is_(None)))
+                .where(*filters)
                 .group_by(KnowledgeFile.file_type)
             )
             return [

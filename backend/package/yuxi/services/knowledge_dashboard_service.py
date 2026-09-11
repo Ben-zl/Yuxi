@@ -37,12 +37,32 @@ DATABASE_TYPE_MAPPING = {
     "dify": "Dify",
     "qdrant": "Qdrant",
     "elasticsearch": "Elasticsearch",
+    "weknora": "WeKnora",
     "unknown": "未知类型",
 }
 
 
+def _visible_kb_types() -> set[str]:
+    """两套后端数据不混用:统计只计入当前模式的知识库类型。"""
+    from yuxi.config.runtime import KNOWLEDGE_BACKEND_WEKNORA, knowledge_backend
+
+    if knowledge_backend() == KNOWLEDGE_BACKEND_WEKNORA:
+        return {"weknora"}
+    return {"milvus", "dify", "notion", "faiss", "qdrant", "elasticsearch", "unknown"}
+
+
+def _backend_uses_local_chunks() -> bool:
+    """weknora 模式的 Chunk 在远端,本地 chunk_count 恒 0,nodes 不反映真实数据。"""
+    from yuxi.config.runtime import KNOWLEDGE_BACKEND_WEKNORA, knowledge_backend
+
+    return knowledge_backend() != KNOWLEDGE_BACKEND_WEKNORA
+
+
 async def get_knowledge_stats() -> dict[str, Any]:
     """通过单批 SQL 聚合高效汇总知识库、文件类型与存储大小统计。"""
+
+    visible_types = _visible_kb_types()
+    visible_kb_ids: set[str] | None = None
 
     databases_by_type: dict[str, int] = {}
     files_by_type: dict[str, int] = {}
@@ -51,13 +71,26 @@ async def get_knowledge_stats() -> dict[str, Any]:
     total_nodes = 0
     total_storage_size = 0
 
+    # 先确定当前模式的 kb_id 集合(用于文件聚合过滤)
+    from yuxi.storage.postgres.models_knowledge import KnowledgeBase
+    from yuxi.storage.postgres.manager import pg_manager
+    from sqlalchemy import select
+
+    async with pg_manager.get_async_session_context() as session:
+        rows = await session.execute(select(KnowledgeBase.kb_id, KnowledgeBase.kb_type))
+        visible_kb_ids = {row.kb_id for row in rows if (row.kb_type or "unknown").lower() in visible_types}
+
     for kb_type, count in await KnowledgeBaseRepository().count_by_type():
         db_type = kb_type.lower()
+        if db_type not in visible_types:
+            continue
         display_type = DATABASE_TYPE_MAPPING.get(db_type, kb_type or "未知类型")
         databases_by_type[display_type] = databases_by_type.get(display_type, 0) + count
         total_databases += count
 
-    for file_type, count, size, nodes in await KnowledgeFileRepository().aggregate_dashboard_stats():
+    for file_type, count, size, nodes in await KnowledgeFileRepository().aggregate_dashboard_stats(
+        kb_ids=visible_kb_ids
+    ):
         ext = file_type.lower()
         display_name = FILE_TYPE_MAPPING.get(
             ext,
@@ -68,7 +101,7 @@ async def get_knowledge_stats() -> dict[str, Any]:
         total_storage_size += size
         total_nodes += nodes
 
-    return {
+    result = {
         "total_databases": total_databases,
         "total_files": total_files,
         "total_nodes": total_nodes,
@@ -76,3 +109,7 @@ async def get_knowledge_stats() -> dict[str, Any]:
         "databases_by_type": databases_by_type,
         "file_type_distribution": files_by_type,
     }
+    if not _backend_uses_local_chunks():
+        # weknora 模式:本地 chunk 恒 0,不伪装为真实节点数
+        result["total_nodes_unavailable"] = True
+    return result
