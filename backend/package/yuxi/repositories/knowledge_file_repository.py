@@ -179,9 +179,14 @@ class KnowledgeFileRepository:
 
         return result
 
-    async def aggregate_dashboard_stats(self) -> list[tuple[str, int, int, int]]:
-        """按文件类型聚合真实文件数、大小与 Chunk 数。"""
+    async def aggregate_dashboard_stats(self, *, kb_ids: set[str] | None = None) -> list[tuple[str, int, int, int]]:
+        """按文件类型聚合真实文件数、大小与 Chunk 数;kb_ids 限定统计范围。"""
         async with pg_manager.get_async_session_context() as session:
+            filters = [or_(KnowledgeFile.is_folder.is_(False), KnowledgeFile.is_folder.is_(None))]
+            if kb_ids is not None:
+                if not kb_ids:
+                    return []
+                filters.append(KnowledgeFile.kb_id.in_(kb_ids))
             result = await session.execute(
                 select(
                     KnowledgeFile.file_type,
@@ -189,7 +194,7 @@ class KnowledgeFileRepository:
                     func.coalesce(func.sum(KnowledgeFile.file_size), 0),
                     func.coalesce(func.sum(KnowledgeFile.chunk_count), 0),
                 )
-                .where(or_(KnowledgeFile.is_folder.is_(False), KnowledgeFile.is_folder.is_(None)))
+                .where(*filters)
                 .group_by(KnowledgeFile.file_type)
             )
             return [
@@ -214,6 +219,7 @@ class KnowledgeFileRepository:
         "content_type",
         "processing_params",
         "is_folder",
+        "remote_knowledge_id",
         "error_message",
         "created_by",
         "updated_by",
@@ -236,6 +242,22 @@ class KnowledgeFileRepository:
         async with pg_manager.get_async_session_context() as session:
             result = await session.execute(select(KnowledgeFile))
             return list(result.scalars().all())
+
+    async def get_by_remote_knowledge_id(self, kb_id: str, remote_knowledge_id: str) -> KnowledgeFile | None:
+        """按远端文档 ID 查找本库绑定行;检索命中映射与引用绑定使用。"""
+        if not remote_knowledge_id:
+            return None
+        async with pg_manager.get_async_session_context() as session:
+            result = await session.execute(
+                select(KnowledgeFile)
+                .where(
+                    KnowledgeFile.kb_id == kb_id,
+                    KnowledgeFile.remote_knowledge_id == remote_knowledge_id,
+                )
+                .limit(1)
+            )
+            # 展示语义取任一绑定行;重复登记不影响检索可用性
+            return result.scalars().first()
 
     async def get_by_file_id(self, file_id: str) -> KnowledgeFile | None:
         async with pg_manager.get_async_session_context() as session:
@@ -553,6 +575,7 @@ class KnowledgeFileRepository:
             KnowledgeFile.created_by.label("created_by"),
             KnowledgeFile.is_folder.label("is_folder"),
             KnowledgeFile.parent_id.label("parent_id"),
+            KnowledgeFile.remote_knowledge_id.label("remote_knowledge_id"),
             KnowledgeFile.path.label("path"),
             KnowledgeFile.minio_url.label("minio_url"),
             KnowledgeFile.markdown_file.label("markdown_file"),
@@ -575,6 +598,7 @@ class KnowledgeFileRepository:
                 cast(literal(None), String).label("created_by"),
                 literal(True).label("is_folder"),
                 cast(literal(parent_id), String).label("parent_id"),
+                cast(literal(None), String).label("remote_knowledge_id"),
                 cast(literal(None), String).label("path"),
                 cast(literal(None), String).label("minio_url"),
                 cast(literal(None), String).label("markdown_file"),

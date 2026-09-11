@@ -20,7 +20,9 @@ export const getKbTypeLabel = (type) => {
   const labels = {
     milvus: 'Yuxi',
     dify: 'Dify',
-    notion: 'Notion'
+    notion: 'Notion',
+    // WeKnora 托管库仅在该后端模式下出现
+    weknora: 'WeKnora'
   }
   return labels[normalized] || type
 }
@@ -38,7 +40,8 @@ export const getKbTypeColor = (type) => {
   const colors = {
     milvus: 'blue',
     dify: 'gold',
-    notion: 'purple'
+    notion: 'purple',
+    weknora: 'geekblue'
   }
   return colors[type] || 'blue'
 }

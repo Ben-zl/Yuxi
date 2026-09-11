@@ -4,6 +4,7 @@ import { message, Modal } from 'ant-design-vue'
 import { databaseApi, documentApi, queryApi } from '@/apis/knowledge_api'
 import { useTaskerStore } from '@/stores/tasker'
 import { useUserStore } from '@/stores/user'
+import { useRuntimeCapabilitiesStore } from '@/stores/runtimeCapabilities'
 import { useRouter } from 'vue-router'
 import { parseToShanghai } from '@/utils/time'
 import { canSelectFile, isProcessingFile } from '@/utils/knowledge_file_policy'
@@ -18,6 +19,7 @@ export const useDatabaseStore = defineStore('database', () => {
   const router = useRouter()
   const taskerStore = useTaskerStore()
   const userStore = useUserStore()
+  const runtimeCapabilitiesStore = useRuntimeCapabilitiesStore()
 
   // State
   const databases = ref([])
@@ -126,7 +128,8 @@ export const useDatabaseStore = defineStore('database', () => {
       return false
     }
 
-    if (!formData.kb_type) {
+    // WeKnora 模式建库使用简化表单,后端按部署配置固定类型,无需客户端选择 kb_type
+    if (!formData.kb_type && !runtimeCapabilitiesStore.weknoraBackendEnabled) {
       message.error('请选择知识库类型')
       return false
     }

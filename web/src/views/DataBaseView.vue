@@ -26,9 +26,10 @@
       </template>
       <template #actions>
         <a-button
+          v-if="canCreateDatabase"
           type="primary"
           class="lucide-icon-btn"
-          :disabled="!kbTypes.length"
+          :disabled="!weknoraBackendEnabled && !kbTypes.length"
           @click="state.openNewDatabaseModel = true"
         >
           <Plus :size="16" /> 新建知识库
@@ -51,15 +52,16 @@
     <ResourceEmptyState
       v-else-if="!databases || databases.length === 0"
       title="暂无知识库"
-      description="创建知识库后，可以上传文件并配置检索、图谱和评估能力。"
+      :description="emptyDescription"
       :icon="getKbTypeIcon('milvus')"
     >
       <template #actions>
         <a-button
+          v-if="canCreateDatabase"
           type="primary"
           size="large"
           class="lucide-icon-btn"
-          :disabled="!kbTypes.length"
+          :disabled="!weknoraBackendEnabled && !kbTypes.length"
           @click="state.openNewDatabaseModel = true"
         >
           <template #icon>
@@ -121,6 +123,8 @@ import { ref, onMounted, reactive, watch, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useDatabaseStore } from '@/stores/database'
+import { useUserStore } from '@/stores/user'
+import { useRuntimeCapabilitiesStore } from '@/stores/runtimeCapabilities'
 import { Copy, Pencil, Plus, Trash2 } from '@lucide/vue'
 import { message, Modal } from 'ant-design-vue'
 import { databaseApi, typeApi } from '@/apis/knowledge_api'
@@ -137,6 +141,9 @@ import { getShareConfigLabel } from '@/utils/shareConfig'
 const route = useRoute()
 const router = useRouter()
 const databaseStore = useDatabaseStore()
+const userStore = useUserStore()
+const runtimeCapabilitiesStore = useRuntimeCapabilitiesStore()
+const { weknoraBackendEnabled } = storeToRefs(runtimeCapabilitiesStore)
 
 const props = defineProps({
   embedded: { type: Boolean, default: false }
@@ -153,6 +160,14 @@ const knowledgeViewItems = [
 const kbTypes = computed(() => Object.keys(supportedKbTypes.value))
 const searchQuery = ref('')
 const typeFilter = ref(null)
+
+// WeKnora 模式建库为管理员专用简化表单,普通成员不展示新建入口
+const canCreateDatabase = computed(() => !weknoraBackendEnabled.value || userStore.isAdmin)
+const emptyDescription = computed(() =>
+  weknoraBackendEnabled.value
+    ? '创建知识库后，可以上传文件并进行检索测试。'
+    : '创建知识库后，可以上传文件并配置检索、图谱和评估能力。'
+)
 
 const filteredDatabases = computed(() => {
   let list = databases.value
@@ -179,6 +194,11 @@ const supportedKbTypes = ref({})
 
 // 加载支持的知识库类型
 const loadSupportedKbTypes = async () => {
+  // WeKnora 模式使用部署固定的简化建库表单,不加载类型列表
+  if (weknoraBackendEnabled.value) {
+    supportedKbTypes.value = {}
+    return
+  }
   try {
     const data = await typeApi.getKnowledgeBaseTypes()
     supportedKbTypes.value = data.kb_types || {}

@@ -1,8 +1,22 @@
-import { apiGet, apiAdminGet, apiAdminPost, apiAdminPut, apiAdminDelete, apiRequest } from './base'
+import {
+  apiGet,
+  apiPost,
+  apiPut,
+  apiDelete,
+  apiAdminGet,
+  apiAdminPost,
+  apiAdminPut,
+  apiAdminDelete,
+  apiRequest
+} from './base'
 
 /**
  * 知识库管理API模块
  * 包含数据库管理、文档管理、查询接口等功能
+ *
+ * 说明:知识库详情、文档读写与检索等按资源鉴权的端点使用普通认证请求,
+ * 不在客户端做管理员拦截。WeKnora 模式下部门普通成员可按 can_write_content
+ * 维护内容;内置模式仍由后端管理员门禁兜底,前端行为不变。
  */
 
 // =============================================================================
@@ -33,7 +47,7 @@ export const databaseApi = {
    * @returns {Promise} - 知识库信息
    */
   getDatabaseInfo: async (kbId) => {
-    return apiAdminGet(`/api/knowledge/databases/${kbId}`)
+    return apiGet(`/api/knowledge/databases/${kbId}`)
   },
 
   /**
@@ -127,14 +141,12 @@ export const documentApi = {
    */
   listDocuments: async (kbId, params = {}) => {
     const query = buildQuery(params)
-    return apiAdminGet(`/api/knowledge/databases/${kbId}/documents${query ? `?${query}` : ''}`)
+    return apiGet(`/api/knowledge/databases/${kbId}/documents${query ? `?${query}` : ''}`)
   },
 
   searchDocuments: async (kbId, params = {}) => {
     const query = buildQuery(params)
-    return apiAdminGet(
-      `/api/knowledge/databases/${kbId}/documents/search${query ? `?${query}` : ''}`
-    )
+    return apiGet(`/api/knowledge/databases/${kbId}/documents/search${query ? `?${query}` : ''}`)
   },
 
   /**
@@ -156,20 +168,20 @@ export const documentApi = {
    * @returns {Promise} - 创建结果
    */
   createFolder: async (kbId, folderName, parentId = null) => {
-    return apiAdminPost(`/api/knowledge/databases/${kbId}/folders`, {
+    return apiPost(`/api/knowledge/databases/${kbId}/folders`, {
       folder_name: folderName,
       parent_id: parentId
     })
   },
 
   renameFolder: async (kbId, folderId, folderName) => {
-    return apiAdminPut(`/api/knowledge/databases/${kbId}/folders/${folderId}/rename`, {
+    return apiPut(`/api/knowledge/databases/${kbId}/folders/${folderId}/rename`, {
       folder_name: folderName
     })
   },
 
   moveDocument: async (kbId, documentId, newParentId) => {
-    return apiAdminPut(`/api/knowledge/databases/${kbId}/documents/${documentId}/move`, {
+    return apiPut(`/api/knowledge/databases/${kbId}/documents/${documentId}/move`, {
       new_parent_id: newParentId
     })
   },
@@ -182,7 +194,7 @@ export const documentApi = {
    * @returns {Promise} - 添加结果
    */
   addDocuments: async (kbId, items, params = {}) => {
-    return apiAdminPost(`/api/knowledge/databases/${kbId}/documents`, {
+    return apiPost(`/api/knowledge/databases/${kbId}/documents`, {
       items,
       params
     })
@@ -209,7 +221,7 @@ export const documentApi = {
    * @returns {Promise} - 文档信息
    */
   getDocumentInfo: async (kbId, docId) => {
-    return apiAdminGet(`/api/knowledge/databases/${kbId}/documents/${docId}`)
+    return apiGet(`/api/knowledge/databases/${kbId}/documents/${docId}`)
   },
 
   /**
@@ -219,7 +231,7 @@ export const documentApi = {
    * @returns {Promise} - 文档基本信息
    */
   getDocumentBasicInfo: async (kbId, docId) => {
-    return apiAdminGet(`/api/knowledge/databases/${kbId}/documents/${docId}/basic`)
+    return apiGet(`/api/knowledge/databases/${kbId}/documents/${docId}/basic`)
   },
 
   /**
@@ -229,7 +241,7 @@ export const documentApi = {
    * @returns {Promise} - 文档内容信息
    */
   getDocumentContent: async (kbId, docId) => {
-    return apiAdminGet(`/api/knowledge/databases/${kbId}/documents/${docId}/content`)
+    return apiGet(`/api/knowledge/databases/${kbId}/documents/${docId}/content`)
   },
 
   /**
@@ -239,7 +251,7 @@ export const documentApi = {
    * @returns {Promise} - 删除结果
    */
   deleteDocument: async (kbId, docId) => {
-    return apiAdminDelete(`/api/knowledge/databases/${kbId}/documents/${docId}`)
+    return apiDelete(`/api/knowledge/databases/${kbId}/documents/${docId}`)
   },
 
   /**
@@ -270,7 +282,8 @@ export const documentApi = {
    * @returns {Promise} - Response对象
    */
   downloadDocument: async (kbId, docId) => {
-    return apiAdminGet(`/api/knowledge/databases/${kbId}/documents/${docId}/download`, {}, 'blob')
+    // apiGet 第 3 参是 requiresAuth,responseType 必须作为第 4 参传入
+    return apiGet(`/api/knowledge/databases/${kbId}/documents/${docId}/download`, {}, true, 'blob')
   },
 
   /**
@@ -281,10 +294,38 @@ export const documentApi = {
    * @returns {Promise} - 解析任务结果
    */
   parseDocuments: async (kbId, fileIds, params = {}) => {
-    return apiAdminPost(`/api/knowledge/databases/${kbId}/documents/parse`, {
+    return apiPost(`/api/knowledge/databases/${kbId}/documents/parse`, {
       file_ids: fileIds,
       params
     })
+  },
+
+  /**
+   * 创建手工 Markdown 文档（仅 WeKnora 模式支持）
+   * @param {string} kbId - 知识库ID
+   * @param {Object} data - 文档数据
+   * @param {string} data.title - 文档标题
+   * @param {string} data.markdown - Markdown 正文
+   * @param {string|null} data.parentId - 目标文件夹ID
+   * @returns {Promise} - 创建结果
+   */
+  createManualDocument: async (kbId, { title, markdown, parentId = null }) => {
+    return apiPost(`/api/knowledge/databases/${kbId}/documents/manual`, {
+      title,
+      markdown,
+      parent_id: parentId
+    })
+  },
+
+  /**
+   * 更新托管文档标题、描述或手工 Markdown 正文（仅 WeKnora 模式支持）
+   * @param {string} kbId - 知识库ID
+   * @param {string} docId - 文档ID
+   * @param {Object} payload - 仅携带需要更新的字段 { title, description, markdown }
+   * @returns {Promise} - 更新结果
+   */
+  updateDocument: async (kbId, docId, payload = {}) => {
+    return apiPut(`/api/knowledge/databases/${kbId}/documents/${docId}`, payload)
   },
 
   /**
@@ -403,7 +444,7 @@ export const queryApi = {
    * @returns {Promise} - 查询结果
    */
   queryKnowledgeBase: async (kbId, query, meta = {}) => {
-    return apiAdminPost(`/api/knowledge/databases/${kbId}/query`, {
+    return apiPost(`/api/knowledge/databases/${kbId}/query`, {
       query,
       meta
     })
@@ -417,7 +458,7 @@ export const queryApi = {
    * @returns {Promise} - 测试结果
    */
   queryTest: async (kbId, query, meta = {}) => {
-    return apiAdminPost(`/api/knowledge/databases/${kbId}/query-test`, {
+    return apiPost(`/api/knowledge/databases/${kbId}/query-test`, {
       query,
       meta
     })
@@ -429,7 +470,7 @@ export const queryApi = {
    * @returns {Promise} - 查询参数
    */
   getKnowledgeBaseQueryParams: async (kbId) => {
-    return apiAdminGet(`/api/knowledge/databases/${kbId}/query-params`)
+    return apiGet(`/api/knowledge/databases/${kbId}/query-params`)
   },
 
   /**
@@ -488,7 +529,7 @@ export const fileApi = {
    * @returns {Promise} - 抓取结果
    */
   fetchUrl: async (url, kbId = null) => {
-    return apiAdminPost('/api/knowledge/files/fetch-url', {
+    return apiPost('/api/knowledge/files/fetch-url', {
       url,
       kb_id: kbId
     })
@@ -501,7 +542,7 @@ export const fileApi = {
    * @returns {Promise} - 导入结果
    */
   importWorkspaceFiles: async (kbId, paths) => {
-    return apiAdminPost('/api/knowledge/files/import-workspace', {
+    return apiPost('/api/knowledge/files/import-workspace', {
       kb_id: kbId,
       paths
     })

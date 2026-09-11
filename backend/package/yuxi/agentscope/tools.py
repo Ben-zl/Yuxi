@@ -54,6 +54,11 @@ async def _ensure_kb_manager_ready() -> bool:
     global _kb_initialized
     if is_lite_mode():
         return False
+    from yuxi.config.runtime import knowledge_api_enabled
+
+    # weknora 模式部署配置不完整时,工具链路同样 fail-closed
+    if not knowledge_api_enabled():
+        return False
     if not _kb_initialized:
         from yuxi.knowledge.runtime import knowledge_base
 
@@ -80,7 +85,7 @@ async def build_kb_tools(*, uid: str, knowledge_slugs: list[str] | None) -> list
         Args:
             kb_id: 知识库 ID（见 list_kbs）
             query_text: 检索文本
-            file_name: 可选，限定文件名包含该值的文档
+            file_name: 可选，限定文件名包含该值的文档（仅内置知识库支持）
         """
         target_error = await _check_target_visible(uid, knowledge_slugs, kb_id)
         if target_error:
@@ -156,15 +161,18 @@ async def build_kb_tools(*, uid: str, knowledge_slugs: list[str] | None) -> list
 
     from agentscope.tool import FunctionTool
 
-    # 全部为只读检索类工具，无需人工审批（与旧栈 KB 工具语义一致）
+    from yuxi.config.runtime import KNOWLEDGE_BACKEND_WEKNORA, knowledge_backend
+
     definitions = [
         (list_kbs, "list_kbs", "列出当前用户可见的知识库"),
         (query_kb, "query_kb", "在知识库中检索相关内容片段"),
         (open_kb_document, "open_kb_document", "分页读取知识库文档内容"),
         (find_kb_document, "find_kb_document", "在文档中查找匹配文本"),
         (search_file, "search_file", "按文件名搜索知识库文件"),
-        (get_mindmap, "get_mindmap", "读取知识库思维导图"),
     ]
+    # 思维导图为内置能力;WeKnora 模式不提供
+    if knowledge_backend() != KNOWLEDGE_BACKEND_WEKNORA:
+        definitions.append((get_mindmap, "get_mindmap", "读取知识库思维导图"))
     return [
         FunctionTool(func, name=name, description=description, is_read_only=True)
         for func, name, description in definitions
@@ -581,9 +589,20 @@ async def build_dependency_tools(
 
     resolved = {tool.name for tool in result}
     missing = [slug for slug in tool_slugs if slug not in resolved]
-    if missing:
-        raise ValueError("Skill 工具依赖当前不可用: " + ", ".join(missing))
+    # WeKnora 模式不提供思维导图;依赖该工具的 Skill 按依赖降级跳过,
+    # 不阻断整个会话的工具装配(能力不可用只影响该 Skill)
+    weknora_unavailable = {"get_mindmap"} if _weknora_backend_selected() else set()
+    blocking = [slug for slug in missing if slug not in weknora_unavailable]
+    if blocking:
+        raise ValueError("Skill 工具依赖当前不可用: " + ", ".join(blocking))
     return result
+
+
+def _weknora_backend_selected() -> bool:
+    """当前进程是否运行在 WeKnora 知识库后端模式。"""
+    from yuxi.config.runtime import KNOWLEDGE_BACKEND_WEKNORA, knowledge_backend
+
+    return knowledge_backend() == KNOWLEDGE_BACKEND_WEKNORA
 
 
 async def build_skill_dependency_gateway(

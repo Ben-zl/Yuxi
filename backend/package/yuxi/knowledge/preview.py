@@ -31,6 +31,19 @@ async def read_knowledge_file_preview(kb_id: str, file_id: str) -> dict:
         "filename": filename,
         "readonly": True,
     }
+    remote_knowledge_id = getattr(file_record, "remote_knowledge_id", None)
+    if remote_knowledge_id:
+        # WeKnora 托管文档:预览返回远端解析文本,明确标注非原件
+        from yuxi.services.weknora_knowledge_service import load_remote_parsed_content
+
+        content = await load_remote_parsed_content(kb_id, file_id)
+        return {
+            **response,
+            "content": content,
+            "preview_type": "text",
+            "supported": True,
+            "remote_parsed": True,
+        }
     original_path = file_record.minio_url or file_record.path
     if not original_path:
         return {

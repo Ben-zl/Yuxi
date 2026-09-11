@@ -5,7 +5,15 @@ from fastapi import HTTPException
 
 from server.routers import knowledge_router
 from server.utils.knowledge_response import serialize_knowledge_base
+
+
 from yuxi.knowledge.read_models import KnowledgeBaseSummary
+
+
+@pytest.fixture(autouse=True)
+def _pin_builtin_backend(monkeypatch):
+    """本文件验证 builtin 时代权限语义,钉住后端选择,不受容器部署模式影响。"""
+    monkeypatch.setenv("KNOWLEDGE_BACKEND", "builtin")
 
 
 def test_serialize_knowledge_base_redacts_credentials_from_compatibility_fields():

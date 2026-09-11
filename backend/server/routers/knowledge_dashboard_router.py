@@ -23,6 +23,8 @@ class KnowledgeStats(BaseModel):
     total_storage_size: int
     databases_by_type: dict
     file_type_distribution: dict
+    # weknora 模式下 Chunk 在远端,nodes 不反映真实数据
+    total_nodes_unavailable: bool = False
 
 
 @knowledge_dashboard.get("/stats/knowledge", response_model=KnowledgeStats)

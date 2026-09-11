@@ -43,6 +43,9 @@ class KnowledgeBase(Base):
     mindmap_metadata = Column(JSON_VALUE)
     sample_questions = Column(JSON_VALUE)
     created_by = Column(String(64))
+    # WeKnora 托管库专用:固定归属部门与远端绑定(含实例指纹与核对状态);内置库两者恒为空
+    owning_department_id = Column(Integer)
+    remote_binding = Column(JSON_VALUE)
     created_at = Column(DateTime(timezone=True), default=utc_now_naive)
     updated_at = Column(DateTime(timezone=True), default=utc_now_naive, onupdate=utc_now_naive)
 
@@ -71,9 +74,32 @@ class KnowledgeFile(Base):
     content_type = Column(String(64))
     processing_params = Column(JSON_VALUE)
     is_folder = Column(Boolean, default=False)
+    # WeKnora 托管文档的远端 ID;内置知识库文件恒为空
+    remote_knowledge_id = Column(String(64), index=True)
     error_message = Column(Text)
     created_by = Column(String(64))
     updated_by = Column(String(64))
+    created_at = Column(DateTime(timezone=True), default=utc_now_naive)
+    updated_at = Column(DateTime(timezone=True), default=utc_now_naive, onupdate=utc_now_naive)
+
+
+class WeknoraDepartmentWorkspace(Base):
+    """WeKnora 部门 workspace 映射。
+
+    每个部门一个远端 workspace:专属 Key 仅以 Fernet 密文保存,实例指纹用于
+    换址后判定映射不可用(专属 Key 只对开通时的实例有效)。
+    """
+
+    __tablename__ = "weknora_department_workspaces"
+    __table_args__ = (UniqueConstraint("department_id", name="uq_weknora_workspaces_department"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    department_id = Column(Integer, nullable=False)
+    workspace_tenant_id = Column(String(64), nullable=False)
+    workspace_name = Column(String(255))
+    encrypted_api_key = Column(Text, nullable=False)
+    instance = Column(String(32), nullable=False)
+    status = Column(String(32), nullable=False, default="confirmed")
     created_at = Column(DateTime(timezone=True), default=utc_now_naive)
     updated_at = Column(DateTime(timezone=True), default=utc_now_naive, onupdate=utc_now_naive)
 

@@ -18,6 +18,9 @@
           <span class="extension-detail-current" :title="database.name || kbId">
             {{ database.name || kbId }}
           </span>
+          <a-tag v-if="bindingPendingReview" class="extension-detail-binding-tag" color="warning">
+            绑定待核对
+          </a-tag>
         </nav>
       </template>
 
@@ -48,12 +51,16 @@
       </template>
 
       <template #panel-filetable>
-        <div v-if="isMilvus" v-show="activeTab === 'filetable'" class="tab-panel file-panel">
+        <div
+          v-if="isMilvus || isWeknoraKb"
+          v-show="activeTab === 'filetable'"
+          class="tab-panel file-panel"
+        >
           <div class="file-management-info">
             <div class="file-info-title">
               <div class="file-info-title-row">
                 <div
-                  v-if="canManageDatabase"
+                  v-if="contentWritable"
                   ref="uploadActionMenuRef"
                   class="file-action-dropdown"
                 >
@@ -99,7 +106,7 @@
             </div>
             <div class="file-panel-status">
               <button
-                v-if="canManageDatabase && pendingParseCount > 0"
+                v-if="canManageDatabase && !isWeknoraKb && pendingParseCount > 0"
                 type="button"
                 class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-warning file-stat-summary"
                 :disabled="store.state.chunkLoading"
@@ -112,7 +119,7 @@
                 </div>
               </button>
               <button
-                v-if="canManageDatabase && pendingIndexCount > 0"
+                v-if="canManageDatabase && !isWeknoraKb && pendingIndexCount > 0"
                 type="button"
                 class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-warning file-stat-summary"
                 :disabled="store.state.chunkLoading"
@@ -128,7 +135,9 @@
                 type="button"
                 class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-summary"
                 :class="{ 'file-stat-warning': virtualFolderStatus.has_virtual_folders }"
-                :disabled="!virtualFolderStatus.has_virtual_folders || !canManageDatabase"
+                :disabled="
+                  !virtualFolderStatus.has_virtual_folders || !canManageDatabase || isWeknoraKb
+                "
                 :title="
                   virtualFolderStatus.has_virtual_folders ? '存在历史虚拟文件夹，点击转换' : ''
                 "
@@ -152,7 +161,7 @@
                 </div>
               </div>
               <button
-                v-if="canManageDatabase"
+                v-if="canManageDatabase && !isWeknoraKb"
                 type="button"
                 class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-summary file-stat-repair"
                 :disabled="statsRepairing"
@@ -169,7 +178,7 @@
                 </div>
               </button>
               <button
-                v-if="canManageDatabase"
+                v-if="canManageDatabase && !isWeknoraKb"
                 type="button"
                 class="lucide-icon-btn extension-panel-action extension-panel-action-secondary file-stat-card file-stat-summary file-stat-repair"
                 :disabled="statsRepairing"
@@ -189,7 +198,7 @@
           </div>
           <FileTable
             ref="fileTableRef"
-            :readonly="!canManageDatabase"
+            :readonly="!contentWritable"
             @mindmap="mindmapModalVisible = true"
             @search="fileSearchModalVisible = true"
           />
@@ -336,7 +345,7 @@
                 </div>
               </a-form-item>
 
-              <a-form-item v-if="!isConnector" name="chunk_preset_id">
+              <a-form-item v-if="!isConnector && !isWeknoraKb" name="chunk_preset_id">
                 <template #label>
                   <span class="chunk-preset-label">
                     分块策略
@@ -411,7 +420,8 @@
             </div>
           </a-tab-pane>
 
-          <a-tab-pane key="retrieval" tab="检索配置" force-render>
+          <!-- WeKnora 模式检索参数由远端/部署决定,不提供本地检索配置页签 -->
+          <a-tab-pane v-if="!isWeknoraKb" key="retrieval" tab="检索配置" force-render>
             <div class="database-edit-tab-content retrieval-config-content">
               <p class="database-edit-tab-description">
                 调整当前知识库在检索测试和 Agent 使用时采用的参数。
@@ -430,6 +440,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDatabaseStore } from '@/stores/database'
 import { useTaskerStore } from '@/stores/tasker'
+import { useUserStore } from '@/stores/user'
 import {
   BarChart3,
   ChevronDown,
@@ -464,6 +475,7 @@ import ShareConfigForm from '@/components/ShareConfigForm.vue'
 import { databaseApi } from '@/apis/knowledge_api'
 import { departmentApi } from '@/apis/department_api'
 import { authApi } from '@/apis/auth_api'
+import { useRuntimeCapabilitiesStore } from '@/stores/runtimeCapabilities'
 import { useChunkPresetOptions } from '@/composables/useChunkPresetOptions'
 import { DEFAULT_CHUNK_PRESET_ID } from '@/utils/chunkUtils'
 import { kbUtils } from '@/utils/kb_utils'
@@ -472,6 +484,8 @@ const route = useRoute()
 const router = useRouter()
 const store = useDatabaseStore()
 const taskerStore = useTaskerStore()
+const userStore = useUserStore()
+const runtimeCapabilitiesStore = useRuntimeCapabilitiesStore()
 const {
   chunkPresetSelectOptions: chunkPresetOptions,
   chunkPresetLoading,
@@ -489,10 +503,27 @@ const kbType = computed(() =>
 const isMilvus = computed(() => kbType.value === 'milvus')
 const isDifyKb = computed(() => kbType.value === 'dify')
 const isNotionKb = computed(() => kbType.value === 'notion')
+// WeKnora 托管库:文件管理与检索之外的页签、思维导图与内置维护动作全部裁剪
+const isWeknoraKb = computed(() => kbType.value === 'weknora')
 const isConnector = computed(
   () => isCurrentDatabaseLoaded.value && kbUtils.isReadOnlyDatabase(database.value)
 )
+// can_write_content 仅 weknora 库返回:内容维护与整库管理(can_manage)分开消费
+const canWriteContent = computed(() => database.value?.can_write_content === true)
+const contentWritable = computed(() =>
+  isWeknoraKb.value ? canWriteContent.value : canManageDatabase.value
+)
+const bindingPendingReview = computed(
+  () => isWeknoraKb.value && database.value?.binding_status === 'pending_review'
+)
 const tabs = computed(() => {
+  if (isWeknoraKb.value) {
+    // 知识图谱待 WeKnora 正式部署图谱查询 API 后开放(当前为 fork 验证态)
+    return [
+      { key: 'filetable', label: '文件管理', icon: FileText },
+      { key: 'query', label: '检索测试', icon: Search, forceRender: true }
+    ]
+  }
   if (isMilvus.value) {
     return [
       { key: 'filetable', label: '文件管理', icon: FileText },
@@ -594,7 +625,8 @@ const fileStats = computed(() => {
 })
 
 const detectVirtualFolders = async () => {
-  if (!kbId.value || !canManageDatabase.value) return
+  // WeKnora 托管库不存在历史虚拟目录数据,跳过内置维护探测
+  if (!kbId.value || !canManageDatabase.value || isWeknoraKb.value) return
   try {
     virtualFolderStatus.value = await databaseApi.detectVirtualFolders(kbId.value)
   } catch (error) {
@@ -924,7 +956,10 @@ const fileList = computed(() => {
   return (store.documentFiles || []).map((f) => f.filename).filter(Boolean)
 })
 
-const canEditShareConfig = computed(() => canManageDatabase.value)
+// WeKnora 库跨部门只读授权仅超级管理员可配置;部门管理员只读展示共享范围
+const canEditShareConfig = computed(
+  () => canManageDatabase.value && (!isWeknoraKb.value || userStore.isSuperAdmin)
+)
 
 const shareConfigDisplay = computed(() => {
   const shareConfig = database.value?.share_config || {}
@@ -1033,8 +1068,11 @@ const handleEditSubmit = async () => {
     const updateData = {
       name: editForm.name,
       description: editForm.description,
-      additional_params: {},
-      share_config: editShareConfig.value
+      additional_params: {}
+    }
+    // WeKnora 库非超级管理员不带 share_config 提交,避免回显值触发后端跨部门校验失败
+    if (!isWeknoraKb.value || userStore.isSuperAdmin) {
+      updateData.share_config = editShareConfig.value
     }
 
     if (isDifyKb.value) {
@@ -1070,6 +1108,9 @@ const handleEditSubmit = async () => {
       if (editForm.notion_token?.trim()) {
         updateData.additional_params.notion_token = editForm.notion_token.trim()
       }
+    } else if (isWeknoraKb.value) {
+      // WeKnora 模式分块与模型由部署统一配置,不提交本地解析参数
+      updateData.additional_params = {}
     } else {
       updateData.additional_params = {
         chunk_preset_id: editForm.chunk_preset_id || DEFAULT_CHUNK_PRESET_ID
@@ -1094,7 +1135,10 @@ const handleEditSubmit = async () => {
 }
 
 onMounted(() => {
-  loadChunkPresetOptions()
+  // WeKnora 模式不展示分块策略,避免普通成员触发管理员端点
+  if (!runtimeCapabilitiesStore.weknoraBackendEnabled) {
+    loadChunkPresetOptions()
+  }
   loadDepartments()
   loadUsers()
   document.addEventListener('click', onUploadMenuOutsideClick)
@@ -1125,6 +1169,10 @@ onUnmounted(() => {
   flex-direction: column;
   overflow: hidden;
   padding: 16px var(--page-padding);
+}
+
+.extension-detail-binding-tag {
+  flex-shrink: 0;
 }
 
 .file-panel {

@@ -18,6 +18,7 @@ class KnowledgeBaseConfig:
     embedding_model_spec: str | None = None
     query_params: dict[str, Any] = field(default_factory=dict)
     additional_params: dict[str, Any] = field(default_factory=dict)
+    remote_binding: dict[str, Any] | None = None
 
     @property
     def query_options(self) -> dict[str, Any]:
@@ -41,6 +42,8 @@ class KnowledgeBaseSummary:
     share_config: dict[str, Any]
     created_by: str | None
     created_at: datetime | None
+    owning_department_id: int | None = None
+    remote_binding: dict[str, Any] | None = None
     file_count: int = 0
     folder_count: int = 0
     row_count: int = 0
@@ -51,6 +54,7 @@ class KnowledgeBaseSummary:
     pending_index_count: int = 0
     processing_count: int = 0
     effective_permission: ResourcePermission | None = None
+    can_write_content: bool | None = None
 
     @property
     def can_manage(self) -> bool:

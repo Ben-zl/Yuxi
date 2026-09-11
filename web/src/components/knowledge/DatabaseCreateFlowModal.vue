@@ -35,7 +35,48 @@
       </header>
 
       <main class="create-flow-body">
-        <section v-if="currentStep === 0" class="flow-section">
+        <!-- WeKnora 模式:单步简化表单,类型/模型/分块由部署统一配置 -->
+        <section v-if="isWeknoraMode" class="flow-section">
+          <div class="form-section">
+            <label for="database-create-name">知识库名称 <b>*</b></label>
+            <a-input
+              id="database-create-name"
+              v-model:value="form.name"
+              placeholder="例如：产品资料库"
+            />
+          </div>
+          <div class="form-section">
+            <label>归属部门</label>
+            <template v-if="userStore.isSuperAdmin">
+              <a-select
+                v-model:value="owningDepartmentId"
+                :options="departmentOptions"
+                :loading="departmentsLoading"
+                placeholder="请选择归属部门"
+                class="full-width"
+              />
+              <small>知识库固定归属所选部门，创建后不可迁移。</small>
+            </template>
+            <template v-else>
+              <div class="readonly-department-field">
+                {{ userStore.departmentName || `部门 ${userStore.departmentId || ''}` }}
+              </div>
+              <small>部门管理员创建的知识库固定归属本部门。</small>
+            </template>
+          </div>
+          <div class="form-section">
+            <label>知识库描述</label>
+            <small>描述会帮助智能体判断何时使用这个知识库。</small>
+            <AiTextarea
+              v-model="form.description"
+              :name="form.name"
+              placeholder="说明包含的内容、适用任务和使用限制"
+              :auto-size="{ minRows: 3, maxRows: 8 }"
+            />
+          </div>
+        </section>
+
+        <section v-else-if="currentStep === 0" class="flow-section">
           <div class="form-section">
             <label for="database-create-name">知识库名称 <b>*</b></label>
             <a-input
@@ -201,9 +242,11 @@
       <footer class="create-flow-footer">
         <span>{{ footerSummary }}</span>
         <div class="footer-actions">
-          <a-button v-if="currentStep === 0" @click="handleCancel">取消</a-button>
+          <a-button v-if="currentStep === 0 || isWeknoraMode" @click="handleCancel">取消</a-button>
           <a-button v-else :disabled="creating" @click="currentStep--">上一步</a-button>
-          <a-button v-if="currentStep < 2" type="primary" @click="goNext">下一步</a-button>
+          <a-button v-if="!isWeknoraMode && currentStep < 2" type="primary" @click="goNext">
+            下一步
+          </a-button>
           <a-button v-else type="primary" :loading="creating" @click="handleCreate">
             创建知识库
           </a-button>
@@ -223,9 +266,13 @@ import ShareConfigForm from '@/components/ShareConfigForm.vue'
 import { useChunkPresetOptions } from '@/composables/useChunkPresetOptions'
 import { useConfigStore } from '@/stores/config'
 import { useDatabaseStore } from '@/stores/database'
+import { useUserStore } from '@/stores/user'
+import { useRuntimeCapabilitiesStore } from '@/stores/runtimeCapabilities'
+import { departmentApi } from '@/apis/department_api'
 import { getKbTypeIcon, getKbTypeLabel } from '@/utils/kb_utils'
 import {
   buildDatabaseRequest,
+  buildWeknoraDatabaseRequest,
   createDefaultShareConfig,
   createEmptyDatabaseForm,
   selectDatabaseType,
@@ -239,6 +286,8 @@ const props = defineProps({
 const emit = defineEmits(['update:open', 'completed'])
 const configStore = useConfigStore()
 const databaseStore = useDatabaseStore()
+const userStore = useUserStore()
+const runtimeCapabilitiesStore = useRuntimeCapabilitiesStore()
 const {
   chunkPresetSelectOptions: chunkPresetOptions,
   chunkPresetLoading,
@@ -246,7 +295,9 @@ const {
   getChunkPresetDescription
 } = useChunkPresetOptions()
 
-const stepLabels = ['类型', '配置', '权限']
+// WeKnora 模式使用部署固定的单步简化表单,不区分类型与模型配置
+const isWeknoraMode = computed(() => runtimeCapabilitiesStore.weknoraBackendEnabled)
+const stepLabels = computed(() => (isWeknoraMode.value ? ['基础信息'] : ['类型', '配置', '权限']))
 const currentStep = ref(0)
 const form = reactive(createEmptyDatabaseForm(configStore.config?.embed_model))
 const shareConfig = ref(createDefaultShareConfig())
@@ -270,6 +321,7 @@ const configuredParamCount = computed(
     }).length
 )
 const footerSummary = computed(() => {
+  if (isWeknoraMode.value) return form.name.trim()
   if (currentStep.value === 0) {
     const typeText = selectedTypeLabel.value
       ? `已选 ${selectedTypeLabel.value}`
@@ -280,11 +332,37 @@ const footerSummary = computed(() => {
   return `${selectedTypeLabel.value} · ${form.name.trim()}`
 })
 
+// WeKnora 归属部门:超级管理员可选,部门管理员固定本部门(后端解析)
+const owningDepartmentId = ref(null)
+const departments = ref([])
+const departmentsLoading = ref(false)
+const departmentOptions = computed(() =>
+  departments.value.map((item) => ({ value: item.id, label: item.name }))
+)
+
+const loadDepartments = async () => {
+  if (departmentsLoading.value) return
+  departmentsLoading.value = true
+  try {
+    const res = await departmentApi.getDepartments()
+    departments.value = res.departments || res || []
+  } catch (error) {
+    console.error('加载部门列表失败:', error)
+    departments.value = []
+  } finally {
+    departmentsLoading.value = false
+  }
+}
+
 const reset = () => {
   Object.assign(form, createEmptyDatabaseForm(configStore.config?.embed_model))
-  const firstType = Object.keys(props.supportedKbTypes)[0] || ''
-  Object.assign(form, selectDatabaseType(form, firstType, props.supportedKbTypes[firstType]))
+  // WeKnora 简化表单不选择知识库类型
+  if (!isWeknoraMode.value) {
+    const firstType = Object.keys(props.supportedKbTypes)[0] || ''
+    Object.assign(form, selectDatabaseType(form, firstType, props.supportedKbTypes[firstType]))
+  }
   shareConfig.value = createDefaultShareConfig()
+  owningDepartmentId.value = null
   currentStep.value = 0
 }
 
@@ -315,6 +393,32 @@ const goNext = () => {
   currentStep.value++
 }
 const handleCreate = async () => {
+  // WeKnora 模式:单步表单只提交名称、描述与(超级管理员)归属部门
+  if (isWeknoraMode.value) {
+    if (!form.name?.trim()) {
+      message.warning('请输入知识库名称')
+      return
+    }
+    if (userStore.isSuperAdmin && !owningDepartmentId.value) {
+      message.warning('请选择归属部门')
+      return
+    }
+    const request = buildWeknoraDatabaseRequest(
+      form.name,
+      form.description,
+      userStore.isSuperAdmin ? owningDepartmentId.value : null
+    )
+    try {
+      const result = await databaseStore.createDatabase(request)
+      if (!result) return
+      emit('completed', result)
+      emit('update:open', false)
+    } catch {
+      // Store 已展示错误，保留输入供用户修正。
+    }
+    return
+  }
+
   const error = validateDatabaseConfig(form, selectedTypeInfo.value)
   if (error) {
     if (!form.name?.trim()) {
@@ -351,6 +455,11 @@ watch(
   (open) => {
     if (!open) return
     reset()
+    if (isWeknoraMode.value) {
+      // 简化表单不需要分块策略;超级管理员需要部门列表做归属选择
+      if (userStore.isSuperAdmin) loadDepartments()
+      return
+    }
     loadChunkPresetOptions()
   }
 )
@@ -568,6 +677,17 @@ watch(
 }
 .full-width {
   width: 100%;
+}
+.readonly-department-field {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 4px 11px;
+  border: 1px solid var(--gray-200);
+  border-radius: 6px;
+  background: var(--gray-25);
+  color: var(--gray-800);
+  font-size: 13px;
 }
 .summary-card {
   display: flex;

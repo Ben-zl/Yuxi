@@ -1,6 +1,6 @@
 <template>
   <div class="graph-canvas-container" ref="rootEl">
-    <div v-show="graphData.nodes.length > 0" class="graph-canvas" ref="container"></div>
+    <div v-if="graphData.nodes.length > 0" class="graph-canvas" ref="container"></div>
     <div class="slots">
       <div v-if="$slots.top" class="overlay top">
         <slot name="top" />

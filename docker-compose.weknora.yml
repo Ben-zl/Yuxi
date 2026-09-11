@@ -1,0 +1,188 @@
+# Yuxi–WeKnora 本地联调栈:从本地 WeKnora 源码构建独立 Compose 项目。
+#
+# 用法(顺序固定,先 Yuxi 后 WeKnora):
+#   1. 启动 Yuxi 栈(compose project yuxi-weknora);本文件外部依赖其网络 yuxi-weknora_app-network
+#   2. docker compose -f docker-compose.weknora.yml up -d --build
+#
+# Yuxi 侧接入配置(.env):
+#   KNOWLEDGE_BACKEND=weknora
+#   WEKNORA_BASE_URL=http://weknora-app:8080/api/v1   # 经共享网络直连 app,绕过 nginx
+#   WEKNORA_API_KEY=<本地空间 Key>                     # 在 WeKnora 中创建,仅驻留服务端
+#
+# 端口(宿主):frontend 28080(验证 /openapi/v1 代理)、app 28081;存储服务仅容器内。
+# 所有凭据为本地联调专用值,不适用于任何共享环境。
+name: yuxi-weknora-remote
+
+x-weknora-source: &weknora-source ${WEKNORA_SOURCE_DIR:-../WeKnora}
+
+services:
+  postgres:
+    image: paradedb/paradedb:v0.22.2-pg17
+    environment:
+      POSTGRES_USER: weknora
+      POSTGRES_PASSWORD: weknora-dev-password
+      POSTGRES_DB: WeKnora
+    volumes:
+      - wk_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weknora -d WeKnora"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7.0-alpine
+    command: redis-server --appendonly yes --requirepass weknora-dev-redis
+    volumes:
+      - wk_redis_data:/data
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server --console-address ":9001" /data
+    environment:
+      MINIO_ROOT_USER: weknora-dev
+      MINIO_ROOT_PASSWORD: weknora-dev-secret
+    volumes:
+      - wk_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  qdrant:
+    image: qdrant/qdrant:v1.16.2
+    volumes:
+      - wk_qdrant_data:/qdrant/storage
+
+  neo4j:
+    image: neo4j:2025.10.1
+    environment:
+      NEO4J_AUTH: neo4j/weknora-dev-neo4j
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_apoc_import_file_use__neo4j__config: "true"
+      NEO4JLABS_PLUGINS: '["apoc"]'
+    volumes:
+      - wk_neo4j_data:/data
+
+  docreader:
+    build:
+      context: *weknora-source
+      dockerfile: docker/Dockerfile.docreader
+      args:
+        APT_MIRROR: https://mirrors.tencent.com
+        HTTP_PROXY: ${WEKNORA_BUILD_PROXY:-}
+        HTTPS_PROXY: ${WEKNORA_BUILD_PROXY:-}
+        NO_PROXY: localhost,127.0.0.1,mirrors.tencent.com,goproxy.cn
+    environment:
+      TZ: Asia/Shanghai
+      DOCREADER_IMAGE_OUTPUT_DIR: /tmp/docreader
+    volumes:
+      - wk_docreader_tmp:/tmp/docreader
+    healthcheck:
+      test: ["CMD-SHELL", "ls /tmp/docreader >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  app:
+    build:
+      context: *weknora-source
+      dockerfile: docker/Dockerfile.app
+      args:
+        APK_MIRROR_ARG: mirrors.tencent.com
+        GOPROXY_ARG: https://goproxy.cn,direct
+        HTTP_PROXY: ${WEKNORA_BUILD_PROXY:-}
+        HTTPS_PROXY: ${WEKNORA_BUILD_PROXY:-}
+        NO_PROXY: localhost,127.0.0.1,mirrors.tencent.com,goproxy.cn
+    environment:
+      GIN_MODE: release
+      TZ: Asia/Shanghai
+      DISABLE_REGISTRATION: "false"
+      # 数据面:显式选择 Postgres + Qdrant + MinIO,不使用其他默认组合
+      DB_DRIVER: postgres
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: weknora
+      DB_PASSWORD: weknora-dev-password
+      DB_NAME: WeKnora
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: weknora-dev-redis
+      STREAM_MANAGER_TYPE: redis
+      RETRIEVE_DRIVER: qdrant
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6334"
+      QDRANT_COLLECTION: weknora_embeddings
+      STORAGE_TYPE: minio
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY_ID: weknora-dev
+      MINIO_SECRET_ACCESS_KEY: weknora-dev-secret
+      MINIO_BUCKET_NAME: weknora
+      DOCREADER_ADDR: docreader:50051
+      DOCREADER_TRANSPORT: grpc
+      # 实体图谱(GraphRAG)抽取与查询
+      NEO4J_ENABLE: "true"
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: weknora-dev-neo4j
+      # 本地联调密钥:仅用于隔离环境,禁止复用到共享环境
+      JWT_SECRET: yuxi-weknora-jwt-secret
+      TENANT_AES_KEY: yuxi-weknora-tenant-aes-key
+      SYSTEM_AES_KEY: yuxi-weknora-system-aes-key
+      WEKNORA_TENANT_ENABLE_RBAC: "true"
+    ports:
+      - "127.0.0.1:28081:8080"
+    volumes:
+      - wk_app_files:/data/files
+      - wk_docreader_tmp:/tmp/docreader:ro
+      - ${WEKNORA_SOURCE_DIR:-../WeKnora}/config/config.yaml:/app/config/config.yaml:ro
+    networks:
+      default:
+      yuxi:
+        aliases:
+          - weknora-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      docreader:
+        condition: service_healthy
+      neo4j:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ${WEKNORA_SOURCE_DIR:-../WeKnora}/frontend
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${WEKNORA_BUILD_PROXY:-}
+        HTTPS_PROXY: ${WEKNORA_BUILD_PROXY:-}
+        NO_PROXY: localhost,127.0.0.1,mirrors.tencent.com,goproxy.cn
+    environment:
+      AUTH_MODE: local
+      APP_HOST: app
+      APP_PORT: "8080"
+      APP_SCHEME: http
+      MAX_FILE_SIZE_MB: "500"
+    ports:
+      - "127.0.0.1:28080:80"
+    depends_on:
+      - app
+
+volumes:
+  wk_neo4j_data:
+  wk_postgres_data:
+  wk_redis_data:
+  wk_minio_data:
+  wk_qdrant_data:
+  wk_docreader_tmp:
+  wk_app_files:
+
+networks:
+  yuxi:
+    name: yuxi-weknora_app-network
+    external: true

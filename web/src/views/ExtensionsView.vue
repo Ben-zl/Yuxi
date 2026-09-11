@@ -11,10 +11,7 @@
     />
 
     <div v-if="!isDetailPage" class="extensions-content">
-      <div
-        v-if="knowledgeEnabled && userStore.isAdmin && activeTab === 'knowledge'"
-        class="tab-panel"
-      >
+      <div v-if="knowledgeTabVisible && activeTab === 'knowledge'" class="tab-panel">
         <DataBaseView ref="knowledgeRef" embedded />
       </div>
       <div v-if="userStore.isAdmin && activeTab === 'tools'" class="tab-panel">
@@ -48,12 +45,17 @@ const route = useRoute()
 const router = useRouter()
 const userStore = useUserStore()
 const runtimeCapabilitiesStore = useRuntimeCapabilitiesStore()
-const { knowledgeEnabled } = storeToRefs(runtimeCapabilitiesStore)
+const { knowledgeEnabled, weknoraBackendEnabled } = storeToRefs(runtimeCapabilitiesStore)
 const activeTab = ref(null)
 const knowledgeRef = ref(null)
 const skillsRef = ref(null)
 const mcpRef = ref(null)
 const toolsRef = ref(null)
+
+// WeKnora 模式下知识库入口向普通成员开放;内置模式保持仅管理员可见
+const knowledgeTabVisible = computed(
+  () => knowledgeEnabled.value && (userStore.isAdmin || weknoraBackendEnabled.value)
+)
 
 const adminExtensionTabs = computed(() => [
   ...(knowledgeEnabled.value ? [{ key: 'knowledge', label: '知识库' }] : []),
@@ -61,9 +63,12 @@ const adminExtensionTabs = computed(() => [
   { key: 'tools', label: '工具' },
   { key: 'mcp', label: 'MCP' }
 ])
-const userExtensionTabs = [{ key: 'skills', label: '技能' }]
+const userExtensionTabs = computed(() => [
+  ...(knowledgeTabVisible.value ? [{ key: 'knowledge', label: '知识库' }] : []),
+  { key: 'skills', label: '技能' }
+])
 const extensionTabs = computed(() =>
-  userStore.isAdmin ? adminExtensionTabs.value : userExtensionTabs
+  userStore.isAdmin ? adminExtensionTabs.value : userExtensionTabs.value
 )
 const allowedTabKeys = computed(() => extensionTabs.value.map((tab) => tab.key))
 const defaultTabKey = computed(() => extensionTabs.value[0]?.key || 'skills')
@@ -105,7 +110,7 @@ const activeChildLoading = computed(() => {
 })
 
 watch(
-  () => [route.query.tab, userStore.isAdmin, knowledgeEnabled.value],
+  () => [route.query.tab, userStore.isAdmin, knowledgeTabVisible.value],
   ([tab]) => {
     const nextTab = normalizeTab(tab)
     if (activeTab.value !== nextTab) activeTab.value = nextTab

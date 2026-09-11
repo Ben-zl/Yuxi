@@ -165,15 +165,74 @@ test('能力发现瞬时失败后保持 fail-closed，并允许下一次调用�
 
     const runtimeCapabilitiesStore = await prepareStores(server)
 
-    assert.deepEqual(await runtimeCapabilitiesStore.ensureLoaded(), { knowledge: false })
+    assert.deepEqual(await runtimeCapabilitiesStore.ensureLoaded(), {
+      knowledge: false,
+      knowledge_backend: 'builtin',
+      knowledge_backend_ready: false
+    })
     assert.equal(runtimeCapabilitiesStore.status, 'error')
     assert.equal(runtimeCapabilitiesStore.knowledgeEnabled, false)
 
-    assert.deepEqual(await runtimeCapabilitiesStore.ensureLoaded(), { knowledge: true })
+    assert.deepEqual(await runtimeCapabilitiesStore.ensureLoaded(), {
+      knowledge: true,
+      knowledge_backend: 'builtin',
+      knowledge_backend_ready: true
+    })
     assert.equal(attempts, 2)
     assert.equal(runtimeCapabilitiesStore.status, 'ready')
     assert.equal(runtimeCapabilitiesStore.error, null)
     assert.equal(runtimeCapabilitiesStore.knowledgeEnabled, true)
+  })
+})
+
+test('能力发现返回知识库后端字段时 store 暴露 weknora 模式判定', async () => {
+  await withServer(async (server) => {
+    storageValues.clear()
+    globalThis.fetch = async (input) => {
+      assert.equal(String(input), '/api/system/discovery')
+      return jsonResponse({
+        capabilities: {
+          features: {
+            knowledge: true,
+            knowledge_backend: 'weknora',
+            knowledge_backend_ready: true
+          }
+        }
+      })
+    }
+
+    const runtimeCapabilitiesStore = await prepareStores(server)
+    await runtimeCapabilitiesStore.ensureLoaded()
+
+    assert.equal(runtimeCapabilitiesStore.knowledgeEnabled, true)
+    assert.equal(runtimeCapabilitiesStore.knowledgeBackend, 'weknora')
+    assert.equal(runtimeCapabilitiesStore.weknoraBackendEnabled, true)
+  })
+})
+
+test('weknora 配置不完整时 knowledge 关闭且不误判为可用的 weknora 模式', async () => {
+  await withServer(async (server) => {
+    storageValues.clear()
+    globalThis.fetch = async (input) => {
+      assert.equal(String(input), '/api/system/discovery')
+      return jsonResponse({
+        capabilities: {
+          features: {
+            knowledge: false,
+            knowledge_backend: 'weknora',
+            knowledge_backend_ready: false,
+            knowledge_backend_config_error: 'WeKnora 后端配置不完整,缺少: WEKNORA_BASE_URL, WEKNORA_API_KEY'
+          }
+        }
+      })
+    }
+
+    const runtimeCapabilitiesStore = await prepareStores(server)
+    await runtimeCapabilitiesStore.ensureLoaded()
+
+    assert.equal(runtimeCapabilitiesStore.knowledgeEnabled, false)
+    assert.equal(runtimeCapabilitiesStore.knowledgeBackend, 'weknora')
+    assert.equal(runtimeCapabilitiesStore.weknoraBackendEnabled, false)
   })
 })
 

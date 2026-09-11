@@ -37,6 +37,14 @@ async def kb_config_cache_lock(kb_id: str) -> AsyncIterator[None]:
         yield
 
 
+def _snapshot_is_complete(snapshot: dict[str, Any]) -> bool:
+    """weknora 快照必须含远端绑定;旧版本缓存缺键时视为 miss 回源。"""
+
+    if snapshot.get("kb_type") == "weknora" and "remote_binding" not in snapshot:
+        return False
+    return True
+
+
 def serialize_kb_config(row: Any) -> dict[str, Any]:
     """将知识库记录转换为最小运行配置快照。"""
     additional_params = dict(row.additional_params or {})
@@ -47,6 +55,7 @@ def serialize_kb_config(row: Any) -> dict[str, Any]:
         "embedding_model_spec": row.embedding_model_spec,
         "query_params": row.query_params,
         "additional_params": additional_params,
+        "remote_binding": getattr(row, "remote_binding", None),
     }
 
 
@@ -60,6 +69,8 @@ async def get_cached_kb_config(kb_id: str) -> dict[str, Any] | None:
         snapshot = json.loads(raw)
         if not isinstance(snapshot, dict) or snapshot.get("kb_id") != kb_id:
             logger.warning(f"Invalid knowledge base cache snapshot: kb_id={kb_id}")
+            return None
+        if not _snapshot_is_complete(snapshot):
             return None
         return snapshot
     except Exception as exc:

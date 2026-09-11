@@ -433,6 +433,7 @@ import { useGraph } from '@/composables/useGraph'
 
 const GRAPH_BUILD_TASK_TYPE = 'knowledge_graph_index'
 const MILVUS_KB_TYPE = 'milvus'
+// WeKnora 图谱待远端正式部署后加入 'weknora'
 const GRAPH_SUPPORTED_KB_TYPES = new Set([MILVUS_KB_TYPE])
 
 const props = defineProps({

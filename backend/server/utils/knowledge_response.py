@@ -6,8 +6,19 @@ from typing import Any
 
 from yuxi.knowledge.read_models import KnowledgeBaseDetail, KnowledgeBaseSummary
 from yuxi.knowledge.utils.security import redact_sensitive_params
+from yuxi.knowledge.weknora import BINDING_CONFIRMED
 from yuxi.permissions import ResourcePermission
 from yuxi.utils.datetime_utils import utc_isoformat
+
+
+def _database_status_label(database: KnowledgeBaseSummary) -> tuple[str, str | None]:
+    """返回展示状态与绑定状态;待核对绑定不得伪装成已连接。"""
+
+    binding = database.remote_binding or {}
+    binding_status = binding.get("status")
+    if database.kb_type == "weknora" and binding_status and binding_status != BINDING_CONFIRMED:
+        return "绑定待核对", binding_status
+    return "已连接", binding_status
 
 
 def _knowledge_base_stats(database: KnowledgeBaseSummary) -> dict[str, int]:
@@ -39,6 +50,7 @@ def serialize_knowledge_base(
         additional_params = redact_sensitive_params(additional_params)
     additional_params["stats"] = stats
 
+    status_label, binding_status = _database_status_label(database)
     response = {
         "kb_id": database.kb_id,
         "name": database.name,
@@ -50,7 +62,9 @@ def serialize_knowledge_base(
         "metadata": dict(additional_params),
         "created_by": database.created_by,
         "created_at": utc_isoformat(database.created_at) if database.created_at else None,
-        "status": "已连接",
+        "owning_department_id": database.owning_department_id,
+        "status": status_label,
+        "binding_status": binding_status,
         "stats": stats,
         "row_count": (database.row_count or database.file_count) if row_count_fallback else database.row_count,
         "share_config": database.share_config,
@@ -61,6 +75,8 @@ def serialize_knowledge_base(
     if effective_permission is not None:
         response["effective_permission"] = effective_permission.value
         response["can_manage"] = effective_permission == ResourcePermission.MANAGE
+    if database.can_write_content is not None:
+        response["can_write_content"] = database.can_write_content
 
     if isinstance(database, KnowledgeBaseDetail):
         response["mindmap"] = database.mindmap

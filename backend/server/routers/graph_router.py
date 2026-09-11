@@ -8,6 +8,7 @@ from yuxi.knowledge.runtime import knowledge_base
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.logging_config import logger
 
+
 graph = APIRouter(prefix="/graph", tags=["graph"])
 
 
@@ -30,14 +31,15 @@ async def get_graphs(current_user: User = Depends(get_admin_user)):
         databases = await knowledge_base.get_databases_by_uid(current_user.uid)
         graphs = []
         for db in databases:
-            if db.kb_type.lower() != "milvus":
+            kb_type = db.kb_type.lower()
+            if kb_type != "milvus":
                 continue
             serialized = serialize_knowledge_base(db)
             graphs.append(
                 {
                     "id": db.kb_id,
                     "name": db.name,
-                    "type": "milvus",
+                    "type": kb_type,
                     "description": db.description,
                     "status": "已连接",
                     "created_at": serialized["created_at"],

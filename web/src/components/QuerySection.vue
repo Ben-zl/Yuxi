@@ -179,8 +179,10 @@ const queryResult = ref('')
 const showRawData = ref(false)
 const showQuerySuggestions = computed(() => !searchLoading.value && !queryResult.value)
 
-// 示例问题生成属于写操作，仅对拥有管理权限（非只读权限）的知识库开放
-const canGenerateQuestions = computed(() => store.database?.can_manage === true)
+// 示例问题生成属于写操作，仅对拥有管理权限（非只读权限）的知识库开放；WeKnora 模式不提供该内置能力
+const canGenerateQuestions = computed(
+  () => store.database?.can_manage === true && store.database?.kb_type !== 'weknora'
+)
 
 // 查询测试
 const queryText = ref('')

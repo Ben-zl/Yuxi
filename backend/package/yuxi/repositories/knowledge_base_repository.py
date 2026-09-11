@@ -10,13 +10,24 @@ from yuxi.storage.postgres.models_knowledge import KnowledgeBase
 
 
 class KnowledgeBaseRepository:
-    async def count_by_type(self) -> list[tuple[str, int]]:
-        """按知识库类型聚合数量。"""
+    async def count_by_type(self, kb_types: set[str] | None = None) -> list[tuple[str, int]]:
+        """按知识库类型聚合数量;kb_types 限定统计范围(两套后端不混用)。"""
         async with pg_manager.get_async_session_context() as session:
-            result = await session.execute(
-                select(KnowledgeBase.kb_type, func.count(KnowledgeBase.id)).group_by(KnowledgeBase.kb_type)
-            )
+            query = select(KnowledgeBase.kb_type, func.count(KnowledgeBase.id)).group_by(KnowledgeBase.kb_type)
+            if kb_types is not None:
+                if not kb_types:
+                    return []
+                query = query.where(KnowledgeBase.kb_type.in_(kb_types))
+            result = await session.execute(query)
             return [(str(kb_type or "unknown"), int(count or 0)) for kb_type, count in result.all()]
+
+    async def list_kb_ids_by_type(self, kb_types: set[str]) -> set[str]:
+        """返回指定类型集合的 kb_id 集合(供文件聚合过滤)。"""
+        if not kb_types:
+            return set()
+        async with pg_manager.get_async_session_context() as session:
+            result = await session.execute(select(KnowledgeBase.kb_id).where(KnowledgeBase.kb_type.in_(kb_types)))
+            return {row for row in result.scalars().all()}
 
     async def get_all(self) -> list[KnowledgeBase]:
         async with pg_manager.get_async_session_context() as session:
