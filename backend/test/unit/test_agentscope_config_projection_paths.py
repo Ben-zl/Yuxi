@@ -28,5 +28,9 @@ def test_build_agentscope_system_prompt_preserves_custom_prompt_and_file_contrac
     assert "/workspace/outputs/tmp 中与当前任务上下文匹配的中间文件" in prompt
     assert "读取候选文件并提取所需标识" in prompt
     assert "/workspace/uploads" in prompt
-    assert "/workspace/workspace" in prompt
+    assert "/workspace/workspace/..." in prompt
+    shared_tools = ("`shared_workspace_list`", "`shared_workspace_read`", "`shared_workspace_write`")
+    assert all(name in prompt for name in shared_tools)
+    assert "不能用 AgentScope 原生 `Read`、`Write`、`Edit`" in prompt
+    assert "确认前不得向用户宣称写入成功" in prompt
     assert "/home/gem/user-data" not in prompt

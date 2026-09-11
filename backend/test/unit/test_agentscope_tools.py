@@ -590,15 +590,41 @@ async def test_present_artifacts_rejects_internal_workspace_file():
         await tool.call(filepaths=["/workspace/skills/private.md"])
 
 
-async def test_shared_workspace_tools_allow_root_and_reject_traversal(tmp_path, monkeypatch):
-    from yuxi.agents.backends.sandbox import paths
+async def test_shared_workspace_write_updates_same_memory_file_read_by_page(tmp_path, monkeypatch):
+    from yuxi.workspace.filesystem import Workspace
+    from yuxi.workspace.paths import ensure_user_workspace
 
-    monkeypatch.setattr(paths.conf, "save_dir", str(tmp_path))
+    monkeypatch.setenv("YUXI_USER_DATA_DIR", str(tmp_path))
+    ensure_user_workspace("user-memory")
+    toolset = {tool.name: tool for tool in tools.build_shared_workspace_tools("user-memory")}
+    path = "/workspace/workspace/agents/MEMORY.md"
+
+    initial = await toolset["shared_workspace_read"].call(path=path)
+    assert "以下是 Agent 需要记住的一些信息" in str(initial.content)
+    await toolset["shared_workspace_write"].call(
+        path=path,
+        content="# MEMORY\n\n以下是 Agent 需要记住的一些信息\n\n- 中国人能飞\n",
+    )
+
+    page_content = Workspace("user-memory").read_authorized_file("/agents/MEMORY.md", 2 * 1024 * 1024)
+    assert page_content.decode("utf-8").endswith("- 中国人能飞\n")
+
+
+async def test_shared_workspace_tools_allow_root_and_reject_traversal(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUXI_USER_DATA_DIR", str(tmp_path))
     toolset = {tool.name: tool for tool in tools.build_shared_workspace_tools("user-1")}
+    assert "/workspace/workspace" in toolset["shared_workspace_list"].description
+    assert "AgentScope" in toolset["shared_workspace_read"].description
+    assert "先读取" in toolset["shared_workspace_write"].description
     await toolset["shared_workspace_write"].call(
         path="/workspace/workspace/report.txt",
         content="result",
     )
+
+    expected_file = tmp_path / "shared" / "user-1" / "workspace" / "report.txt"
+    assert expected_file.read_text(encoding="utf-8") == "result"
+    read_back = await toolset["shared_workspace_read"].call(path="/workspace/workspace/report.txt")
+    assert "result" in str(read_back.content)
 
     listed = await toolset["shared_workspace_list"].call(path="/workspace/workspace")
     assert "report.txt" in str(listed.content)

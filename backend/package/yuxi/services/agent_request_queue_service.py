@@ -268,6 +268,7 @@ async def intake_request(
             expected_request_id=request_id if policy == "reject" else None,
         )
         if dispatched and dispatched.request_id == request_id:
+            await ConversationRepository(db).set_model_spec(conversation, resolved_model_spec)
             return IntakeResult(
                 request_id=request_id,
                 status=REQUEST_STATUS_DISPATCHED,
@@ -300,6 +301,7 @@ async def intake_request(
             thread_id=thread_id,
         )
 
+    await ConversationRepository(db).set_model_spec(conversation, resolved_model_spec)
     return IntakeResult(
         request_id=request_id,
         status=REQUEST_STATUS_QUEUED,

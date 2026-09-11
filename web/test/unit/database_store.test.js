@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import { createPinia, setActivePinia } from 'pinia'
 import { createServer } from 'vite'
+import { readFileSync } from 'node:fs'
 
 const storageValues = new Map()
 globalThis.localStorage = {
@@ -64,4 +65,16 @@ test('从二级目录点击全部文件会清空 parent_id 并返回根目录', 
   } finally {
     await server.close()
   }
+})
+
+
+test('文档入库提交只提示任务已提交，不提前显示成功', () => {
+  const source = readFileSync(new URL('../../src/stores/database.js', import.meta.url), 'utf8')
+  const indexActions = source.slice(
+    source.indexOf('async function indexFiles'),
+    source.indexOf('function openFileDetail')
+  )
+
+  assert.equal((indexActions.match(/message\.info\(data\.message \|\| '入库任务已提交'\)/g) || []).length, 2)
+  assert.doesNotMatch(indexActions, /message\.success\(data\.message \|\| '入库任务已提交'\)/)
 })

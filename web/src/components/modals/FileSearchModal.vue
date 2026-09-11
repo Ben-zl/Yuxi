@@ -85,13 +85,14 @@
 </template>
 
 <script setup>
-import { nextTick, ref, watch } from 'vue'
+import { nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { FileText, Search, X } from '@lucide/vue'
 import dayjs, { parseToShanghai } from '@/utils/time'
 import { formatFileSize } from '@/utils/file_utils'
 import { documentApi } from '@/apis/knowledge_api'
 
 const SEARCH_LIMIT = 100
+const SEARCH_DEBOUNCE_MS = 300
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -108,13 +109,27 @@ const loading = ref(false)
 const hasSearched = ref(false)
 const hasMore = ref(false)
 
-const resetState = () => {
-  searchToken++
-  keyword.value = ''
+let searchToken = 0
+let searchTimer = null
+
+const cancelScheduledSearch = () => {
+  if (searchTimer === null) return
+  clearTimeout(searchTimer)
+  searchTimer = null
+}
+
+const resetSearchResults = () => {
   results.value = []
   loading.value = false
   hasSearched.value = false
   hasMore.value = false
+}
+
+const resetState = () => {
+  cancelScheduledSearch()
+  searchToken++
+  keyword.value = ''
+  resetSearchResults()
 }
 
 const close = () => emit('update:open', false)
@@ -124,11 +139,14 @@ const selectResult = (item) => {
   close()
 }
 
-let searchToken = 0
-
 const handleSearch = async () => {
+  cancelScheduledSearch()
   const query = keyword.value.trim()
-  if (!query || !props.kbId) return
+  if (!query || !props.kbId) {
+    searchToken++
+    resetSearchResults()
+    return
+  }
   const token = ++searchToken
   loading.value = true
   hasSearched.value = true
@@ -150,6 +168,33 @@ const handleSearch = async () => {
     if (token === searchToken) loading.value = false
   }
 }
+
+const scheduleSearch = () => {
+  cancelScheduledSearch()
+  searchToken++
+
+  const query = keyword.value.trim()
+  if (!query || !props.kbId) {
+    resetSearchResults()
+    return
+  }
+
+  results.value = []
+  loading.value = true
+  hasSearched.value = true
+  hasMore.value = false
+  searchTimer = setTimeout(() => {
+    searchTimer = null
+    handleSearch()
+  }, SEARCH_DEBOUNCE_MS)
+}
+
+watch(keyword, scheduleSearch)
+
+onBeforeUnmount(() => {
+  cancelScheduledSearch()
+  searchToken++
+})
 
 const PATH_PREVIEW_LIMIT = 48
 
@@ -176,8 +221,10 @@ const formatResultDate = (value) => {
 watch(
   () => props.open,
   (nextOpen) => {
-    if (!nextOpen) return
     resetState()
+    if (!nextOpen) {
+      return
+    }
     nextTick(() => searchInputRef.value?.focus())
   }
 )

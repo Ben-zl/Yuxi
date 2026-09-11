@@ -380,3 +380,20 @@ async def test_load_state_marks_interrupted_and_prunes(monkeypatch):
     assert listing["summary"]["total"] == 2
     assert "c" in repo.deleted and "d" in repo.deleted
     await tasker.shutdown()
+
+
+async def test_failed_task_preserves_result_written_before_summary_error():
+    repo = FakeRepo()
+    tasker = await _make_tasker(repo)
+
+    async def coro(ctx):
+        await ctx.set_result({"processed": 2, "failed": 1})
+        raise RuntimeError("入库完成，失败 1 个")
+
+    task = await tasker.enqueue(name="文档入库", task_type="knowledge_index", coroutine=coro)
+    final = await _wait_status(tasker, task.id, {"failed"})
+
+    assert final["status"] == "failed"
+    assert final["error"] == "入库完成，失败 1 个"
+    assert final["result"] == {"processed": 2, "failed": 1}
+    await tasker.shutdown()

@@ -463,12 +463,9 @@ class MilvusKB(KnowledgeBase):
         return False
 
     async def _initialize_kb_instance(self, instance: Any) -> None:
-        """初始化 Milvus 集合（加载到内存）"""
-        try:
-            instance.load()
-            logger.info("Milvus collection loaded into memory")
-        except Exception as e:
-            logger.warning(f"Failed to load collection into memory: {e}")
+        """初始化 Milvus 集合并加载到内存。"""
+        instance.load()
+        logger.info("Milvus collection loaded into memory")
 
     def _get_embedding_function(self, embedding_model_spec: str, *, sync: bool = False):
         """获取 embedding 编码函数。sync=True 返回同步版本，否则返回异步版本。"""
@@ -480,22 +477,19 @@ class MilvusKB(KnowledgeBase):
         return partial(method, batch_size=batch_size)
 
     async def _get_or_create_milvus_collection(self, kb_id: str, embedding_model_spec: str | None):
-        """获取或创建 Milvus 集合"""
+        """获取或创建 Milvus 集合。"""
         if kb_id in self.collections:
             return self.collections[kb_id]
 
         try:
-            # 创建集合
             collection = await self._create_kb_instance(kb_id, embedding_model_spec)
             await self._initialize_kb_instance(collection)
+        except Exception as exc:
+            logger.error(f"Failed to create Milvus collection for {kb_id}: {exc}")
+            raise
 
-            self.collections[kb_id] = collection
-            return collection
-
-        except Exception as e:
-            logger.error(f"Failed to create Milvus collection for {kb_id}: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return None
+        self.collections[kb_id] = collection
+        return collection
 
     def _get_existing_milvus_collection(self, kb_id: str) -> Collection | None:
         """获取已存在的集合，不因删除操作创建新集合。"""
@@ -1110,9 +1104,9 @@ class MilvusKB(KnowledgeBase):
             # 统一返回结果
             return retrieved_chunks[:final_top_k]
 
-        except Exception as e:
-            logger.error(f"Milvus query error: {e}, {traceback.format_exc()}")
-            return []
+        except Exception as exc:
+            logger.error(f"Milvus query error: {exc}, {traceback.format_exc()}")
+            raise
 
     async def _retrieve_graph_chunks(
         self,

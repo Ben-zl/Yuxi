@@ -749,3 +749,33 @@ def test_collection_supports_bm25_requires_analyzed_content_sparse_field_and_fun
     collection = type("Collection", (), {"schema": schema})()
 
     assert kb._collection_supports_bm25(collection)
+
+
+async def test_query_propagates_milvus_search_failure():
+    class FailingCollection(FakeCollection):
+        def search(self, **kwargs):
+            raise RuntimeError("milvus unavailable")
+
+    kb = make_kb(FailingCollection())
+
+    with pytest.raises(RuntimeError, match="milvus unavailable"):
+        await kb.aquery("query", "db", config=make_query_config())
+
+
+async def test_collection_load_failure_is_not_cached():
+    class FailingLoadCollection:
+        def load(self):
+            raise RuntimeError("milvus load unavailable")
+
+    kb = MilvusKB.__new__(MilvusKB)
+    kb.collections = {}
+
+    async def create_collection(kb_id, embedding_model_spec):
+        return FailingLoadCollection()
+
+    kb._create_kb_instance = create_collection
+
+    with pytest.raises(RuntimeError, match="milvus load unavailable"):
+        await kb._get_or_create_milvus_collection("db", EMBEDDING_MODEL_SPEC)
+
+    assert "db" not in kb.collections

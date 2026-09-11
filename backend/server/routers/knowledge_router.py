@@ -1127,6 +1127,8 @@ async def _run_index_file_ids(
     result_payload = {"items": processed_items, "processed": len(processed_items), "failed": failed_count}
     await context.set_result(result_payload)
     await context.set_progress(100.0, message)
+    if failed_count:
+        raise RuntimeError(message)
     return result_payload
 
 
@@ -1252,6 +1254,8 @@ async def _run_index_pending_statuses(
     }
     await context.set_result(result_payload)
     await context.set_progress(100.0, message)
+    if failed_count:
+        raise RuntimeError(message)
     return result_payload
 
 
@@ -1774,9 +1778,11 @@ async def query_test(
     try:
         result = await knowledge_base.aquery(query, kb_id=kb_id, **meta)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"测试查询失败 {e}, {traceback.format_exc()}")
-        return {"message": f"测试查询失败: {e}", "status": "failed"}
+        raise HTTPException(status_code=500, detail="知识库检索失败") from e
 
 
 @knowledge.put("/databases/{kb_id}/query-params")
@@ -2311,11 +2317,18 @@ async def generate_description(
     """).strip()
 
     try:
-        model = select_model(model_spec=(await system_options.get(db))["default_model"])
-        response = await model.call(prompt)
-        description = response.content.strip()
+        model_spec = (await system_options.get(db))["fast_model"]
+        model = select_model(model_spec=model_spec)
+        response = await model.call(prompt, stream=False)
+        content = getattr(response, "content", "")
+        description = content.strip() if isinstance(content, str) else ""
+        if not description:
+            raise HTTPException(status_code=502, detail="模型未返回有效描述")
+
         logger.debug(f"Generated description: {description}")
         return {"description": description, "status": "success"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"生成描述失败: {e}, {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"生成描述失败: {e}")
+        raise HTTPException(status_code=500, detail="生成描述失败") from e

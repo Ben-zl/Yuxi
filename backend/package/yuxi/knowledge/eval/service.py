@@ -363,6 +363,9 @@ class EvaluationService:
         graph_expand_top_k = min(max(1, int(graph_expand_top_k)), 3)
         if generation_mode not in {"vector", "graph_enhanced"}:
             raise ValueError("不支持的评估基准生成方式")
+        chunk_count = await self.chunk_repo.count_by_kb_id(kb_id)
+        if chunk_count <= 0:
+            raise ValueError("知识库暂无已入库内容，请先完成文件入库")
         if generation_mode == "graph_enhanced":
             indexed_count = await self.chunk_repo.count_graph_indexed_by_kb_id(kb_id)
             if indexed_count <= 0:

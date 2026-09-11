@@ -126,3 +126,19 @@ async def test_generate_database_sample_questions_maps_invalid_json(monkeypatch)
 
     assert exc_info.value.status_code == 500
     assert "AI返回格式错误" in exc_info.value.detail
+
+
+def test_parse_sample_questions_content_strips_qwen_thinking_before_json():
+    questions = sq.parse_sample_questions_content(
+        '<think>先分析文件名和类型。</think>\n{"questions": ["长得快是什么产品？"]}'
+    )
+
+    assert questions == ["长得快是什么产品？"]
+
+
+def test_parse_sample_questions_content_skips_invalid_brackets_before_json():
+    questions = sq.parse_sample_questions_content(
+        '说明 [请注意] 后输出 {"questions": ["长得快主要用来做什么？"]}'
+    )
+
+    assert questions == ["长得快主要用来做什么？"]

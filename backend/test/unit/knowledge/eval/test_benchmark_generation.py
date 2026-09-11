@@ -512,3 +512,28 @@ async def test_iter_generated_benchmark_items_yields_partial_items_before_cancel
             items.append(item)
 
     assert len(items) == 2
+
+
+@pytest.mark.asyncio
+async def test_iter_generated_benchmark_items_propagates_model_call_failure(monkeypatch):
+    class FailingLlm:
+        async def call(self, prompt, stream):
+            raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(benchmark_generation, "select_model", lambda model_spec: FailingLlm())
+    monkeypatch.setattr(benchmark_generation, "kb_manager", NoQueryKnowledgeBase())
+
+    async def collect_items():
+        return [
+            item
+            async for item in iter_generated_benchmark_items(
+                kb_id="db_1",
+                count=1,
+                neighbors_count=1,
+                concurrency_count=1,
+                llm_model_spec="test-provider:test-model",
+            )
+        ]
+
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        await collect_items()

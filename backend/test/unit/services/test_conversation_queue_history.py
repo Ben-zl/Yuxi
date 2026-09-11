@@ -24,7 +24,16 @@ async def session():
 
 async def test_queue_history_keeps_each_request_with_its_reply(session):
     started_at = datetime(2026, 7, 12, 9, 0, 0)
-    session.add(Conversation(id=1, thread_id="thread-1", project_id="project-thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(
+        Conversation(
+            id=1,
+            thread_id="thread-1",
+            project_id="project-thread-1",
+            uid="user-1",
+            agent_id="main",
+            status="active",
+        )
+    )
     session.add(
         AgentRun(
             id="run-a",
@@ -81,6 +90,7 @@ async def test_queue_history_keeps_each_request_with_its_reply(session):
     assert [message["content"] for message in queued_history["history"]] == ["A", "A reply"]
     assert queued_history["history"][0]["created_at"] == "2026-07-12T09:00:00Z"
     assert queued_history["history"][1]["created_at"] == "2026-07-12T09:00:02Z"
+    assert "model_spec" not in queued_history["history"][0]["extra_metadata"]
 
     request_b = await session.get(Message, 2)
     request_b.run_id = "run-b"
@@ -125,10 +135,64 @@ async def test_queue_history_keeps_each_request_with_its_reply(session):
     ]
 
 
+async def test_history_projects_run_model_spec_to_user_message(session):
+    started_at = datetime(2026, 9, 10, 4, 0, 0)
+    session.add(
+        Conversation(
+            id=1,
+            thread_id="thread-1",
+            project_id="project-thread-1",
+            uid="user-1",
+            agent_id="main",
+            status="active",
+        )
+    )
+    session.add(
+        AgentRun(
+            id="run-glm",
+            conversation_thread_id="thread-1",
+            runtime_scope_id="thread-1",
+            agent_slug="main",
+            uid="user-1",
+            request_id="request-glm",
+            conversation_id=1,
+            input_payload={"model_spec": "provider:glm-5"},
+            status="completed",
+            created_at=started_at,
+        )
+    )
+    session.add(
+        Message(
+            id=1,
+            conversation_id=1,
+            role="user",
+            content="你好",
+            request_id="request-glm",
+            run_id="run-glm",
+            delivery_status="complete",
+            created_at=started_at,
+        )
+    )
+    await session.commit()
+
+    response = await get_thread_history_view(thread_id="thread-1", current_uid="user-1", db=session)
+
+    assert response["history"][0]["extra_metadata"]["model_spec"] == "provider:glm-5"
+
+
 async def test_history_keeps_cancelled_request_when_run_has_assistant_output(session):
     """执行后取消的 Run 已有回复时，历史必须保留完整问答。"""
     started_at = datetime(2026, 8, 21, 13, 0, 0)
-    session.add(Conversation(id=1, thread_id="thread-1", project_id="project-thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(
+        Conversation(
+            id=1,
+            thread_id="thread-1",
+            project_id="project-thread-1",
+            uid="user-1",
+            agent_id="main",
+            status="active",
+        )
+    )
     session.add(
         AgentRun(
             id="run-cancelled",
@@ -184,7 +248,16 @@ async def test_history_keeps_cancelled_request_when_run_has_assistant_output(ses
 async def test_history_exposes_failed_run_without_assistant_output(session):
     """失败 Run 没有回复消息时，历史仍应展示明确的错误回复。"""
     started_at = datetime(2026, 8, 28, 8, 5, 41)
-    session.add(Conversation(id=1, thread_id="thread-1", project_id="project-thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(
+        Conversation(
+            id=1,
+            thread_id="thread-1",
+            project_id="project-thread-1",
+            uid="user-1",
+            agent_id="main",
+            status="active",
+        )
+    )
     session.add(
         AgentRun(
             id="run-failed",
@@ -236,7 +309,16 @@ async def test_history_exposes_failed_run_without_assistant_output(session):
 
 async def test_history_restores_reasoning_and_tool_calls(session):
     """历史接口应恢复实时阶段可见的推理内容与工具执行详情。"""
-    session.add(Conversation(id=1, thread_id="thread-1", project_id="project-thread-1", uid="user-1", agent_id="main", status="active"))
+    session.add(
+        Conversation(
+            id=1,
+            thread_id="thread-1",
+            project_id="project-thread-1",
+            uid="user-1",
+            agent_id="main",
+            status="active",
+        )
+    )
     session.add(
         Message(
             id=1,

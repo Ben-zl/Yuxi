@@ -224,8 +224,8 @@ async def _generate_benchmark_item_once(
     ctx_items = [(chunk["id"], chunk["content"]) for chunk in ctx_chunks]
     allowed_ids = {cid for cid, _ in ctx_items}
 
+    resp = await llm.call(build_benchmark_generation_prompt(ctx_items), False)
     try:
-        resp = await llm.call(build_benchmark_generation_prompt(ctx_items), False)
         obj = json_repair.loads(resp.content if resp else "")
         query = obj.get("query")
         answer = obj.get("gold_answer")

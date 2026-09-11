@@ -1141,6 +1141,7 @@ async def get_thread_history_view(
                 AgentRun.status,
                 AgentRun.error_type,
                 AgentRun.error_message,
+                AgentRun.input_payload,
             )
             .where(AgentRun.id.in_(run_ids_in_messages))
             .order_by(AgentRun.created_at.asc(), AgentRun.id.asc())
@@ -1152,8 +1153,9 @@ async def get_thread_history_view(
                 "status": status,
                 "error_type": error_type,
                 "error_message": error_message,
+                "model_spec": (input_payload or {}).get("model_spec") if isinstance(input_payload, dict) else None,
             }
-            for run_id, created_at, finished_at, status, error_type, error_message in run_result.all()
+            for run_id, created_at, finished_at, status, error_type, error_message, input_payload in run_result.all()
         }
     messages.sort(
         key=lambda message: (
@@ -1194,8 +1196,12 @@ async def get_thread_history_view(
 
         extra_metadata = dict(msg.extra_metadata or {})
         request_id = extra_metadata.get("request_id")
-        if msg.role == "user" and request_id and not extra_metadata.get("attachments"):
-            extra_metadata["attachments"] = attachments_by_request_id.get(str(request_id), [])
+        if msg.role == "user":
+            if request_id and not extra_metadata.get("attachments"):
+                extra_metadata["attachments"] = attachments_by_request_id.get(str(request_id), [])
+            run_model_spec = (run_details.get(msg.run_id) or {}).get("model_spec")
+            if run_model_spec:
+                extra_metadata.setdefault("model_spec", run_model_spec)
 
         msg_dict = {
             "id": msg.id,

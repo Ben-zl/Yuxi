@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import posixpath
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -55,6 +56,38 @@ class RuntimeSystemPromptMiddleware(MiddlewareBase):
         if not marker:
             raise RuntimeError("AgentScope 系统提示词缺少会话通知边界")
         return f"{self._system_prompt}\n\n{marker}{runtime_instructions}"
+
+
+class SharedWorkspaceToolBoundaryMiddleware(MiddlewareBase):
+    """阻止 AgentScope 原生文件工具误操作用户共享工作区路径。"""
+
+    _NATIVE_FILE_TOOLS = {"Read", "Write", "Edit"}
+    _SHARED_ROOT = "/workspace/workspace"
+
+    async def on_check_permission(self, agent, input_kwargs, next_handler):
+        """共享路径必须走 Yuxi 工具，避免在 Session workspace 产生同名文件。"""
+        tool = input_kwargs.get("tool")
+        tool_input = input_kwargs.get("tool_input") or {}
+        file_path = str(tool_input.get("file_path") or "")
+        if posixpath.isabs(file_path):
+            normalized_path = "/" + posixpath.normpath(file_path).lstrip("/")
+        else:
+            normalized_path = posixpath.normpath(posixpath.join("/workspace", file_path))
+        is_shared_path = normalized_path == self._SHARED_ROOT or normalized_path.startswith(
+            f"{self._SHARED_ROOT}/"
+        )
+        if getattr(tool, "name", None) in self._NATIVE_FILE_TOOLS and is_shared_path:
+            from agentscope.permission import PermissionBehavior, PermissionDecision
+
+            return PermissionDecision(
+                behavior=PermissionBehavior.DENY,
+                message=(
+                    f"{file_path} 属于页面个人共享工作区。请使用 "
+                    "shared_workspace_read/shared_workspace_write；修改已有文件时先读取完整原文，"
+                    "写回后再次读取确认。"
+                ),
+            )
+        return await next_handler(**input_kwargs)
 
 
 class NativeScheduleBlockMiddleware(MiddlewareBase):

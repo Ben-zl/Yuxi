@@ -1,6 +1,7 @@
 """知识库示例问题生成工具。"""
 
 import json
+import re
 import textwrap
 from typing import Any
 
@@ -23,7 +24,7 @@ SAMPLE_QUESTIONS_SYSTEM_PROMPT = """你是一个专业的知识库问答测试�
 3. 问题要简洁明了，适合用于检索测试
 4. 问题要多样化，包括事实查询、概念解释、操作指导等
 5. 问题长度控制在10-30字之间
-6. 直接返回JSON数组格式，不要其他说明
+6. 直接返回JSON对象格式，不要其他说明
 
 返回格式：
 ```json
@@ -60,25 +61,47 @@ def build_sample_questions_user_message(db_name: str, files_info: list[dict[str,
         请根据这些文件的名称和类型，生成{count}个有价值的测试问题。""")
 
 
-def parse_sample_questions_content(content: str) -> list[str]:
-    if "```json" in content:
-        json_start = content.find("```json") + 7
-        json_end = content.find("```", json_start)
-        if json_end == -1:
-            raise ValueError("AI返回的JSON代码块不完整")
-        content = content[json_start:json_end].strip()
-    elif "```" in content:
-        json_start = content.find("```") + 3
-        json_end = content.find("```", json_start)
-        if json_end == -1:
-            raise ValueError("AI返回的代码块不完整")
-        content = content[json_start:json_end].strip()
+def _normalize_sample_questions_payload(payload: Any) -> list[str]:
+    """校验模型返回的示例问题载荷。"""
+    if isinstance(payload, dict):
+        questions = payload.get("questions")
+    elif isinstance(payload, list):
+        questions = payload
+    else:
+        questions = None
 
-    questions_data = json.loads(content)
-    questions = questions_data.get("questions", []) if isinstance(questions_data, dict) else []
-    if not questions or not isinstance(questions, list):
+    if not isinstance(questions, list) or not questions:
         raise ValueError("AI返回的问题格式不正确")
-    return questions
+    if any(not isinstance(question, str) or not question.strip() for question in questions):
+        raise ValueError("AI返回的问题必须是非空文本")
+    return [question.strip() for question in questions]
+
+
+def parse_sample_questions_content(content: str) -> list[str]:
+    """从模型文本中查找并校验示例问题 JSON。"""
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    fence_match = re.search(r"```(?:json)?\s*(.*?)```", content, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        content = fence_match.group(1).strip()
+
+    decoder = json.JSONDecoder()
+    last_validation_error: ValueError | None = None
+    for json_start, character in enumerate(content):
+        if character not in "[{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(content[json_start:])
+        except json.JSONDecodeError:
+            continue
+        try:
+            return _normalize_sample_questions_payload(payload)
+        except ValueError as exc:
+            last_validation_error = exc
+
+    if last_validation_error is not None:
+        raise last_validation_error
+    raise ValueError("AI返回内容中没有有效JSON")
 
 
 async def generate_database_sample_questions(kb_id: str, count: int = 10) -> dict[str, Any]:

@@ -1085,6 +1085,7 @@ async def test_reject_marks_request_rejected_when_immediate_dispatch_loses_race(
     from yuxi.repositories.agent_run_request_repository import AgentRunRequestRepository
     from yuxi.services import agent_request_queue_service
     from yuxi.services.input_message_service import build_chat_input_message
+    from yuxi.storage.postgres.models_business import Conversation
 
     monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
 
@@ -1112,6 +1113,8 @@ async def test_reject_marks_request_rejected_when_immediate_dispatch_loses_race(
     assert request.status == "rejected"
     assert request.input_payload == {}
     assert message.delivery_status == "rejected"
+    conversation = await session.scalar(select(Conversation).where(Conversation.thread_id == "t1"))
+    assert "model_spec" not in (conversation.extra_metadata or {})
 
 
 @pytest.mark.asyncio
@@ -1165,6 +1168,35 @@ async def test_intake_rejects_message_while_run_is_interrupted(
     assert await repo.get_by_request_id("request-c") is None
     message_count = await session.scalar(select(sa_func.count()).select_from(Message).where(Message.content == "C"))
     assert message_count == 0
+
+
+@pytest.mark.asyncio
+async def test_intake_persists_accepted_model_on_conversation(session, monkeypatch: pytest.MonkeyPatch):
+    from yuxi.services import agent_request_queue_service
+    from yuxi.services.input_message_service import build_chat_input_message
+    from yuxi.storage.postgres.models_business import Conversation
+
+    monkeypatch.setattr(
+        agent_request_queue_service,
+        "resolve_agent_run_config",
+        lambda *args: ("provider:glm-5", "default"),
+    )
+    await _seed_thread(session)
+
+    result = await intake_request(
+        db=session,
+        request_id="request-model",
+        uid="user-1",
+        agent_slug="main",
+        thread_id="t1",
+        input_message=build_chat_input_message("使用 glm"),
+        agent_item=MagicMock(),
+        agent_backend=MagicMock(),
+    )
+
+    conversation = await session.scalar(select(Conversation).where(Conversation.thread_id == "t1"))
+    assert result.status == "dispatched"
+    assert conversation.extra_metadata["model_spec"] == "provider:glm-5"
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,11 @@ PROMPT = f"""
     - {VIRTUAL_PATH_OUTPUTS}/tmp/：用于存放中间结果或备份内容
 - {VIRTUAL_PATH_UPLOADS}：用于存放用户上传的附件（只读，除非用户要求，否则不得写入）
 - {VIRTUAL_PATH_WORKSPACE}：用于存放用户文件（用户私人目录，除非用户要求，否则不得写入）
+    - 访问 {VIRTUAL_PATH_WORKSPACE}/... 只可使用共享工作区工具：
+        - `shared_workspace_list` 列目录；`shared_workspace_read` 读文件；`shared_workspace_write` 写文件。
+    - 不能用 AgentScope 原生 `Read`、`Write`、`Edit` 访问该目录；它们操作的是会话 workspace。
+    - 修改已有文件（包括 agents/MEMORY.md）时，先读取原文，合并后再完整写回。
+    - 写入后必须再次调用 `shared_workspace_read` 回读确认；确认前不得向用户宣称写入成功。
 - 其他路径：非必要不写入其他路径
 
 <| 产出物交付约束 |>

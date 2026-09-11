@@ -108,6 +108,7 @@ async def _build_extra_agent_middlewares(user_id: str, agent_id: str, session_id
     from yuxi.agentscope.middleware import (
         NativeScheduleBlockMiddleware,
         RuntimeSystemPromptMiddleware,
+        SharedWorkspaceToolBoundaryMiddleware,
         build_context_observability_middleware,
         build_steer_middleware,
         build_team_lifecycle_middleware,
@@ -140,6 +141,7 @@ async def _build_extra_agent_middlewares(user_id: str, agent_id: str, session_id
     middlewares = [
         TracingMiddleware(),
         RuntimeSystemPromptMiddleware(projection.agent_request["system_prompt"]),
+        SharedWorkspaceToolBoundaryMiddleware(),
         NativeScheduleBlockMiddleware(),
         build_context_observability_middleware(app.state.message_bus, session_id),
     ]

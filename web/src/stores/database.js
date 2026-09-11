@@ -595,7 +595,7 @@ export const useDatabaseStore = defineStore('database', () => {
       const data = await documentApi.indexDocuments(kbId.value, fileIds, params)
       if (data.status === 'success' || data.status === 'queued') {
         enableAutoRefresh('auto')
-        message.success(data.message || '入库任务已提交')
+        message.info(data.message || '入库任务已提交')
         if (data.task_id) {
           taskerStore.registerQueuedTask({
             task_id: data.task_id,
@@ -626,7 +626,7 @@ export const useDatabaseStore = defineStore('database', () => {
       const data = await documentApi.indexPendingDocuments(kbId.value, params)
       if (data.status === 'success' || data.status === 'queued') {
         enableAutoRefresh('auto')
-        message.success(data.message || '入库任务已提交')
+        message.info(data.message || '入库任务已提交')
         if (data.task_id) {
           taskerStore.registerQueuedTask({
             task_id: data.task_id,

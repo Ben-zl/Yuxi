@@ -7,6 +7,15 @@
     :closable="!generating"
     @cancel="handleCancel"
   >
+    <a-alert
+      v-if="chunkStatusLoaded && !hasIndexedChunks"
+      class="chunk-requirement-alert"
+      type="warning"
+      show-icon
+      message="知识库暂无已入库内容"
+      description="请先完成知识库文件入库，再自动生成评估基准。"
+    />
+
     <a-form ref="formRef" :model="formState" :rules="rules" layout="vertical">
       <a-form-item label="基准名称" name="name">
         <a-input v-model:value="formState.name" placeholder="请输入评估基准名称" />
@@ -167,7 +176,7 @@
           <a-button
             type="primary"
             :loading="generating"
-            :disabled="generating"
+            :disabled="generating || chunkStatusLoading || !hasIndexedChunks"
             @click="handleGenerate"
           >
             确定
@@ -214,7 +223,10 @@ const defaultBenchmarkName = () => {
 // 响应式数据
 const formRef = ref()
 const generating = ref(false)
+const totalChunks = ref(0)
 const graphIndexedChunks = ref(0)
+const chunkStatusLoaded = ref(false)
+const chunkStatusLoading = ref(false)
 
 const formState = reactive({
   name: defaultBenchmarkName(),
@@ -243,6 +255,7 @@ const visible = computed({
   set: (val) => emit('update:visible', val)
 })
 
+const hasIndexedChunks = computed(() => !chunkStatusLoaded.value || totalChunks.value > 0)
 const graphEnhancedDisabled = computed(() => graphIndexedChunks.value <= 0)
 
 const generationModeOptions = computed(() => [
@@ -270,9 +283,13 @@ const generationModeOptions = computed(() => [
 
 const loadGraphBuildStatus = async () => {
   if (!props.kbId) return
+  chunkStatusLoading.value = true
+  chunkStatusLoaded.value = false
   try {
     const status = await graphBuildApi.getStatus(props.kbId)
+    totalChunks.value = Number(status?.total_chunks || 0)
     graphIndexedChunks.value = Number(status?.indexed_chunks || 0)
+    chunkStatusLoaded.value = true
     if (graphEnhancedDisabled.value && formState.generation_mode === 'graph_enhanced') {
       formState.generation_mode = 'vector'
     }
@@ -282,6 +299,8 @@ const loadGraphBuildStatus = async () => {
     if (formState.generation_mode === 'graph_enhanced') {
       formState.generation_mode = 'vector'
     }
+  } finally {
+    chunkStatusLoading.value = false
   }
 }
 
@@ -293,6 +312,14 @@ const selectGenerationMode = (option) => {
 // 生成基准
 const handleGenerate = async () => {
   if (generating.value) return
+  if (chunkStatusLoading.value) {
+    message.warning('正在检查知识库入库状态，请稍候')
+    return
+  }
+  if (!hasIndexedChunks.value) {
+    message.warning('请先完成知识库文件入库')
+    return
+  }
 
   try {
     // 表单验证
@@ -367,6 +394,10 @@ watch(visible, (val) => {
 </script>
 
 <style scoped lang="less">
+.chunk-requirement-alert {
+  margin-bottom: 16px;
+}
+
 .generation-mode-cards {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -720,3 +720,74 @@ async def test_parse_pending_documents_uses_params(monkeypatch):
     assert captured["parsed"] == [
         {"kb_id": "kb_1", "file_id": "file_pending_1", "operator_id": "uid-user"}
     ]
+
+
+async def test_run_index_file_ids_raises_after_persisting_partial_failure(monkeypatch):
+    context = FakeTaskContext()
+
+    async def fake_index_file(kb_id: str, file_id: str, operator_id: str | None = None, params: dict | None = None):
+        if file_id == "file_2":
+            raise RuntimeError("vector write failed")
+        return {"file_id": file_id, "status": "indexed"}
+
+    monkeypatch.setattr(knowledge_router.knowledge_base, "index_file", fake_index_file)
+
+    with pytest.raises(RuntimeError, match="入库完成，失败 1 个"):
+        await knowledge_router._run_index_file_ids(
+            context=context,
+            kb_id="kb_1",
+            file_ids=["file_1", "file_2"],
+            operator_id="user_1",
+            params={},
+        )
+
+    assert context.result == {
+        "items": [
+            {"file_id": "file_1", "status": "indexed"},
+            {"file_id": "file_2", "status": "failed", "error": "vector write failed"},
+        ],
+        "processed": 2,
+        "failed": 1,
+    }
+
+
+async def test_run_index_pending_statuses_raises_after_persisting_partial_failure(monkeypatch):
+    context = FakeTaskContext()
+    list_calls = 0
+
+    async def fake_list_document_file_ids_by_statuses(kb_id: str, *, statuses, after_file_id, limit):
+        nonlocal list_calls
+        list_calls += 1
+        return ["file_1", "file_2"] if list_calls == 1 else []
+
+    async def fake_index_file(kb_id: str, file_id: str, operator_id: str | None = None, params: dict | None = None):
+        if file_id == "file_2":
+            raise RuntimeError("vector write failed")
+        return {"file_id": file_id, "status": "indexed"}
+
+    monkeypatch.setattr(
+        knowledge_router.knowledge_base,
+        "list_document_file_ids_by_statuses",
+        fake_list_document_file_ids_by_statuses,
+    )
+    monkeypatch.setattr(knowledge_router.knowledge_base, "index_file", fake_index_file)
+
+    with pytest.raises(RuntimeError, match="入库完成，失败 1 个"):
+        await knowledge_router._run_index_pending_statuses(
+            context=context,
+            kb_id="kb_1",
+            statuses=knowledge_router.PENDING_INDEX_STATUSES,
+            initial_total=2,
+            operator_id="user_1",
+            params={},
+        )
+
+    assert context.result == {
+        "items": [
+            {"file_id": "file_1", "status": "indexed"},
+            {"file_id": "file_2", "status": "failed", "error": "vector write failed"},
+        ],
+        "processed": 2,
+        "failed": 1,
+        "result_truncated": False,
+    }

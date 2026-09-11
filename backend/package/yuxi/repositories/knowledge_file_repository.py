@@ -18,11 +18,40 @@ from yuxi.utils.datetime_utils import utc_now_naive
 # mindmap_file_ids 等大尺寸传入触发 `too many parameters` 报错。
 SQL_IN_BATCH_SIZE = 10_000
 
-# 文件统计聚合缓存 TTL：列表页高频请求时避免反复全表聚合；文件增删后最多延迟该时长更新
+# 文件统计聚合缓存 TTL：列表页高频请求时避免反复全表聚合；文件写入成功后主动失效
 KB_FILE_STATS_CACHE_TTL = 10
 
 
 class KnowledgeFileRepository:
+    @staticmethod
+    def _stats_cache_key(kb_id: str) -> str:
+        return f"yuxi:kb_file_stats:{kb_id}"
+
+    async def _lock_kb_file_stats(self, session: Any, kb_ids: set[str | None]) -> None:
+        """用 PostgreSQL 事务锁串行化统计回填与文件事实提交。"""
+        bind = session.get_bind()
+        if bind.dialect.name != "postgresql":
+            return
+        for kb_id in sorted(kb_id for kb_id in kb_ids if kb_id):
+            await session.execute(
+                select(func.pg_advisory_xact_lock(func.hashtext(f"yuxi:kb_file_stats:{kb_id}")))
+            )
+
+    async def invalidate_kb_file_stats(self, kb_id: str) -> None:
+        """文件事实提交后失效知识库聚合统计缓存。"""
+        from yuxi.storage.redis import get_async_redis_client
+
+        cache_key = self._stats_cache_key(kb_id)
+        try:
+            redis_client = await get_async_redis_client()
+            await redis_client.delete(cache_key)
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate kb file stats cache {cache_key}: {exc}")
+
+    async def _invalidate_kb_file_stats(self, kb_ids: set[str | None]) -> None:
+        for kb_id in sorted(kb_id for kb_id in kb_ids if kb_id):
+            await self.invalidate_kb_file_stats(kb_id)
+
     @asynccontextmanager
     async def lock_file_tree(self, kb_id: str) -> AsyncIterator[None]:
         """按知识库串行化目录树结构修改。"""
@@ -77,6 +106,7 @@ class KnowledgeFileRepository:
 
         async with pg_manager.get_async_session_context() as session:
             await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(kb_id))))
+            await self._lock_kb_file_stats(session, {kb_id})
             records = list(
                 (
                     await session.execute(
@@ -138,13 +168,16 @@ class KnowledgeFileRepository:
                     record.filename = record.filename.split("/", 1)[1]
                     processed += 1
 
-            return {
+            result = {
                 "scanned": len(records),
                 "processed": processed,
                 "created_folders": created_folders,
                 "conflict_file_ids": conflict_file_ids,
                 "last_file_id": records[-1].file_id,
             }
+            await self.invalidate_kb_file_stats(kb_id)
+
+        return result
 
     async def aggregate_dashboard_stats(self) -> list[tuple[str, int, int, int]]:
         """按文件类型聚合真实文件数、大小与 Chunk 数。"""
@@ -640,62 +673,82 @@ class KnowledgeFileRepository:
             )
             return {str(parent_id): int(count or 0) for parent_id, count in result.all() if parent_id}
 
-    async def get_kb_file_stats(self, kb_id: str) -> dict[str, int]:
-        """获取知识库文件统计；结果带短 TTL 缓存，避免高频列表请求反复全表聚合。"""
-        from yuxi.storage.redis import get_async_redis_client
-
-        cache_key = f"yuxi:kb_file_stats:{kb_id}"
-        redis_client = await get_async_redis_client()
+    @staticmethod
+    async def _load_cached_stats(redis_client: Any, cache_key: str) -> dict[str, int] | None:
         try:
             cached = await redis_client.get(cache_key)
-            if cached:
-                return json.loads(cached)
+            return json.loads(cached) if cached else None
         except Exception as exc:
             logger.warning(f"Failed to load kb file stats cache {cache_key}: {exc}")
+            return None
 
-        stats = await self._query_kb_file_stats(kb_id)
+    async def get_kb_file_stats(self, kb_id: str) -> dict[str, int]:
+        """获取知识库文件统计；事务锁防止并发旧读在写入后回填缓存。"""
+        from yuxi.storage.redis import get_async_redis_client
+
+        cache_key = self._stats_cache_key(kb_id)
         try:
-            await redis_client.set(cache_key, json.dumps(stats), ex=KB_FILE_STATS_CACHE_TTL)
+            redis_client = await get_async_redis_client()
         except Exception as exc:
-            logger.warning(f"Failed to store kb file stats cache {cache_key}: {exc}")
-        return stats
+            logger.warning(f"Failed to initialize kb file stats cache {cache_key}: {exc}")
+            return await self._query_kb_file_stats(kb_id)
+
+        cached = await self._load_cached_stats(redis_client, cache_key)
+        if cached is not None:
+            return cached
+
+        async with pg_manager.get_async_session_context() as session:
+            await self._lock_kb_file_stats(session, {kb_id})
+            cached = await self._load_cached_stats(redis_client, cache_key)
+            if cached is not None:
+                return cached
+
+            stats = await self._query_kb_file_stats_in_session(session, kb_id)
+            try:
+                await redis_client.set(cache_key, json.dumps(stats), ex=KB_FILE_STATS_CACHE_TTL)
+            except Exception as exc:
+                logger.warning(f"Failed to store kb file stats cache {cache_key}: {exc}")
+            return stats
 
     async def _query_kb_file_stats(self, kb_id: str) -> dict[str, int]:
         """直接查询数据库计算知识库文件统计。"""
-        non_folder = KnowledgeFile.is_folder.is_(False)
         async with pg_manager.get_async_session_context() as session:
-            result = await session.execute(
-                select(
-                    func.count(KnowledgeFile.file_id).label("row_count"),
-                    func.sum(case((non_folder, 1), else_=0)).label("file_count"),
-                    func.sum(case((KnowledgeFile.is_folder.is_(True), 1), else_=0)).label("folder_count"),
-                    func.coalesce(func.sum(case((non_folder, KnowledgeFile.file_size), else_=0)), 0).label(
-                        "total_size"
-                    ),
-                    func.coalesce(func.sum(case((non_folder, KnowledgeFile.chunk_count), else_=0)), 0).label(
-                        "chunk_count"
-                    ),
-                    func.coalesce(func.sum(case((non_folder, KnowledgeFile.token_count), else_=0)), 0).label(
-                        "token_count"
-                    ),
-                    func.sum(case((non_folder & (KnowledgeFile.status == "uploaded"), 1), else_=0)).label(
-                        "pending_parse_count"
-                    ),
-                    func.sum(
-                        case((non_folder & KnowledgeFile.status.in_(["parsed", "error_indexing"]), 1), else_=0)
-                    ).label("pending_index_count"),
-                    func.sum(
-                        case(
-                            (
-                                non_folder & KnowledgeFile.status.in_(["processing", "waiting", "parsing", "indexing"]),
-                                1,
-                            ),
-                            else_=0,
-                        )
-                    ).label("processing_count"),
-                ).where(KnowledgeFile.kb_id == kb_id)
-            )
-            row = result.one()
+            return await self._query_kb_file_stats_in_session(session, kb_id)
+
+    async def _query_kb_file_stats_in_session(self, session: Any, kb_id: str) -> dict[str, int]:
+        non_folder = KnowledgeFile.is_folder.is_(False)
+        result = await session.execute(
+            select(
+                func.count(KnowledgeFile.file_id).label("row_count"),
+                func.sum(case((non_folder, 1), else_=0)).label("file_count"),
+                func.sum(case((KnowledgeFile.is_folder.is_(True), 1), else_=0)).label("folder_count"),
+                func.coalesce(func.sum(case((non_folder, KnowledgeFile.file_size), else_=0)), 0).label(
+                    "total_size"
+                ),
+                func.coalesce(func.sum(case((non_folder, KnowledgeFile.chunk_count), else_=0)), 0).label(
+                    "chunk_count"
+                ),
+                func.coalesce(func.sum(case((non_folder, KnowledgeFile.token_count), else_=0)), 0).label(
+                    "token_count"
+                ),
+                func.sum(case((non_folder & (KnowledgeFile.status == "uploaded"), 1), else_=0)).label(
+                    "pending_parse_count"
+                ),
+                func.sum(
+                    case((non_folder & KnowledgeFile.status.in_(["parsed", "error_indexing"]), 1), else_=0)
+                ).label("pending_index_count"),
+                func.sum(
+                    case(
+                        (
+                            non_folder & KnowledgeFile.status.in_(["processing", "waiting", "parsing", "indexing"]),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("processing_count"),
+            ).where(KnowledgeFile.kb_id == kb_id)
+        )
+        row = result.one()
 
         return {
             "row_count": int(row.row_count or 0),
@@ -711,16 +764,22 @@ class KnowledgeFileRepository:
 
     async def upsert(self, file_id: str, data: dict[str, Any]) -> KnowledgeFile:
         sanitized_data = self._sanitize_data(data)
+        affected_kb_ids: set[str | None] = {sanitized_data.get("kb_id")}
         async with pg_manager.get_async_session_context() as session:
+            await self._lock_kb_file_stats(session, affected_kb_ids)
             result = await session.execute(select(KnowledgeFile).where(KnowledgeFile.file_id == file_id))
             existing = result.scalar_one_or_none()
             if existing is None:
                 record = KnowledgeFile(file_id=file_id, **sanitized_data)
                 session.add(record)
-                return record
-            for key, value in sanitized_data.items():
-                setattr(existing, key, value)
-            return existing
+            else:
+                affected_kb_ids.add(existing.kb_id)
+                for key, value in sanitized_data.items():
+                    setattr(existing, key, value)
+                record = existing
+            await self._invalidate_kb_file_stats(affected_kb_ids)
+
+        return record
 
     async def update_fields(
         self,
@@ -737,14 +796,18 @@ class KnowledgeFileRepository:
         if kb_id:
             filters.append(KnowledgeFile.kb_id == kb_id)
 
+        affected_kb_ids: set[str | None] = {kb_id, sanitized_data.get("kb_id")}
         async with pg_manager.get_async_session_context() as session:
+            await self._lock_kb_file_stats(session, affected_kb_ids)
             result = await session.execute(select(KnowledgeFile).where(*filters))
             record = result.scalar_one_or_none()
-            if record is None:
-                return None
-            for key, value in sanitized_data.items():
-                setattr(record, key, value)
-            return record
+            if record is not None:
+                affected_kb_ids.add(record.kb_id)
+                for key, value in sanitized_data.items():
+                    setattr(record, key, value)
+                await self._invalidate_kb_file_stats(affected_kb_ids)
+
+        return record
 
     async def update_fields_if_status(
         self,
@@ -759,6 +822,7 @@ class KnowledgeFileRepository:
             return await self.get_by_file_id(file_id)
 
         async with pg_manager.get_async_session_context() as session:
+            await self._lock_kb_file_stats(session, {kb_id, sanitized_data.get("kb_id")})
             result = await session.execute(
                 update(KnowledgeFile)
                 .where(
@@ -769,17 +833,30 @@ class KnowledgeFileRepository:
                 .values(**sanitized_data)
                 .returning(KnowledgeFile)
             )
-            return result.scalar_one_or_none()
+            record = result.scalar_one_or_none()
+            if record is not None:
+                await self._invalidate_kb_file_stats({kb_id, sanitized_data.get("kb_id")})
+
+        return record
 
     async def delete(self, file_id: str) -> None:
         async with pg_manager.get_async_session_context() as session:
             result = await session.execute(select(KnowledgeFile).where(KnowledgeFile.file_id == file_id))
             record = result.scalar_one_or_none()
+            if record is None:
+                return
+
+            await self._lock_kb_file_stats(session, {record.kb_id})
+            result = await session.execute(select(KnowledgeFile).where(KnowledgeFile.file_id == file_id))
+            record = result.scalar_one_or_none()
             if record is not None:
                 await session.delete(record)
+                await self.invalidate_kb_file_stats(record.kb_id)
 
     async def delete_by_kb_id(self, kb_id: str) -> None:
         async with pg_manager.get_async_session_context() as session:
+            await self._lock_kb_file_stats(session, {kb_id})
             result = await session.execute(select(KnowledgeFile).where(KnowledgeFile.kb_id == kb_id))
             for record in result.scalars().all():
                 await session.delete(record)
+            await self.invalidate_kb_file_stats(kb_id)

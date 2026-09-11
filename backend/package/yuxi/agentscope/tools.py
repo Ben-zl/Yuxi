@@ -419,7 +419,7 @@ def build_media_reader_tool(workspace):
 def build_shared_workspace_tools(uid: str) -> list:
     """构建服务进程侧个人工作区工具，不向 Docker workspace 暴露宿主路径。"""
     from agentscope.tool import FunctionTool
-    from yuxi.agents.backends.sandbox.paths import global_user_data_dir
+    from yuxi.workspace.paths import global_user_data_dir
 
     user_data_root = global_user_data_dir(uid)
     user_data_root.mkdir(parents=True, exist_ok=True)
@@ -476,14 +476,33 @@ def build_shared_workspace_tools(uid: str) -> list:
         return _json({"path": path, "size": target.stat().st_size})
 
     return [
-        FunctionTool(shared_workspace_list, name="shared_workspace_list", description="列出个人共享工作区目录"),
+        FunctionTool(
+            shared_workspace_list,
+            name="shared_workspace_list",
+            description=(
+                "列出页面个人工作区对应的 /workspace/workspace 目录；"
+                "不要用 AgentScope 原生文件工具访问此路径"
+            ),
+            is_read_only=True,
+        ),
         FunctionTool(
             shared_workspace_read,
             name="shared_workspace_read",
-            description="读取个人共享工作区文本文件",
+            description=(
+                "读取页面个人工作区中的 /workspace/workspace 文本文件；"
+                "修改已有文件前必须先用本工具读取完整原文，不要用 AgentScope 原生 Read"
+            ),
             is_read_only=True,
         ),
-        FunctionTool(shared_workspace_write, name="shared_workspace_write", description="写入个人共享工作区文本文件"),
+        FunctionTool(
+            shared_workspace_write,
+            name="shared_workspace_write",
+            description=(
+                "写入页面个人工作区中的 /workspace/workspace 文本文件；"
+                "已有文件必须先读取完整原文、合并变更后完整写回，并再次读取确认；"
+                "不要用 AgentScope 原生 Write 或 Edit"
+            ),
+        ),
     ]
 
 

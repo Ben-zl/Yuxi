@@ -10,12 +10,13 @@ from agentscope.agent import Agent
 from agentscope.event import ToolResultEndEvent, ToolResultStartEvent
 from agentscope.message import TextBlock, ToolCallBlock, ToolResultState
 from agentscope.model import ChatResponse, ChatUsage
-from agentscope.permission import PermissionMode
+from agentscope.permission import PermissionBehavior, PermissionDecision, PermissionMode
 from agentscope.tool import FunctionTool, Toolkit, ToolChunk, ToolResponse
 
 from yuxi.agentscope.middleware import (
     ContextObservabilityMiddleware,
     RuntimeSystemPromptMiddleware,
+    SharedWorkspaceToolBoundaryMiddleware,
     SteerMiddleware,
     TeamLifecycleMiddleware,
     build_team_lifecycle_middleware,
@@ -49,6 +50,70 @@ async def test_runtime_system_prompt_replaces_stale_agent_prompt_and_keeps_runti
     assert "<system-notification>session attachment</system-notification>" in prompt
     assert "activated skill instructions" in prompt
     assert "workspace instructions" in prompt
+
+
+@pytest.mark.parametrize("tool_name", ["Read", "Write", "Edit"])
+async def test_shared_workspace_boundary_denies_native_file_tools_for_page_workspace(tool_name):
+    middleware = SharedWorkspaceToolBoundaryMiddleware()
+    next_handler = AsyncMock()
+
+    decision = await middleware.on_check_permission(
+        None,
+        {
+            "tool": SimpleNamespace(name=tool_name),
+            "tool_input": {"file_path": "/workspace/workspace/agents/MEMORY.md"},
+        },
+        next_handler,
+    )
+
+    assert decision.behavior == PermissionBehavior.DENY
+    assert "shared_workspace_read/shared_workspace_write" in decision.message
+    next_handler.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "file_path",
+    [
+        "/workspace/./workspace/agents/MEMORY.md",
+        "/workspace/workspace-other/../workspace/agents/MEMORY.md",
+        "//workspace/workspace/agents/MEMORY.md",
+        "workspace/agents/MEMORY.md",
+    ],
+)
+async def test_shared_workspace_boundary_denies_equivalent_page_workspace_paths(file_path):
+    middleware = SharedWorkspaceToolBoundaryMiddleware()
+    next_handler = AsyncMock()
+
+    decision = await middleware.on_check_permission(
+        None,
+        {
+            "tool": SimpleNamespace(name="Write"),
+            "tool_input": {"file_path": file_path},
+        },
+        next_handler,
+    )
+
+    assert decision.behavior == PermissionBehavior.DENY
+    next_handler.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "file_path",
+    ["/workspace/outputs/report.md", "/workspace/workspace-other/report.md"],
+)
+async def test_shared_workspace_boundary_keeps_native_write_outside_page_workspace(file_path):
+    middleware = SharedWorkspaceToolBoundaryMiddleware()
+    expected = PermissionDecision(PermissionBehavior.ALLOW, "allowed")
+    next_handler = AsyncMock(return_value=expected)
+    input_kwargs = {
+        "tool": SimpleNamespace(name="Write"),
+        "tool_input": {"file_path": file_path},
+    }
+
+    decision = await middleware.on_check_permission(None, input_kwargs, next_handler)
+
+    assert decision is expected
+    next_handler.assert_awaited_once_with(**input_kwargs)
 
 
 async def test_steer_stops_before_model_when_already_pending():

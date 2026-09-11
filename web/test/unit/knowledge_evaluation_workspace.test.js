@@ -150,3 +150,25 @@ test('新建评估在没有已完成基准时禁用且不伪造成功', () => {
   assert.match(modalSource, /message\.error\(error\.message \|\| '启动评估失败'\)/)
   assert.match(modalSource, /hasAnswerModel !== hasJudgeModel/)
 })
+
+test('自动生成评估基准使用实时 Chunk 事实并在零 Chunk 时阻止提交', () => {
+  const modalSource = readSource('../../src/components/modals/BenchmarkGenerateModal.vue')
+
+  assert.match(modalSource, /const status = await graphBuildApi\.getStatus\(props\.kbId\)/)
+  assert.match(modalSource, /totalChunks\.value = Number\(status\?\.total_chunks \|\| 0\)/)
+  assert.match(
+    modalSource,
+    /const hasIndexedChunks = computed\(\(\) => !chunkStatusLoaded\.value \|\| totalChunks\.value > 0\)/
+  )
+  assert.match(modalSource, /v-if="chunkStatusLoaded && !hasIndexedChunks"/)
+  assert.match(modalSource, /请先完成知识库文件入库，再自动生成评估基准。/)
+  assert.match(modalSource, /:disabled="generating \|\| chunkStatusLoading \|\| !hasIndexedChunks"/)
+  assert.match(
+    modalSource,
+    /if \(chunkStatusLoading\.value\) \{\s*message\.warning\('正在检查知识库入库状态，请稍候'\)/
+  )
+  assert.match(
+    modalSource,
+    /if \(!hasIndexedChunks\.value\) \{\s*message\.warning\('请先完成知识库文件入库'\)/
+  )
+})

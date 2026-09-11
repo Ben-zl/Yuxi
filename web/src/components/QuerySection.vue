@@ -14,7 +14,7 @@
             />
             <div class="search-actions">
               <span class="query-hint">Enter 检索知识库内容</span>
-              <div style="display: flex; gap: 12px; align-items: center">
+              <div class="query-action-buttons">
                 <a-tooltip :title="showRawData ? '切换至格式化显示' : '切换至原始数据'">
                   <a-button
                     type="text"
@@ -26,6 +26,16 @@
                     <template #icon><Braces :size="18" /></template>
                   </a-button>
                 </a-tooltip>
+                <a-button
+                  v-if="canGenerateQuestions"
+                  class="generate-examples-button"
+                  :loading="generatingQuestions"
+                  :disabled="loadingQuestions"
+                  @click="generateSampleQuestions(false)"
+                >
+                  <template #icon><RefreshCw :size="16" /></template>
+                  生成示例
+                </a-button>
                 <a-button
                   @click="onQuery"
                   :loading="searchLoading"
@@ -128,25 +138,10 @@
               <SearchOutlined class="suggestion-icon" />
               <span class="suggestion-text">{{ example }}</span>
             </button>
-            <button
-              v-if="canGenerateQuestions"
-              type="button"
-              class="suggestion-row"
-              @click="() => generateSampleQuestions(false)"
-            >
-              <RefreshCw class="suggestion-icon" />
-              <span class="suggestion-text">重新生成</span>
-            </button>
           </div>
 
-          <div v-else-if="canGenerateQuestions" class="suggestions-empty">
-            <button class="suggestion-row" @click="() => generateSampleQuestions(false)">
-              <RefreshCw class="suggestion-icon" />
-              <span class="suggestion-text">生成示例问题</span>
-            </button>
-          </div>
           <div v-else class="suggestions-empty">
-            <span class="suggestion-text">暂无示例问题</span>
+            <span class="suggestion-text">暂无示例问题，可点击上方“生成示例”</span>
           </div>
         </div>
       </div>
@@ -425,6 +420,26 @@ defineExpose({
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.query-action-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.generate-examples-button {
+  display: inline-flex;
+  align-items: center;
+  color: var(--main-color);
+  border-color: var(--main-200);
+  background-color: var(--gray-0);
+
+  &:hover {
+    color: var(--main-800);
+    border-color: var(--main-color);
+    background-color: var(--main-50);
+  }
 }
 
 .search-button {
@@ -724,17 +739,6 @@ defineExpose({
   transition:
     color 0.2s ease,
     opacity 0.2s ease;
-}
-
-.generate-suggestions-btn {
-  height: auto;
-  background-color: var(--gray-0);
-  border-radius: 40px;
-
-  &:hover {
-    background-color: var(--gray-0);
-    box-shadow: 0 2px 8px var(--shadow-1);
-  }
 }
 
 @media (max-width: 767px) {

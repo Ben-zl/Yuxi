@@ -27,8 +27,12 @@ class FakeEvaluationRepository:
 
 
 class FakeChunkRepository:
-    def __init__(self, indexed_count):
+    def __init__(self, indexed_count, total_count=1):
         self.indexed_count = indexed_count
+        self.total_count = total_count
+
+    async def count_by_kb_id(self, kb_id):
+        return self.total_count
 
     async def count_graph_indexed_by_kb_id(self, kb_id):
         return self.indexed_count
@@ -131,3 +135,32 @@ async def test_run_evaluation_saves_custom_name(monkeypatch):
     assert repo.created_run["name"] == "回归评估"
     assert repo.created_run["retrieval_config"]["top_k"] == 3
     assert repo.created_run["retrieval_config"]["answer_llm"] == "test:model"
+
+
+@pytest.mark.asyncio
+async def test_generate_dataset_rejects_empty_knowledge_base_before_creation(monkeypatch):
+    enqueue_called = False
+
+    async def fake_enqueue(**kwargs):
+        nonlocal enqueue_called
+        enqueue_called = True
+
+    monkeypatch.setattr(eval_service_module.tasker, "enqueue", fake_enqueue)
+    service = EvaluationService()
+    service.eval_repo = FakeEvaluationRepository()
+    service.chunk_repo = FakeChunkRepository(indexed_count=0, total_count=0)
+
+    with pytest.raises(ValueError, match="请先完成文件入库"):
+        await service.generate_dataset(
+            kb_id="db_1",
+            name="dataset",
+            description="desc",
+            count=2,
+            neighbors_count=1,
+            concurrency_count=1,
+            llm_model_spec="test:model",
+            created_by="user_1",
+        )
+
+    assert service.eval_repo.created_dataset is None
+    assert enqueue_called is False

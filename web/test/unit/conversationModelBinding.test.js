@@ -34,3 +34,14 @@ test('发送当前展示模型并在请求被接受后同步 Conversation metada
   assert.match(sendBlock, /status !== 'rejected' && modelSpec/)
   assert.match(sendBlock, /thread\.metadata = \{ \.\.\.\(thread\.metadata \|\| \{\}\), model_spec: modelSpec \}/)
 })
+
+
+test('刷新历史对话时把最近模型恢复到当前 threadId', () => {
+  const restoreBlock = source.slice(
+    source.indexOf('const restoreThreadModelSelection'),
+    source.indexOf('const fetchThreadAttachments')
+  )
+
+  assert.match(restoreBlock, /selectedModelByThread\[threadId\]/)
+  assert.doesNotMatch(restoreBlock, /target\[key\]/)
+})

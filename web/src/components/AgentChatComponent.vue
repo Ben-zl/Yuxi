@@ -2831,19 +2831,16 @@ const promoteDraftSelection = (selectionByThread, threadId) => {
 
 // 跨会话还原：从最近一条显式携带覆盖值的用户消息恢复线程级选择。
 const restoreThreadModelSelection = (threadId, history) => {
-  const restoreField = (target, accept, key) => {
-    if (target[key]) return
-    for (let i = history.length - 1; i >= 0; i -= 1) {
-      const msg = history[i]
-      if (msg?.type !== 'human') continue
-      const value = msg?.extra_metadata?.[key]
-      if (accept(value)) {
-        target[key] = value
-        return
-      }
+  if (selectedModelByThread[threadId]) return
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const msg = history[i]
+    if (msg?.type !== 'human') continue
+    const modelSpec = msg?.extra_metadata?.model_spec
+    if (typeof modelSpec === 'string' && modelSpec) {
+      selectedModelByThread[threadId] = modelSpec
+      return
     }
   }
-  restoreField(selectedModelByThread, (spec) => spec, 'model_spec')
 }
 
 const fetchThreadAttachments = async (threadId) => {
