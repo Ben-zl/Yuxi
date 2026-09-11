@@ -59,6 +59,34 @@ def confirmed_kb(monkeypatch):
     return detail
 
 
+@pytest.fixture
+def document_intents(monkeypatch):
+    rows = {}
+
+    async def fake_upsert(self, file_id, data):
+        row = SimpleNamespace(file_id=file_id, remote_knowledge_id=None, **data)
+        rows[file_id] = row
+        return row
+
+    async def fake_update(self, *, file_id, data, kb_id=None):
+        row = rows.get(file_id)
+        if row is None or (kb_id and row.kb_id != kb_id):
+            return None
+        for key, value in data.items():
+            setattr(row, key, value)
+        return row
+
+    async def fake_get(self, file_id):
+        return rows.get(file_id)
+
+    monkeypatch.setattr("yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.upsert", fake_upsert)
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.update_fields", fake_update
+    )
+    monkeypatch.setattr("yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id", fake_get)
+    return rows
+
+
 def test_file_ref_roundtrip_and_rejects_foreign_item() -> None:
     ref = build_weknora_file_ref("rid-1", "规范 文档 v2.md")
     assert parse_weknora_file_ref(ref) == ("rid-1", "规范 文档 v2.md")
@@ -75,7 +103,7 @@ def test_status_labels_map_known_and_expose_unknown() -> None:
 
 
 @pytest.mark.asyncio
-async def test_upload_returns_ref_and_initial_status(monkeypatch, confirmed_kb) -> None:
+async def test_upload_returns_ref_and_initial_status(monkeypatch, confirmed_kb, document_intents) -> None:
     _settings_env(monkeypatch)
     requests = []
 
@@ -84,47 +112,58 @@ async def test_upload_returns_ref_and_initial_status(monkeypatch, confirmed_kb) 
         return httpx.Response(200, json={"data": {"id": "rk-1", "parse_status": "pending"}})
 
     result = await upload_weknora_file(
-        "kb_w", filename="规范.md", content=b"# hello", content_type="text/markdown", client=_client(handler)
+        "kb_w",
+        filename="规范.md",
+        content=b"# hello",
+        content_type="text/markdown",
+        operator_id="u1",
+        client=_client(handler),
     )
 
     assert requests == [("POST", "/api/v1/knowledge-bases/remote-kb-1/knowledge/file")]
     assert result["remote_knowledge_id"] == "rk-1"
-    assert result["ref"] == build_weknora_file_ref("rk-1", "规范.md")
+    assert result["ref"] == build_weknora_file_ref(result["file_id"], "规范.md")
     assert result["remote_status"] == "pending"
     assert result["size"] == 7
+    assert document_intents[result["file_id"]].remote_knowledge_id == "rk-1"
 
 
 @pytest.mark.asyncio
-async def test_upload_propagates_remote_duplicate(monkeypatch, confirmed_kb) -> None:
+async def test_upload_propagates_remote_duplicate(monkeypatch, confirmed_kb, document_intents) -> None:
     _settings_env(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(409, json={"error": "duplicate"})
 
     with pytest.raises(KBOperationError, match="相同内容"):
-        await upload_weknora_file("kb_w", filename="a.md", content=b"x", client=_client(handler))
+        await upload_weknora_file("kb_w", filename="a.md", content=b"x", operator_id="u1", client=_client(handler))
+    assert next(iter(document_intents.values())).status == "failed"
 
 
 @pytest.mark.asyncio
-async def test_upload_timeout_surfaces_uncertain_outcome(monkeypatch, confirmed_kb) -> None:
+async def test_upload_timeout_surfaces_uncertain_outcome(monkeypatch, confirmed_kb, document_intents) -> None:
     _settings_env(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("timed out", request=request)
 
-    with pytest.raises(KBOperationError, match="上传失败"):
-        await upload_weknora_file("kb_w", filename="a.md", content=b"x", client=_client(handler))
+    with pytest.raises(KBOperationError, match="结果不确定"):
+        await upload_weknora_file("kb_w", filename="a.md", content=b"x", operator_id="u1", client=_client(handler))
+    row = next(iter(document_intents.values()))
+    assert row.status == "pending_review"
+    assert "ConnectTimeout" in row.error_message
 
 
 @pytest.mark.asyncio
-async def test_upload_missing_remote_id_is_uncertain(monkeypatch, confirmed_kb) -> None:
+async def test_upload_missing_remote_id_is_uncertain(monkeypatch, confirmed_kb, document_intents) -> None:
     _settings_env(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": {}})
 
     with pytest.raises(KBOperationError, match="结果不确定"):
-        await upload_weknora_file("kb_w", filename="a.md", content=b"x", client=_client(handler))
+        await upload_weknora_file("kb_w", filename="a.md", content=b"x", operator_id="u1", client=_client(handler))
+    assert next(iter(document_intents.values())).status == "pending_review"
 
 
 @pytest.mark.asyncio
@@ -296,22 +335,47 @@ async def test_add_file_record_uses_source_path_for_tree(monkeypatch) -> None:
     from yuxi.knowledge.implementations.weknora import WeKnoraKB
 
     kb = WeKnoraKB("/tmp/yuxi-weknora-test")
-    persisted = {}
+    existing = SimpleNamespace(
+        file_id="file_local",
+        kb_id="kb_w",
+        parent_id=None,
+        filename="细则.md",
+        original_filename="细则.md",
+        file_type="md",
+        path="weknora-local://file_local/x",
+        minio_url=None,
+        markdown_file=None,
+        status="pending",
+        content_hash=None,
+        file_size=10,
+        chunk_count=0,
+        token_count=0,
+        content_type=None,
+        processing_params=None,
+        is_folder=False,
+        error_message=None,
+        created_by="u1",
+        updated_by=None,
+        created_at=None,
+        updated_at=None,
+        remote_knowledge_id="rk-9",
+    )
 
-    async def fake_persist(file_id, meta):
-        persisted.update(meta)
+    async def fake_get(self, file_id):
+        return existing if file_id == "file_local" else None
 
-    async def fake_get_by_remote(self, kb_id, remote_knowledge_id):
-        return None
+    async def fake_update(self, *, file_id, data, kb_id=None):
+        for key, value in data.items():
+            setattr(existing, key, value)
+        return existing
 
-    monkeypatch.setattr(kb, "_persist_file_meta", fake_persist)
+    monkeypatch.setattr("yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id", fake_get)
     monkeypatch.setattr(
-        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_remote_knowledge_id",
-        fake_get_by_remote,
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.update_fields", fake_update
     )
     meta = await kb.add_file_record(
         "kb_w",
-        "weknora://rk-9/%E7%BB%86%E5%88%99.md",
+        build_weknora_file_ref("file_local", "细则.md"),
         params={"source_path": "子目录/细则.md", "content_hashes": {}, "file_sizes": {}},
         operator_id="u1",
         additional_params={},
@@ -320,6 +384,17 @@ async def test_add_file_record_uses_source_path_for_tree(monkeypatch) -> None:
     assert meta["filename"] == "子目录/细则.md"
     assert meta["remote_knowledge_id"] == "rk-9"
     assert meta["created_by"] == "u1"
+
+
+@pytest.mark.asyncio
+async def test_add_file_record_rejects_client_supplied_remote_id() -> None:
+    from yuxi.knowledge.implementations.weknora import WeKnoraKB
+
+    kb = WeKnoraKB("/tmp/yuxi-weknora-test")
+    with pytest.raises(ValueError, match="非 WeKnora 文件引用"):
+        await kb.add_file_record(
+            "kb_w", "weknora://foreign-document/fake.md", params={}, operator_id="u1", additional_params={}
+        )
 
 
 @pytest.mark.asyncio
@@ -357,7 +432,7 @@ def test_source_paths_product_payload_preserves_tree(monkeypatch) -> None:
 
     from server.routers.knowledge_router import _params_for_uploaded_document_item
 
-    ref = build_weknora_file_ref("rk-9", "细则.md")
+    ref = build_weknora_file_ref("file_local_9", "细则.md")
     params = {
         "source_paths": {ref: "子目录/细则.md"},
         "content_hashes": {ref: "h1"},
@@ -371,7 +446,7 @@ def test_source_paths_product_payload_preserves_tree(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_import_url_returns_ref(monkeypatch, confirmed_kb) -> None:
+async def test_import_url_returns_ref(monkeypatch, confirmed_kb, document_intents) -> None:
     _settings_env(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -380,27 +455,30 @@ async def test_import_url_returns_ref(monkeypatch, confirmed_kb) -> None:
 
     from yuxi.services.weknora_knowledge_service import import_weknora_url
 
-    result = await import_weknora_url("kb_w", url="https://example.com", client=_client(handler))
+    result = await import_weknora_url("kb_w", url="https://example.com", operator_id="u1", client=_client(handler))
 
     assert result["remote_knowledge_id"] == "rk-u"
     assert result["filename"] == "示例页面"
-    assert result["ref"] == build_weknora_file_ref("rk-u", "示例页面")
+    assert result["ref"] == build_weknora_file_ref(result["file_id"], "https://example.com")
 
 
 @pytest.mark.asyncio
-async def test_create_manual_returns_ref(monkeypatch, confirmed_kb) -> None:
+async def test_create_manual_returns_ref(monkeypatch, confirmed_kb, document_intents) -> None:
     _settings_env(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/knowledge-bases/remote-kb-1/knowledge/manual"
-        return httpx.Response(200, json={"data": {"id": "rk-m", "parse_status": "draft"}})
+        assert b'"status":"publish"' in request.read()
+        return httpx.Response(200, json={"data": {"id": "rk-m", "parse_status": "pending"}})
 
     from yuxi.services.weknora_knowledge_service import create_weknora_manual
 
-    result = await create_weknora_manual("kb_w", title="值班规范", markdown="# 内容", client=_client(handler))
+    result = await create_weknora_manual(
+        "kb_w", title="值班规范", markdown="# 内容", operator_id="u1", client=_client(handler)
+    )
 
     assert result["remote_knowledge_id"] == "rk-m"
-    assert result["remote_status"] == "draft"
+    assert result["remote_status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -411,7 +489,7 @@ async def test_update_document_syncs_title_locally(monkeypatch, confirmed_kb) ->
     requests = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append((request.method, request.url.path))
+        requests.append((request.method, request.url.path, request.read()))
         return httpx.Response(200, json={"data": {}})
 
     async def fake_get_by_file_id(self, file_id):
@@ -433,7 +511,11 @@ async def test_update_document_syncs_title_locally(monkeypatch, confirmed_kb) ->
 
     result = await update_weknora_document("kb_w", "f1", title="新标题", markdown="# 新正文", client=_client(handler))
 
-    assert requests == [("PUT", "/api/v1/knowledge/rk-1"), ("PUT", "/api/v1/knowledge/manual/rk-1")]
+    assert [(method, path) for method, path, _ in requests] == [
+        ("PUT", "/api/v1/knowledge/rk-1"),
+        ("PUT", "/api/v1/knowledge/manual/rk-1"),
+    ]
+    assert b'"status":"publish"' in requests[1][2]
     assert local_updates == [("f1", {"filename": "新标题"})]
     assert result["title"] == "新标题"
     assert result["markdown_updated"] is True
@@ -568,7 +650,7 @@ async def test_register_same_ref_twice_returns_existing_row(monkeypatch) -> None
         filename="规范.md",
         original_filename=None,
         file_type="md",
-        path="weknora://rk-9/x",
+        path="weknora-local://file_existing/x",
         minio_url=None,
         markdown_file=None,
         status="completed",
@@ -587,18 +669,22 @@ async def test_register_same_ref_twice_returns_existing_row(monkeypatch) -> None
         remote_knowledge_id="rk-9",
     )
 
-    async def fake_get_by_remote(self, kb_id, remote_knowledge_id):
-        return existing_row if remote_knowledge_id == "rk-9" else None
+    async def fake_get_by_file_id(self, file_id):
+        return existing_row if file_id == "file_existing" else None
 
     async def fake_persist(file_id, meta):
         persisted.append(file_id)
 
     async def fake_update_fields(self, *, file_id, data, kb_id=None):
-        existing_row.created_by = data.get("created_by")
+        assert file_id == "file_existing"
+        assert kb_id == "kb_w"
+        for key, value in data.items():
+            setattr(existing_row, key, value)
+        return existing_row
 
     monkeypatch.setattr(
-        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_remote_knowledge_id",
-        fake_get_by_remote,
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
     )
     monkeypatch.setattr(
         "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.update_fields",
@@ -608,7 +694,7 @@ async def test_register_same_ref_twice_returns_existing_row(monkeypatch) -> None
 
     meta = await kb.add_file_record(
         "kb_w",
-        "weknora://rk-9/%E8%A7%84%E8%8C%83.md",
+        build_weknora_file_ref("file_existing", "规范.md"),
         params={"filename": "规范.md"},
         operator_id="u1",
         additional_params={},
@@ -617,3 +703,192 @@ async def test_register_same_ref_twice_returns_existing_row(monkeypatch) -> None
     assert meta["file_id"] == "file_existing"
     assert meta["created_by"] == "u1"
     assert persisted == []  # 未新建行
+
+
+@pytest.mark.asyncio
+async def test_download_redirect_drops_api_key_on_object_store_hop(monkeypatch, confirmed_kb) -> None:
+    _settings_env(monkeypatch)
+    monkeypatch.setenv("WEKNORA_DOWNLOAD_HOSTS", "objects.example")
+    record = SimpleNamespace(
+        file_id="f1",
+        kb_id="kb_w",
+        filename="规范.pdf",
+        content_type="application/pdf",
+        remote_knowledge_id="rk-1",
+    )
+    seen = []
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers.get("x-api-key")))
+        if request.url.host == "weknora-app":
+            return httpx.Response(302, headers={"location": "https://objects.example/signed/file"})
+        return httpx.Response(200, content=b"document-bytes")
+
+    from yuxi.services.weknora_knowledge_service import download_weknora_document_stream
+
+    stream, filename, media_type = await download_weknora_document_stream("kb_w", "f1", client=_client(handler))
+    body = b"".join([chunk async for chunk in stream])
+
+    assert body == b"document-bytes"
+    assert filename == "规范.pdf"
+    assert media_type == "application/pdf"
+    assert seen == [
+        ("http://weknora-app:8080/api/v1/knowledge/rk-1/download", "sk-test"),
+        ("https://objects.example/signed/file", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_redirect_to_unapproved_host(monkeypatch, confirmed_kb) -> None:
+    _settings_env(monkeypatch)
+    monkeypatch.delenv("WEKNORA_DOWNLOAD_HOSTS", raising=False)
+    record = SimpleNamespace(
+        file_id="f1",
+        kb_id="kb_w",
+        filename="规范.pdf",
+        content_type="application/pdf",
+        remote_knowledge_id="rk-1",
+    )
+    calls = []
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://evil.example/collect"})
+
+    from yuxi.services.weknora_knowledge_service import download_weknora_document_stream
+
+    with pytest.raises(KBOperationError, match="重定向目标不在允许域"):
+        await download_weknora_document_stream("kb_w", "f1", client=_client(handler))
+    assert calls == ["http://weknora-app:8080/api/v1/knowledge/rk-1/download"]
+
+
+@pytest.mark.asyncio
+async def test_parsed_content_uses_manual_metadata_not_description(monkeypatch) -> None:
+    _settings_env(monkeypatch)
+    record = SimpleNamespace(file_id="f1", kb_id="kb_w", remote_knowledge_id="rk-1")
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "type": "manual",
+                    "description": "摘要不能冒充正文",
+                    "metadata": {"content": "# 完整正文"},
+                }
+            },
+        )
+
+    from yuxi.services.weknora_knowledge_service import load_remote_parsed_content
+
+    assert await load_remote_parsed_content("kb_w", "f1", client=_client(handler)) == "# 完整正文"
+
+
+@pytest.mark.asyncio
+async def test_parsed_content_ignores_description_for_regular_document(monkeypatch) -> None:
+    _settings_env(monkeypatch)
+    record = SimpleNamespace(file_id="f1", kb_id="kb_w", remote_knowledge_id="rk-1")
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/knowledge/rk-1"):
+            return httpx.Response(200, json={"data": {"type": "file", "description": "仅摘要"}})
+        return httpx.Response(200, json={"data": [], "total": 0})
+
+    from yuxi.services.weknora_knowledge_service import load_remote_parsed_content
+
+    assert await load_remote_parsed_content("kb_w", "f1", client=_client(handler)) == ""
+
+
+@pytest.mark.asyncio
+async def test_parsed_content_reads_all_chunk_pages(monkeypatch) -> None:
+    _settings_env(monkeypatch)
+    record = SimpleNamespace(file_id="f1", kb_id="kb_w", remote_knowledge_id="rk-1")
+    chunk_pages = []
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/knowledge/rk-1"):
+            return httpx.Response(200, json={"data": {"type": "file", "description": "摘要"}})
+        page = int(request.url.params["page"])
+        chunk_pages.append(page)
+        if page == 1:
+            data = [{"seq": index, "content": f"chunk-{index}"} for index in range(100)]
+        else:
+            data = [{"seq": 100, "content": "chunk-100"}]
+        return httpx.Response(200, json={"data": data, "total": 101})
+
+    from yuxi.services.weknora_knowledge_service import load_remote_parsed_content
+
+    content = await load_remote_parsed_content("kb_w", "f1", client=_client(handler))
+
+    assert chunk_pages == [1, 2]
+    assert content.startswith("chunk-0\n\nchunk-1")
+    assert content.endswith("chunk-100")
+    assert len(content.split("\n\n")) == 101
+
+
+@pytest.mark.asyncio
+async def test_download_wraps_remote_transport_failure(monkeypatch, confirmed_kb) -> None:
+    _settings_env(monkeypatch)
+    record = SimpleNamespace(
+        file_id="f1",
+        kb_id="kb_w",
+        filename="规范.pdf",
+        content_type="application/pdf",
+        remote_knowledge_id="rk-1",
+    )
+
+    async def fake_get_by_file_id(self, file_id):
+        return record
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_file_id",
+        fake_get_by_file_id,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("down", request=request)
+
+    from yuxi.services.weknora_knowledge_service import download_weknora_document_stream
+
+    with pytest.raises(KBOperationError, match="文档下载失败"):
+        await download_weknora_document_stream("kb_w", "f1", client=_client(handler))

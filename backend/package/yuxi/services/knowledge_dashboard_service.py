@@ -62,7 +62,6 @@ async def get_knowledge_stats() -> dict[str, Any]:
     """通过单批 SQL 聚合高效汇总知识库、文件类型与存储大小统计。"""
 
     visible_types = _visible_kb_types()
-    visible_kb_ids: set[str] | None = None
 
     databases_by_type: dict[str, int] = {}
     files_by_type: dict[str, int] = {}
@@ -71,19 +70,11 @@ async def get_knowledge_stats() -> dict[str, Any]:
     total_nodes = 0
     total_storage_size = 0
 
-    # 先确定当前模式的 kb_id 集合(用于文件聚合过滤)
-    from yuxi.storage.postgres.models_knowledge import KnowledgeBase
-    from yuxi.storage.postgres.manager import pg_manager
-    from sqlalchemy import select
+    kb_repo = KnowledgeBaseRepository()
+    visible_kb_ids = await kb_repo.list_kb_ids_by_type(visible_types)
 
-    async with pg_manager.get_async_session_context() as session:
-        rows = await session.execute(select(KnowledgeBase.kb_id, KnowledgeBase.kb_type))
-        visible_kb_ids = {row.kb_id for row in rows if (row.kb_type or "unknown").lower() in visible_types}
-
-    for kb_type, count in await KnowledgeBaseRepository().count_by_type():
+    for kb_type, count in await kb_repo.count_by_type(kb_types=visible_types):
         db_type = kb_type.lower()
-        if db_type not in visible_types:
-            continue
         display_type = DATABASE_TYPE_MAPPING.get(db_type, kb_type or "未知类型")
         databases_by_type[display_type] = databases_by_type.get(display_type, 0) + count
         total_databases += count

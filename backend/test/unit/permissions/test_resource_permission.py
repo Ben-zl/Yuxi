@@ -194,3 +194,51 @@ def test_v2_scope_validation_rejects_disallowed_access_level():
             },
             allowed_access_levels={"user"},
         )
+
+
+def _weknora_resource(*, created_by="creator", owning_department_id=2, share_config=None):
+    return SimpleNamespace(
+        kb_type="weknora",
+        created_by=created_by,
+        owning_department_id=owning_department_id,
+        share_config=share_config or {"version": 2},
+    )
+
+
+def test_weknora_creator_moved_out_of_owning_department_cannot_manage() -> None:
+    resource = _weknora_resource(created_by="creator", owning_department_id=2)
+
+    assert (
+        resolve_knowledge_base_permission(_user(uid="creator", role="admin", department_id=3), resource)
+        == ResourcePermission.NONE
+    )
+
+
+def test_weknora_creator_downgraded_to_member_has_read_only_access() -> None:
+    resource = _weknora_resource(created_by="creator", owning_department_id=2)
+
+    assert (
+        resolve_knowledge_base_permission(_user(uid="creator", role="user", department_id=2), resource)
+        == ResourcePermission.READ
+    )
+
+
+def test_weknora_owning_department_admin_can_manage() -> None:
+    resource = _weknora_resource(owning_department_id=2)
+
+    assert (
+        resolve_knowledge_base_permission(_user(role="admin", department_id=2), resource) == ResourcePermission.MANAGE
+    )
+
+
+def test_builtin_creator_management_rule_is_unchanged() -> None:
+    resource = SimpleNamespace(
+        kb_type="milvus",
+        created_by="creator",
+        owning_department_id=None,
+        share_config={"version": 2},
+    )
+
+    assert (
+        resolve_knowledge_base_permission(_user(uid="creator", department_id=3), resource) == ResourcePermission.MANAGE
+    )

@@ -79,17 +79,18 @@ async def build_kb_tools(*, uid: str, knowledge_slugs: list[str] | None) -> list
         visible = await _visible_knowledge_bases(uid, knowledge_slugs)
         return _json([{"kb_id": kb["kb_id"], "name": kb["name"], "description": kb["description"]} for kb in visible])
 
-    async def query_kb(kb_id: str, query_text: str) -> str:
+    async def query_kb(kb_id: str, query_text: str, file_name: str | None = None) -> str:
         """在指定知识库中检索与 query_text 相关的内容片段。
 
         Args:
             kb_id: 知识库 ID（见 list_kbs）
             query_text: 检索文本
+            file_name: 可选，限定文件名包含该值的文档（仅内置知识库支持）
         """
         target_error = await _check_target_visible(uid, knowledge_slugs, kb_id)
         if target_error:
             return target_error
-        result = await knowledge_base.retrieve(kb_id, query_text)
+        result = await knowledge_base.retrieve(kb_id, query_text, file_name=file_name)
         return _json(result)
 
     async def open_kb_document(kb_id: str, file_id: str, offset: int = 0, window_size: int = 200) -> str:

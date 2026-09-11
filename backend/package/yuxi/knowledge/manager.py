@@ -743,6 +743,7 @@ class KnowledgeBaseManager:
             return None
         if not self._kb_type_visible_in_current_backend(kb.kb_type or "milvus"):
             # 两套后端数据不混用:当前模式下另一后端的知识库视同不存在
+            # (不暴露跨后端存在性;引用方统一报"不存在"以保持隔离语义)
             return None
 
         files = None

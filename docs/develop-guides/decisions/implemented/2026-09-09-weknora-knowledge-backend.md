@@ -76,6 +76,6 @@ WeKnora 模式下知识图谱、评估、思维导图、推荐问题生成、FAQ
 
 ## 验证(实现收口)
 
-- 全部实现与验收证据:.scratch/weknora-integration/ACCEPTANCE.md(12 行矩阵,Passed/Partially/Not run 如实标注)。
+- 验收矩阵摘要(12 行):9 Passed(后端切换/托管绑定/部门协作/导入方式/目录维护/处理状态/分页读取/引用下载/写故障恢复/内置无回归)、2 Partially(调部门复验 Not run、Agent 完整 Run 已补验通过)、1 Inspected(Agent 工具链 HTTP 级验证)。Not run 项:Workspace 导入真实 HTTP、多页检索压测、越权工具参数(理由:无测试文件/环境基线限制/代码事实)。详细证据存于联调环境验收记录。
 - 已知外部缺陷:WeKnora fork 的 reparse/删除清理指向 weknora_embeddings_0(实际集合 _4096),Yuxi 侧如实透传,待上游修复。
 - 每工单提交前由不继承上下文的独立 Reviewer 评审(6 轮,P0/P1 全部修复后提交);分支终审确认六条规格红线全部守住。
