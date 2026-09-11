@@ -20,6 +20,10 @@ from yuxi.knowledge.weknora import (
     weknora_instance_fingerprint,
 )
 from yuxi.permissions import normalize_permission_config
+from yuxi.services.weknora_workspace_service import (
+    ensure_department_workspace,
+    resolve_department_settings,
+)
 from yuxi.utils import logger
 
 
@@ -89,6 +93,10 @@ async def create_weknora_database(
     if await knowledge_base.database_name_exists(database_name):
         raise KBNameConflictError(f"知识库名称 '{database_name}' 已存在，请使用其他名称")
 
+    # 部门 workspace 幂等开通:已有当前实例映射直接复用专属 Key(直接采用返回值,避免重读竞态)
+    dept_api_key, workspace = await ensure_department_workspace(int(owning_department_id))
+    dept_settings = settings.with_api_key(dept_api_key)
+
     kb_repo = KnowledgeBaseRepository()
     alphabet = string.ascii_lowercase + string.digits
     while True:
@@ -112,6 +120,7 @@ async def create_weknora_database(
             "owning_department_id": int(owning_department_id),
             "remote_binding": {
                 "instance": fingerprint,
+                "workspace_tenant_id": str(workspace.workspace_tenant_id),
                 "remote_kb_id": None,
                 "status": BINDING_PENDING_REVIEW,
             },
@@ -141,7 +150,7 @@ async def create_weknora_database(
             ],
         }
 
-    remote_client = client or WeKnoraClient(settings)
+    remote_client = client or WeKnoraClient(dept_settings)
     try:
         response = await remote_client.request("POST", "knowledge-bases", json=remote_payload)
     except WeKnoraClientError as error:
@@ -170,6 +179,7 @@ async def create_weknora_database(
             {
                 "remote_binding": {
                     "instance": fingerprint,
+                    "workspace_tenant_id": str(workspace.workspace_tenant_id),
                     "remote_kb_id": remote_kb_id,
                     "status": BINDING_PENDING_REVIEW,
                 }
@@ -185,6 +195,7 @@ async def create_weknora_database(
         {
             "remote_binding": {
                 "instance": fingerprint,
+                "workspace_tenant_id": str(workspace.workspace_tenant_id),
                 "remote_kb_id": remote_kb_id,
                 "status": BINDING_CONFIRMED,
                 "remote_name": remote_name,
@@ -199,7 +210,11 @@ async def create_weknora_database(
 
 
 async def load_confirmed_binding(kb_id: str, *, action: str):
-    """加载并校验已确认的托管绑定;所有远端写操作前共用。"""
+    """加载并校验已确认的托管绑定;所有远端操作前共用。
+
+    返回 (库详情, 绑定, 部门专属 Key 的出站配置)。绑定必须同时匹配
+    实例指纹与部门当前 workspace;部门重新开通后旧绑定立即失效。
+    """
 
     from yuxi.knowledge.runtime import knowledge_base
 
@@ -219,7 +234,18 @@ async def load_confirmed_binding(kb_id: str, *, action: str):
         raise KBOperationError(
             f"当前 WeKnora 服务地址与绑定时不同,拒绝{action}以免影响另一实例的资源;请先恢复原地址或人工核对绑定"
         )
-    return detail, binding, settings
+
+    department_id = getattr(detail, "owning_department_id", None)
+    if not department_id:
+        raise KBOperationError(f"知识库 {kb_id} 缺少归属部门,无法解析部门 workspace")
+    dept_settings, workspace = await resolve_department_settings(int(department_id))
+
+    binding_workspace = str(binding.get("workspace_tenant_id") or "")
+    if not binding_workspace:
+        raise KBOperationError(f"知识库 {kb_id} 的绑定缺少 workspace 信息(旧版单空间绑定),需删除后重建到部门 workspace")
+    if binding_workspace != str(workspace.workspace_tenant_id):
+        raise KBOperationError(f"知识库 {kb_id} 绑定的 workspace 与部门当前空间不一致(部门已重新开通),需人工核对后处理")
+    return detail, binding, dept_settings
 
 
 async def delete_weknora_database(kb_id: str, *, client: WeKnoraClient | None = None) -> dict:

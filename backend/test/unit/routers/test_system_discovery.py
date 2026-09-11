@@ -7,6 +7,7 @@ import pytest
 from server.routers.system_router import discovery
 
 pytestmark = pytest.mark.unit
+CREDENTIAL_KEY = "uAIxxMDb8OeoGaM5SsqnFfr6QLFLtmYzXVaOYRHj2vU="
 
 
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -36,6 +37,7 @@ async def test_discovery_reports_weknora_backend_when_ready(monkeypatch) -> None
     monkeypatch.setenv("KNOWLEDGE_BACKEND", "weknora")
     monkeypatch.setenv("WEKNORA_BASE_URL", "http://weknora-app:8080/api/v1")
     monkeypatch.setenv("WEKNORA_API_KEY", "sk-local")
+    monkeypatch.setenv("WEKNORA_WORKSPACE_CREDENTIAL_KEY", CREDENTIAL_KEY)
 
     payload = await discovery()
     features = payload["capabilities"]["features"]
@@ -71,6 +73,7 @@ async def test_discovery_keeps_lite_mode_semantics(monkeypatch) -> None:
     monkeypatch.setenv("KNOWLEDGE_BACKEND", "weknora")
     monkeypatch.setenv("WEKNORA_BASE_URL", "http://weknora-app:8080/api/v1")
     monkeypatch.setenv("WEKNORA_API_KEY", "sk-local")
+    monkeypatch.setenv("WEKNORA_WORKSPACE_CREDENTIAL_KEY", CREDENTIAL_KEY)
 
     payload = await discovery()
     features = payload["capabilities"]["features"]

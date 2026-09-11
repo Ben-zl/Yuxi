@@ -25,7 +25,12 @@ from yuxi.services.weknora_knowledge_service import (
 pytestmark = pytest.mark.unit
 
 FINGERPRINT = "a967587a3500f032"
-CONFIRMED_BINDING = {"instance": FINGERPRINT, "remote_kb_id": "remote-kb-1", "status": "confirmed"}
+CONFIRMED_BINDING = {
+    "instance": FINGERPRINT,
+    "workspace_tenant_id": "ws-100",
+    "remote_kb_id": "remote-kb-1",
+    "status": "confirmed",
+}
 
 
 def _settings_env(monkeypatch):
@@ -43,6 +48,15 @@ def _client(handler):
     )
 
 
+DEPT_WORKSPACE = SimpleNamespace(
+    department_id=2,
+    workspace_tenant_id="ws-100",
+    workspace_name="dept-2",
+    instance=FINGERPRINT,
+    status="confirmed",
+)
+
+
 @pytest.fixture
 def confirmed_kb(monkeypatch):
     detail = SimpleNamespace(
@@ -55,7 +69,14 @@ def confirmed_kb(monkeypatch):
     async def fake_info(kb_id, **kwargs):
         return detail if kb_id == "kb_w" else None
 
+    async def fake_resolve(department_id):
+        from yuxi.knowledge.weknora import WeKnoraSettings
+
+        assert int(department_id) == 2
+        return WeKnoraSettings(base_url="http://weknora-app:8080/api/v1", api_key="sk-dept"), DEPT_WORKSPACE
+
     monkeypatch.setattr(knowledge_base, "get_database_info", fake_info)
+    monkeypatch.setattr("yuxi.services.weknora_kb_service.resolve_department_settings", fake_resolve)
     return detail
 
 
@@ -207,6 +228,32 @@ async def test_status_sync_failure_keeps_local_values(monkeypatch) -> None:
     synced = await sync_weknora_file_statuses("kb_w", metas, client=_client(handler))
 
     # 远端不可达保留本地旧值,不把故障伪装成终态
+    assert synced[0]["status"] == "processing"
+
+
+@pytest.mark.asyncio
+async def test_status_sync_degrades_when_department_unresolvable(monkeypatch) -> None:
+    """部门解析失败(映射缺失)与远端不可达同等降级,不阻塞列表读路径。"""
+
+    _settings_env(monkeypatch)
+
+    async def missing_mapping(self, department_id):
+        raise KBOperationError(f"部门 {department_id} 的 WeKnora workspace 未开通")
+
+    async def missing_kb(self, kb_id):
+        return None
+
+    monkeypatch.setattr(
+        "yuxi.services.weknora_workspace_service.resolve_department_settings", missing_mapping
+    )
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_base_repository.KnowledgeBaseRepository.get_by_kb_id", missing_kb
+    )
+
+    metas = [{"file_id": "f1", "status": "processing", "remote_knowledge_id": "rk-1", "is_folder": False}]
+
+    synced = await sync_weknora_file_statuses("kb_w", metas)
+
     assert synced[0]["status"] == "processing"
 
 
@@ -561,6 +608,32 @@ def _config(remote_binding):
     )
 
 
+def _dept_workspace_env(monkeypatch, handler) -> None:
+    """为 aquery 打部门解析桩:库行、workspace 解析与客户端构造全部收敛到替身。"""
+
+    async def fake_get_by_kb_id(self, kb_id):
+        return SimpleNamespace(kb_id=kb_id, owning_department_id=2)
+
+    async def fake_resolve(department_id):
+        from yuxi.knowledge.weknora import WeKnoraSettings
+
+        assert int(department_id) == 2
+        return WeKnoraSettings(base_url="http://weknora-app:8080/api/v1", api_key="sk-dept"), DEPT_WORKSPACE
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_base_repository.KnowledgeBaseRepository.get_by_kb_id", fake_get_by_kb_id
+    )
+    monkeypatch.setattr("yuxi.services.weknora_workspace_service.resolve_department_settings", fake_resolve)
+    from yuxi.knowledge import weknora as weknora_module
+
+    real_client = weknora_module.WeKnoraClient
+
+    def client_factory(settings):
+        return real_client(settings, transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr("yuxi.knowledge.weknora.WeKnoraClient", client_factory)
+
+
 @pytest.mark.asyncio
 async def test_aquery_maps_hits_to_bound_documents_only(monkeypatch) -> None:
     """检索命中只映射到本项目绑定文档;未绑定远端对象被过滤。"""
@@ -572,6 +645,7 @@ async def test_aquery_maps_hits_to_bound_documents_only(monkeypatch) -> None:
     kb = WeKnoraKB("/tmp/yuxi-weknora-test")
     binding = {
         "instance": weknora_instance_fingerprint(),
+        "workspace_tenant_id": "ws-100",
         "remote_kb_id": "rkb-1",
         "status": "confirmed",
     }
@@ -597,7 +671,7 @@ async def test_aquery_maps_hits_to_bound_documents_only(monkeypatch) -> None:
         "yuxi.repositories.knowledge_file_repository.KnowledgeFileRepository.get_by_remote_knowledge_id",
         fake_get_by_remote,
     )
-    monkeypatch.setattr(kb, "_remote_client", lambda: _client(handler))
+    _dept_workspace_env(monkeypatch, handler)
 
     results = await kb.aquery("查询", "kb_w", config=_config(binding))
 
@@ -616,6 +690,7 @@ async def test_aquery_rejects_stale_instance_binding(monkeypatch) -> None:
     monkeypatch.setenv("WEKNORA_API_KEY", "sk-test")
     kb = WeKnoraKB("/tmp/yuxi-weknora-test")
     binding = {"instance": "0000000000000000", "remote_kb_id": "rkb-1", "status": "confirmed"}
+    _dept_workspace_env(monkeypatch, lambda request: httpx.Response(200, json={"data": []}))
 
     with pytest.raises(KBOperationError, match="服务地址与绑定时不同"):
         await kb.aquery("查询", "kb_w", config=_config(binding))
@@ -628,9 +703,31 @@ async def test_aquery_rejects_unconfirmed_binding(monkeypatch) -> None:
     monkeypatch.setenv("WEKNORA_BASE_URL", "http://weknora-app:8080/api/v1")
     monkeypatch.setenv("WEKNORA_API_KEY", "sk-test")
     kb = WeKnoraKB("/tmp/yuxi-weknora-test")
+    _dept_workspace_env(monkeypatch, lambda request: httpx.Response(200, json={"data": []}))
 
     with pytest.raises(KBOperationError, match="绑定未确认"):
         await kb.aquery("查询", "kb_w", config=_config({"status": "pending_review", "remote_kb_id": None}))
+
+
+@pytest.mark.asyncio
+async def test_aquery_rejects_workspace_mismatch_binding(monkeypatch) -> None:
+    """绑定 workspace 与部门当前空间不一致(部门已重新开通)时拒绝检索。"""
+
+    from yuxi.knowledge.implementations.weknora import WeKnoraKB
+
+    monkeypatch.setenv("WEKNORA_BASE_URL", "http://weknora-app:8080/api/v1")
+    monkeypatch.setenv("WEKNORA_API_KEY", "sk-test")
+    kb = WeKnoraKB("/tmp/yuxi-weknora-test")
+    binding = {
+        "instance": weknora_instance_fingerprint(),
+        "workspace_tenant_id": "ws-old",
+        "remote_kb_id": "rkb-1",
+        "status": "confirmed",
+    }
+    _dept_workspace_env(monkeypatch, lambda request: httpx.Response(200, json={"data": []}))
+
+    with pytest.raises(KBOperationError, match="workspace 与部门当前空间不一致"):
+        await kb.aquery("查询", "kb_w", config=_config(binding))
 
 
 @pytest.mark.asyncio

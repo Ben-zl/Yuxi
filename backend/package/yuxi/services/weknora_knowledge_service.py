@@ -21,11 +21,21 @@ STATUS_SYNC_TIMEOUT_SECONDS = 5.0
 DOCUMENT_PENDING_REVIEW = "pending_review"
 
 
-def _client_for_kb(*, timeout: float = 30.0) -> WeKnoraClient:
+async def _client_for_kb(kb_id: str, *, timeout: float = 30.0) -> WeKnoraClient:
+    """按知识库归属部门解析 workspace 专属 Key 构造客户端。"""
+
+    from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
+    from yuxi.services.weknora_workspace_service import resolve_department_settings
+
     settings = load_weknora_settings()
     if not settings.ready:
         raise KBOperationError("WeKnora 部署配置不完整,无法执行文档用例")
-    return WeKnoraClient(settings, timeout=timeout)
+    kb_row = await KnowledgeBaseRepository().get_by_kb_id(kb_id)
+    department_id = getattr(kb_row, "owning_department_id", None) if kb_row is not None else None
+    if not department_id:
+        raise KBOperationError(f"知识库 {kb_id} 缺少归属部门,无法解析部门 workspace")
+    dept_settings, _ = await resolve_department_settings(int(department_id))
+    return WeKnoraClient(dept_settings, timeout=timeout)
 
 
 async def _create_document_intent(
@@ -196,15 +206,16 @@ async def sync_weknora_file_statuses(
     if not pending_ids:
         return metas
 
-    remote_client = client or _client_for_kb(timeout=STATUS_SYNC_TIMEOUT_SECONDS)
     try:
+        remote_client = client or await _client_for_kb(kb_id, timeout=STATUS_SYNC_TIMEOUT_SECONDS)
         response = await remote_client.request(
             "GET",
             "knowledge/batch",
             params=[("ids", remote_id) for remote_id in pending_ids],
         )
         items = response.json().get("data") or []
-    except (WeKnoraClientError, ValueError, AttributeError) as error:
+    except (WeKnoraClientError, KBOperationError, ValueError, AttributeError) as error:
+        # 部门解析失败与远端不可达同等降级:保留本地状态,不阻塞列表读路径
         logger.warning(f"WeKnora 状态同步失败,保留本地状态: kb_id={kb_id}: {error}")
         return metas
 
@@ -533,7 +544,7 @@ async def load_remote_parsed_content(kb_id: str, file_id: str, *, client: WeKnor
     remote_knowledge_id = getattr(record, "remote_knowledge_id", None)
     if not remote_knowledge_id:
         raise KBOperationError(f"文档 {file_id} 缺少远端绑定")
-    remote_client = client or _client_for_kb()
+    remote_client = client or await _client_for_kb(kb_id)
     try:
         response = await remote_client.request("GET", f"knowledge/{remote_knowledge_id}")
     except WeKnoraClientError as error:

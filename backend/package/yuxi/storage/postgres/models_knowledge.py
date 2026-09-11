@@ -83,6 +83,27 @@ class KnowledgeFile(Base):
     updated_at = Column(DateTime(timezone=True), default=utc_now_naive, onupdate=utc_now_naive)
 
 
+class WeknoraDepartmentWorkspace(Base):
+    """WeKnora 部门 workspace 映射。
+
+    每个部门一个远端 workspace:专属 Key 仅以 Fernet 密文保存,实例指纹用于
+    换址后判定映射不可用(专属 Key 只对开通时的实例有效)。
+    """
+
+    __tablename__ = "weknora_department_workspaces"
+    __table_args__ = (UniqueConstraint("department_id", name="uq_weknora_workspaces_department"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    department_id = Column(Integer, nullable=False)
+    workspace_tenant_id = Column(String(64), nullable=False)
+    workspace_name = Column(String(255))
+    encrypted_api_key = Column(Text, nullable=False)
+    instance = Column(String(32), nullable=False)
+    status = Column(String(32), nullable=False, default="confirmed")
+    created_at = Column(DateTime(timezone=True), default=utc_now_naive)
+    updated_at = Column(DateTime(timezone=True), default=utc_now_naive, onupdate=utc_now_naive)
+
+
 class KnowledgeChunk(Base):
     """知识库 Chunk 模型"""
 

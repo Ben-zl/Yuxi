@@ -145,7 +145,7 @@ async def main() -> None:
                     "knowledge",
                     versions.get("knowledge"),
                     KNOWLEDGE_SCHEMA_VERSION,
-                    upgrade_from=(1, 2),
+                    upgrade_from=(1, 2, 3),
                 )
 
             if business_version is None:

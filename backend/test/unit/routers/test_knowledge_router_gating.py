@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 pytestmark = pytest.mark.unit
+CREDENTIAL_KEY = "uAIxxMDb8OeoGaM5SsqnFfr6QLFLtmYzXVaOYRHj2vU="
 
 _COLLECT_ROUTES = (
     "import json; from server.routers import router; print(json.dumps(sorted({route.path for route in router.routes})))"
@@ -78,6 +79,7 @@ def test_weknora_backend_with_complete_config_registers_knowledge_routes(tmp_pat
             "KNOWLEDGE_BACKEND": "weknora",
             "WEKNORA_BASE_URL": "http://weknora-app:8080/api/v1",
             "WEKNORA_API_KEY": "sk-local",
+            "WEKNORA_WORKSPACE_CREDENTIAL_KEY": CREDENTIAL_KEY,
         },
     )
 

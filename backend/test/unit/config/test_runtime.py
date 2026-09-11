@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from cryptography.fernet import Fernet
+
 from yuxi.config.runtime import (
     knowledge_api_enabled,
     knowledge_backend,
@@ -38,7 +40,7 @@ def test_lite_mode_owner_rejects_other_values(monkeypatch, value: str) -> None:
 
 def _clear_backend_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("KNOWLEDGE_BACKEND", raising=False)
-    for name in ("WEKNORA_BASE_URL", "WEKNORA_API_KEY"):
+    for name in ("WEKNORA_BASE_URL", "WEKNORA_API_KEY", "WEKNORA_WORKSPACE_CREDENTIAL_KEY"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -78,7 +80,7 @@ def test_builtin_backend_ignores_weknora_config(monkeypatch) -> None:
     _clear_backend_env(monkeypatch)
     monkeypatch.setenv("KNOWLEDGE_BACKEND", "builtin")
 
-    assert weknora_backend_config_missing() == ["WEKNORA_BASE_URL", "WEKNORA_API_KEY"]
+    assert weknora_backend_config_missing() == ["WEKNORA_BASE_URL", "WEKNORA_API_KEY", "WEKNORA_WORKSPACE_CREDENTIAL_KEY"]
     assert knowledge_backend_ready() is True
     assert knowledge_api_enabled() is True
 
@@ -89,18 +91,19 @@ def test_weknora_backend_not_ready_when_config_missing(monkeypatch) -> None:
     _clear_backend_env(monkeypatch)
     monkeypatch.setenv("KNOWLEDGE_BACKEND", "weknora")
 
-    assert weknora_backend_config_missing() == ["WEKNORA_BASE_URL", "WEKNORA_API_KEY"]
+    assert weknora_backend_config_missing() == ["WEKNORA_BASE_URL", "WEKNORA_API_KEY", "WEKNORA_WORKSPACE_CREDENTIAL_KEY"]
     assert knowledge_backend_ready() is False
     assert knowledge_api_enabled() is False
 
 
 def test_weknora_backend_ready_with_transport_config(monkeypatch) -> None:
-    """地址与 API Key 齐备即视为传输层就绪,模型标识留给建库用例校验。"""
+    """地址、开通 Key 与 workspace 凭据 Key 齐备即视为传输层就绪,模型标识留给建库用例校验。"""
 
     _clear_backend_env(monkeypatch)
     monkeypatch.setenv("KNOWLEDGE_BACKEND", "weknora")
     monkeypatch.setenv("WEKNORA_BASE_URL", " http://weknora-app:8080/api/v1 ")
     monkeypatch.setenv("WEKNORA_API_KEY", " sk-local ")
+    monkeypatch.setenv("WEKNORA_WORKSPACE_CREDENTIAL_KEY", Fernet.generate_key().decode())
 
     assert weknora_backend_config_missing() == []
     assert knowledge_backend_ready() is True

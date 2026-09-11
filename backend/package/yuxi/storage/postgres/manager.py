@@ -24,7 +24,7 @@ from yuxi.utils.singleton import SingletonMeta
 CombinedBase = declarative_base()
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
 BUSINESS_SCHEMA_VERSION = 4
-KNOWLEDGE_SCHEMA_VERSION = 3
+KNOWLEDGE_SCHEMA_VERSION = 4
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS runtime_scope_id VARCHAR(64)",
@@ -768,6 +768,23 @@ class PostgresManager(metaclass=SingletonMeta):
             (
                 "CREATE INDEX IF NOT EXISTS ix_knowledge_graph_triple_mentions_chunk_id "
                 "ON knowledge_graph_triple_mentions(chunk_id)"
+            ),
+            """
+            CREATE TABLE IF NOT EXISTS weknora_department_workspaces (
+                id SERIAL PRIMARY KEY,
+                department_id INTEGER NOT NULL,
+                workspace_tenant_id VARCHAR(64) NOT NULL,
+                workspace_name VARCHAR(255),
+                encrypted_api_key TEXT NOT NULL,
+                instance VARCHAR(32) NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
+                created_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ
+            )
+            """,
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_weknora_workspaces_department "
+                "ON weknora_department_workspaces(department_id)"
             ),
         ]
 

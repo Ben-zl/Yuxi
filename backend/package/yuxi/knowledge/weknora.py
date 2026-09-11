@@ -32,6 +32,16 @@ class WeKnoraSettings:
     def ready(self) -> bool:
         return bool(self.base_url and self.api_key)
 
+    def with_api_key(self, api_key: str) -> WeKnoraSettings:
+        """返回仅替换出站 Key 的同实例配置;用于部门 workspace 专属 Key 注入。"""
+
+        return WeKnoraSettings(
+            base_url=self.base_url,
+            api_key=api_key,
+            embedding_model_id=self.embedding_model_id,
+            summary_model_id=self.summary_model_id,
+        )
+
     @property
     def missing_model_fields(self) -> list[str]:
         """返回缺失的模型配置变量名,供建库等需要模型标识的用例做前置校验。"""

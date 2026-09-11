@@ -36,6 +36,32 @@ def env_ready(monkeypatch):
     monkeypatch.setenv("WEKNORA_SUMMARY_MODEL_ID", "sum-1")
 
 
+WORKSPACE = SimpleNamespace(
+    department_id=2,
+    workspace_tenant_id="ws-100",
+    workspace_name="dept-2",
+    instance=weknora_kb_service.weknora_instance_fingerprint(SETTINGS),
+    status="confirmed",
+)
+
+
+@pytest.fixture
+def workspace_ready(monkeypatch):
+    """部门 workspace 已开通:建库与绑定校验不触达真实开通/解析。"""
+
+    async def fake_ensure(department_id, *, client=None):
+        assert int(department_id) == 2
+        return "sk-dept-2", WORKSPACE
+
+    async def fake_resolve(department_id):
+        assert int(department_id) == 2
+        return SETTINGS.with_api_key("sk-dept-2"), WORKSPACE
+
+    monkeypatch.setattr(weknora_kb_service, "ensure_department_workspace", fake_ensure)
+    monkeypatch.setattr(weknora_kb_service, "resolve_department_settings", fake_resolve)
+    return WORKSPACE
+
+
 class FakeRepos:
     """记录本地知识库仓储副作用的替身。"""
 
@@ -94,7 +120,7 @@ def _ok_create_handler(remote_kb_id="remote-1"):
 
 
 @pytest.mark.asyncio
-async def test_create_confirms_binding_on_both_sides(env_ready, monkeypatch) -> None:
+async def test_create_confirms_binding_on_both_sides(env_ready, workspace_ready, monkeypatch) -> None:
     repos = FakeRepos().install(monkeypatch)
     monkeypatch.setattr(knowledge_base, "database_name_exists", _async_false())
     detail = SimpleNamespace(kb_id="kb_x", kb_type="weknora")
@@ -114,6 +140,7 @@ async def test_create_confirms_binding_on_both_sides(env_ready, monkeypatch) -> 
     assert record["kb_type"] == "weknora"
     assert record["owning_department_id"] == 2
     assert record["remote_binding"]["status"] == BINDING_PENDING_REVIEW
+    assert record["remote_binding"]["workspace_tenant_id"] == "ws-100"
     # 归属部门默认授权:本部门可读、本部门可管理
     assert record["share_config"]["read_scope"]["department_ids"] == [2]
     assert record["share_config"]["manage_scope"]["department_ids"] == [2]
@@ -125,7 +152,7 @@ async def test_create_confirms_binding_on_both_sides(env_ready, monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_create_with_definite_remote_rejection_rolls_back_local(env_ready, monkeypatch) -> None:
+async def test_create_with_definite_remote_rejection_rolls_back_local(env_ready, workspace_ready, monkeypatch) -> None:
     repos = FakeRepos().install(monkeypatch)
     monkeypatch.setattr(knowledge_base, "database_name_exists", _async_false())
 
@@ -147,7 +174,7 @@ async def test_create_with_definite_remote_rejection_rolls_back_local(env_ready,
 
 
 @pytest.mark.asyncio
-async def test_create_timeout_keeps_pending_review_binding(env_ready, monkeypatch) -> None:
+async def test_create_timeout_keeps_pending_review_binding(env_ready, workspace_ready, monkeypatch) -> None:
     repos = FakeRepos().install(monkeypatch)
     monkeypatch.setattr(knowledge_base, "database_name_exists", _async_false())
 
@@ -232,6 +259,7 @@ def _confirmed_binding_detail():
         owning_department_id=2,
         remote_binding={
             "instance": weknora_kb_service.weknora_instance_fingerprint(SETTINGS),
+            "workspace_tenant_id": "ws-100",
             "remote_kb_id": "remote-1",
             "status": BINDING_CONFIRMED,
         },
@@ -239,7 +267,7 @@ def _confirmed_binding_detail():
 
 
 @pytest.mark.asyncio
-async def test_delete_confirms_remote_before_local_cleanup(env_ready, monkeypatch) -> None:
+async def test_delete_confirms_remote_before_local_cleanup(env_ready, workspace_ready, monkeypatch) -> None:
     repos = FakeRepos().install(monkeypatch)
     detail = _confirmed_binding_detail()
     monkeypatch.setattr(knowledge_base, "get_database_info", _async_return(detail))
@@ -257,7 +285,7 @@ async def test_delete_confirms_remote_before_local_cleanup(env_ready, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_delete_treats_remote_404_as_already_gone(env_ready, monkeypatch) -> None:
+async def test_delete_treats_remote_404_as_already_gone(env_ready, workspace_ready, monkeypatch) -> None:
     repos = FakeRepos().install(monkeypatch)
     monkeypatch.setattr(knowledge_base, "get_database_info", _async_return(_confirmed_binding_detail()))
 
@@ -270,7 +298,7 @@ async def test_delete_treats_remote_404_as_already_gone(env_ready, monkeypatch) 
 
 
 @pytest.mark.asyncio
-async def test_delete_timeout_keeps_local_record(env_ready, monkeypatch) -> None:
+async def test_delete_timeout_keeps_local_record(env_ready, workspace_ready, monkeypatch) -> None:
     repos = FakeRepos().install(monkeypatch)
     monkeypatch.setattr(knowledge_base, "get_database_info", _async_return(_confirmed_binding_detail()))
 
@@ -341,7 +369,7 @@ def _async_return(value):
 
 
 @pytest.mark.asyncio
-async def test_update_syncs_remote_before_local(env_ready, monkeypatch) -> None:
+async def test_update_syncs_remote_before_local(env_ready, workspace_ready, monkeypatch) -> None:
     repos = FakeRepos().install(monkeypatch)
     detail = _confirmed_binding_detail()
     detail.kb_id = "kb_bound"
@@ -365,7 +393,7 @@ async def test_update_syncs_remote_before_local(env_ready, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_remote_failure_keeps_local_unchanged(env_ready, monkeypatch) -> None:
+async def test_update_remote_failure_keeps_local_unchanged(env_ready, workspace_ready, monkeypatch) -> None:
     FakeRepos().install(monkeypatch)
     monkeypatch.setattr(knowledge_base, "get_database_info", _async_return(_confirmed_binding_detail()))
     local_updated = []
@@ -382,6 +410,57 @@ async def test_update_remote_failure_keeps_local_unchanged(env_ready, monkeypatc
         await weknora_kb_service.update_weknora_database("kb_bound", name="冲突名", client=_client(handler))
 
     assert local_updated == []
+
+
+@pytest.mark.asyncio
+async def test_delete_refuses_when_workspace_mismatch(env_ready, workspace_ready, monkeypatch) -> None:
+    """部门重新开通后,旧绑定指向的 workspace 与当前空间不一致,拒绝删除。"""
+    repos = FakeRepos().install(monkeypatch)
+    mismatched = SimpleNamespace(
+        kb_id="kb_ws_mismatch",
+        kb_type="weknora",
+        owning_department_id=2,
+        remote_binding={
+            "instance": weknora_kb_service.weknora_instance_fingerprint(SETTINGS),
+            "workspace_tenant_id": "ws-old",
+            "remote_kb_id": "remote-1",
+            "status": BINDING_CONFIRMED,
+        },
+    )
+    monkeypatch.setattr(knowledge_base, "get_database_info", _async_return(mismatched))
+    requested = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        return httpx.Response(200, json={"data": {}})
+
+    with pytest.raises(KBOperationError, match="workspace"):
+        await delete_weknora_database("kb_ws_mismatch", client=_client(handler))
+
+    assert requested == []
+    assert repos.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_delete_refuses_legacy_binding_without_workspace(env_ready, workspace_ready, monkeypatch) -> None:
+    """旧版单空间绑定缺少 workspace 信息,必须显式要求重建而非继续操作。"""
+    repos = FakeRepos().install(monkeypatch)
+    legacy = SimpleNamespace(
+        kb_id="kb_legacy",
+        kb_type="weknora",
+        owning_department_id=2,
+        remote_binding={
+            "instance": weknora_kb_service.weknora_instance_fingerprint(SETTINGS),
+            "remote_kb_id": "remote-1",
+            "status": BINDING_CONFIRMED,
+        },
+    )
+    monkeypatch.setattr(knowledge_base, "get_database_info", _async_return(legacy))
+
+    with pytest.raises(KBOperationError, match="缺少 workspace 信息"):
+        await delete_weknora_database("kb_legacy", client=_client(_ok_create_handler()))
+
+    assert repos.deleted == []
 
 
 def _recorder(calls):

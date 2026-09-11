@@ -16,6 +16,8 @@ Owner：backend/package/yuxi/knowledge/weknora.py
 
 ### 单空间与服务端统一 Key
 
+> 2026-09-11 起本节已被 [2026-09-11-weknora-department-workspace](2026-09-11-weknora-department-workspace.md) 修订:每部门独立 workspace 与专属 Key,`WEKNORA_API_KEY` 收窄为开通 Key,新增必需配置 `WEKNORA_WORKSPACE_CREDENTIAL_KEY`。
+
 所有 Yuxi 托管库创建在同一个 WeKnora 空间,使用部署提供的单一 `X-API-Key`。部门隔离完全由 Yuxi 的归属部门与授权模型执行;WeKnora 只承担文档保存、解析、分块、索引与检索,不承担用户级权限。检索只发送显式授权的库集合,不把统一 Key 的全空间搜索当作默认范围。
 
 ### can_write_content 与固定归属部门

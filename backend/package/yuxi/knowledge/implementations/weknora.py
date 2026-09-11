@@ -59,16 +59,8 @@ class WeKnoraKB(KnowledgeBase):
         del kb_id
         return {"message": "WeKnora 资源清理由删除用例协调"}
 
-    def _remote_client(self):
-        from yuxi.knowledge.weknora import WeKnoraClient, load_weknora_settings
-
-        settings = load_weknora_settings()
-        if not settings.ready:
-            raise KBOperationError("WeKnora 部署配置不完整,无法执行检索")
-        return WeKnoraClient(settings)
-
-    def _require_remote_kb_id(self, config: KnowledgeBaseConfig) -> str:
-        """校验实例指纹一致后返回远端库 ID;换址后旧绑定立即失效。"""
+    def _require_remote_kb_id(self, config: KnowledgeBaseConfig, workspace_tenant_id: str | None = None) -> str:
+        """校验实例指纹与 workspace 一致后返回远端库 ID;换址或部门重新开通后旧绑定失效。"""
 
         from yuxi.knowledge.weknora import weknora_instance_fingerprint
 
@@ -78,7 +70,30 @@ class WeKnoraKB(KnowledgeBase):
             raise KBOperationError("知识库远端绑定未确认,暂不可检索")
         if binding.get("instance") != weknora_instance_fingerprint():
             raise KBOperationError("当前 WeKnora 服务地址与绑定时不同,该知识库暂不可访问")
+        if workspace_tenant_id is not None:
+            binding_workspace = str(binding.get("workspace_tenant_id") or "")
+            if not binding_workspace:
+                raise KBOperationError("知识库绑定缺少 workspace 信息(旧版单空间绑定),需删除后重建到部门 workspace")
+            if binding_workspace != workspace_tenant_id:
+                raise KBOperationError("知识库绑定的 workspace 与部门当前空间不一致(部门已重新开通),暂不可检索")
         return remote_kb_id
+
+    async def _department_client(self, kb_id: str) -> tuple[object, str]:
+        """按库归属部门解析 workspace 专属 Key,返回 (客户端, workspace_tenant_id)。"""
+
+        from yuxi.knowledge.weknora import WeKnoraClient, load_weknora_settings
+        from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
+        from yuxi.services.weknora_workspace_service import resolve_department_settings
+
+        settings = load_weknora_settings()
+        if not settings.ready:
+            raise KBOperationError("WeKnora 部署配置不完整,无法执行远端调用")
+        kb_row = await KnowledgeBaseRepository().get_by_kb_id(kb_id)
+        department_id = getattr(kb_row, "owning_department_id", None) if kb_row is not None else None
+        if not department_id:
+            raise KBOperationError(f"知识库 {kb_id} 缺少归属部门,无法解析部门 workspace")
+        dept_settings, workspace = await resolve_department_settings(int(department_id))
+        return WeKnoraClient(dept_settings), str(workspace.workspace_tenant_id)
 
     async def aquery(
         self,
@@ -94,7 +109,8 @@ class WeKnoraKB(KnowledgeBase):
         from yuxi.knowledge.weknora import WeKnoraClientError
         from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
 
-        remote_kb_id = self._require_remote_kb_id(config)
+        dept_client, workspace_tenant_id = await self._department_client(kb_id)
+        remote_kb_id = self._require_remote_kb_id(config, workspace_tenant_id)
         merged = {**config.query_options, **kwargs}
         if merged.get("file_name"):
             raise KBOperationError("WeKnora 检索暂不支持按文件名过滤,请直接检索后按来源筛选")
@@ -104,7 +120,7 @@ class WeKnoraKB(KnowledgeBase):
             top_k = 10
 
         try:
-            response = await self._remote_client().request(
+            response = await dept_client.request(
                 "POST",
                 f"knowledge-bases/{remote_kb_id}/hybrid-search",
                 json={"query_text": query_text, "match_count": top_k},
@@ -290,7 +306,8 @@ class WeKnoraKB(KnowledgeBase):
         remote_knowledge_id = file_meta.get("remote_knowledge_id")
         chunks: list[dict] = []
         try:
-            response = await self._remote_client().request("GET", f"chunks/{remote_knowledge_id}")
+            dept_client, _ = await self._department_client(kb_id)
+            response = await dept_client.request("GET", f"chunks/{remote_knowledge_id}")
             raw = response.json().get("data") or []
             if isinstance(raw, dict):
                 raw = raw.get("items") or []

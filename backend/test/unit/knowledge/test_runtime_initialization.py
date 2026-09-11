@@ -88,6 +88,7 @@ def test_weknora_backend_does_not_register_builtin_executor(tmp_path):
                 "KNOWLEDGE_BACKEND": "weknora",
                 "WEKNORA_BASE_URL": "http://weknora-app:8080/api/v1",
                 "WEKNORA_API_KEY": "sk-local",
+                "WEKNORA_WORKSPACE_CREDENTIAL_KEY": "uAIxxMDb8OeoGaM5SsqnFfr6QLFLtmYzXVaOYRHj2vU=",
             },
         )
     )
