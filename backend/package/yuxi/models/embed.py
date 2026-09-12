@@ -247,7 +247,8 @@ class OtherEmbedding(BaseEmbeddingModel):
 
 
 def get_embedding_model_info_by_id(model_id: str) -> dict:
-    info = model_cache.get_model_info(model_id)
+    canonical_spec = model_cache.canonicalize_spec(model_id)
+    info = model_cache.get_model_info(canonical_spec) if canonical_spec else None
     if not info:
         raise ValueError(f"Unknown embedding model spec: {model_id}")
     if info.model_type != "embedding":
@@ -266,14 +267,15 @@ def get_embedding_model_info_by_id(model_id: str) -> dict:
 
 
 def select_embedding_model(model_id: str):
-    info = model_cache.get_model_info(model_id)
+    canonical_spec = model_cache.canonicalize_spec(model_id)
+    info = model_cache.get_model_info(canonical_spec) if canonical_spec else None
     if not info:
         raise ValueError(f"Unknown embedding model spec: {model_id}")
 
     if info.model_type != "embedding":
         raise ValueError(f"Model {model_id} is not an embedding model (type={info.model_type})")
 
-    logger.info(f"Selecting embedding model: {model_id} (provider_type={info.provider_type})")
+    logger.info(f"Selecting embedding model: {canonical_spec} (provider_type={info.provider_type})")
     return OtherEmbedding(
         model=info.model_id,
         base_url=info.base_url,
@@ -285,10 +287,13 @@ def select_embedding_model(model_id: str):
 
 async def test_embedding_model_status_by_spec(spec: str) -> dict:
     try:
-        model = select_embedding_model(spec)
+        canonical_spec = model_cache.canonicalize_spec(spec)
+        if canonical_spec is None:
+            raise ValueError(f"模型资源 {spec} 不存在或存在歧义")
+        model = select_embedding_model(canonical_spec)
         success, message = await model.test_connection()
         return {
-            "spec": spec,
+            "spec": canonical_spec,
             "status": "available" if success else "unavailable",
             "message": "连接正常" if success else message,
         }

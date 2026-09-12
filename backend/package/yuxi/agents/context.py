@@ -386,12 +386,16 @@ async def resolve_agent_resource_options(
     if "mcps" in fields_to_load:
         from yuxi.agents.mcp.service import get_all_mcp_servers, get_enabled_mcp_server_slugs
 
-        servers = await get_all_mcp_servers(db)
-        enabled_slugs = set(await get_enabled_mcp_server_slugs(db=db))
+        servers = await get_all_mcp_servers(db, user=user)
+        enabled_slugs = set(await get_enabled_mcp_server_slugs(db=db, user=user, use_resource_ids=True))
         options["mcps"] = [
-            _resource_option(server.slug, server.name, server.description)
+            _resource_option(
+                server.resource_id,
+                f"{server.name} ({(server.share_config or {}).get('read_scope', {}).get('access_level', 'global')})",
+                server.description,
+            )
             for server in servers
-            if server.slug in enabled_slugs
+            if server.resource_id in enabled_slugs
         ]
     if "skills" in fields_to_load:
         from yuxi.agents.skills.service import list_accessible_skills

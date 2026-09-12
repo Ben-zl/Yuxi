@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from yuxi.permissions import agent_config_resource as resource_policy
 from yuxi.repositories.agent_repository import (
     AgentRepository,
     DEFAULT_AGENT_DESCRIPTION,
@@ -27,6 +28,12 @@ class FakeDb:
 
     def add(self, item):
         self.added = item
+
+
+@pytest.fixture(autouse=True)
+def empty_agent_resources(monkeypatch):
+    monkeypatch.setattr(resource_policy, "list_authorizable_skills", AsyncMock(return_value=[]))
+    monkeypatch.setattr(resource_policy, "list_authorizable_mcp_servers", AsyncMock(return_value=[]))
 
 
 _MANAGER_USER_SCOPE = {
@@ -157,6 +164,7 @@ async def test_create_agent_defaults_to_creator_read_scope_without_manage_scope(
         backend_id="ChatbotAgent",
         slug="personal-bot",
         created_by="user",
+        creator=SimpleNamespace(uid="user", role="user"),
     )
 
     assert agent.share_config == {
@@ -168,7 +176,7 @@ async def test_create_agent_defaults_to_creator_read_scope_without_manage_scope(
 
 
 @pytest.mark.asyncio
-async def test_create_agent_allows_same_explicit_share_scope_for_normal_user(monkeypatch):
+async def test_create_agent_allows_explicit_global_scope_for_admin(monkeypatch):
     db = FakeDb()
     repo = AgentRepository(db)
 
@@ -186,6 +194,7 @@ async def test_create_agent_allows_same_explicit_share_scope_for_normal_user(mon
             "manage_scope": None,
         },
         created_by="user",
+        creator=SimpleNamespace(uid="user", role="admin"),
     )
 
     assert agent.share_config == DEFAULT_SHARE_CONFIG
@@ -218,6 +227,7 @@ async def test_delegated_manager_update_preserves_shared_agent_acl():
         agent,
         share_config=_MANAGER_USER_SCOPE,
         updated_by="manager",
+        updater=SimpleNamespace(uid="manager", role="user"),
     )
 
     assert agent.share_config["read_scope"]["user_uids"] == ["manager"]
@@ -237,6 +247,7 @@ async def test_delegated_manager_can_update_agent_acl_with_standard_validation()
             "manage_scope": None,
         },
         updated_by="manager",
+        updater=SimpleNamespace(uid="manager", role="admin"),
     )
 
     assert agent.share_config == DEFAULT_SHARE_CONFIG
@@ -256,6 +267,7 @@ async def test_normal_user_can_update_read_scope_without_granting_manage_scope()
             "manage_scope": None,
         },
         updated_by="manager",
+        updater=SimpleNamespace(uid="manager", role="user"),
     )
 
     assert agent.share_config == {
@@ -279,6 +291,7 @@ async def test_normal_user_can_update_agent_with_equivalent_v2_share_config():
         name="Renamed Bot",
         share_config=_MANAGER_USER_SCOPE,
         updated_by="manager",
+        updater=SimpleNamespace(uid="manager", role="user"),
     )
 
     assert agent.name == "Renamed Bot"

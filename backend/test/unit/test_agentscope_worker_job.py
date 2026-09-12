@@ -3,8 +3,14 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 from yuxi.agentscope import worker_job
 from yuxi.services import run_queue_service
+from yuxi.services.agent_run_manifest_service import compute_manifest_fingerprint
+
+
+MANIFEST = {"manifest_version": 1, "resource_snapshot": {"id": "submitted-snapshot", "fingerprint": "snapshot-digest"}}
 
 
 async def test_fail_run_with_cancel_signal_finishes_as_cancelled(monkeypatch):
@@ -124,11 +130,12 @@ async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
         request_id="request-1",
         conversation_thread_id="thread-1",
         agent_slug="agent-1",
+        manifest=MANIFEST.copy(),
+        manifest_fingerprint=compute_manifest_fingerprint(MANIFEST),
     )
     run_repo = SimpleNamespace(
         get_run=AsyncMock(return_value=run),
         mark_running=AsyncMock(return_value=(run, True)),
-        record_run_manifest=AsyncMock(return_value=(run, True)),
     )
     conv_repo = SimpleNamespace(
         get_message_by_id=AsyncMock(
@@ -153,8 +160,8 @@ async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
     monkeypatch.setattr(worker_job, "ConversationRepository", lambda _db: conv_repo)
     monkeypatch.setattr(
         worker_job,
-        "build_run_manifest_result",
-        AsyncMock(return_value=SimpleNamespace(manifest={"manifest_version": 1})),
+        "load_run_resources",
+        AsyncMock(return_value=SimpleNamespace()),
     )
     monkeypatch.setattr(
         worker_job,
@@ -188,7 +195,19 @@ async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
     )
 
 
-async def test_manifest_failure_prevents_agentscope_execution(monkeypatch):
+@pytest.mark.parametrize(
+    "manifest,fingerprint,error",
+    [
+        (None, None, "Run 缺少提交时固化的运行清单"),
+        (MANIFEST, None, "Run 缺少提交时固化的运行清单"),
+        (
+            {**MANIFEST, "resource_snapshot": {"id": "changed", "fingerprint": "snapshot-digest"}},
+            compute_manifest_fingerprint(MANIFEST),
+            "Run 运行清单指纹不一致",
+        ),
+    ],
+)
+async def test_manifest_failure_prevents_agentscope_execution(monkeypatch, manifest, fingerprint, error):
     """manifest 未成为持久事实时不得启动 AgentScope Session 或模型执行。"""
     run = SimpleNamespace(
         id="run-manifest",
@@ -202,11 +221,12 @@ async def test_manifest_failure_prevents_agentscope_execution(monkeypatch):
         conversation_thread_id="thread-manifest",
         agent_slug="agent-manifest",
         worker_id=worker_job.WORKER_ID,
+        manifest=manifest,
+        manifest_fingerprint=fingerprint,
     )
     run_repo = SimpleNamespace(
         get_run=AsyncMock(return_value=run),
         mark_running=AsyncMock(return_value=(run, True)),
-        record_run_manifest=AsyncMock(side_effect=RuntimeError("write-once rejected")),
     )
     conv_repo = SimpleNamespace(
         get_message_by_id=AsyncMock(
@@ -229,11 +249,8 @@ async def test_manifest_failure_prevents_agentscope_execution(monkeypatch):
     monkeypatch.setattr(worker_job.pg_manager, "get_async_session_context", lambda: _SessionContext())
     monkeypatch.setattr(worker_job, "AgentRunRepository", lambda _db: run_repo)
     monkeypatch.setattr(worker_job, "ConversationRepository", lambda _db: conv_repo)
-    monkeypatch.setattr(
-        worker_job,
-        "build_run_manifest_result",
-        AsyncMock(return_value=SimpleNamespace(manifest={"manifest_version": 1})),
-    )
+    load_resources = AsyncMock()
+    monkeypatch.setattr(worker_job, "load_run_resources", load_resources)
     ensure_session = AsyncMock()
     execute = AsyncMock()
     fail_run = AsyncMock()
@@ -247,6 +264,7 @@ async def test_manifest_failure_prevents_agentscope_execution(monkeypatch):
     db.rollback.assert_awaited_once()
     ensure_session.assert_not_awaited()
     execute.assert_not_awaited()
+    load_resources.assert_not_awaited()
     fail_run.assert_awaited_once_with(
         db,
         run_repo,
@@ -256,7 +274,7 @@ async def test_manifest_failure_prevents_agentscope_execution(monkeypatch):
         thread_id="thread-manifest",
         input_message_id=1,
         worker_id=worker_job.WORKER_ID,
-        message="运行清单固化失败: write-once rejected",
+        message=f"运行清单固化失败: {error}",
     )
 
 
@@ -354,23 +372,26 @@ async def test_timeout_interrupts_remote_sessions_before_finishing_run(monkeypat
         ("finish", "parent-run"),
     ]
 
-async def test_manifest_write_once_rejects_persisted_fingerprint_mismatch(monkeypatch):
-    """重复投递不得用新配置覆盖已固化的 manifest 指纹。"""
-    run = SimpleNamespace(id="run-manifest", uid="u", manifest_fingerprint="old")
-    db = SimpleNamespace(scalar=AsyncMock(return_value=SimpleNamespace(uid="u")))
-    repo = SimpleNamespace(
-        record_run_manifest=AsyncMock(
-            return_value=(SimpleNamespace(manifest_fingerprint="old"), False)
-        )
-    )
-    monkeypatch.setattr(
-        worker_job,
-        "build_run_manifest_result",
-        AsyncMock(return_value=SimpleNamespace(manifest={"model": "new"})),
-    )
-    monkeypatch.setattr(worker_job, "compute_manifest_fingerprint", lambda _manifest: "new")
 
-    import pytest
+async def test_manifest_validation_loads_persisted_snapshot_without_writing(monkeypatch):
+    """重复投递只验证已有清单并加载其精确快照，不重新固化配置。"""
+    run = SimpleNamespace(
+        id="run-manifest",
+        uid="u",
+        agent_slug="agent",
+        manifest=MANIFEST.copy(),
+        manifest_fingerprint=compute_manifest_fingerprint(MANIFEST),
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+    repo = SimpleNamespace(record_run_manifest=AsyncMock())
+    load_resources = AsyncMock()
+    monkeypatch.setattr(worker_job, "load_run_resources", load_resources)
 
-    with pytest.raises(RuntimeError, match="拒绝覆盖"):
-        await worker_job._record_run_manifest(db, repo, run, worker_id="worker-1")
+    await worker_job._record_run_manifest(db, repo, run, worker_id="worker-1")
+
+    load_resources.assert_awaited_once_with(db, uid="u", manifest=MANIFEST, agent_slug="agent")
+    assert load_resources.await_args.kwargs["manifest"] is run.manifest
+    assert run.manifest == MANIFEST
+    assert run.manifest_fingerprint == compute_manifest_fingerprint(MANIFEST)
+    repo.record_run_manifest.assert_not_awaited()
+    db.commit.assert_not_awaited()

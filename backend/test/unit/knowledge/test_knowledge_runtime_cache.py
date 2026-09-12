@@ -6,8 +6,27 @@ from types import SimpleNamespace
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from yuxi.knowledge.manager import KnowledgeBaseManager
+from yuxi.models.providers.cache import ModelInfo, model_cache
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def embedding_models(monkeypatch):
+    """提供唯一资源映射，保留真实模型标识规范化逻辑。"""
+    model = ModelInfo(
+        provider_id="provider",
+        resource_id="embedding-provider-resource",
+        model_id="embedding",
+        model_type="embedding",
+        display_name="Embedding",
+        api_key="",
+        base_url="https://example.test",
+        provider_type="openai",
+    )
+    models = {model.spec: model}
+    monkeypatch.setattr(model_cache, "_load_cache", lambda: models)
+    return models
 
 
 class _FakeKnowledgeBase:
@@ -89,7 +108,7 @@ async def test_retrieve_uses_cached_config_without_postgres(monkeypatch, tmp_pat
     assert result == {"kb_id": "kb_1", "results": [{"content": "matched"}]}
     assert fake_kb.queries[0][:3] == ("hello", "kb_1", {"agent_call": True, "top_k": 2})
     config = fake_kb.queries[0][3]
-    assert config.embedding_model_spec == "provider:embedding"
+    assert config.embedding_model_spec == "embedding-provider-resource:embedding"
     assert config.query_options == {"top_k": 3}
     assert "stats" not in config.additional_params
     assert not hasattr(fake_kb, "_runtime_configs")
@@ -132,6 +151,7 @@ async def test_retrieve_falls_back_to_postgres_and_populates_cache(monkeypatch, 
     assert result["kb_id"] == "kb_1"
     assert cached_payloads == [row]
     assert fake_kb.queries[0][3].query_options == {"top_k": 5}
+    assert fake_kb.queries[0][3].embedding_model_spec == "embedding-provider-resource:embedding"
 
 
 @pytest.mark.asyncio
@@ -174,6 +194,7 @@ async def test_cache_miss_rechecks_snapshot_after_acquiring_lock(monkeypatch, tm
     config = await manager.get_kb_config("kb_1")
 
     assert config.query_options == {"top_k": 8}
+    assert config.embedding_model_spec == "embedding-provider-resource:embedding"
     assert lock_events == [("enter", "kb_1"), ("exit", "kb_1")]
 
 
@@ -210,6 +231,7 @@ async def test_cache_lock_connection_failure_reads_postgres_without_refill(monke
     config = await manager.get_kb_config("kb_1")
 
     assert config.query_options == {"top_k": 9}
+    assert config.embedding_model_spec == "embedding-provider-resource:embedding"
 
 
 @pytest.mark.asyncio
@@ -245,3 +267,33 @@ async def test_retrieve_refreshes_runtime_config_on_each_call(monkeypatch, tmp_p
 
     assert fake_kb.queries[0][3].query_options == {"top_k": 3}
     assert fake_kb.queries[1][3].query_options == {"top_k": 8}
+    assert all(config.embedding_model_spec == "embedding-provider-resource:embedding" for *_, config in fake_kb.queries)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_model", ["missing", "ambiguous"])
+async def test_retrieve_rejects_unresolved_embedding_before_query(
+    monkeypatch, tmp_path, embedding_models, invalid_model
+):
+    """缓存配置不能绕过缺失或歧义模型的拒绝规则。"""
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    if invalid_model == "missing":
+        embedding_models.clear()
+    else:
+        duplicate = replace(next(iter(embedding_models.values())), resource_id="other-provider-resource")
+        embedding_models[duplicate.spec] = duplicate
+    manager = KnowledgeBaseManager(str(tmp_path))
+    fake_kb = _FakeKnowledgeBase()
+    _patch_supported_type(monkeypatch)
+    monkeypatch.setattr(manager, "_get_or_create_kb_instance", lambda kb_type: fake_kb)
+    monkeypatch.setattr(
+        "yuxi.knowledge.manager.get_cached_kb_config",
+        AsyncMock(return_value={"kb_id": "kb_1", "kb_type": "milvus", "embedding_model_spec": "provider:embedding"}),
+    )
+
+    with pytest.raises(ValueError, match="知识库 embedding 模型 provider:embedding 不存在或存在歧义"):
+        await manager.retrieve("kb_1", "hello")
+
+    assert fake_kb.queries == []

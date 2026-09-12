@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from yuxi.services.agent_run_manifest_service import compute_manifest_fingerprint
 from sqlalchemy import func as sa_func
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -21,6 +23,28 @@ from yuxi.storage.postgres.models_business import AgentRunRequest, Base, Message
 from yuxi.utils.datetime_utils import utc_now_naive
 
 pytestmark = [pytest.mark.unit]
+
+
+SUBMISSION_MANIFEST = {
+    "manifest_version": 1,
+    "resource_snapshot": {"id": "queued-snapshot", "fingerprint": "snapshot-digest"},
+}
+
+
+def _patch_intake_resources(monkeypatch):
+    """只隔离配置解析与快照构建边界，保留队列授权和持久化流程。"""
+    from yuxi.services import agent_request_queue_service
+    from yuxi.storage.postgres.models_business import User
+
+    user = User(uid="user-1", username="queue-user", password_hash="unused", role="user")
+    monkeypatch.setattr(
+        agent_request_queue_service,
+        "resolve_agent_run_config",
+        AsyncMock(return_value=("model", "default")),
+    )
+    build_manifest = AsyncMock(return_value=SimpleNamespace(manifest=SUBMISSION_MANIFEST.copy()))
+    monkeypatch.setattr(agent_request_queue_service, "build_submission_manifest_result", build_manifest)
+    return user, build_manifest
 
 
 # ── validate_queue_policy ──
@@ -82,10 +106,9 @@ async def test_intake_rejects_steer_for_unsupported_source(session):
 async def test_channel_steer_is_accepted_for_active_message_run(
     session, monkeypatch: pytest.MonkeyPatch, active_source: str
 ):
-    from yuxi.services import agent_request_queue_service
     from yuxi.services.input_message_service import build_chat_input_message
 
-    monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
+    user, build_manifest = _patch_intake_resources(monkeypatch)
     await _seed_thread(session)
     await _seed_active_run(session, source=active_source)
 
@@ -101,10 +124,16 @@ async def test_channel_steer_is_accepted_for_active_message_run(
         input_message=build_chat_input_message("steer"),
         agent_item=MagicMock(),
         agent_backend=MagicMock(),
+        user=user,
     )
 
     assert result.status == "queued"
     assert result.queue_policy == "steer"
+    request = await session.scalar(select(AgentRunRequest).where(AgentRunRequest.request_id == result.request_id))
+    assert request.input_payload["_run_manifest"] == SUBMISSION_MANIFEST
+    assert request.input_payload["_run_manifest_fingerprint"] == compute_manifest_fingerprint(SUBMISSION_MANIFEST)
+    build_manifest.assert_awaited_once()
+    assert build_manifest.await_args.kwargs["user"] is user
 
 
 @pytest.mark.asyncio
@@ -119,7 +148,7 @@ async def test_intake_rejects_image_for_declared_text_model_before_persisting(
     monkeypatch.setattr(
         agent_request_queue_service,
         "resolve_agent_run_config",
-        lambda *args: ("provider:glm-5", "default"),
+        lambda *args, **kwargs: ("provider:glm-5", "default"),
     )
     monkeypatch.setattr(
         agent_run_service.model_cache,
@@ -1087,7 +1116,7 @@ async def test_reject_marks_request_rejected_when_immediate_dispatch_loses_race(
     from yuxi.services.input_message_service import build_chat_input_message
     from yuxi.storage.postgres.models_business import Conversation
 
-    monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
+    user, build_manifest = _patch_intake_resources(monkeypatch)
 
     async def lose_dispatch_race(**kwargs):
         return None
@@ -1105,6 +1134,7 @@ async def test_reject_marks_request_rejected_when_immediate_dispatch_loses_race(
         input_message=build_chat_input_message("reject me"),
         agent_item=MagicMock(),
         agent_backend=MagicMock(),
+        user=user,
     )
 
     request = await AgentRunRequestRepository(session).get_by_request_id("request-reject")
@@ -1125,14 +1155,13 @@ async def test_intake_rejects_message_while_run_is_interrupted(
     from fastapi import HTTPException
     from yuxi.agentscope import thread_guard
     from yuxi.repositories.agent_run_request_repository import AgentRunRequestRepository
-    from yuxi.services import agent_request_queue_service
     from yuxi.services.input_message_service import build_chat_input_message
 
     async def pending_confirm(_thread_id: str) -> bool:
         return True
 
     monkeypatch.setattr(thread_guard, "has_pending_confirm", pending_confirm)
-    monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
+    user, build_manifest = _patch_intake_resources(monkeypatch)
     await _seed_thread(session)
     now = utc_now_naive()
     await _seed_queued_request(session, request_id="request-b", message_id=101, created_at=now)
@@ -1156,6 +1185,7 @@ async def test_intake_rejects_message_while_run_is_interrupted(
             input_message=build_chat_input_message("C"),
             agent_item=MagicMock(),
             agent_backend=MagicMock(),
+            user=user,
         )
 
     repo = AgentRunRequestRepository(session)
@@ -1168,19 +1198,15 @@ async def test_intake_rejects_message_while_run_is_interrupted(
     assert await repo.get_by_request_id("request-c") is None
     message_count = await session.scalar(select(sa_func.count()).select_from(Message).where(Message.content == "C"))
     assert message_count == 0
+    build_manifest.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_intake_persists_accepted_model_on_conversation(session, monkeypatch: pytest.MonkeyPatch):
-    from yuxi.services import agent_request_queue_service
     from yuxi.services.input_message_service import build_chat_input_message
     from yuxi.storage.postgres.models_business import Conversation
 
-    monkeypatch.setattr(
-        agent_request_queue_service,
-        "resolve_agent_run_config",
-        lambda *args: ("provider:glm-5", "default"),
-    )
+    user, build_manifest = _patch_intake_resources(monkeypatch)
     await _seed_thread(session)
 
     result = await intake_request(
@@ -1192,19 +1218,20 @@ async def test_intake_persists_accepted_model_on_conversation(session, monkeypat
         input_message=build_chat_input_message("使用 glm"),
         agent_item=MagicMock(),
         agent_backend=MagicMock(),
+        user=user,
     )
 
     conversation = await session.scalar(select(Conversation).where(Conversation.thread_id == "t1"))
     assert result.status == "dispatched"
-    assert conversation.extra_metadata["model_spec"] == "provider:glm-5"
+    assert conversation.extra_metadata["model_spec"] == "model"
+    build_manifest.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_enqueue_after_empty_failed_queue_dispatches_new_request(session, monkeypatch: pytest.MonkeyPatch):
-    from yuxi.services import agent_request_queue_service
     from yuxi.services.input_message_service import build_chat_input_message
 
-    monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
+    user, build_manifest = _patch_intake_resources(monkeypatch)
     await _seed_thread(session)
     now = utc_now_naive()
     await _seed_terminal_run(
@@ -1225,7 +1252,18 @@ async def test_enqueue_after_empty_failed_queue_dispatches_new_request(session, 
         input_message=build_chat_input_message("B"),
         agent_item=MagicMock(),
         agent_backend=MagicMock(),
+        user=user,
     )
 
     assert result.status == "dispatched"
     assert result.run_id is not None
+    from yuxi.storage.postgres.models_business import AgentRun
+
+    await session.flush()
+    session.expire_all()
+    run = await session.get(AgentRun, result.run_id)
+    assert run.manifest == SUBMISSION_MANIFEST
+    assert run.manifest_fingerprint == compute_manifest_fingerprint(SUBMISSION_MANIFEST)
+    assert run.manifest_recorded_at is not None
+    build_manifest.assert_awaited_once()
+    assert build_manifest.await_args.kwargs["user"] is user

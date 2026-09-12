@@ -1,6 +1,8 @@
 """PostgreSQL 业务数据模型 - 用户、部门、对话等相关表"""
 
 from datetime import timedelta
+from urllib.parse import urlsplit
+from uuid import uuid4
 from typing import Any
 
 from sqlalchemy import (
@@ -52,6 +54,19 @@ OR (
      AND subagent_thread_relation_id IS NOT NULL))
 )
 """
+
+
+def _is_sensitive_config_url(value: str | None) -> bool:
+    """判断配置 URL 或 endpoint 是否包含不可回传的凭据片段。"""
+    if not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return True
+    return parsed.username is not None or bool(parsed.query) or bool(parsed.fragment)
+
+
 PROJECT_STATUS_CONSTRAINT_NAME = "ck_projects_status"
 PROJECT_STATUS_CONSTRAINT_SQL = "status IN ('active', 'deleted')"
 # 新建线程的初始已查看标记，用于区分"尚无任何 Run"与"上线前的历史会话"，
@@ -659,7 +674,10 @@ class MCPServer(Base):
     __tablename__ = "mcp_servers"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    slug = Column(String(100), nullable=False, unique=True, index=True, comment="稳定标识")
+    resource_id = Column(
+        String(36), nullable=False, unique=True, index=True, default=lambda: str(uuid4()), comment="全局不可变资源 ID"
+    )
+    slug = Column(String(100), nullable=False, index=True, comment="逻辑标识")
     name = Column(String(100), nullable=False, comment="展示名称")
     description = Column(String(500), nullable=True, comment="描述")
 
@@ -684,23 +702,30 @@ class MCPServer(Base):
     # 用户追踪
     created_by = Column(String(100), nullable=False, comment="创建人用户名")
     updated_by = Column(String(100), nullable=False, comment="修改人用户名")
+    share_config = Column(
+        JSON_VALUE,
+        nullable=False,
+        default=lambda: {
+            "version": 2,
+            "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+            "manage_scope": None,
+        },
+        comment="共享权限配置",
+    )
 
     # 时间戳
     created_at = Column(DateTime, default=utc_now_naive, comment="创建时间")
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive, comment="更新时间")
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, sanitize: bool = False) -> dict[str, Any]:
+        result = {
             "id": self.id,
+            "resource_id": self.resource_id,
             "slug": self.slug,
             "name": self.name,
             "description": self.description,
             "transport": self.transport,
             "url": self.url,
-            "command": self.command,
-            "args": self.args or [],
-            "env": self.env or {},
-            "headers": self.headers or {},
             "timeout": self.timeout,
             "sse_read_timeout": self.sse_read_timeout,
             "tags": self.tags or [],
@@ -711,7 +736,30 @@ class MCPServer(Base):
             "updated_by": self.updated_by,
             "created_at": format_utc_datetime(self.created_at),
             "updated_at": format_utc_datetime(self.updated_at),
+            "share_config": self.share_config or {},
+            "credential_status": "configured" if any((self.headers, self.env, self.command)) else "unknown",
+            "url_configured": bool(self.url),
         }
+        if sanitize and self.url:
+            from urllib.parse import urlsplit
+
+            try:
+                parsed_url = urlsplit(self.url)
+                sensitive_url = parsed_url.username is not None or "?" in self.url or "#" in self.url
+            except ValueError:
+                sensitive_url = True
+            if sensitive_url:
+                result.pop("url")
+        if not sanitize:
+            result.update(
+                {
+                    "command": self.command,
+                    "args": self.args or [],
+                    "env": self.env or {},
+                    "headers": self.headers or {},
+                }
+            )
+        return result
 
     def to_mcp_config(self) -> dict[str, Any]:
         """转换为 MCP 配置格式（用于加载到 MCP_SERVERS 缓存）"""
@@ -762,7 +810,10 @@ class ModelProvider(Base):
     __tablename__ = "model_providers"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    provider_id = Column(String(100), nullable=False, unique=True, index=True, comment="供应商稳定标识")
+    resource_id = Column(
+        String(36), nullable=False, unique=True, index=True, default=lambda: str(uuid4()), comment="全局不可变资源 ID"
+    )
+    provider_id = Column(String(100), nullable=False, index=True, comment="逻辑标识")
     display_name = Column(String(100), nullable=False, comment="展示名称")
     provider_type = Column(String(32), nullable=False, default="openai", comment="供应商适配类型，默认 openai")
 
@@ -788,10 +839,21 @@ class ModelProvider(Base):
     updated_by = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=utc_now_naive, comment="创建时间")
     updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive, comment="更新时间")
+    share_config = Column(
+        JSON_VALUE,
+        nullable=False,
+        default=lambda: {
+            "version": 2,
+            "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+            "manage_scope": None,
+        },
+        comment="共享权限配置",
+    )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, sanitize: bool = False) -> dict[str, Any]:
+        result = {
             "id": self.id,
+            "resource_id": self.resource_id,
             "provider_id": self.provider_id,
             "display_name": self.display_name,
             "provider_type": self.provider_type,
@@ -802,19 +864,51 @@ class ModelProvider(Base):
             "models_endpoint": self.models_endpoint,
             "embedding_models_endpoint": self.embedding_models_endpoint,
             "rerank_models_endpoint": self.rerank_models_endpoint,
-            "api_key_env": self.api_key_env,
-            "api_key": self.api_key,
             "capabilities": self.capabilities or [],
             "enabled_models": self.enabled_models or [],
-            "headers_json": self.headers_json or {},
-            "extra_json": self.extra_json or {},
             "is_enabled": bool(self.is_enabled),
             "is_builtin": bool(self.is_builtin),
             "created_by": self.created_by,
             "updated_by": self.updated_by,
             "created_at": format_utc_datetime(self.created_at),
             "updated_at": format_utc_datetime(self.updated_at),
+            "share_config": self.share_config or {},
+            "credential_status": "configured" if (self.api_key or self.api_key_env) else "warning",
         }
+        url_fields = (
+            "base_url",
+            "embedding_base_url",
+            "rerank_base_url",
+            "models_endpoint",
+            "embedding_models_endpoint",
+            "rerank_models_endpoint",
+        )
+        for field_name in url_fields:
+            result[f"{field_name}_configured"] = bool(getattr(self, field_name))
+            if sanitize and _is_sensitive_config_url(getattr(self, field_name)):
+                result.pop(field_name, None)
+        if not sanitize:
+            result.update(
+                {
+                    "api_key_env": self.api_key_env,
+                    "api_key": self.api_key,
+                    "headers_json": self.headers_json or {},
+                    "extra_json": self.extra_json or {},
+                }
+            )
+        return result
+
+
+class RunResourceSnapshot(Base):
+    """提交事务持有的加密运行资产；公共清单只引用 ID 和指纹。"""
+
+    __tablename__ = "run_resource_snapshots"
+
+    id = Column(String(36), primary_key=True)
+    uid = Column(String(64), ForeignKey("users.uid", ondelete="CASCADE"), nullable=False, index=True)
+    encrypted_payload = Column(Text, nullable=False)
+    fingerprint = Column(String(64), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=utc_now_naive)
 
 
 class ConfigOption(Base):

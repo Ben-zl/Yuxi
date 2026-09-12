@@ -1,5 +1,4 @@
 import traceback
-import uuid
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File
@@ -8,9 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.storage.postgres.models_business import User
 from server.utils.auth_middleware import get_db, get_required_user
-from yuxi.config import config as conf
 from yuxi.agents.tool_approval import ToolApprovalMode
-from yuxi.models import select_model
+from yuxi.services.model_call_service import call_model
 from yuxi.services.thread_state_service import get_thread_state_view
 from yuxi.services.conversation_service import (
     confirm_tmp_thread_attachments_view,
@@ -59,20 +57,14 @@ chat = APIRouter(prefix="/chat", tags=["chat"])
 
 
 @chat.post("/call")
-async def call(query: str = Body(...), meta: dict = Body(None), current_user: User = Depends(get_required_user)):
+async def call(
+    query: str = Body(...),
+    meta: dict = Body(None),
+    current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
+):
     """调用模型进行简单问答（需要登录）"""
-    meta = meta or {}
-
-    # 确保 request_id 存在
-    if "request_id" not in meta or not meta.get("request_id"):
-        meta["request_id"] = str(uuid.uuid4())
-
-    model = select_model(model_spec=meta.get("model_spec") or meta.get("model") or conf.default_model)
-
-    response = await model.call(query)
-    logger.debug({"query": query, "response": response.content})
-
-    return {"response": response.content, "request_id": meta["request_id"]}
+    return await call_model(query=query, meta=meta, user=current_user, db=db)
 
 
 @chat.get("/thread/{thread_id}/history")

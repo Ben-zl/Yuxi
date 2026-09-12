@@ -57,7 +57,8 @@ class MilvusGraphVectorStore:
     ) -> None:
         if not records:
             return
-        embedding_info = model_cache.get_model_info(embedding_model_spec)
+        canonical_spec = model_cache.canonicalize_spec(embedding_model_spec)
+        embedding_info = model_cache.get_model_info(canonical_spec or embedding_model_spec)
         if not embedding_info or embedding_info.model_type != "embedding":
             raise ValueError(f"Unsupported embedding model: {embedding_model_spec}")
 
@@ -68,7 +69,7 @@ class MilvusGraphVectorStore:
         else:
             raise ValueError(f"Unsupported graph vector record type: {record_type}")
 
-        embed = self._get_embedding_function(embedding_model_spec)
+        embed = self._get_embedding_function(canonical_spec or embedding_model_spec)
         embeddings = await embed([record["content"] for record in records])
         if record_type == "entity":
             await asyncio.to_thread(self._upsert_entities, collection, records, embeddings)

@@ -8,6 +8,7 @@ from typing import Any
 
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.knowledge.base import KBNameConflictError, KBNotFoundError, KnowledgeBase
 from yuxi.knowledge.cache import (
@@ -28,6 +29,7 @@ from yuxi.knowledge.utils.security import redact_sensitive_params
 from yuxi.permissions import (
     ResourcePermission,
     normalize_permission_config,
+    resource_read_scope_covers_share_config,
     resolve_knowledge_base_permission,
     resolve_knowledge_content_write,
 )
@@ -36,6 +38,44 @@ from yuxi.utils import logger
 from yuxi.utils.datetime_utils import utc_isoformat
 
 KB_FILE_SEARCH_SCAN_LIMIT = 5000
+
+
+async def authorize_knowledge_model_spec(
+    spec: str,
+    *,
+    expected_type: str,
+    db: AsyncSession,
+    user: User,
+    knowledge_share_config: dict,
+    owner_uid: str,
+) -> str:
+    """授权知识库模型引用并返回规范资源 ID spec。"""
+
+    from yuxi.models.providers.cache import model_cache
+    from yuxi.models.providers.repository import (
+        get_legacy_model_provider_for_user,
+        get_model_provider_for_user,
+    )
+
+    canonical_spec = model_cache.canonicalize_spec(spec.strip())
+    info = model_cache.get_model_info(canonical_spec) if canonical_spec else None
+    if info is None or info.model_type != expected_type:
+        raise ValueError(f"知识库 {expected_type} 模型不存在、类型错误或旧标识存在歧义: {spec}")
+
+    if info.resource_id and info.resource_id != info.provider_id:
+        provider = await get_model_provider_for_user(db, info.resource_id, user)
+    else:
+        provider = await get_legacy_model_provider_for_user(db, info.provider_id, user=user)
+    if provider is None or not provider.is_enabled:
+        raise ValueError(f"知识库 {expected_type} 模型资源不可访问: {spec}")
+    if not await resource_read_scope_covers_share_config(
+        db,
+        resource_share_config=provider.share_config,
+        target_share_config=knowledge_share_config,
+        owner_uid=owner_uid,
+    ):
+        raise ValueError(f"知识库 {expected_type} 模型资源未覆盖知识库完整读取范围: {spec}")
+    return f"{provider.resource_id}:{info.model_id}"
 
 
 class KnowledgeBaseManager:
@@ -177,10 +217,18 @@ class KnowledgeBaseManager:
         executor = self._get_or_create_kb_instance(kb_type)
         additional_params = executor.normalize_additional_params(snapshot.get("additional_params"))
         additional_params.pop("stats", None)
+        embedding_model_spec = snapshot.get("embedding_model_spec")
+        if embedding_model_spec:
+            from yuxi.models.providers.cache import model_cache
+
+            embedding_model_spec = model_cache.canonicalize_spec(embedding_model_spec)
+            if embedding_model_spec is None:
+                raise ValueError(f"知识库 embedding 模型 {snapshot.get('embedding_model_spec')} 不存在或存在歧义")
+
         return KnowledgeBaseConfig(
             kb_id=kb_id,
             kb_type=kb_type,
-            embedding_model_spec=snapshot.get("embedding_model_spec"),
+            embedding_model_spec=embedding_model_spec,
             query_params=snapshot.get("query_params") or executor.get_default_query_params(kb_id),
             additional_params=additional_params,
             remote_binding=snapshot.get("remote_binding"),
@@ -497,6 +545,8 @@ class KnowledgeBaseManager:
         share_config: dict | None = None,
         created_by: str | None = None,
         created_by_department_id: int | str | None = None,
+        db: AsyncSession | None = None,
+        user: User | None = None,
         **kwargs,
     ) -> KnowledgeBaseDetail:
         """
@@ -539,14 +589,30 @@ class KnowledgeBaseManager:
         if kb_instance.requires_embedding_model:
             if not embedding_model_spec:
                 raise ValueError("embedding_model_spec 不能为空")
-
-            from yuxi.models.providers.cache import model_cache
-
-            info = model_cache.get_model_info(embedding_model_spec)
-            if not info or info.model_type != "embedding":
-                raise ValueError(f"不支持的 embedding 模型: {embedding_model_spec}")
+            if db is None or user is None:
+                raise ValueError("创建内置知识库需要模型授权上下文")
+            embedding_model_spec = await authorize_knowledge_model_spec(
+                embedding_model_spec,
+                expected_type="embedding",
+                db=db,
+                user=user,
+                knowledge_share_config=share_config,
+                owner_uid=str(created_by or user.uid),
+            )
         else:
             embedding_model_spec = None
+
+        if llm_model_spec:
+            if db is None or user is None:
+                raise ValueError("创建内置知识库需要模型授权上下文")
+            llm_model_spec = await authorize_knowledge_model_spec(
+                llm_model_spec,
+                expected_type="chat",
+                db=db,
+                user=user,
+                knowledge_share_config=share_config,
+                owner_uid=str(created_by or user.uid),
+            )
 
         from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
 
@@ -1153,6 +1219,8 @@ class KnowledgeBaseManager:
         share_config: dict | None = None,
         operator_uid: str | None = None,
         operator_department_id: int | str | None = None,
+        db: AsyncSession | None = None,
+        user: User | None = None,
     ) -> KnowledgeBaseDetail:
         """更新数据库"""
         from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
@@ -1171,7 +1239,43 @@ class KnowledgeBaseManager:
             "name": name,
             "description": description,
         }
-        if update_llm_model_spec:
+        target_share_config = (
+            self._normalize_share_config(
+                share_config,
+                user_uid=operator_uid,
+                department_id=operator_department_id,
+            )
+            if share_config is not None
+            else self._normalize_share_config(kb.share_config)
+        )
+
+        if kb_type != "weknora":
+            embedding_model_spec = kb.embedding_model_spec
+            effective_llm_model_spec = llm_model_spec if update_llm_model_spec else kb.llm_model_spec
+            if (embedding_model_spec or effective_llm_model_spec) and (db is None or user is None):
+                raise ValueError("更新内置知识库需要模型授权上下文")
+            owner_uid = str(kb.created_by or operator_uid or getattr(user, "uid", ""))
+            if embedding_model_spec:
+                update_data["embedding_model_spec"] = await authorize_knowledge_model_spec(
+                    embedding_model_spec,
+                    expected_type="embedding",
+                    db=db,
+                    user=user,
+                    knowledge_share_config=target_share_config,
+                    owner_uid=owner_uid,
+                )
+            if effective_llm_model_spec:
+                update_data["llm_model_spec"] = await authorize_knowledge_model_spec(
+                    effective_llm_model_spec,
+                    expected_type="chat",
+                    db=db,
+                    user=user,
+                    knowledge_share_config=target_share_config,
+                    owner_uid=owner_uid,
+                )
+            elif update_llm_model_spec:
+                update_data["llm_model_spec"] = None
+        elif update_llm_model_spec:
             update_data["llm_model_spec"] = llm_model_spec
 
         if additional_params is not None:
@@ -1186,11 +1290,7 @@ class KnowledgeBaseManager:
             update_data["additional_params"] = merged_additional_params
 
         if share_config is not None:
-            update_data["share_config"] = self._normalize_share_config(
-                share_config,
-                user_uid=operator_uid,
-                department_id=operator_department_id,
-            )
+            update_data["share_config"] = target_share_config
 
         # 保存到数据库
         await kb_repo.update(kb_id, update_data)

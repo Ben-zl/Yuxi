@@ -26,7 +26,7 @@ from yuxi.agentscope.projection import (
 from yuxi.config.options import system_options
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.user_repository import UserRepository
-from yuxi.models.providers.repository import get_model_provider
+from yuxi.models.providers.repository import get_model_provider_for_user
 from yuxi.storage.postgres.models_business import Agent, ModelProvider
 
 
@@ -84,13 +84,13 @@ async def _load_agent(db: AsyncSession, agent_slug: str, user) -> Agent:
     return agent
 
 
-async def _load_provider(db: AsyncSession, provider_id: str) -> ModelProvider:
-    """按 provider_id 读取模型供应商，缺失或未启用即显式失败。"""
-    provider = await get_model_provider(db, provider_id)
+async def _load_provider(db: AsyncSession, resource_id: str, user) -> ModelProvider:
+    """按资源 ID读取当前用户可用的模型供应商，缺失或未启用即显式失败。"""
+    provider = await get_model_provider_for_user(db, resource_id, user)
     if provider is None:
-        raise ValueError(f"模型供应商 {provider_id} 不存在")
+        raise ValueError(f"模型供应商资源 {resource_id} 不存在或不可访问")
     if not provider.is_enabled:
-        raise ValueError(f"模型供应商 {provider_id} 未启用")
+        raise ValueError(f"模型供应商资源 {resource_id} 未启用")
     return provider
 
 
@@ -117,8 +117,23 @@ async def project_runtime(
         spec = settings["default_model"] or ""
     if not spec:
         raise ValueError(f"智能体 {agent_slug} 未配置模型（context.model 为空）")
-    provider_id, model_id = split_model_spec(spec)
-    provider = await _load_provider(db, provider_id)
+    from yuxi.models.providers.cache import model_cache
+
+    canonical_spec = model_cache.canonicalize_spec(spec)
+    if canonical_spec is None and ":" in spec:
+        # 缓存刷新与同事务配置写入之间允许短暂失配；先用当前用户可见的
+        # resource_id 记录确认资源和模型存在，再按相同 canonical spec 继续。
+        candidate_resource_id, candidate_model_id = split_model_spec(spec)
+        candidate_provider = await get_model_provider_for_user(db, candidate_resource_id, user)
+        if candidate_provider is not None and any(
+            model.get("id") == candidate_model_id for model in candidate_provider.enabled_models or []
+        ):
+            canonical_spec = spec
+    if canonical_spec is None:
+        raise ValueError(f"模型资源 {spec} 不存在或存在歧义")
+    spec = canonical_spec
+    provider_resource_id, model_id = split_model_spec(spec)
+    provider = await _load_provider(db, provider_resource_id, user)
 
     credential_data, chat_model_config = project_chat_model(provider, model_id)
     agent_request = project_agent_request(agent)
@@ -147,16 +162,22 @@ async def project_runtime(
     user_config = await UserConfig.load(db, uid)
     projection.memory_enabled = bool(user_config.schema.enable_memory and not is_team_worker)
     if projection.memory_enabled or (include_memory_models and not is_team_worker):
-        fast_provider_id, fast_model_id = split_model_spec(settings["fast_model"])
-        fast_provider = await _load_provider(db, fast_provider_id)
+        fast_spec = model_cache.canonicalize_spec(settings["fast_model"])
+        if fast_spec is None:
+            raise ValueError(f"记忆快速模型资源 {settings['fast_model']} 不存在或存在歧义")
+        fast_provider_id, fast_model_id = split_model_spec(fast_spec)
+        fast_provider = await _load_provider(db, fast_provider_id, user)
         memory_credential, memory_chat_config = project_chat_model(fast_provider, fast_model_id)
         projection.memory_chat_model_config = {
             "credential_data": memory_credential,
             "model_config": memory_chat_config,
         }
 
-        embed_provider_id, embed_model_id = split_model_spec(settings["embed_model"])
-        embed_provider = await _load_provider(db, embed_provider_id)
+        embed_spec = model_cache.canonicalize_spec(settings["embed_model"])
+        if embed_spec is None:
+            raise ValueError(f"记忆向量模型资源 {settings['embed_model']} 不存在或存在歧义")
+        embed_provider_id, embed_model_id = split_model_spec(embed_spec)
+        embed_provider = await _load_provider(db, embed_provider_id, user)
         projection.memory_embedding_model_config = project_embedding_model(
             embed_provider,
             embed_model_id,
@@ -252,25 +273,62 @@ async def project_runtime(
         dict.fromkeys(slug for dependencies in projection.skill_mcp_dependencies.values() for slug in dependencies)
     )
     requested_mcps = None if selected_mcps is None else list(dict.fromkeys([*selected_mcps, *dependency_mcps]))
-    loaded_mcp_configs = await load_enabled_mcp_server_configs(names=requested_mcps, db=db)
+    loaded_mcp_configs = await load_enabled_mcp_server_configs(
+        names=requested_mcps, db=db, user=user, use_resource_ids=True
+    )
     mcp_configs = {
-        slug: config
-        for slug, config in loaded_mcp_configs.items()
+        resource_id: config
+        for resource_id, config in loaded_mcp_configs.items()
         if config.get("transport") in {"stdio", "sse", "streamable_http"}
     }
+
+    def resolve_mcp_reference(reference: str) -> tuple[str, dict] | None:
+        direct = mcp_configs.get(reference)
+        if direct is not None:
+            return reference, direct
+        matches = [
+            (resource_id, config) for resource_id, config in mcp_configs.items() if config.get("slug") == reference
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    mcp_reference_map: dict[str, str] = {}
+
+    def normalize_mcp_references(references: list[str]) -> tuple[list[str], list[str]]:
+        normalized: list[str] = []
+        unavailable: list[str] = []
+        for reference in references:
+            resolved = resolve_mcp_reference(reference)
+            if resolved is None:
+                unavailable.append(reference)
+            else:
+                mcp_reference_map[reference] = resolved[0]
+                if resolved[0] not in normalized:
+                    normalized.append(resolved[0])
+        return normalized, unavailable
+
     if selected_mcps is not None:
-        unavailable_mcps = [slug for slug in selected_mcps if slug not in mcp_configs]
+        selected_mcps, unavailable_mcps = normalize_mcp_references(selected_mcps)
         if unavailable_mcps:
             raise ValueError("智能体引用了不存在、未启用或不允许的 MCP: " + ", ".join(unavailable_mcps))
         mcp_slugs = selected_mcps
     else:
         mcp_slugs = list(mcp_configs)
-    projection.mcp_servers = [{"slug": slug, **mcp_configs[slug]} for slug in mcp_slugs]
-    unavailable_skill_mcps = [slug for slug in dependency_mcps if slug not in mcp_configs]
+    projection.mcp_servers = [{**mcp_configs[resource_id], "resource_id": resource_id} for resource_id in mcp_slugs]
+    dependency_mcps, unavailable_skill_mcps = normalize_mcp_references(dependency_mcps)
     if unavailable_skill_mcps:
         raise ValueError("Skill 引用了不存在、未启用或不允许的 MCP: " + ", ".join(unavailable_skill_mcps))
+    projection.skill_mcp_dependencies = {
+        skill_slug: list(dict.fromkeys(mcp_reference_map[reference] for reference in dependencies))
+        for skill_slug, dependencies in projection.skill_mcp_dependencies.items()
+    }
     projection.skill_mcp_servers = {
-        skill_slug: [{"slug": mcp_slug, **mcp_configs[mcp_slug]} for mcp_slug in dependencies]
+        skill_slug: [
+            {
+                **mcp_configs[mcp_slug],
+                "resource_id": mcp_slug,
+            }
+            for mcp_slug in dependencies
+        ]
         for skill_slug, dependencies in projection.skill_mcp_dependencies.items()
     }
 

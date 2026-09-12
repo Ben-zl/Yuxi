@@ -9,6 +9,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.permissions import ResourcePermission, normalize_permission_config, resolve_agent_permission
+from yuxi.permissions.agent_config_resource import authorize_agent_config_resources
 from yuxi.storage.postgres.models_business import Agent, User
 from yuxi.utils.datetime_utils import utc_now_naive
 
@@ -53,18 +54,24 @@ DEEP_RESEARCH_AGENT_NAME = "深度研究"
 DEEP_RESEARCH_AGENT_DESCRIPTION = (
     "面向多来源、需事实核查的深度研究任务：规划拆解、并行调度调研子智能体、核验并综合成带引用的结构化报告。"
 )
-DEEP_RESEARCH_SYSTEM_PROMPT = """你是「深度研究」智能体，负责一项深度研究任务的整体把控与子智能体调度。
-
-你的核心定位是编排者，而不是亲自完成所有检索：把繁重、可独立、可并行的调研与核验工作派发给子智能体，自己专注于规划、调度与最终综合。
-
-工作方式：
-1. 接到研究任务后，先读取 `deep-research` 技能（read_file 其 SKILL.md）获取完整方法论，并严格据此执行。
-2. 问题不明确时先澄清范围，再用待办拆解出可独立调研的子问题。
-3. 优先用团队工具编排调研：`TeamCreate` 建团队后，用 `AgentCreate` 为每个子问题创建调研子智能体（prompt 中写清任务与交付要求），再用 `TeamSay` 把子问题派发出去（可指定成员，也可广播）；仅在澄清范围或补少量零散事实时自己直接检索。
-4. 对关键结论与相互冲突的发现，同样以 `AgentCreate` + `TeamSay` 派发核查子智能体核验，未通过的结论不写入正文或明确降级标注。成员回报会自动送达你，不要轮询；收齐回报后再进入综合。
-5. 证据充分后由你统一综合为结构化、带引用的报告，不要简单拼接子智能体返回的原文。
-
-始终全程跟踪进度，最终交付一份可直接使用、围绕论证组织、来源可追溯的报告。"""
+DEEP_RESEARCH_SYSTEM_PROMPT = (
+    "你是「深度研究」智能体，负责一项深度研究任务的整体把控与子智能体调度。\n"
+    "\n"
+    "你的核心定位是编排者，而不是亲自完成所有检索：把繁重、可独立、可并行的调研与核验工作派发给子智能体，"
+    "自己专注于规划、调度与最终综合。\n"
+    "\n"
+    "工作方式：\n"
+    "1. 接到研究任务后，先读取 `deep-research` 技能（read_file 其 SKILL.md）获取完整方法论，并严格据此执行。\n"
+    "2. 问题不明确时先澄清范围，再用待办拆解出可独立调研的子问题。\n"
+    "3. 优先用团队工具编排调研：`TeamCreate` 建团队后，用 `AgentCreate` 为每个子问题创建调研子智能体"
+    "（prompt 中写清任务与交付要求），再用 `TeamSay` 把子问题派发出去（可指定成员，也可广播）；"
+    "仅在澄清范围或补少量零散事实时自己直接检索。\n"
+    "4. 对关键结论与相互冲突的发现，同样以 `AgentCreate` + `TeamSay` 派发核查子智能体核验，"
+    "未通过的结论不写入正文或明确降级标注。成员回报会自动送达你，不要轮询；收齐回报后再进入综合。\n"
+    "5. 证据充分后由你统一综合为结构化、带引用的报告，不要简单拼接子智能体返回的原文。\n"
+    "\n"
+    "始终全程跟踪进度，最终交付一份可直接使用、围绕论证组织、来源可追溯的报告。"
+)
 
 RESEARCH_EXPLORER_AGENT_SLUG = "research-explorer"
 RESEARCH_EXPLORER_AGENT_NAME = "调研探索员"
@@ -456,10 +463,12 @@ class AgentRepository:
         created_by: str | None = None,
         creator: User | None = None,
     ) -> Agent:
+        if creator is None:
+            raise ValueError("保存智能体必须提供当前操作者 creator")
         resolved_is_subagent = resolve_agent_is_subagent(backend_id, is_subagent)
         if resolved_is_subagent and is_default:
             raise ValueError("子智能体不能设为默认智能体")
-        owner_uid = str(created_by or "")
+        owner_uid = str(created_by or creator.uid)
         default_share_config = {
             "version": 2,
             "read_scope": {
@@ -469,7 +478,7 @@ class AgentRepository:
             },
             "manage_scope": None,
         }
-        allowed_access_levels = get_allowed_agent_access_levels(creator) if creator else None
+        allowed_access_levels = get_allowed_agent_access_levels(creator)
         normalized_share_config = normalize_agent_share_config(
             share_config or default_share_config,
             allowed_access_levels=allowed_access_levels,
@@ -477,6 +486,13 @@ class AgentRepository:
         if is_default and (normalized_share_config.get("read_scope") or {}).get("access_level") != "global":
             raise ValueError("默认智能体必须全局共享")
 
+        config_json = await authorize_agent_config_resources(
+            config_json or {"context": {}},
+            db=self.db,
+            user=creator,
+            agent_share_config=normalized_share_config,
+            owner_uid=owner_uid,
+        )
         agent = Agent(
             slug=await self._unique_slug(slug, name),
             backend_id=backend_id,
@@ -488,8 +504,8 @@ class AgentRepository:
             share_config=normalized_share_config,
             is_default=False,
             is_subagent=resolved_is_subagent,
-            created_by=created_by,
-            updated_by=created_by,
+            created_by=owner_uid,
+            updated_by=str(creator.uid),
             created_at=utc_now_naive(),
             updated_at=utc_now_naive(),
         )
@@ -514,6 +530,24 @@ class AgentRepository:
         updated_by: str | None = None,
         updater: User | None = None,
     ) -> Agent:
+        if updater is None:
+            raise ValueError("保存智能体必须提供当前操作者 updater")
+        candidate_share_config = agent.share_config
+        if share_config is not None:
+            candidate_share_config = (
+                DEFAULT_SHARE_CONFIG.copy()
+                if is_builtin_agent(agent)
+                else normalize_agent_share_config(
+                    share_config, allowed_access_levels=get_allowed_agent_access_levels(updater)
+                )
+            )
+        validated_config = await authorize_agent_config_resources(
+            config_json if config_json is not None else agent.config_json,
+            db=self.db,
+            user=updater,
+            agent_share_config=candidate_share_config,
+            owner_uid=str(agent.created_by or updater.uid),
+        )
         if is_subagent is not None:
             agent.is_subagent = resolve_agent_is_subagent(agent.backend_id, is_subagent)
         if name is not None:
@@ -524,17 +558,9 @@ class AgentRepository:
             agent.icon = icon
         if pics is not None:
             agent.pics = pics
-        if config_json is not None:
-            agent.config_json = config_json
+        agent.config_json = validated_config
         if share_config is not None:
-            if is_builtin_agent(agent):
-                agent.share_config = DEFAULT_SHARE_CONFIG.copy()
-            else:
-                allowed_access_levels = get_allowed_agent_access_levels(updater) if updater else None
-                agent.share_config = normalize_agent_share_config(
-                    share_config,
-                    allowed_access_levels=allowed_access_levels,
-                )
+            agent.share_config = candidate_share_config
 
         agent.updated_by = updated_by
         agent.updated_at = utc_now_naive()

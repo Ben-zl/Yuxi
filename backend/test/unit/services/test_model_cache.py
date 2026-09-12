@@ -126,8 +126,9 @@ def test_model_cache_detects_modalities_missing_from_old_redis_payload(
     _patch_redis(monkeypatch, redis)
     redis.data[REDIS_CACHE_KEY] = json.dumps(
         {
-            "custom:glm-5": {
+            "provider-resource:glm-5": {
                 "provider_id": "custom",
+                "resource_id": "provider-resource",
                 "model_id": "glm-5",
                 "model_type": "chat",
                 "display_name": "GLM-5",
@@ -143,6 +144,7 @@ def test_model_cache_detects_modalities_missing_from_old_redis_payload(
         {
             "is_enabled": True,
             "provider_id": "custom",
+            "resource_id": "provider-resource",
             "enabled_models": [{"id": "glm-5", "type": "chat", "input_modalities": ["text"]}],
         },
     )()

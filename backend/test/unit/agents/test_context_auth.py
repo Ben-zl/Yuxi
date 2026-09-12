@@ -117,15 +117,22 @@ async def test_normalize_agent_context_config_expands_null_and_filters_explicit_
     async def fake_get_databases_by_user(_user):
         return [_knowledge_summary("kb-a"), _knowledge_summary("kb-b")]
 
-    async def fake_get_all_mcp_servers(_db):
+    async def fake_get_all_mcp_servers(_db, *, user):
+        assert user.uid == "u1"
         return [
-            types.SimpleNamespace(slug="mcp-a", name="MCP A", description="", enabled=True),
-            types.SimpleNamespace(slug="mcp-b", name="MCP B", description="", enabled=True),
+            types.SimpleNamespace(
+                slug="mcp-a", resource_id="mcp-resource-a", share_config={}, name="MCP A", description="", enabled=True
+            ),
+            types.SimpleNamespace(
+                slug="mcp-b", resource_id="mcp-resource-b", share_config={}, name="MCP B", description="", enabled=False
+            ),
         ]
 
-    async def fake_get_enabled_mcp_server_slugs(*, db=None):
+    async def fake_get_enabled_mcp_server_slugs(*, db=None, user, use_resource_ids):
         del db
-        return ["mcp-a"]
+        assert user.uid == "u1"
+        assert use_resource_ids is True
+        return ["mcp-resource-a"]
 
     async def fake_list_skills(_db, _user):
         return [
@@ -198,7 +205,7 @@ async def test_normalize_agent_context_config_expands_null_and_filters_explicit_
 
     assert normalized["tools"] == ["ask_user_question", "web_search"]
     assert normalized["knowledges"] == ["kb-b"]
-    assert normalized["mcps"] == ["mcp-a"]
+    assert normalized["mcps"] == ["mcp-resource-a"]
     assert normalized["skills"] == []
     assert normalized["subagents"] == ["research-agent"]
     assert "summary_threshold" not in normalized
@@ -222,12 +229,19 @@ async def test_prepare_agent_runtime_context_filters_resources_for_file_view(mon
     async def fake_get_databases_by_user(_user):
         return [_knowledge_summary("kb-a"), _knowledge_summary("kb-b")]
 
-    async def fake_get_all_mcp_servers(_db):
-        return [types.SimpleNamespace(slug="mcp-a", name="MCP A", description="", enabled=True)]
+    async def fake_get_all_mcp_servers(_db, *, user):
+        assert user.uid == "u1"
+        return [
+            types.SimpleNamespace(
+                slug="mcp-a", resource_id="mcp-resource-a", share_config={}, name="MCP A", description="", enabled=True
+            )
+        ]
 
-    async def fake_get_enabled_mcp_server_slugs(*, db=None):
+    async def fake_get_enabled_mcp_server_slugs(*, db=None, user, use_resource_ids):
         del db
-        return ["mcp-a"]
+        assert user.uid == "u1"
+        assert use_resource_ids is True
+        return ["mcp-resource-a"]
 
     async def fake_list_skills(_db, _user):
         return [
@@ -310,7 +324,7 @@ async def test_prepare_agent_runtime_context_filters_resources_for_file_view(mon
 
     assert prepared.tools == ["ask_user_question"]
     assert prepared.knowledges == ["kb-a"]
-    assert prepared.mcps == ["mcp-a"]
+    assert prepared.mcps == ["mcp-resource-a"]
     assert prepared.skills == ["skill-a"]
     assert prepared.subagents == ["research-agent"]
     assert prepared._readable_skills == ["skill-a"]

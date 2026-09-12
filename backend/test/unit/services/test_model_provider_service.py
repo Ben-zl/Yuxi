@@ -2,10 +2,12 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from unittest.mock import AsyncMock
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 
 from yuxi.models.providers.builtin import BUILTIN_PROVIDERS
+from yuxi.models.providers import service as provider_service
 from yuxi.models.providers.service import (
     _normalize_payload,
     _normalize_remote_model,
@@ -128,7 +130,13 @@ async def test_update_provider_config_rejects_provider_type_change_with_existing
     monkeypatch.setattr("yuxi.models.providers.service.update_model_provider", fail_update_model_provider)
 
     with pytest.raises(ValueError, match="仅支持 OpenAI 兼容供应商"):
-        await update_provider_config(None, "openai-local", {"provider_type": "anthropic"}, "tester")
+        await update_provider_config(
+            None,
+            "openai-local",
+            {"provider_type": "anthropic"},
+            "tester",
+            operator=SimpleNamespace(uid="tester", role="superadmin", department_id=None),
+        )
 
 
 def test_normalize_payload_accepts_anthropic_provider_type():
@@ -258,6 +266,34 @@ def test_builtin_provider_templates_default_to_openai_provider_type():
     }
     assert provider_types == {"openai"}
     assert all("ollama" not in provider["provider_id"] for provider in BUILTIN_PROVIDERS)
+
+
+@pytest.mark.asyncio
+async def test_builtin_sync_ignores_non_builtin_provider_with_same_logical_id(monkeypatch):
+    """部门同名 Provider 不能阻止或覆盖内置 Provider 同步。"""
+    shadow = SimpleNamespace(provider_id="builtin-id", is_builtin=False)
+    monkeypatch.setattr(
+        provider_service,
+        "BUILTIN_PROVIDERS",
+        [
+            {
+                "provider_id": "builtin-id",
+                "display_name": "Builtin",
+                "base_url": "https://builtin.example/v1",
+                "enabled_models": [],
+            }
+        ],
+    )
+    monkeypatch.setattr(provider_service, "list_all_model_providers_internal", AsyncMock(return_value=[shadow]))
+    create = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(provider_service, "create_model_provider", create)
+
+    await provider_service.ensure_builtin_model_providers_in_db(object())
+
+    payload = create.await_args.args[1]
+    assert payload["provider_id"] == "builtin-id"
+    assert payload["is_builtin"] is True
+    assert payload["created_by"] == "system"
 
 
 @pytest.mark.parametrize(

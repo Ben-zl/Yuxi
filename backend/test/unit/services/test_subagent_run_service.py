@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
 
 import yuxi.services.agent_run_service as agent_run_service
 import yuxi.services.subagent_run_service as service_module
+from yuxi.services.agent_run_manifest_service import compute_manifest_fingerprint
 from yuxi.services.input_message_service import build_chat_input_message
 from yuxi.services.subagent_run_service import (
     serialize_subagent_run_state,
@@ -14,6 +16,12 @@ from yuxi.services.subagent_run_service import (
     SubagentRunService,
 )
 from yuxi.utils.hash_utils import subagent_child_thread_id
+
+
+PARENT_MANIFEST = {
+    "manifest_version": 1,
+    "resource_snapshot": {"id": "parent-snapshot", "fingerprint": "snapshot-digest"},
+}
 
 
 def make_child_thread_id(parent_thread_id: str, agent_slug: str, tool_call_id: str) -> str:
@@ -288,6 +296,8 @@ def _patch_run_record_creation(
     active_run=None,
 ):
     db.active_run = active_run
+    db.load_run_resources = AsyncMock(return_value=SimpleNamespace(model_spec="snapshot:model"))
+    monkeypatch.setattr(service_module, "load_run_resources", db.load_run_resources)
 
     async def get_system_options(_option, _db=None):
         return {"default_model": "system-default:model"}
@@ -745,7 +755,8 @@ async def test_subagent_run_service_translates_busy_run(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
-async def test_subagent_run_service_create_run_record_persists_subagent_context(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("model_spec", [None, "snapshot:model"])
+async def test_subagent_run_service_create_run_record_persists_subagent_context(monkeypatch, model_spec):
     db = _FakeDB()
     _patch_run_record_creation(monkeypatch, db)
     creator_run = SimpleNamespace(
@@ -753,6 +764,7 @@ async def test_subagent_run_service_create_run_record_persists_subagent_context(
         conversation_id=10,
         conversation_thread_id="parent-thread",
         input_payload={"tool_approval_mode": "default"},
+        manifest=PARENT_MANIFEST.copy(),
     )
     relation = _relation(child_thread_id="child-thread", parent_conversation_id=10, subagent_slug="worker")
 
@@ -760,7 +772,7 @@ async def test_subagent_run_service_create_run_record_persists_subagent_context(
         input_message=build_chat_input_message("delegate this"),
         request_id="subagent-req",
         current_uid="user-1",
-        model_spec=None,
+        model_spec=model_spec,
         creator_run=creator_run,
         relation=relation,
         tool_call_id="tool-1",
@@ -781,7 +793,9 @@ async def test_subagent_run_service_create_run_record_persists_subagent_context(
     assert db.created_run_kwargs["runtime_scope_id"] == "parent-thread"
     assert db.created_run_kwargs["input_message_id"] == 10
     assert db.created_run_kwargs["input_payload"] == {
-        "model_spec": "agent-default-model",
+        "model_spec": "snapshot:model",
+        "_run_manifest": PARENT_MANIFEST,
+        "_run_manifest_fingerprint": compute_manifest_fingerprint(PARENT_MANIFEST),
         "tool_approval_mode": "default",
         "runtime": {
             "tool_call_id": "tool-1",
@@ -790,6 +804,16 @@ async def test_subagent_run_service_create_run_record_persists_subagent_context(
         },
     }
     assert db.committed is False
+    assert run.manifest == PARENT_MANIFEST
+    assert run.manifest_fingerprint == compute_manifest_fingerprint(PARENT_MANIFEST)
+    assert run.manifest_recorded_at is not None
+    db.load_run_resources.assert_awaited_once_with(
+        db,
+        uid="user-1",
+        manifest=creator_run.manifest,
+        agent_slug="worker",
+    )
+    assert db.load_run_resources.await_args.kwargs["manifest"] is creator_run.manifest
 
 
 @pytest.mark.asyncio
@@ -803,6 +827,7 @@ async def test_subagent_run_service_create_run_record_uses_creator_runtime_scope
         conversation_id=10,
         conversation_thread_id="current-parent-thread",
         input_payload={"tool_approval_mode": "always_trust"},
+        manifest=PARENT_MANIFEST.copy(),
     )
     relation = _relation(child_thread_id="child-thread", parent_conversation_id=10, subagent_slug="worker")
 
@@ -819,6 +844,41 @@ async def test_subagent_run_service_create_run_record_uses_creator_runtime_scope
     assert db.created_run_kwargs["created_by_run_id"] == "parent-run"
     assert db.created_run_kwargs["input_payload"]["runtime"]["parent_thread_id"] == "current-parent-thread"
     assert db.created_run_kwargs["input_payload"]["tool_approval_mode"] == "always_trust"
+
+
+@pytest.mark.asyncio
+async def test_subagent_run_service_create_run_record_rejects_model_outside_parent_snapshot(monkeypatch):
+    """显式模型与父快照中子智能体模型不同时不得写入消息或运行。"""
+    db = _FakeDB()
+    _patch_run_record_creation(monkeypatch, db)
+    creator_run = SimpleNamespace(
+        id="parent-run",
+        conversation_id=10,
+        conversation_thread_id="parent-thread",
+        input_payload={"tool_approval_mode": "default"},
+        manifest=PARENT_MANIFEST.copy(),
+    )
+
+    with pytest.raises(ValueError, match="子 Run 模型必须属于父 Run 提交快照"):
+        await SubagentRunService(db)._create_run_record(
+            input_message=build_chat_input_message("delegate this"),
+            request_id="subagent-req",
+            current_uid="user-1",
+            model_spec="agent-default-model",
+            creator_run=creator_run,
+            relation=_relation(),
+            tool_call_id="tool-1",
+        )
+
+    db.load_run_resources.assert_awaited_once_with(
+        db,
+        uid="user-1",
+        manifest=PARENT_MANIFEST,
+        agent_slug="worker",
+    )
+    assert db.created_run is None
+    assert db.added == []
+    assert db.committed is False
 
 
 @pytest.mark.asyncio

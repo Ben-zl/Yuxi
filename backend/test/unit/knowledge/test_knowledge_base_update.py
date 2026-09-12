@@ -1,4 +1,5 @@
 import types
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -184,8 +185,8 @@ async def test_create_database_persists_allowed_record_fields(tmp_path, monkeypa
         classmethod(lambda cls, _kb_type: True),
     )
     monkeypatch.setattr(
-        "yuxi.models.providers.cache.model_cache.get_model_info",
-        lambda _spec: types.SimpleNamespace(model_type="embedding"),
+        "yuxi.knowledge.manager.authorize_knowledge_model_spec",
+        AsyncMock(return_value="provider:embedding"),
     )
 
     async def get_database_info(kb_id: str):
@@ -212,6 +213,8 @@ async def test_create_database_persists_allowed_record_fields(tmp_path, monkeypa
         embedding_model_spec="provider:embedding",
         share_config=share_config,
         created_by="root",
+        db=object(),
+        user=types.SimpleNamespace(uid="root"),
         auto_generate_questions=False,
     )
 
@@ -223,6 +226,341 @@ async def test_create_database_persists_allowed_record_fields(tmp_path, monkeypa
     assert "created_by" not in payload["additional_params"]
     assert result.kb_id.startswith("kb_")
     assert not hasattr(kb, "_runtime_configs")
+
+
+@pytest.mark.asyncio
+async def test_authorize_knowledge_model_rejects_inaccessible_provider(monkeypatch):
+    from yuxi.knowledge.manager import authorize_knowledge_model_spec
+
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.canonicalize_spec",
+        lambda spec: "provider-resource:embedding",
+    )
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.get_model_info",
+        lambda spec: types.SimpleNamespace(
+            resource_id="provider-resource",
+            provider_id="provider",
+            model_id="embedding",
+            model_type="embedding",
+        ),
+    )
+    monkeypatch.setattr(
+        "yuxi.models.providers.repository.get_model_provider_for_user",
+        AsyncMock(return_value=None),
+    )
+
+    with pytest.raises(ValueError, match="不可访问"):
+        await authorize_knowledge_model_spec(
+            "provider:embedding",
+            expected_type="embedding",
+            db=object(),
+            user=types.SimpleNamespace(uid="department-a"),
+            knowledge_share_config={
+                "version": 2,
+                "read_scope": {
+                    "access_level": "department",
+                    "department_ids": [1],
+                    "user_uids": [],
+                },
+                "manage_scope": None,
+            },
+            owner_uid="department-a",
+        )
+
+
+@pytest.mark.asyncio
+async def test_authorize_knowledge_model_rejects_provider_scope_smaller_than_knowledge_scope(monkeypatch):
+    from yuxi.knowledge.manager import authorize_knowledge_model_spec
+
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.canonicalize_spec",
+        lambda spec: "provider-resource:embedding",
+    )
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.get_model_info",
+        lambda spec: types.SimpleNamespace(
+            resource_id="provider-resource",
+            provider_id="provider",
+            model_id="embedding",
+            model_type="embedding",
+        ),
+    )
+    monkeypatch.setattr(
+        "yuxi.models.providers.repository.get_model_provider_for_user",
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                resource_id="provider-resource",
+                is_enabled=True,
+                share_config={
+                    "version": 2,
+                    "read_scope": {
+                        "access_level": "department",
+                        "department_ids": [1],
+                        "user_uids": [],
+                    },
+                    "manage_scope": None,
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match="完整读取范围"):
+        await authorize_knowledge_model_spec(
+            "provider:embedding",
+            expected_type="embedding",
+            db=object(),
+            user=types.SimpleNamespace(uid="department-a"),
+            knowledge_share_config={
+                "version": 2,
+                "read_scope": {
+                    "access_level": "department",
+                    "department_ids": [1, 2],
+                    "user_uids": [],
+                },
+                "manage_scope": None,
+            },
+            owner_uid="department-a",
+        )
+
+
+@pytest.mark.asyncio
+async def test_authorize_knowledge_model_canonicalizes_unique_legacy_provider_id(monkeypatch):
+    from yuxi.knowledge.manager import authorize_knowledge_model_spec
+
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.canonicalize_spec",
+        lambda spec: "provider-resource:embedding",
+    )
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.get_model_info",
+        lambda spec: types.SimpleNamespace(
+            resource_id="provider-resource",
+            provider_id="provider",
+            model_id="embedding",
+            model_type="embedding",
+        ),
+    )
+    monkeypatch.setattr(
+        "yuxi.models.providers.repository.get_model_provider_for_user",
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                resource_id="provider-resource",
+                is_enabled=True,
+                share_config={
+                    "version": 2,
+                    "read_scope": {
+                        "access_level": "global",
+                        "department_ids": [],
+                        "user_uids": [],
+                    },
+                    "manage_scope": None,
+                },
+            )
+        ),
+    )
+
+    canonical = await authorize_knowledge_model_spec(
+        "provider:embedding",
+        expected_type="embedding",
+        db=object(),
+        user=types.SimpleNamespace(uid="department-a"),
+        knowledge_share_config={
+            "version": 2,
+            "read_scope": {
+                "access_level": "department",
+                "department_ids": [1],
+                "user_uids": [],
+            },
+            "manage_scope": None,
+        },
+        owner_uid="department-a",
+    )
+
+    assert canonical == "provider-resource:embedding"
+
+
+@pytest.mark.asyncio
+async def test_authorize_knowledge_model_resolves_old_cache_payload_through_database(monkeypatch):
+    from yuxi.knowledge.manager import authorize_knowledge_model_spec
+
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.canonicalize_spec",
+        lambda spec: "provider:embedding",
+    )
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.get_model_info",
+        lambda spec: types.SimpleNamespace(
+            resource_id="provider",
+            provider_id="provider",
+            model_id="embedding",
+            model_type="embedding",
+        ),
+    )
+    provider = types.SimpleNamespace(
+        resource_id="provider-resource",
+        is_enabled=True,
+        share_config={
+            "version": 2,
+            "read_scope": {
+                "access_level": "global",
+                "department_ids": [],
+                "user_uids": [],
+            },
+            "manage_scope": None,
+        },
+    )
+    resolve_reference = AsyncMock(return_value=provider)
+    monkeypatch.setattr(
+        "yuxi.models.providers.repository.get_legacy_model_provider_for_user",
+        resolve_reference,
+    )
+
+    canonical = await authorize_knowledge_model_spec(
+        "provider:embedding",
+        expected_type="embedding",
+        db=object(),
+        user=types.SimpleNamespace(uid="department-a"),
+        knowledge_share_config={
+            "version": 2,
+            "read_scope": {
+                "access_level": "department",
+                "department_ids": [1],
+                "user_uids": [],
+            },
+            "manage_scope": None,
+        },
+        owner_uid="department-a",
+    )
+
+    assert canonical == "provider-resource:embedding"
+    resolve_reference.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_authorize_knowledge_model_rejects_ambiguous_legacy_provider_id(monkeypatch):
+    from yuxi.knowledge.manager import authorize_knowledge_model_spec
+
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.canonicalize_spec",
+        lambda spec: None,
+    )
+
+    with pytest.raises(ValueError, match="不存在、类型错误或旧标识存在歧义"):
+        await authorize_knowledge_model_spec(
+            "provider:embedding",
+            expected_type="embedding",
+            db=object(),
+            user=types.SimpleNamespace(uid="department-a"),
+            knowledge_share_config={
+                "version": 2,
+                "read_scope": {
+                    "access_level": "department",
+                    "department_ids": [1],
+                    "user_uids": [],
+                },
+                "manage_scope": None,
+            },
+            owner_uid="department-a",
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_database_reauthorizes_existing_models_for_expanded_scope(tmp_path, monkeypatch):
+    updated_payloads = []
+    row = types.SimpleNamespace(
+        kb_id="db",
+        kb_type="fake",
+        name="Database",
+        description="Description",
+        embedding_model_spec="provider-resource:embedding",
+        llm_model_spec="provider-resource:chat",
+        additional_params={},
+        share_config={
+            "version": 2,
+            "read_scope": {
+                "access_level": "department",
+                "department_ids": [1],
+                "user_uids": [],
+            },
+            "manage_scope": None,
+        },
+        created_by="owner",
+    )
+
+    class FakeRepository:
+        async def get_by_kb_id(self, kb_id):
+            return row if kb_id == "db" else None
+
+        async def update(self, kb_id, payload):
+            assert kb_id == "db"
+            updated_payloads.append(payload)
+
+    monkeypatch.setattr(
+        "yuxi.repositories.knowledge_base_repository.KnowledgeBaseRepository",
+        FakeRepository,
+    )
+    monkeypatch.setattr(
+        "yuxi.knowledge.manager.KnowledgeBaseFactory.is_type_supported",
+        classmethod(lambda cls, _kb_type: True),
+    )
+    monkeypatch.setattr(
+        "yuxi.knowledge.manager.KnowledgeBaseFactory.get_kb_class",
+        classmethod(lambda cls, _kb_type: FakeKnowledgeBase),
+    )
+
+    authorization_calls = []
+
+    async def authorize(spec, *, expected_type, db, user, knowledge_share_config, owner_uid):
+        authorization_calls.append(
+            {
+                "spec": spec,
+                "expected_type": expected_type,
+                "db": db,
+                "user": user,
+                "knowledge_share_config": knowledge_share_config,
+                "owner_uid": owner_uid,
+            }
+        )
+        return spec
+
+    monkeypatch.setattr("yuxi.knowledge.manager.authorize_knowledge_model_spec", authorize)
+
+    manager = KnowledgeBaseManager(str(tmp_path))
+    monkeypatch.setattr(
+        manager,
+        "get_database_info",
+        AsyncMock(return_value=types.SimpleNamespace(kb_id="db")),
+    )
+    expanded_share_config = {
+        "version": 2,
+        "read_scope": {
+            "access_level": "department",
+            "department_ids": [1, 2],
+            "user_uids": [],
+        },
+        "manage_scope": None,
+    }
+    user = types.SimpleNamespace(uid="operator")
+
+    await manager.update_database(
+        "db",
+        "Database",
+        "Description",
+        share_config=expanded_share_config,
+        operator_uid="operator",
+        operator_department_id=1,
+        db=object(),
+        user=user,
+    )
+
+    assert [(call["spec"], call["expected_type"]) for call in authorization_calls] == [
+        ("provider-resource:embedding", "embedding"),
+        ("provider-resource:chat", "chat"),
+    ]
+    assert all(call["knowledge_share_config"] == expanded_share_config for call in authorization_calls)
+    assert all(call["owner_uid"] == "owner" for call in authorization_calls)
+    assert updated_payloads[0]["share_config"] == expanded_share_config
 
 
 async def test_manager_refresh_database_stats_persists_metadata(tmp_path, monkeypatch):

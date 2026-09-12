@@ -91,6 +91,7 @@ async def test_build_mcp_tools_runs_http_client_in_service_process(monkeypatch):
         mcp_servers=[
             {
                 "slug": "internal-mcp",
+                "resource_id": "resource-http",
                 "transport": "streamable_http",
                 "url": "http://internal-mcp:9000/mcp",
                 "headers": {"Authorization": "secret"},
@@ -103,9 +104,11 @@ async def test_build_mcp_tools_runs_http_client_in_service_process(monkeypatch):
     assert result == [exposed_tool]
     assert requests == [
         (
-            "internal-mcp",
+            "resource-http",
             {
-                "internal-mcp": {
+                "resource-http": {
+                    "slug": "internal-mcp",
+                    "resource_id": "resource-http",
                     "transport": "streamable_http",
                     "url": "http://internal-mcp:9000/mcp",
                     "headers": {"Authorization": "secret"},
@@ -132,6 +135,7 @@ async def test_build_mcp_tools_propagates_health_failure(monkeypatch):
             mcp_servers=[
                 {
                     "slug": "broken-mcp",
+                    "resource_id": "resource-broken",
                     "transport": "streamable_http",
                     "url": "http://broken:9000/mcp",
                 }
@@ -153,6 +157,7 @@ async def test_build_mcp_tools_starts_registered_builtin_stdio(monkeypatch):
         mcp_servers=[
             {
                 "slug": "mcp-server-chart",
+                "resource_id": "resource-chart",
                 "transport": "stdio",
                 "command": "npx",
                 "args": ["-y", "@antv/mcp-server-chart"],
@@ -163,9 +168,11 @@ async def test_build_mcp_tools_starts_registered_builtin_stdio(monkeypatch):
     assert result == [exposed_tool]
     assert requests == [
         (
-            "mcp-server-chart",
+            "resource-chart",
             {
-                "mcp-server-chart": {
+                "resource-chart": {
+                    "slug": "mcp-server-chart",
+                    "resource_id": "resource-chart",
                     "transport": "stdio",
                     "command": "npx",
                     "args": ["-y", "@antv/mcp-server-chart"],
@@ -174,6 +181,41 @@ async def test_build_mcp_tools_starts_registered_builtin_stdio(monkeypatch):
             [],
         )
     ]
+
+
+async def test_duplicate_mcp_slugs_keep_distinct_sdk_tool_names(monkeypatch):
+    """同名服务器和工具经过真实 SDK 装配后不能覆盖彼此。"""
+    from agentscope.mcp import MCPClient
+    from mcp.types import Tool
+    from yuxi.agents.mcp import service
+
+    clients = []
+
+    async def discover(client):
+        clients.append(client.name)
+        client._cached_tools = [Tool(name="echo", inputSchema={"type": "object", "properties": {}})]
+        return client._cached_tools
+
+    monkeypatch.setattr(MCPClient, "list_raw_tools", discover)
+    service.clear_mcp_cache()
+    configs = [
+        {
+            "resource_id": resource_id,
+            "slug": "same",
+            "transport": "streamable_http",
+            "url": f"https://{resource_id}.example.test/mcp",
+        }
+        for resource_id in ["resource-a", "resource-b"]
+    ]
+    try:
+        result = await tools.build_mcp_tools(mcp_servers=configs)
+        assert clients == ["resource-a", "resource-b"]
+        assert {tool.name for tool in result} == {"mcp__resource-a__echo", "mcp__resource-b__echo"}
+        assert len({tool.metadata["id"] for tool in result}) == 2
+        assert all(tool.metadata["mcp_tool_name"] == "echo" for tool in result)
+        assert len({tool.name: tool for tool in result}) == 2
+    finally:
+        service.clear_mcp_cache()
 
 
 async def test_build_subagent_tools_overrides_agent_create_with_session_templates():

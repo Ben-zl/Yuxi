@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from yuxi.repositories.user_repository import UserRepository
+
 
 class ResourcePermission(StrEnum):
     """资源权限等级，数值顺序用于判断权限是否足够。"""
@@ -32,6 +36,7 @@ class ResourcePermissionPolicy:
     """声明资源类型允许的角色上限，不包含共享范围匹配逻辑。"""
 
     role_ceiling: dict[str, ResourcePermission]
+    owner_requires_current_scope: bool = False
 
 
 RESOURCE_PERMISSION_ORDER = {
@@ -56,6 +61,15 @@ AGENT_PERMISSION_POLICY = ResourcePermissionPolicy(
     }
 )
 SKILL_PERMISSION_POLICY = AGENT_PERMISSION_POLICY
+MODEL_PROVIDER_PERMISSION_POLICY = ResourcePermissionPolicy(
+    owner_requires_current_scope=True,
+    role_ceiling={
+        "user": ResourcePermission.READ,
+        "admin": ResourcePermission.MANAGE,
+        "superadmin": ResourcePermission.MANAGE,
+    },
+)
+MCP_PERMISSION_POLICY = MODEL_PROVIDER_PERMISSION_POLICY
 
 
 def _normalize_scope(scope: dict | None) -> dict | None:
@@ -153,6 +167,64 @@ def scope_matches(user: Any, scope: dict | None) -> bool:
     return False
 
 
+async def _scope_contains(
+    db: AsyncSession,
+    container: dict | None,
+    target: dict | None,
+) -> bool:
+    """判断一个读取范围是否完整覆盖目标范围。"""
+
+    if target is None:
+        return True
+    if container is None:
+        return False
+
+    container_level = container.get("access_level")
+    target_level = target.get("access_level")
+    if container_level == "global":
+        return True
+    if target_level == "global":
+        return False
+    if container_level == target_level == "department":
+        return set(target.get("department_ids") or []).issubset(container.get("department_ids") or [])
+    if container_level == target_level == "user":
+        return set(target.get("user_uids") or []).issubset(container.get("user_uids") or [])
+    if container_level != "department" or target_level != "user":
+        return False
+
+    target_uids = {str(uid) for uid in target.get("user_uids") or []}
+    users = await UserRepository(db).list_by_uids(list(target_uids))
+    if {str(user.uid) for user in users if not bool(user.is_deleted)} != target_uids:
+        return False
+    allowed_departments = set(container.get("department_ids") or [])
+    return all(user.department_id in allowed_departments for user in users)
+
+
+async def resource_read_scope_covers_share_config(
+    db: AsyncSession,
+    *,
+    resource_share_config: dict | None,
+    target_share_config: dict,
+    owner_uid: str,
+) -> bool:
+    """确保依赖资源对目标资源的全部可访问用户保持可读。"""
+
+    resource_config = normalize_permission_config(resource_share_config)
+    target_config = normalize_permission_config(target_share_config)
+    target_scopes = [scope for scope in (target_config["read_scope"], target_config["manage_scope"]) if scope]
+    target_scopes.append(
+        {
+            "access_level": "user",
+            "department_ids": [],
+            "user_uids": [owner_uid],
+        }
+    )
+    for scope in target_scopes:
+        if not await _scope_contains(db, resource_config["read_scope"], scope):
+            return False
+    return True
+
+
 def _value(source: Any, key: str, default: Any = None) -> Any:
     """从字典或对象读取属性，统一权限解析的输入访问方式。"""
 
@@ -181,9 +253,17 @@ def resolve_resource_permission(
     config = normalize_permission_config(
         raw_share_config,
     )
-    if str(_value(resource, "created_by", "") or "") == str(_value(user, "uid", "") or ""):
+    is_owner = str(_value(resource, "created_by", "") or "") == str(_value(user, "uid", "") or "")
+    if policy.owner_requires_current_scope:
+        if not scope_matches(user, config["read_scope"]):
+            return ResourcePermission.NONE
+        if config["read_scope"]["access_level"] == "global":
+            return ResourcePermission.READ
+        if is_owner:
+            return policy.role_ceiling.get(_value(user, "role"), ResourcePermission.READ)
+    elif is_owner:
         return ResourcePermission.MANAGE
-    elif scope_matches(user, config["manage_scope"]) and (
+    if scope_matches(user, config["manage_scope"]) and (
         config["read_scope"] is None or scope_matches(user, config["read_scope"])
     ):
         granted = ResourcePermission.MANAGE
@@ -284,3 +364,13 @@ def resolve_skill_permission(user: Any, resource: ShareableResource) -> Resource
         resource,
         SKILL_PERMISSION_POLICY,
     )
+
+
+def resolve_model_provider_permission(user: Any, resource: ShareableResource) -> ResourcePermission:
+    """解析模型供应商对当前用户的有效权限。"""
+    return resolve_resource_permission(user, resource, MODEL_PROVIDER_PERMISSION_POLICY)
+
+
+def resolve_mcp_permission(user: Any, resource: ShareableResource) -> ResourcePermission:
+    """解析 MCP 对当前用户的有效权限。"""
+    return resolve_resource_permission(user, resource, MCP_PERMISSION_POLICY)

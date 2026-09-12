@@ -14,10 +14,18 @@ from yuxi.models.providers.repository import (
     create_model_provider,
     delete_model_provider,
     get_model_provider,
+    list_all_model_providers_internal,
     list_model_providers,
     update_model_provider,
 )
 from yuxi.storage.postgres.models_business import ModelProvider
+from yuxi.permissions.resource_permission import (
+    ResourcePermission,
+    normalize_permission_config,
+    require_resource_permission,
+    resolve_model_provider_permission,
+)
+from yuxi.utils import logger
 
 VALID_MODEL_TYPES = {"chat", "embedding", "rerank"}
 VALID_MODEL_SOURCES = {"manual", "remote"}
@@ -214,6 +222,20 @@ def _normalize_payload(data: dict[str, Any], *, partial: bool = False) -> dict[s
     return payload
 
 
+def _validate_operator_share_scope(operator, share_config: dict) -> None:
+    """限制部门管理员只能创建或保留本部门范围。"""
+    scope = share_config["read_scope"]
+    if scope["access_level"] == "global":
+        if getattr(operator, "role", None) != "superadmin":
+            raise PermissionError("只有超级管理员可以创建或修改 global 模型供应商")
+        return
+    if getattr(operator, "role", None) == "superadmin":
+        return
+    department_id = getattr(operator, "department_id", None)
+    if department_id is None or set(scope["department_ids"]) != {int(department_id)}:
+        raise PermissionError("部门管理员只能管理本部门模型供应商")
+
+
 def resolve_api_key(provider: ModelProvider) -> str | None:
     """解析 provider 的 API Key，优先直接配置，其次从环境变量读取。"""
     if provider.api_key:
@@ -274,14 +296,23 @@ def _normalize_remote_model(raw_model: dict[str, Any], model_type: str = "chat")
     return {key: value for key, value in normalized.items() if value is not None}
 
 
-async def get_all_model_providers(db: AsyncSession) -> list[ModelProvider]:
-    """获取全部独立模型供应商配置。"""
-    return await list_model_providers(db)
+async def get_all_model_providers(db: AsyncSession, *, user) -> list[ModelProvider]:
+    """获取当前用户可读的独立模型供应商配置。"""
+    return await list_model_providers(db, user=user)
 
 
-async def get_model_provider_by_id(db: AsyncSession, provider_id: str) -> ModelProvider | None:
-    """按 provider_id 获取独立模型供应商配置。"""
-    return await get_model_provider(db, provider_id)
+async def get_all_model_providers_internal(db: AsyncSession) -> list[ModelProvider]:
+    """供系统缓存和内置同步显式读取全部模型供应商。"""
+    return await list_all_model_providers_internal(db)
+
+
+async def get_model_provider_by_id(db: AsyncSession, provider_id: str, *, user) -> ModelProvider | None:
+    """按 resource_id 获取当前用户可读的模型供应商。"""
+    from yuxi.models.providers.repository import get_model_provider_for_user
+
+    if user is None:
+        raise PermissionError("模型供应商详情需要当前用户授权上下文")
+    return await get_model_provider_for_user(db, provider_id, user)
 
 
 async def ensure_builtin_model_providers_in_db(db: AsyncSession) -> None:
@@ -289,8 +320,8 @@ async def ensure_builtin_model_providers_in_db(db: AsyncSession) -> None:
 
     这里只补不存在的内置 provider，不覆盖管理员已编辑的配置。
     """
-    existing = await list_model_providers(db)
-    existing_ids = {p.provider_id: p for p in existing}
+    existing = await list_all_model_providers_internal(db)
+    existing_ids = {p.provider_id: p for p in existing if p.is_builtin}
 
     for provider_def in BUILTIN_PROVIDERS:
         provider_id = provider_def["provider_id"]
@@ -314,12 +345,20 @@ async def ensure_builtin_model_providers_in_db(db: AsyncSession) -> None:
         await create_model_provider(db, _normalize_payload(payload))
 
 
-async def create_provider_config(db: AsyncSession, data: dict[str, Any], username: str) -> ModelProvider:
+async def create_provider_config(
+    db: AsyncSession, data: dict[str, Any], username: str, *, operator=None
+) -> ModelProvider:
     """创建独立模型供应商配置。"""
-    payload = _normalize_payload(data)
-    if await get_model_provider(db, payload["provider_id"]):
-        raise ValueError(f"供应商 {payload['provider_id']} 已存在")
-    payload["created_by"] = username
+    if operator is None:
+        raise PermissionError("模型供应商写入需要当前操作者")
+    create_data = dict(data)
+    create_data["is_builtin"] = False
+    payload = _normalize_payload(create_data)
+    payload["share_config"] = normalize_permission_config(
+        payload.get("share_config"), allowed_access_levels={"global", "department"}, strict=True
+    )
+    _validate_operator_share_scope(operator, payload["share_config"])
+    payload["created_by"] = str(getattr(operator, "uid", None) or username)
     payload["updated_by"] = username
     return await create_model_provider(db, payload)
 
@@ -329,12 +368,33 @@ async def update_provider_config(
     provider_id: str,
     data: dict[str, Any],
     username: str,
+    *,
+    operator=None,
 ) -> ModelProvider | None:
     """更新独立模型供应商配置。"""
-    provider = await get_model_provider(db, provider_id)
+    if operator is None:
+        raise PermissionError("模型供应商写入需要当前操作者")
+    if "is_builtin" in data:
+        raise ValueError("is_builtin 仅由系统内置供应商同步流程维护")
+    from yuxi.models.providers.repository import get_model_provider_by_resource_id
+
+    provider = (
+        await get_model_provider(db, provider_id)
+        if db is None
+        else await get_model_provider_by_resource_id(db, provider_id)
+    )
     if provider is None:
         return None
+    if bool(getattr(provider, "is_builtin", False)):
+        raise PermissionError("系统内置模型供应商由代码管理，无法通过接口修改")
     payload = _normalize_payload(data, partial=True)
+    if "share_config" in payload:
+        payload["share_config"] = normalize_permission_config(
+            payload["share_config"], allowed_access_levels={"global", "department"}, strict=True
+        )
+    require_resource_permission(resolve_model_provider_permission(operator, provider), ResourcePermission.MANAGE)
+    if "share_config" in payload:
+        _validate_operator_share_scope(operator, payload["share_config"])
     # partial 更新时仅传 enabled_models，结合 DB 中现有 capabilities 校验
     if "enabled_models" in payload and "capabilities" not in payload:
         existing_caps = set(provider.capabilities or [])
@@ -349,11 +409,18 @@ async def update_provider_config(
     return await update_model_provider(db, provider, payload)
 
 
-async def delete_provider_config(db: AsyncSession, provider_id: str) -> bool:
+async def delete_provider_config(db: AsyncSession, provider_id: str, *, operator=None) -> bool:
     """删除独立模型供应商配置。"""
-    provider = await get_model_provider(db, provider_id)
+    if operator is None:
+        raise PermissionError("模型供应商写入需要当前操作者")
+    from yuxi.models.providers.repository import get_model_provider_by_resource_id
+
+    provider = await get_model_provider_by_resource_id(db, provider_id)
     if provider is None:
         return False
+    require_resource_permission(resolve_model_provider_permission(operator, provider), ResourcePermission.MANAGE)
+    if provider.is_builtin:
+        raise PermissionError("系统内置模型供应商无法删除")
     await delete_model_provider(db, provider)
     return True
 
@@ -505,4 +572,5 @@ async def test_model_status_by_spec(spec: str) -> dict:
             return {"spec": spec, "status": "available", "message": "连接正常", "model_type": "chat"}
         return {"spec": spec, "status": "unavailable", "message": "响应无效", "model_type": "chat"}
     except Exception as e:
-        return {"spec": spec, "status": "error", "message": str(e), "model_type": info.model_type}
+        logger.warning(f"模型状态检查失败: spec={spec}, error_type={type(e).__name__}")
+        return {"spec": spec, "status": "error", "message": "模型连接检查失败", "model_type": info.model_type}

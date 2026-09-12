@@ -8,6 +8,7 @@ import pytest
 from yuxi.agentscope import config_projection as projection
 from yuxi.config import UserConfig, config
 from yuxi.config.options import Option
+from yuxi.models.providers.cache import model_cache
 
 
 @pytest.mark.asyncio
@@ -32,6 +33,7 @@ async def test_runtime_uses_persisted_memory_and_default_models(monkeypatch, req
     stored = {"default_model": "saved:chat", "fast_model": "saved:fast", "embed_model": "saved:embed"}
     get_options = AsyncMock(return_value=stored)
     monkeypatch.setattr(Option, "get", get_options)
+    monkeypatch.setattr(model_cache, "canonicalize_spec", lambda spec: spec)
     monkeypatch.setattr(
         UserConfig, "load", AsyncMock(return_value=SimpleNamespace(schema=SimpleNamespace(enable_memory=True)))
     )

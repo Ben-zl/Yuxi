@@ -6,18 +6,41 @@ from unittest.mock import ANY, AsyncMock
 import pytest
 
 from yuxi.agentscope import runtime_resources
+from yuxi.services.agent_run_manifest_service import compute_manifest_fingerprint
 
 pytestmark = pytest.mark.unit
 
 
-async def test_direct_session_uses_exact_mapping(monkeypatch):
+@pytest.fixture
+def active_run(monkeypatch):
+    """提供当前运行及其提交时快照，不读取会话中的旧模型配置。"""
+    manifest = {
+        "manifest_version": 1,
+        "resource_snapshot": {"id": "current-run-snapshot", "fingerprint": "snapshot-digest"},
+    }
+    run = SimpleNamespace(
+        id="current-run",
+        status="running",
+        manifest=manifest,
+        manifest_fingerprint=compute_manifest_fingerprint(manifest),
+    )
+    lookup = AsyncMock(return_value=run)
+    monkeypatch.setattr(
+        runtime_resources,
+        "AgentRunRepository",
+        lambda db: SimpleNamespace(get_active_run_by_thread_for_user=lookup),
+    )
+    return run, lookup
+
+
+async def test_direct_session_uses_exact_mapping(monkeypatch, active_run):
     """主线程必须通过 uid、agent、session 的精确映射消费统一投影。"""
     mapping = SimpleNamespace(agent_slug="leader", model_spec="p:m", thread_id="thread-1")
     lookup = AsyncMock(return_value=mapping)
     projection = SimpleNamespace(agent_slug="leader")
     project = AsyncMock(return_value=projection)
     monkeypatch.setattr(runtime_resources, "get_thread_session_by_agentscope_context", lookup)
-    monkeypatch.setattr(runtime_resources, "project_runtime", project)
+    monkeypatch.setattr(runtime_resources, "load_run_resources", project)
 
     result = await runtime_resources.resolve_runtime_projection(
         SimpleNamespace(),
@@ -38,13 +61,17 @@ async def test_direct_session_uses_exact_mapping(monkeypatch):
         ANY,
         uid="u",
         agent_slug="leader",
-        model_spec="p:m",
-        thread_id="thread-1",
-        is_team_worker=False,
+        manifest=active_run[0].manifest,
+    )
+    assert project.await_args.kwargs["manifest"] is active_run[0].manifest
+    active_run[1].assert_awaited_once_with(
+        uid="u",
+        agent_slug="leader",
+        conversation_thread_id="thread-1",
     )
 
 
-async def test_team_worker_uses_subagent_resources_with_parent_run_context(monkeypatch):
+async def test_team_worker_uses_subagent_resources_with_parent_run_context(monkeypatch, active_run):
     """动态 worker 使用子智能体资源，同时沿用父线程与本轮模型。"""
     mapping = SimpleNamespace(agent_slug="leader", model_spec="p:m", thread_id="thread-1")
     lookup = AsyncMock(side_effect=[None, mapping])
@@ -69,7 +96,7 @@ async def test_team_worker_uses_subagent_resources_with_parent_run_context(monke
         get_team=AsyncMock(return_value=SimpleNamespace(session_id="leader-session")),
     )
     monkeypatch.setattr(runtime_resources, "get_thread_session_by_agentscope_context", lookup)
-    monkeypatch.setattr(runtime_resources, "project_runtime", project)
+    monkeypatch.setattr(runtime_resources, "load_run_resources", project)
     monkeypatch.setattr(
         runtime_resources,
         "asyncio",
@@ -99,10 +126,47 @@ async def test_team_worker_uses_subagent_resources_with_parent_run_context(monke
         ANY,
         uid="u",
         agent_slug="automation-analysis-agent",
-        model_spec="p:m",
-        thread_id="thread-1",
-        is_team_worker=True,
+        manifest=active_run[0].manifest,
     )
+    assert project.await_args.kwargs["manifest"] is active_run[0].manifest
+    active_run[1].assert_awaited_once_with(
+        uid="u",
+        agent_slug="leader",
+        conversation_thread_id="thread-1",
+    )
+
+
+@pytest.mark.parametrize("invalid", ["missing_run", "pending", "completed", "missing_manifest", "changed_fingerprint"])
+async def test_runtime_rejects_missing_or_invalid_current_run(monkeypatch, active_run, invalid):
+    """无正在执行的有效快照时必须拒绝，不能改用会话或最新配置。"""
+    run, lookup = active_run
+    if invalid == "missing_run":
+        lookup.return_value = None
+    elif invalid == "missing_manifest":
+        run.manifest = None
+    elif invalid == "changed_fingerprint":
+        run.manifest = {**run.manifest, "resource_snapshot": {"id": "another-run", "fingerprint": "snapshot-digest"}}
+    else:
+        run.status = invalid
+    monkeypatch.setattr(
+        runtime_resources,
+        "get_thread_session_by_agentscope_context",
+        AsyncMock(return_value=SimpleNamespace(agent_slug="leader", thread_id="thread-1", model_spec="stale:model")),
+    )
+    load_resources = AsyncMock()
+    monkeypatch.setattr(runtime_resources, "load_run_resources", load_resources)
+
+    error = "指纹不一致" if invalid == "changed_fingerprint" else "缺少正在执行"
+    with pytest.raises(ValueError, match=error):
+        await runtime_resources.resolve_runtime_projection(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            user_id="u",
+            agent_id="a",
+            session_id="s",
+        )
+
+    load_resources.assert_not_awaited()
 
 
 async def test_runtime_skills_reconcile_to_subagent_projection():

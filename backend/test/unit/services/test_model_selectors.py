@@ -10,6 +10,20 @@ from yuxi.models.rerank import OpenAIReranker, get_reranker
 from yuxi.models.providers.cache import ModelInfo
 
 
+@pytest.fixture(autouse=True)
+def _identity_canonicalize(monkeypatch):
+    monkeypatch.setattr("yuxi.models.chat.model_cache.canonicalize_spec", lambda spec: spec)
+    monkeypatch.setattr("yuxi.models.embed.model_cache.canonicalize_spec", lambda spec: spec)
+    monkeypatch.setattr("yuxi.models.rerank.model_cache.canonicalize_spec", lambda spec: spec)
+
+
+@pytest.fixture(autouse=True)
+def _identity_canonicalize(monkeypatch):
+    monkeypatch.setattr("yuxi.models.chat.model_cache.canonicalize_spec", lambda spec: spec)
+    monkeypatch.setattr("yuxi.models.embed.model_cache.canonicalize_spec", lambda spec: spec)
+    monkeypatch.setattr("yuxi.models.rerank.model_cache.canonicalize_spec", lambda spec: spec)
+
+
 def _model_info(model_type: str) -> ModelInfo:
     return ModelInfo(
         provider_id="test-provider",

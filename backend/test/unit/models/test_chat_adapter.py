@@ -47,6 +47,7 @@ async def test_adapter_preserves_call_contract_and_normalizes_messages(monkeypat
 
 
 def test_select_model_rejects_unknown_or_non_chat_model(monkeypatch):
+    monkeypatch.setattr(chat.model_cache, "canonicalize_spec", lambda spec: spec)
     monkeypatch.setattr(chat.model_cache, "get_model_info", lambda _spec: None)
     monkeypatch.setattr(chat.model_cache, "get_all_specs", lambda _kind: [])
     with pytest.raises(ValueError, match="未找到模型"):

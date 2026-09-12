@@ -12,7 +12,7 @@ import asyncio
 import json
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="openai-mock")
@@ -325,8 +325,10 @@ def _chunk(model: str, delta: dict, finish_reason: str | None = None) -> dict:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(body: dict):
+async def chat_completions(body: dict, authorization: str | None = Header(None)):
     model = body.get("model", "mock-chat-model")
+    if model == "snapshot-proof" and authorization != "Bearer snapshot-fixture-key":
+        raise HTTPException(status_code=401, detail="snapshot credential mismatch")
     import logging
 
     logging.getLogger("mock").warning(

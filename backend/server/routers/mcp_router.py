@@ -19,6 +19,11 @@ from yuxi.agents.mcp.service import (
 )
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils import logger
+from yuxi.permissions.resource_permission import (
+    ResourcePermission,
+    require_resource_permission,
+    resolve_mcp_permission,
+)
 
 from server.utils.auth_middleware import get_admin_user, get_db, get_required_user
 
@@ -43,6 +48,7 @@ class CreateMcpServerRequest(BaseModel):
     sse_read_timeout: int | None = Field(None, description="SSE 读取超时（秒）")
     tags: list | None = Field(None, description="标签数组")
     icon: str | None = Field(None, description="图标（emoji）")
+    share_config: dict | None = Field(None, description="共享权限配置，仅支持 global/department")
 
 
 class UpdateMcpServerRequest(BaseModel):
@@ -57,6 +63,7 @@ class UpdateMcpServerRequest(BaseModel):
     sse_read_timeout: int | None = Field(None, description="SSE 读取超时（秒）")
     tags: list | None = Field(None, description="标签数组")
     icon: str | None = Field(None, description="图标（emoji）")
+    share_config: dict | None = Field(None, description="共享权限配置，仅支持 global/department")
 
 
 class UpdateMcpServerStatusRequest(BaseModel):
@@ -68,17 +75,32 @@ class UpdateMcpServerStatusRequest(BaseModel):
 # =============================================================================
 
 
-async def get_server_or_404(db: AsyncSession, slug: str):
+async def get_server_or_404(db: AsyncSession, slug: str, user: User | None = None):
     """Helper to get server or raise 404."""
-    server = await get_mcp_server(db, slug)
+    server = await get_mcp_server(db, slug, allow_slug=False)
     if not server:
         raise HTTPException(status_code=404, detail=f"服务器 '{slug}' 不存在")
+    if user is not None:
+        from yuxi.permissions.resource_permission import resolve_mcp_permission
+
+        if resolve_mcp_permission(user, server).value == "none":
+            raise HTTPException(status_code=404, detail=f"服务器 '{slug}' 不存在")
     return server
 
 
-def serialize_mcp_server(server) -> dict:
+async def get_manageable_server_or_404(db: AsyncSession, resource_id: str, user: User):
+    """读取当前用户可管理的 MCP，管理型连接操作不得只依赖 READ。"""
+    server = await get_server_or_404(db, resource_id, user)
+    try:
+        require_resource_permission(resolve_mcp_permission(user, server), ResourcePermission.MANAGE)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return server
+
+
+def serialize_mcp_server(server, *, sanitize: bool = True) -> dict:
     """序列化 MCP，并补充代码内置与迁移状态。"""
-    data = server.to_dict()
+    data = server.to_dict(sanitize=sanitize)
     data["is_builtin"] = is_builtin_mcp_server(server)
     data["requires_migration"] = requires_mcp_stdio_migration(server)
     if data["requires_migration"]:
@@ -104,25 +126,11 @@ async def get_mcp_servers(
 ):
     """获取所有 MCP 服务器配置（普通用户仅获取脱敏的基础信息）"""
     try:
-        servers = await get_all_mcp_servers(db)
-        if current_user.role in ["admin", "superadmin"]:
-            return {"success": True, "data": [serialize_mcp_server(s) for s in servers]}
-
-        data = []
-        for s in servers:
-            data.append(
-                {
-                    "name": getattr(s, "name", ""),
-                    "description": getattr(s, "description", None),
-                    "icon": getattr(s, "icon", None),
-                    "enabled": bool(getattr(s, "enabled", True)) and not requires_mcp_stdio_migration(s),
-                    "tags": getattr(s, "tags", None) or [],
-                }
-            )
-        return {"success": True, "data": data}
+        servers = await get_all_mcp_servers(db, user=current_user)
+        return {"success": True, "data": [serialize_mcp_server(s, sanitize=True) for s in servers]}
     except Exception as e:
-        logger.error(f"Failed to get MCP servers: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to get MCP servers: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="获取 MCP 服务器失败")
 
 
 @mcp.post("")
@@ -155,30 +163,36 @@ async def create_mcp_server_route(
             tags=request.tags,
             icon=request.icon,
             created_by=current_user.username,
+            share_config=request.share_config,
+            operator=current_user,
         )
-        return {"success": True, "data": serialize_mcp_server(server)}
+        return {"success": True, "data": serialize_mcp_server(server, sanitize=True)}
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
     except Exception as e:
-        logger.error(f"Failed to create MCP server: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to create MCP server: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="创建 MCP 服务器失败")
 
 
 @mcp.get("/{slug}")
 async def get_mcp_server_route(
     slug: str,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     """获取单个 MCP 服务器配置"""
     try:
-        server = await get_server_or_404(db, slug)
-        return {"success": True, "data": serialize_mcp_server(server)}
+        server = await get_server_or_404(db, slug, current_user)
+        return {"success": True, "data": serialize_mcp_server(server, sanitize=True)}
     except HTTPException:
         raise
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
     except Exception as e:
-        logger.error(f"Failed to get MCP server: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to get MCP server: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="获取 MCP 服务器失败")
 
 
 @mcp.put("/{slug}")
@@ -208,8 +222,14 @@ async def update_mcp_server_route(
             tags=request.tags,
             icon=request.icon,
             updated_by=current_user.username,
+            share_config=request.share_config,
+            operator=current_user,
+            resource_only=True,
         )
-        return {"success": True, "data": serialize_mcp_server(server)}
+        return {
+            "success": True,
+            "data": serialize_mcp_server(server, sanitize=True),
+        }
     except HTTPException:
         raise
     except MCPServerNotFoundError as exc:
@@ -219,8 +239,8 @@ async def update_mcp_server_route(
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        logger.error(f"Failed to update MCP server: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to update MCP server: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="更新 MCP 服务器失败")
 
 
 @mcp.delete("/{slug}")
@@ -232,19 +252,21 @@ async def delete_mcp_server_route(
     """删除 MCP 服务器"""
     try:
         # 检查是否为系统内置服务器
-        server = await get_mcp_server(db, slug)
+        server = await get_mcp_server(db, slug, allow_slug=False)
         if server and is_builtin_mcp_server(server):
             raise HTTPException(status_code=403, detail="系统内置的 MCP 服务器无法删除")
 
-        deleted = await delete_mcp_server(db, slug)
+        deleted = await delete_mcp_server(db, slug, operator=current_user, resource_only=True)
         if not deleted:
             raise HTTPException(status_code=404, detail=f"服务器 '{slug}' 不存在")
         return {"success": True, "message": f"服务器 '{slug}' 已删除"}
     except HTTPException:
         raise
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
     except Exception as e:
-        logger.error(f"Failed to delete MCP server: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to delete MCP server: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="删除 MCP 服务器失败")
 
 
 # =============================================================================
@@ -260,23 +282,26 @@ async def test_mcp_server(
 ):
     """测试 MCP 服务器连接"""
     try:
-        server = await get_server_or_404(db, slug)
+        server = await get_manageable_server_or_404(db, slug, current_user)
         ensure_mcp_server_runnable(server)
 
         try:
-            tools = await get_all_mcp_tools(slug)
+            tools = await get_all_mcp_tools(server.resource_id, user=current_user)
             return {
                 "success": True,
                 "message": f"连接成功，共发现 {len(tools)} 个工具",
                 "tool_count": len(tools),
             }
         except Exception as test_error:
-            raise HTTPException(status_code=500, detail=f"连接失败: {str(test_error)}")
+            logger.warning(
+                f"MCP 连接测试失败: resource_id={server.resource_id}, error_type={type(test_error).__name__}"
+            )
+            raise HTTPException(status_code=502, detail="MCP 连接测试失败")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to test MCP server: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to test MCP server: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="MCP 连接测试失败")
 
 
 @mcp.put("/{slug}/status")
@@ -288,20 +313,29 @@ async def update_mcp_server_status_route(
 ):
     """更新 MCP 服务器启用状态"""
     try:
-        is_enabled, server = await set_server_enabled(db, slug, request.enabled, current_user.username)
+        is_enabled, server = await set_server_enabled(
+            db,
+            slug,
+            request.enabled,
+            current_user.username,
+            operator=current_user,
+            resource_only=True,
+        )
         return {
             "success": True,
             "enabled": is_enabled,
-            "data": serialize_mcp_server(server),
+            "data": serialize_mcp_server(server, sanitize=True),
             "message": f"MCP '{slug}' 已{'添加' if is_enabled else '移除'}",
         }
     except MCPServerNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        logger.error(f"Failed to toggle MCP server: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to toggle MCP server: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="更新 MCP 状态失败")
 
 
 # =============================================================================
@@ -317,13 +351,13 @@ async def get_mcp_server_tools(
 ):
     """获取 MCP 服务器的工具列表"""
     try:
-        server = await get_server_or_404(db, slug)
+        server = await get_manageable_server_or_404(db, slug, current_user)
         ensure_mcp_server_runnable(server)
         disabled_tools = server.disabled_tools or []
 
         try:
             # 获取所有工具（不过滤 disabled_tools）
-            tools = await get_all_mcp_tools(slug)
+            tools = await get_all_mcp_tools(server.resource_id, user=current_user)
             tool_list = []
 
             for tool in tools:
@@ -352,13 +386,15 @@ async def get_mcp_server_tools(
                 "total": len(tool_list),
             }
         except Exception as tool_error:
-            logger.error(f"Failed to get tools from MCP server '{slug}': {tool_error}")
-            raise HTTPException(status_code=500, detail=f"获取工具失败: {str(tool_error)}")
+            logger.error(
+                f"Failed to get tools from MCP server '{server.resource_id}': error_type={type(tool_error).__name__}"
+            )
+            raise HTTPException(status_code=502, detail="获取 MCP 工具失败")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get MCP server tools: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to get MCP server tools: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="获取 MCP 工具失败")
 
 
 @mcp.post("/{slug}/tools/refresh")
@@ -369,15 +405,15 @@ async def refresh_mcp_server_tools(
 ):
     """刷新 MCP 服务器的工具列表（清除缓存重新获取）"""
     try:
-        server = await get_server_or_404(db, slug)
+        server = await get_manageable_server_or_404(db, slug, current_user)
         ensure_mcp_server_runnable(server)
 
         try:
             # 获取所有工具（不过滤 disabled_tools）
-            tools = await get_all_mcp_tools(slug)
+            tools = await get_all_mcp_tools(server.resource_id, user=current_user)
 
             # 获取统计信息
-            stats = get_mcp_tools_stats(slug)
+            stats = get_mcp_tools_stats(server.resource_id)
             enabled_count = stats.get("enabled", len(tools)) if stats else len(tools)
             disabled_count = stats.get("disabled", 0) if stats else 0
 
@@ -395,12 +431,15 @@ async def refresh_mcp_server_tools(
                 "disabled_count": disabled_count,
             }
         except Exception as tool_error:
-            raise HTTPException(status_code=500, detail=f"刷新失败: {str(tool_error)}")
+            logger.warning(
+                f"MCP 工具刷新失败: resource_id={server.resource_id}, error_type={type(tool_error).__name__}"
+            )
+            raise HTTPException(status_code=502, detail="刷新 MCP 工具失败")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to refresh MCP server tools: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to refresh MCP server tools: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="刷新 MCP 工具失败")
 
 
 @mcp.put("/{slug}/tools/{tool_name}/toggle")
@@ -412,7 +451,14 @@ async def toggle_mcp_server_tool_route(
 ):
     """切换单个工具的启用状态"""
     try:
-        enabled, _ = await toggle_tool_enabled(db, slug, tool_name, current_user.username)
+        enabled, _ = await toggle_tool_enabled(
+            db,
+            slug,
+            tool_name,
+            current_user.username,
+            operator=current_user,
+            resource_only=True,
+        )
         return {
             "success": True,
             "tool_name": tool_name,
@@ -421,6 +467,8 @@ async def toggle_mcp_server_tool_route(
         }
     except ValueError as ve:
         raise HTTPException(status_code=404, detail=str(ve))
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
     except Exception as e:
-        logger.error(f"Failed to toggle MCP server tool: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to toggle MCP server tool: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="更新 MCP 工具状态失败")

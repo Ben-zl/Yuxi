@@ -40,13 +40,22 @@
       </a-row>
       <template v-if="form.transport === 'streamable_http' || form.transport === 'sse'">
         <a-form-item label="MCP URL" required class="form-item">
-          <a-input v-model:value="form.url" placeholder="https://example.com/mcp" />
+          <a-input
+            v-model:value="form.url"
+            :placeholder="
+              editMode && editData?.url_configured && !editData?.url
+                ? '已配置（地址已隐藏）'
+                : 'https://example.com/mcp'
+            "
+            @change="urlEdited = true"
+          />
         </a-form-item>
         <a-form-item label="HTTP 请求头" class="form-item">
           <a-textarea
             v-model:value="form.headersText"
             placeholder='JSON 格式，如：{"Authorization": "Bearer xxx"}'
             :rows="3"
+            @change="headersEdited = true"
           />
         </a-form-item>
         <a-row :gutter="16">
@@ -80,6 +89,13 @@
           style="width: 100%"
         />
       </a-form-item>
+      <ShareConfigForm
+        ref="shareConfigFormRef"
+        v-model="form.share_config"
+        :allowed-access-levels="allowedShareAccessLevels"
+        :require-read-scope="true"
+        :disabled="isGlobalScopeReadOnly"
+      />
     </a-form>
   </a-modal>
 </template>
@@ -88,6 +104,10 @@
 import { ref, reactive, computed, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { mcpApi } from '@/apis/mcp_api'
+import ShareConfigForm from '@/components/ShareConfigForm.vue'
+import { useUserStore } from '@/stores/user'
+
+const userStore = useUserStore()
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -103,6 +123,21 @@ const visible = computed({
 })
 
 const formLoading = ref(false)
+const urlEdited = ref(false)
+const headersEdited = ref(false)
+const shareConfigFormRef = ref(null)
+const createDefaultShareConfig = () => ({
+  version: 2,
+  read_scope: {
+    access_level: userStore.isSuperAdmin ? 'global' : 'department',
+    department_ids:
+      !userStore.isSuperAdmin && userStore.departmentId != null
+        ? [Number(userStore.departmentId)]
+        : [],
+    user_uids: []
+  },
+  manage_scope: null
+})
 
 const form = reactive({
   slug: '',
@@ -114,12 +149,26 @@ const form = reactive({
   timeout: null,
   sse_read_timeout: null,
   tags: [],
-  icon: ''
+  icon: '',
+  share_config: createDefaultShareConfig()
 })
+const isGlobalScopeReadOnly = computed(
+  () =>
+    !userStore.isSuperAdmin &&
+    props.editMode &&
+    form.share_config?.read_scope?.access_level === 'global'
+)
+const allowedShareAccessLevels = computed(() =>
+  userStore.isSuperAdmin || isGlobalScopeReadOnly.value ? ['global', 'department'] : ['department']
+)
 
 watch(
   () => props.open,
   (val) => {
+    if (val) {
+      urlEdited.value = false
+      headersEdited.value = false
+    }
     if (val && props.editData) {
       Object.assign(form, {
         slug: props.editData.slug || '',
@@ -131,7 +180,10 @@ watch(
         timeout: props.editData.timeout,
         sse_read_timeout: props.editData.sse_read_timeout,
         tags: props.editData.tags || [],
-        icon: props.editData.icon || ''
+        icon: props.editData.icon || '',
+        share_config: props.editData.share_config
+          ? JSON.parse(JSON.stringify(props.editData.share_config))
+          : createDefaultShareConfig()
       })
     } else if (val && !props.editData) {
       Object.assign(form, {
@@ -144,7 +196,8 @@ watch(
         timeout: null,
         sse_read_timeout: null,
         tags: [],
-        icon: ''
+        icon: '',
+        share_config: createDefaultShareConfig()
       })
     }
   },
@@ -154,6 +207,11 @@ watch(
 const handleFormSubmit = async () => {
   try {
     formLoading.value = true
+    const shareValidation = shareConfigFormRef.value?.validate()
+    if (shareValidation && !shareValidation.valid) {
+      message.error(shareValidation.message)
+      return
+    }
     let headers = null
     if (form.headersText.trim()) {
       try {
@@ -169,11 +227,11 @@ const handleFormSubmit = async () => {
       description: form.description || null,
       transport: form.transport,
       url: form.url || null,
-      headers,
       timeout: form.timeout || null,
       sse_read_timeout: form.sse_read_timeout || null,
       tags: form.tags.length > 0 ? form.tags : null,
-      icon: form.icon || null
+      icon: form.icon || null,
+      share_config: form.share_config
     }
     if (!data.slug?.trim()) {
       message.error('MCP 标识不能为空')
@@ -187,15 +245,21 @@ const handleFormSubmit = async () => {
       message.error('请选择传输类型')
       return
     }
+    const preserveUrl =
+      props.editMode &&
+      !urlEdited.value &&
+      (props.editData?.url_configured || Boolean(props.editData?.url))
     if (['sse', 'streamable_http'].includes(data.transport)) {
-      if (!data.url?.trim()) {
+      if (!preserveUrl && !data.url?.trim()) {
         message.error('HTTP 类型必须填写 MCP URL')
         return
       }
     }
     if (props.editMode) {
-      const { slug, ...updateData } = data
-      const result = await mcpApi.updateMcpServer(props.editData?.slug || slug, updateData)
+      delete data.slug
+      if (preserveUrl) delete data.url
+      if (headersEdited.value) data.headers = headers
+      const result = await mcpApi.updateMcpServer(props.editData?.resource_id, data)
       if (result.success) {
         message.success('MCP 更新成功')
       } else {
@@ -203,6 +267,7 @@ const handleFormSubmit = async () => {
         return
       }
     } else {
+      data.headers = headers
       const result = await mcpApi.createMcpServer(data)
       if (result.success) {
         message.success('MCP 创建成功')

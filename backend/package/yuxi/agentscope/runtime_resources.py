@@ -5,7 +5,10 @@ from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from yuxi.agentscope.config_projection import RuntimeProjection, project_runtime
+from yuxi.agentscope.config_projection import RuntimeProjection
+from yuxi.repositories.agent_run_repository import AgentRunRepository
+from yuxi.services.agent_run_manifest_service import compute_manifest_fingerprint
+from yuxi.services.run_resource_snapshot_service import load_run_resources
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session_by_agentscope_context
 from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerRepository
 
@@ -50,15 +53,6 @@ async def resolve_runtime_projection(
         if session is None or session.team_id is None:
             if mapping is None:
                 raise ValueError("AgentScope 会话不存在有效的 Yuxi 线程映射")
-        if mapping is not None:
-            return await project_runtime(
-                db,
-                uid=user_id,
-                agent_slug=mapping.agent_slug,
-                model_spec=mapping.model_spec,
-                thread_id=mapping.thread_id,
-                is_team_worker=False,
-            )
 
         binding_repo = AgentScopeTeamWorkerRepository(db)
         binding = None
@@ -90,11 +84,18 @@ async def resolve_runtime_projection(
         if mapping is None:
             raise ValueError("AgentScope Team leader 不存在有效的 Yuxi 线程映射")
 
-    return await project_runtime(
+    run = await AgentRunRepository(db).get_active_run_by_thread_for_user(
+        uid=user_id,
+        agent_slug=mapping.agent_slug,
+        conversation_thread_id=mapping.thread_id,
+    )
+    if run is None or run.status != "running" or not run.manifest:
+        raise ValueError("AgentScope 会话缺少正在执行的 Yuxi Run")
+    if compute_manifest_fingerprint(run.manifest) != run.manifest_fingerprint:
+        raise ValueError("Run 运行清单指纹不一致")
+    return await load_run_resources(
         db,
         uid=user_id,
+        manifest=run.manifest,
         agent_slug=runtime_agent_slug or mapping.agent_slug,
-        model_spec=mapping.model_spec,
-        thread_id=mapping.thread_id,
-        is_team_worker=runtime_agent_slug is not None,
     )

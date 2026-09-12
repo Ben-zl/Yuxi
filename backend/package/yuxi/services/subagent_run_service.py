@@ -18,6 +18,7 @@ from typing import Any
 
 import yuxi.services.agent_run_service as agent_run_service
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agents.tool_approval import DEFAULT_TOOL_APPROVAL_MODE
 from yuxi.repositories.agent_run_repository import AgentRunRepository
@@ -25,7 +26,9 @@ from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.repositories.project_repository import ProjectRepository
 from yuxi.repositories.subagent_thread_repository import SubagentThreadRepository
 from yuxi.services.input_message_service import AgentRunInputMessage
-from yuxi.storage.postgres.models_business import Agent, AgentRun, SubagentThread
+from yuxi.services.agent_run_manifest_service import RUN_MANIFEST_INPUT_KEY, compute_manifest_fingerprint
+from yuxi.services.run_resource_snapshot_service import load_run_resources
+from yuxi.storage.postgres.models_business import Agent, AgentRun, SubagentThread, User
 from yuxi.utils.datetime_utils import format_utc_datetime
 from yuxi.utils.hash_utils import hash_id, subagent_child_thread_id
 
@@ -103,6 +106,10 @@ class SubagentRunService:
         self.conv_repo = ConversationRepository(db)
         self.project_repo = ProjectRepository(db)
         self.thread_repo = SubagentThreadRepository(db)
+
+    async def _get_user(self, uid: str) -> User | None:
+        result = await self.db.execute(select(User).where(User.uid == str(uid)))
+        return result.scalar_one_or_none()
 
     async def start(
         self,
@@ -225,18 +232,23 @@ class SubagentRunService:
         if creator_run.conversation_id != relation.parent_conversation_id:
             raise HTTPException(status_code=409, detail="subagent thread relation 与本次运行不匹配")
 
-        context = agent_run_service.load_agent_run_context(scope.agent_item, scope.agent_backend)
-        resolved_model_spec = await agent_run_service.resolve_agent_run_model_spec(
-            model_spec,
-            getattr(context, "model", None),
+        projection = await load_run_resources(
             self.db,
+            uid=current_uid,
+            manifest=creator_run.manifest,
+            agent_slug=relation.subagent_slug,
         )
+        resolved_model_spec = projection.model_spec
+        if model_spec and model_spec != resolved_model_spec:
+            raise ValueError("子 Run 模型必须属于父 Run 提交快照")
         runtime_payload = {
             "tool_call_id": tool_call_id,
             "subagent_name": scope.agent_item.name,
             "parent_thread_id": creator_run.conversation_thread_id,
         }
         input_payload = {
+            RUN_MANIFEST_INPUT_KEY: creator_run.manifest,
+            "_run_manifest_fingerprint": compute_manifest_fingerprint(creator_run.manifest),
             "model_spec": resolved_model_spec,
             "tool_approval_mode": creator_run.input_payload.get("tool_approval_mode", DEFAULT_TOOL_APPROVAL_MODE),
             "runtime": {key: value for key, value in runtime_payload.items() if value is not None},

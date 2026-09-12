@@ -166,7 +166,8 @@ class DashscopeReranker(BaseReranker):
 
 
 def get_reranker(model_id: str, **kwargs):
-    info = model_cache.get_model_info(model_id)
+    canonical_spec = model_cache.canonicalize_spec(model_id)
+    info = model_cache.get_model_info(canonical_spec) if canonical_spec else None
     if not info:
         raise ValueError(f"Unknown reranker model spec: {model_id}")
     if info.model_type != "rerank":

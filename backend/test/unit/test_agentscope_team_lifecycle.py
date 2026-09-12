@@ -1,11 +1,330 @@
 """AgentScope Team worker 生命周期投影测试。"""
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 from yuxi.agentscope import team_lifecycle
 from yuxi.agentscope.team_lifecycle import TeamLifecycleModule, retain_latest_team_hint
+from yuxi.services.agent_run_manifest_service import compute_manifest_fingerprint
+
+
+@pytest.fixture
+def manifest_runtime(monkeypatch):
+    """隔离存储边界，保留创建、回复、清单校验与继承的真实流程。"""
+    manifest = {
+        "run_type": "chat",
+        "agent": {"slug": "root", "backend_id": "backend"},
+        "resource_snapshot": {"id": "parent-snapshot", "fingerprint": "snapshot-digest"},
+    }
+    parent = SimpleNamespace(
+        id="parent-run",
+        uid="u",
+        agent_slug="root",
+        status="running",
+        conversation_id=1,
+        manifest=manifest,
+        manifest_fingerprint=compute_manifest_fingerprint(manifest),
+        input_payload={"model_spec": "snapshot:model"},
+    )
+    rows = {parent.id: parent}
+    binding = SimpleNamespace(
+        runtime_active=True,
+        active_run_id=None,
+        last_reply_id=None,
+        created_by_run_id=parent.id,
+        parent_thread_id="parent-thread",
+        child_thread_id="child-thread",
+        subagent_slug="child",
+        subagent_thread_relation_id=2,
+        worker_agent_id="worker-agent",
+        worker_session_id="worker-session",
+        team_id="team",
+    )
+    db = SimpleNamespace(add=Mock(), flush=AsyncMock(), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def db_context():
+        yield db
+
+    async def create_run(**kwargs):
+        """保存测试运行行，后续回复读取同一份持久状态。"""
+        run = SimpleNamespace(**{key: value for key, value in kwargs.items() if key != "run_id"})
+        run.id = kwargs["run_id"]
+        run.status = "running"
+        run.worker_id = "worker-owner"
+        run.manifest = None
+        run.manifest_fingerprint = None
+        rows[run.id] = run
+        return run
+
+    async def record_manifest(run_id, *, manifest, fingerprint, worker_id):
+        """模拟仓储首次写入，禁止 fixture 覆盖既有清单。"""
+        run = rows[run_id]
+        assert worker_id == run.worker_id
+        if run.manifest is not None:
+            return run, False
+        run.manifest = deepcopy(manifest)
+        run.manifest_fingerprint = fingerprint
+        return run, True
+
+    runs = SimpleNamespace(
+        get_run=AsyncMock(side_effect=lambda run_id: rows.get(run_id)),
+        get_run_for_user=AsyncMock(side_effect=lambda run_id, uid: rows.get(run_id) if uid == "u" else None),
+        get_active_run_by_thread_for_user=AsyncMock(return_value=parent),
+        get_run_by_request_id=AsyncMock(return_value=None),
+        create_run=AsyncMock(side_effect=create_run),
+        mark_running=AsyncMock(side_effect=lambda run_id, **kwargs: (rows[run_id], True)),
+        record_run_manifest=AsyncMock(side_effect=record_manifest),
+    )
+    bindings = SimpleNamespace(get_by_worker_session=AsyncMock(return_value=binding), create=AsyncMock())
+    monkeypatch.setattr(team_lifecycle.pg_manager, "get_async_session_context", db_context)
+    monkeypatch.setattr(team_lifecycle, "AgentRunRepository", lambda db: runs)
+    monkeypatch.setattr(team_lifecycle, "AgentScopeTeamWorkerRepository", lambda db: bindings)
+    monkeypatch.setattr(
+        team_lifecycle,
+        "SubagentThreadRepository",
+        lambda db: SimpleNamespace(
+            get_for_user=AsyncMock(return_value=SimpleNamespace(id=2)),
+            get_by_child_thread_for_user=AsyncMock(return_value=SimpleNamespace(id=2)),
+        ),
+    )
+    monkeypatch.setattr(
+        team_lifecycle,
+        "ConversationRepository",
+        lambda db: SimpleNamespace(
+            get_conversation_by_thread_id=AsyncMock(return_value=SimpleNamespace(id=3)),
+        ),
+    )
+    monkeypatch.setattr(
+        team_lifecycle,
+        "AgentRepository",
+        lambda db: SimpleNamespace(
+            get_by_slug=AsyncMock(return_value=SimpleNamespace(is_subagent=True, name="Child")),
+        ),
+    )
+    monkeypatch.setattr(
+        team_lifecycle,
+        "get_thread_session_by_agentscope_context",
+        AsyncMock(return_value=SimpleNamespace(agent_slug="root", thread_id="parent-thread")),
+    )
+    load = AsyncMock(return_value=SimpleNamespace(model_spec="snapshot:model"))
+    heartbeat = Mock()
+    monkeypatch.setattr(team_lifecycle, "load_run_resources", load)
+    monkeypatch.setattr(team_lifecycle, "start_run_lease_heartbeat", heartbeat)
+    monkeypatch.setattr(team_lifecycle, "append_run_stream_event", AsyncMock())
+    lifecycle = TeamLifecycleModule(
+        storage=_worker_storage(), uid="u", agent_id="leader-agent", session_id="leader-session"
+    )
+    lifecycle.storage.get_session.return_value = SimpleNamespace(config=SimpleNamespace(workspace_id="workspace"))
+    return SimpleNamespace(
+        lifecycle=lifecycle,
+        db=db,
+        parent=parent,
+        rows=rows,
+        runs=runs,
+        binding=binding,
+        bindings=bindings,
+        load=load,
+        heartbeat=heartbeat,
+    )
+
+
+async def _project_first_child(runtime):
+    """经 AgentCreate 差分入口创建首次子运行。"""
+    runtime.bindings.get_by_worker_session.return_value = None
+    await runtime.lifecycle.project_created_member(
+        before=team_lifecycle.TeamRosterSnapshot(team_id="team", members={}),
+        after=team_lifecycle.TeamRosterSnapshot(
+            team_id="team", members={"worker-session": ("worker-agent", "created")}
+        ),
+        tool_call_id="create-child",
+        tool_input={"subagent_type": "child", "prompt": "Task"},
+    )
+
+
+async def test_first_child_and_first_reply_reuse_persisted_parent_snapshot(manifest_runtime):
+    """首次回复复用创建时清单，父配置变化不得触发重新捕获。"""
+    rt = manifest_runtime
+    parent_manifest = deepcopy(rt.parent.manifest)
+    await _project_first_child(rt)
+    child = next(row for row in rt.rows.values() if row.id != rt.parent.id)
+    expected = {**parent_manifest, "run_type": "subagent", "agent": {**parent_manifest["agent"], "slug": "child"}}
+    assert child.created_by_run_id == rt.parent.id
+    assert child.manifest == expected
+    assert child.manifest_fingerprint == compute_manifest_fingerprint(expected)
+    rt.runs.get_run_for_user.assert_awaited_once_with("parent-run", "u")
+    rt.load.assert_awaited_once_with(rt.db, uid="u", manifest=parent_manifest, agent_slug="child")
+    persisted_manifest = child.manifest
+    rt.parent.manifest = {**parent_manifest, "resource_snapshot": {"id": "changed-live-snapshot"}}
+    rt.binding.active_run_id = child.id
+    rt.bindings.get_by_worker_session.return_value = rt.binding
+
+    assert await rt.lifecycle._open_worker_run("worker-session", "first-reply", {}) == (child.id, child.request_id)
+
+    assert child.manifest is persisted_manifest
+    assert child.manifest == expected
+    assert child.manifest_fingerprint == compute_manifest_fingerprint(expected)
+    rt.runs.record_run_manifest.assert_awaited_once()
+    rt.runs.create_run.assert_awaited_once()
+    rt.runs.get_run_for_user.assert_awaited_once()
+    assert rt.load.await_args.kwargs["manifest"] is persisted_manifest
+    assert rt.binding.last_reply_id == "first-reply"
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing_parent", "missing_manifest", "changed_fingerprint", "unavailable_snapshot"]
+)
+async def test_first_child_requires_valid_explicit_parent_snapshot(manifest_runtime, invalid):
+    """创建时父运行缺失、清单篡改或快照不可加载必须阻止发布。"""
+    rt = manifest_runtime
+    error = "缺少父 Run 提交快照"
+    if invalid == "missing_parent":
+        rt.rows.clear()
+    elif invalid == "missing_manifest":
+        rt.parent.manifest = None
+    elif invalid == "changed_fingerprint":
+        rt.parent.manifest_fingerprint = "changed"
+        error = "父 Run manifest 指纹不一致"
+    else:
+        rt.load.side_effect = ValueError("parent snapshot unavailable")
+        error = "parent snapshot unavailable"
+
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        await _project_first_child(rt)
+
+    rt.runs.get_run_for_user.assert_awaited_once_with("parent-run", "u")
+    rt.runs.record_run_manifest.assert_not_awaited()
+    rt.bindings.create.assert_not_awaited()
+    rt.db.commit.assert_not_awaited()
+    rt.heartbeat.assert_not_called()
+    if invalid != "unavailable_snapshot":
+        rt.load.assert_not_awaited()
+
+
+@pytest.mark.parametrize("invalid", ["changed_fingerprint", "unavailable_snapshot"])
+async def test_first_reply_revalidates_persisted_child_snapshot(manifest_runtime, invalid):
+    """首次回复必须重新校验已有清单及其可加载性，不能直接复用 lease。"""
+    rt = manifest_runtime
+    await _project_first_child(rt)
+    child = next(row for row in rt.rows.values() if row.id != rt.parent.id)
+    rt.binding.active_run_id = child.id
+    rt.bindings.get_by_worker_session.return_value = rt.binding
+    rt.db.commit.reset_mock()
+    rt.heartbeat.reset_mock()
+    rt.load.reset_mock()
+    if invalid == "changed_fingerprint":
+        child.manifest_fingerprint = "changed"
+        error = "child Run manifest 指纹不一致"
+    else:
+        rt.load.side_effect = ValueError("child snapshot unavailable")
+        error = "child snapshot unavailable"
+
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        await rt.lifecycle._open_worker_run("worker-session", "first-reply", {})
+
+    assert rt.binding.last_reply_id is None
+    rt.db.commit.assert_not_awaited()
+    rt.heartbeat.assert_not_called()
+    rt.runs.record_run_manifest.assert_awaited_once()
+    if invalid == "changed_fingerprint":
+        rt.load.assert_not_awaited()
+
+
+@pytest.mark.parametrize("parent_status", [None, "pending", "completed"])
+async def test_continuation_requires_current_running_root(manifest_runtime, parent_status):
+    """旧创建者存在也不能替代当前正在运行的根 Run。"""
+    rt = manifest_runtime
+    rt.runs.get_active_run_by_thread_for_user.return_value = (
+        SimpleNamespace(status=parent_status) if parent_status else None
+    )
+
+    with pytest.raises(ValueError, match="缺少正在执行的父 Run"):
+        await rt.lifecycle._open_worker_run("worker-session", "next-reply", {})
+
+    rt.runs.get_active_run_by_thread_for_user.assert_awaited_once_with(
+        agent_slug="root",
+        conversation_thread_id="parent-thread",
+        uid="u",
+    )
+    rt.runs.create_run.assert_not_awaited()
+    rt.load.assert_not_awaited()
+    rt.db.commit.assert_not_awaited()
+
+
+async def test_continuation_inherits_current_root_not_original_creator(manifest_runtime):
+    """后续回复绑定当前根运行的快照，不取最初创建者或 latest Run。"""
+    rt = manifest_runtime
+    current = deepcopy(rt.parent)
+    current.id = "current-root"
+    current.manifest["resource_snapshot"]["id"] = "current-snapshot"
+    current.manifest_fingerprint = compute_manifest_fingerprint(current.manifest)
+    rt.rows[current.id] = current
+    rt.runs.get_active_run_by_thread_for_user.return_value = current
+
+    child_id, _ = await rt.lifecycle._open_worker_run("worker-session", "next-reply", {})
+
+    child = rt.rows[child_id]
+    assert child.created_by_run_id == current.id
+    assert child.manifest["resource_snapshot"] == current.manifest["resource_snapshot"]
+    assert child.manifest["resource_snapshot"] != rt.parent.manifest["resource_snapshot"]
+    assert child.manifest_fingerprint == compute_manifest_fingerprint(child.manifest)
+    rt.runs.get_active_run_by_thread_for_user.assert_awaited_once_with(
+        agent_slug="root",
+        conversation_thread_id="parent-thread",
+        uid="u",
+    )
+    rt.load.assert_awaited_once_with(rt.db, uid="u", manifest=current.manifest, agent_slug="child")
+
+
+async def test_repeated_continuation_reply_reuses_existing_manifest(manifest_runtime):
+    """相同 continuation reply 重入只校验既有清单，不创建第二个运行。"""
+    rt = manifest_runtime
+    first = await rt.lifecycle._open_worker_run("worker-session", "next-reply", {})
+    child = rt.rows[first[0]]
+    persisted = deepcopy(child.manifest)
+    rt.runs.get_run_by_request_id.return_value = child
+
+    assert await rt.lifecycle._open_worker_run("worker-session", "next-reply", {}) == first
+
+    rt.runs.create_run.assert_awaited_once()
+    rt.runs.record_run_manifest.assert_awaited_once()
+    assert child.manifest == persisted
+    assert child.manifest_fingerprint == compute_manifest_fingerprint(persisted)
+    assert rt.load.await_count == 2
+    assert rt.load.await_args.kwargs["manifest"] is child.manifest
+
+
+@pytest.mark.parametrize("persisted", [None, SimpleNamespace(manifest_fingerprint="conflicting-fingerprint")])
+async def test_first_child_rejects_missing_or_conflicting_persisted_manifest(manifest_runtime, persisted):
+    """仓储拒绝写入或返回冲突指纹时，不得发布 Team binding。"""
+    rt = manifest_runtime
+    rt.runs.record_run_manifest.side_effect = None
+    rt.runs.record_run_manifest.return_value = (persisted, False)
+    error = "child Run 不存在" if persisted is None else "manifest 已变化"
+
+    with pytest.raises(RuntimeError, match=error):
+        await _project_first_child(rt)
+
+    rt.bindings.create.assert_not_awaited()
+    rt.db.commit.assert_not_awaited()
+    rt.heartbeat.assert_not_called()
+
+
+async def test_continuation_requires_original_creator_identity(manifest_runtime):
+    """缺少创建者时无法确定根 Agent，不得猜测其他活跃运行。"""
+    rt = manifest_runtime
+    rt.rows.clear()
+
+    with pytest.raises(ValueError, match="缺少创建者 Run"):
+        await rt.lifecycle._open_worker_run("worker-session", "next-reply", {})
+
+    rt.runs.get_active_run_by_thread_for_user.assert_not_awaited()
+    rt.runs.create_run.assert_not_awaited()
+    rt.db.commit.assert_not_awaited()
 
 
 def _worker_storage() -> SimpleNamespace:

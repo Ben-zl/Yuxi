@@ -19,11 +19,17 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import yaml
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from yuxi.agents.mcp.service import get_enabled_mcp_server_slugs
+from yuxi.agents.mcp.service import get_enabled_mcp_server_config, get_enabled_mcp_server_slugs
+from yuxi.agents.skills.metadata import (
+    SKILL_SLUG_PATTERN,
+    normalize_string_list,
+    parse_skill_dir_metadata,
+    parse_skill_markdown as _parse_skill_markdown,
+    rewrite_skill_frontmatter_slug as _rewrite_frontmatter_slug,
+)
 from yuxi.agents.skills.repository import SkillRepository
 from yuxi.config import (
     get_runtime_dir,
@@ -34,9 +40,6 @@ from yuxi.permissions import ResourcePermission, normalize_permission_config, re
 from yuxi.storage.postgres.models_business import Skill, User
 from yuxi.utils.logging_config import logger
 from yuxi.utils.paths import ensure_within_root
-
-SKILL_SLUG_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
-SKILL_NAME_PATTERN = SKILL_SLUG_PATTERN
 
 TEXT_FILE_EXTENSIONS = {
     ".md",
@@ -145,22 +148,6 @@ def _user_skills_file_lock(uid: str):
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def normalize_string_list(values: list[str] | None) -> list[str]:
-    if not values:
-        return []
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        item = value.strip()
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        normalized.append(item)
-    return normalized
 
 
 def is_valid_skill_slug(slug: str) -> bool:
@@ -630,17 +617,17 @@ async def get_skill_dependency_options(
         all_tools = get_tool_metadata()
         return [{"slug": tool["slug"], "name": tool.get("name", tool["slug"])} for tool in all_tools]
 
-    skill_slugs, tool_list, mcp_names = await asyncio.gather(
+    skill_slugs, tool_list, mcp_resource_ids = await asyncio.gather(
         list_skill_slugs(db, user=user),
         asyncio.to_thread(get_tools),
-        get_enabled_mcp_server_slugs(db=db),
+        get_enabled_mcp_server_slugs(db=db, user=user, use_resource_ids=True),
     )
     if slug:
         skill_slugs = [item for item in skill_slugs if item != slug]
 
     return {
         "tools": tool_list,
-        "mcps": mcp_names,
+        "mcps": mcp_resource_ids,
         "skills": skill_slugs,
     }
 
@@ -672,6 +659,8 @@ def _get_all_tool_names() -> list[str]:
 
 async def _validate_dependencies(
     *,
+    db: AsyncSession,
+    operator: User,
     parent: Skill,
     tool_dependencies: list[str],
     mcp_dependencies: list[str],
@@ -688,10 +677,18 @@ async def _validate_dependencies(
     if invalid_tools:
         raise ValueError(f"存在无效工具依赖: {', '.join(invalid_tools)}")
 
-    available_mcps = set(await get_enabled_mcp_server_slugs(db=None))
-    invalid_mcps = [name for name in mcps if name not in available_mcps]
+    canonical_mcps: list[str] = []
+    invalid_mcps: list[str] = []
+    for reference in mcps:
+        config = await get_enabled_mcp_server_config(reference, db=db, user=operator)
+        resource_id = str((config or {}).get("resource_id") or "")
+        if not resource_id:
+            invalid_mcps.append(reference)
+            continue
+        if resource_id not in canonical_mcps:
+            canonical_mcps.append(resource_id)
     if invalid_mcps:
-        raise ValueError(f"存在无效 MCP 依赖: {', '.join(invalid_mcps)}")
+        raise ValueError(f"存在无效、不可访问或歧义的 MCP 依赖: {', '.join(invalid_mcps)}")
 
     invalid_skills = [name for name in skills if name not in available_skills]
     if invalid_skills:
@@ -704,7 +701,7 @@ async def _validate_dependencies(
     if forbidden_skills:
         raise ValueError(f"存在权限范围不匹配的 skill 依赖: {', '.join(forbidden_skills)}")
 
-    return tools, mcps, skills
+    return tools, canonical_mcps, skills
 
 
 async def update_skill_dependencies(
@@ -722,6 +719,8 @@ async def update_skill_dependencies(
     skill_items = await _list_accessible_shared_skills(db, operator)
     available_skills = {skill.slug: skill for skill in skill_items}
     tools, mcps, skills = await _validate_dependencies(
+        db=db,
+        operator=operator,
         parent=item,
         tool_dependencies=tool_dependencies,
         mcp_dependencies=mcp_dependencies,
@@ -738,86 +737,6 @@ async def update_skill_dependencies(
     )
     await db.commit()
     return updated
-
-
-def _validate_skill_slug_value(slug: str, *, field_name: str) -> str:
-    slug = slug.strip()
-    if not slug:
-        raise ValueError(f"SKILL.md frontmatter 缺少 {field_name}")
-    if len(slug) > 128:
-        raise ValueError(f"SKILL.md frontmatter.{field_name} 长度不能超过 128")
-    if not SKILL_NAME_PATTERN.match(slug):
-        raise ValueError(f"SKILL.md frontmatter.{field_name} 必须是小写字母/数字/短横线，且不能连续短横线")
-    return slug
-
-
-def _validate_skill_display_name(name: str) -> str:
-    name = name.strip()
-    if not name:
-        raise ValueError("SKILL.md frontmatter 缺少 name")
-    if len(name) > 128:
-        raise ValueError("SKILL.md frontmatter.name 长度不能超过 128")
-    return name
-
-
-def _split_frontmatter(content: str) -> tuple[str, str]:
-    if not content.startswith("---"):
-        raise ValueError("SKILL.md 缺少有效 frontmatter（--- ... ---）")
-
-    lines = content.splitlines(keepends=True)
-    if not lines or lines[0].strip() != "---":
-        raise ValueError("SKILL.md 缺少有效 frontmatter（--- ... ---）")
-
-    frontmatter_lines: list[str] = []
-    body_start = 0
-    for index, line in enumerate(lines[1:], start=1):
-        if line.strip() == "---":
-            body_start = index + 1
-            break
-        frontmatter_lines.append(line)
-    else:
-        raise ValueError("SKILL.md 缺少有效 frontmatter（--- ... ---）")
-
-    frontmatter_raw = "".join(frontmatter_lines)
-    body = "".join(lines[body_start:])
-    return frontmatter_raw, body
-
-
-def _parse_skill_markdown(content: str) -> tuple[str, str, str, dict[str, Any]]:
-    frontmatter_raw, _body = _split_frontmatter(content)
-    try:
-        data = yaml.safe_load(frontmatter_raw)
-    except yaml.YAMLError as e:
-        raise ValueError(f"SKILL.md frontmatter YAML 解析失败: {e}") from e
-
-    if not isinstance(data, dict):
-        raise ValueError("SKILL.md frontmatter 必须是对象")
-
-    name = _validate_skill_display_name(str(data.get("name", "")))
-    raw_slug = str(data.get("slug", "")).strip()
-    slug = (
-        _validate_skill_slug_value(raw_slug, field_name="slug")
-        if raw_slug
-        else _validate_skill_slug_value(name, field_name="name")
-    )
-    description = str(data.get("description", "")).strip()
-    if not description:
-        raise ValueError("SKILL.md frontmatter 缺少 description")
-
-    return slug, name, description, data
-
-
-def _rewrite_frontmatter_slug(content: str, new_slug: str) -> str:
-    frontmatter_raw, body = _split_frontmatter(content)
-    data = yaml.safe_load(frontmatter_raw)
-    if not isinstance(data, dict):
-        raise ValueError("SKILL.md frontmatter 必须是对象")
-    if data.get("slug"):
-        data["slug"] = new_slug
-    else:
-        data["name"] = new_slug
-    dumped = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).strip()
-    return f"---\n{dumped}\n---\n{body}"
 
 
 def _validate_zip_paths(zip_file: zipfile.ZipFile) -> None:
@@ -840,23 +759,6 @@ async def _generate_available_slug(repo: SkillRepository, base_slug: str) -> str
         if not await repo.exists_slug(candidate) and not (root / candidate).exists():
             return candidate
         idx += 1
-
-
-def parse_skill_dir_metadata(source_skill_dir: Path) -> dict[str, Any]:
-    skill_md_path = source_skill_dir / "SKILL.md"
-    if not skill_md_path.exists() or not skill_md_path.is_file():
-        raise ValueError("技能目录缺少根级 SKILL.md")
-
-    content = skill_md_path.read_text(encoding="utf-8")
-    parsed_slug, parsed_name, parsed_desc, meta = _parse_skill_markdown(content)
-    return {
-        "slug": parsed_slug,
-        "name": parsed_name,
-        "description": parsed_desc,
-        "tool_dependencies": normalize_string_list(meta.get("tool_dependencies")),
-        "mcp_dependencies": normalize_string_list(meta.get("mcp_dependencies")),
-        "skill_dependencies": normalize_string_list(meta.get("skill_dependencies")),
-    }
 
 
 def get_personal_skills_root_dir(uid: str) -> Path:
@@ -940,6 +842,8 @@ async def enable_personal_skills_for_agent_config(
     """为显式 Skill 白名单追加个人 Skill；全部模式无需写入。"""
     from yuxi.repositories.agent_repository import AgentRepository
     from yuxi.repositories.conversation_repository import ConversationRepository
+    from yuxi.repositories.user_repository import UserRepository
+    from yuxi.services.agent_config_resource_service import authorize_agent_config_resources
 
     conversation = await ConversationRepository(db).get_conversation_by_thread_id(thread_id)
     if not conversation or str(conversation.uid) != str(uid):
@@ -947,6 +851,9 @@ async def enable_personal_skills_for_agent_config(
     agent_repo = AgentRepository(db)
     agent = await agent_repo.get_by_slug(conversation.agent_id)
     if not agent or agent.created_by != str(uid):
+        return False
+    user = await UserRepository(db).get_by_uid(str(uid))
+    if user is None or bool(user.is_deleted):
         return False
 
     config = dict(agent.config_json or {})
@@ -962,7 +869,19 @@ async def enable_personal_skills_for_agent_config(
 
     context["skills"] = updated_skills
     config["context"] = context
-    await agent_repo.update(agent, config_json=config, updated_by=str(uid))
+    config = await authorize_agent_config_resources(
+        config,
+        db=db,
+        user=user,
+        agent_share_config=agent.share_config,
+        owner_uid=str(agent.created_by or uid),
+    )
+    await agent_repo.update(
+        agent,
+        config_json=config,
+        updated_by=str(uid),
+        updater=user,
+    )
     return True
 
 

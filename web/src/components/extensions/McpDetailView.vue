@@ -124,7 +124,15 @@
                 v-if="editForm.transport === 'streamable_http' || editForm.transport === 'sse'"
               >
                 <a-form-item label="MCP URL" required class="form-item form-item-full">
-                  <a-input v-model:value="editForm.url" placeholder="https://example.com/mcp" />
+                  <a-input
+                    v-model:value="editForm.url"
+                    :placeholder="
+                      server?.url_configured && !server?.url
+                        ? '已配置（地址已隐藏）'
+                        : 'https://example.com/mcp'
+                    "
+                    @change="urlEdited = true"
+                  />
                 </a-form-item>
                 <div class="form-grid">
                   <a-form-item label="HTTP 超时（秒）" class="form-item">
@@ -169,10 +177,25 @@
                     placeholder='JSON 格式，如：{"Authorization": "Bearer xxx"}'
                     :rows="4"
                     class="config-textarea"
+                    @change="headersEdited = true"
                   />
                   <div class="form-helper">请输入合法 JSON 对象，留空表示不发送额外请求头。</div>
                 </a-form-item>
               </template>
+            </section>
+
+            <section class="form-section">
+              <div class="form-section-title">
+                <span>共享范围</span>
+                <small>控制当前 MCP 对全局或指定部门的可见性。</small>
+              </div>
+              <ShareConfigForm
+                ref="shareConfigFormRef"
+                v-model="editForm.share_config"
+                :allowed-access-levels="allowedShareAccessLevels"
+                :require-read-scope="true"
+                :disabled="isGlobalScopeReadOnly"
+              />
             </section>
           </a-form>
 
@@ -217,9 +240,11 @@
             </span>
           </div>
           <template v-if="server.transport === 'streamable_http' || server.transport === 'sse'">
-            <div class="info-item" v-if="server.url">
+            <div class="info-item" v-if="server.url || server.url_configured">
               <label>MCP URL</label>
-              <span class="code-inline text-break-all">{{ server.url }}</span>
+              <span class="code-inline text-break-all">{{
+                server.url || '已配置（地址已隐藏）'
+              }}</span>
             </div>
             <div class="info-item" v-if="server.headers && Object.keys(server.headers).length > 0">
               <label>请求头</label>
@@ -378,11 +403,14 @@ import {
   X
 } from '@lucide/vue'
 import ExtensionDetailLayout from '@/components/shared/ExtensionDetailLayout.vue'
+import ShareConfigForm from '@/components/ShareConfigForm.vue'
 import { mcpApi } from '@/apis/mcp_api'
 import { formatFullDateTime } from '@/utils/time'
+import { useUserStore } from '@/stores/user'
 
 const route = useRoute()
 const router = useRouter()
+const userStore = useUserStore()
 const slug = computed(() => decodeURIComponent(route.params.slug ?? route.params.name))
 
 const loading = ref(false)
@@ -406,6 +434,12 @@ const mcpDetailTabs = computed(() => {
 
 const isEditing = ref(false)
 const editLoading = ref(false)
+const urlEdited = ref(false)
+const headersEdited = ref(false)
+const shareConfigFormRef = ref(null)
+const preserveUrl = computed(
+  () => !urlEdited.value && Boolean(server.value?.url_configured || server.value?.url)
+)
 
 const editForm = reactive({
   slug: '',
@@ -417,8 +451,20 @@ const editForm = reactive({
   timeout: null,
   sse_read_timeout: null,
   tags: [],
-  icon: ''
+  icon: '',
+  share_config: {
+    version: 2,
+    read_scope: { access_level: 'global', department_ids: [], user_uids: [] },
+    manage_scope: null
+  }
 })
+const isGlobalScopeReadOnly = computed(
+  () =>
+    !userStore.isSuperAdmin && editForm.share_config?.read_scope?.access_level === 'global'
+)
+const allowedShareAccessLevels = computed(() =>
+  userStore.isSuperAdmin || isGlobalScopeReadOnly.value ? ['global', 'department'] : ['department']
+)
 
 const actionLabel = computed(() => {
   if (server.value?.requires_migration) return '删除'
@@ -448,6 +494,8 @@ const getTransportColor = (transport) => {
 }
 
 const resetEditForm = (data) => {
+  urlEdited.value = false
+  headersEdited.value = false
   Object.assign(editForm, {
     slug: data?.slug || '',
     name: data?.name || '',
@@ -458,7 +506,14 @@ const resetEditForm = (data) => {
     timeout: data?.timeout,
     sse_read_timeout: data?.sse_read_timeout,
     tags: data?.tags || [],
-    icon: data?.icon || ''
+    icon: data?.icon || '',
+    share_config: data?.share_config
+      ? JSON.parse(JSON.stringify(data.share_config))
+      : {
+          version: 2,
+          read_scope: { access_level: 'global', department_ids: [], user_uids: [] },
+          manage_scope: null
+        }
   })
 }
 
@@ -489,12 +544,13 @@ const buildEditPayload = () => {
     name: editForm.name,
     description: editForm.description || null,
     transport: editForm.transport,
-    url: editForm.url || null,
-    headers,
+    ...(preserveUrl.value ? {} : { url: editForm.url || null }),
+    ...(headersEdited.value ? { headers } : {}),
     timeout: editForm.timeout || null,
     sse_read_timeout: editForm.sse_read_timeout || null,
     tags: editForm.tags.length > 0 ? editForm.tags : null,
-    icon: editForm.icon || null
+    icon: editForm.icon || null,
+    share_config: editForm.share_config
   }
 }
 
@@ -507,7 +563,11 @@ const validateEditPayload = (data) => {
     message.error('请选择传输类型')
     return false
   }
-  if (['sse', 'streamable_http'].includes(data.transport) && !data.url?.trim()) {
+  if (
+    ['sse', 'streamable_http'].includes(data.transport) &&
+    !preserveUrl.value &&
+    !data.url?.trim()
+  ) {
     message.error('HTTP 类型必须填写 MCP URL')
     return false
   }
@@ -516,12 +576,17 @@ const validateEditPayload = (data) => {
 
 const handleSaveEdit = async () => {
   if (!server.value) return
+  const shareValidation = shareConfigFormRef.value?.validate()
+  if (shareValidation && !shareValidation.valid) {
+    message.error(shareValidation.message)
+    return
+  }
   const data = buildEditPayload()
   if (!data || !validateEditPayload(data)) return
 
   try {
     editLoading.value = true
-    const result = await mcpApi.updateMcpServer(server.value.slug, data)
+    const result = await mcpApi.updateMcpServer(server.value.resource_id, data)
     if (result.success) {
       message.success('MCP 更新成功')
       isEditing.value = false
@@ -563,7 +628,7 @@ const fetchTools = async () => {
   try {
     toolsLoading.value = true
     toolsError.value = null
-    const result = await mcpApi.getMcpServerTools(server.value.slug)
+    const result = await mcpApi.getMcpServerTools(server.value.resource_id)
     if (result.success) {
       tools.value = result.data || []
     } else {
@@ -582,7 +647,7 @@ const handleToggleTool = async (tool) => {
   if (!server.value) return
   try {
     toggleToolLoading.value = tool.name
-    const result = await mcpApi.toggleMcpServerTool(server.value.slug, tool.name)
+    const result = await mcpApi.toggleMcpServerTool(server.value.resource_id, tool.name)
     if (result.success) {
       message.success(result.message)
       const targetTool = tools.value.find((t) => t.name === tool.name)
@@ -610,7 +675,7 @@ const handleTestServer = async () => {
   if (!server.value) return
   try {
     testLoading.value = server.value.name
-    const result = await mcpApi.testMcpServer(server.value.slug)
+    const result = await mcpApi.testMcpServer(server.value.resource_id)
     if (result.success) {
       message.success(result.message)
     } else {
@@ -642,7 +707,7 @@ const handleDangerAction = async () => {
 
 const handleSetServerEnabled = async (srv, enabled) => {
   try {
-    const result = await mcpApi.updateMcpServerStatus(srv.slug, enabled)
+    const result = await mcpApi.updateMcpServerStatus(srv.resource_id, enabled)
     if (result.success) {
       message.success(result.message || `MCP 已${enabled ? '添加' : '移除'}`)
       await fetchServer()
@@ -663,7 +728,7 @@ const confirmDeleteServer = (srv) => {
     cancelText: '取消',
     async onOk() {
       try {
-        const result = await mcpApi.deleteMcpServer(srv.slug)
+        const result = await mcpApi.deleteMcpServer(srv.resource_id)
         if (result.success) {
           message.success('MCP 删除成功')
           router.push({ path: '/extensions', query: { tab: 'mcp' } })

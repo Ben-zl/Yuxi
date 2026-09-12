@@ -16,7 +16,7 @@ from yuxi.config.options import (
 )
 from yuxi.knowledge.parser.factory import DocumentProcessorFactory
 from yuxi.knowledge.parser.registry import PROCESSOR_TYPES, get_parser_metadata
-from yuxi.models.providers.service import get_model_provider_by_id, resolve_api_key
+from yuxi.models.providers.service import resolve_api_key
 
 
 async def get_ocr_options(db: AsyncSession | None = None) -> dict[str, Any]:
@@ -143,7 +143,9 @@ async def _build_processor_kwargs(db: AsyncSession, engine_id: str) -> dict[str,
         opts = await pp_structure_v3_ocr_host_opts.get(db)
         return {"server_url": opts["server_url"]} if opts["server_url"] else {}
     if engine_id == "deepseek_ocr":
-        provider = await get_model_provider_by_id(db, "siliconflow-cn")
+        from yuxi.models.providers.repository import get_builtin_model_provider
+
+        provider = await get_builtin_model_provider(db, "siliconflow-cn")
         api_key = resolve_api_key(provider) if provider and provider.is_enabled else None
         if not api_key:
             raise ValueError("siliconflow-cn 模型供应商凭证不可用")

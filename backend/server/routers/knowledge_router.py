@@ -326,6 +326,7 @@ async def create_database(
     share_config: dict | None = Body(None),
     owning_department_id: int | None = Body(None),
     current_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """创建知识库"""
     logger.debug(
@@ -354,6 +355,8 @@ async def create_database(
                 share_config=share_config,
                 created_by=current_user.uid,
                 created_by_department_id=current_user.department_id,
+                db=db,
+                user=current_user,
                 **(additional_params or {}),
             )
 
@@ -506,6 +509,7 @@ async def update_database_info(
     kb_id: str,
     data: UpdateDatabaseRequest,
     current_user: User = Depends(require_knowledge_base_manage),
+    db: AsyncSession = Depends(get_db),
 ):
     """更新知识库信息"""
     logger.debug(
@@ -541,6 +545,8 @@ async def update_database_info(
                 share_config=data.share_config,
                 operator_uid=current_user.uid,
                 operator_department_id=current_user.department_id,
+                db=db,
+                user=current_user,
             )
         return {"message": "更新成功", "database": serialize_knowledge_base(database)}
     except HTTPException:

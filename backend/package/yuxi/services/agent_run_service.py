@@ -37,7 +37,7 @@ from yuxi.agents.buildin import agent_manager
 from yuxi.agents.tool_approval import DEFAULT_TOOL_APPROVAL_MODE, normalize_tool_approval_mode
 from yuxi.config.options import system_options
 from yuxi.models.providers.cache import model_cache
-from yuxi.models.providers.service import get_model_provider_by_id
+from yuxi.models.providers.repository import get_model_provider_by_resource_id
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_output_repository import AgentRunOutputRepository
 from yuxi.repositories.agent_run_repository import TERMINAL_RUN_STATUSES, AgentRunRepository
@@ -45,6 +45,11 @@ from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.services.input_message_service import (
     AgentRunInputMessage,
     build_resume_input_message,
+)
+from yuxi.services.agent_run_manifest_service import (
+    RUN_MANIFEST_INPUT_KEY,
+    build_submission_manifest_result,
+    compute_manifest_fingerprint,
 )
 from yuxi.services.langfuse_service import get_trace_url_by_id_async
 from yuxi.services.run_queue_service import (
@@ -117,6 +122,7 @@ async def resolve_agent_run_model_spec(
     requested_model: str | None,
     configured_model: str | None,
     db: AsyncSession | None = None,
+    user: User | None = None,
 ) -> str:
     """按请求、Agent 配置、系统默认的顺序解析并校验聊天模型。"""
     model_spec = next(
@@ -131,9 +137,18 @@ async def resolve_agent_run_model_spec(
         model_spec = str((await system_options.get(db))["default_model"]).strip()
 
     info = model_cache.get_model_info(model_spec)
+    if info is None:
+        canonical_spec = model_cache.canonicalize_spec(model_spec)
+        info = model_cache.get_model_info(canonical_spec) if canonical_spec else None
     if not info or info.model_type != "chat":
         raise HTTPException(status_code=422, detail=f"未找到可用聊天模型: '{model_spec}'")
-    return model_spec
+    if user is not None and db is not None and hasattr(info, "resource_id"):
+        from yuxi.models.providers.repository import get_model_provider_for_user
+
+        provider = await get_model_provider_for_user(db, getattr(info, "resource_id", None) or info.provider_id, user)
+        if provider is None or not provider.is_enabled:
+            raise HTTPException(status_code=422, detail=f"模型资源不可访问: '{model_spec}'")
+    return getattr(info, "spec", model_spec)
 
 
 def resolve_agent_run_tool_approval_mode(requested_mode: str | None, configured_mode: str | None) -> str:
@@ -151,6 +166,7 @@ async def resolve_agent_run_config(
     agent_item,
     agent_backend,
     db: AsyncSession | None = None,
+    user: User | None = None,
 ) -> tuple[str, str]:
     """一次性解析 model_spec 与 tool_approval_mode，共享同一份运行上下文。"""
     context = load_agent_run_context(agent_item, agent_backend)
@@ -158,6 +174,7 @@ async def resolve_agent_run_config(
         model_spec,
         getattr(context, "model", None),
         db,
+        user,
     )
     resolved_tool_approval_mode = resolve_agent_run_tool_approval_mode(
         tool_approval_mode,
@@ -176,10 +193,10 @@ async def validate_agent_run_input_modalities(
         return
     info = model_cache.get_model_info(model_spec)
     modalities = tuple(getattr(info, "input_modalities", ()) or ())
-    provider_id = getattr(info, "provider_id", None)
+    resource_id = getattr(info, "resource_id", None)
     model_id = getattr(info, "model_id", None)
-    if not modalities and provider_id and model_id and db is not None:
-        provider = await get_model_provider_by_id(db, provider_id)
+    if not modalities and resource_id and model_id and db is not None:
+        provider = await get_model_provider_by_resource_id(db, resource_id)
         configured_model = (
             next(
                 (model for model in provider.enabled_models or [] if model.get("id") == model_id),
@@ -507,6 +524,7 @@ async def create_agent_run_view(
             await _commit_and_enqueue(db, scope.existing_run.id)
         return _build_run_response(scope.existing_run)
 
+    submission_manifest = None
     if run_type == "resume":
         resolved_model_spec = scope.parent_run.input_payload["model_spec"]
         # 旧版本固化的 input_payload 没有 tool_approval_mode，回退默认值以兼容历史 interrupted run。
@@ -520,6 +538,21 @@ async def create_agent_run_view(
             scope.agent_item,
             scope.agent_backend,
             db,
+            user=scope.current_user,
+        )
+
+    if run_type == "resume":
+        submission_manifest = None
+    else:
+        submission_manifest = await build_submission_manifest_result(
+            agent_item=scope.agent_item,
+            agent_backend=scope.agent_backend,
+            user=scope.current_user,
+            db=db,
+            model_spec=resolved_model_spec,
+            tool_approval_mode=resolved_tool_approval_mode,
+            run_type=run_type,
+            thread_id=thread_id,
         )
 
     run_input_message = _prepare_run_input_message(
@@ -543,6 +576,17 @@ async def create_agent_run_view(
         "model_spec": resolved_model_spec,
         "tool_approval_mode": resolved_tool_approval_mode,
     }
+    if run_type == "resume" and scope.parent_run is not None:
+        parent_manifest = getattr(scope.parent_run, "manifest", None)
+        parent_fingerprint = getattr(scope.parent_run, "manifest_fingerprint", None)
+        if isinstance(parent_manifest, dict) and isinstance(parent_fingerprint, str):
+            input_payload[RUN_MANIFEST_INPUT_KEY] = parent_manifest
+            input_payload["_run_manifest_fingerprint"] = parent_fingerprint
+        else:
+            raise HTTPException(status_code=409, detail="父 Run 缺少可继承的提交时运行清单")
+    elif submission_manifest is not None:
+        input_payload[RUN_MANIFEST_INPUT_KEY] = submission_manifest.manifest
+        input_payload["_run_manifest_fingerprint"] = compute_manifest_fingerprint(submission_manifest.manifest)
     if run_type == "resume" and scope.parent_run is not None:
         if source is None:
             source = getattr(scope.parent_run, "source", None) or "chat"
@@ -591,6 +635,7 @@ class AgentRunCreationScope:
     agent_item: Any
     agent_backend: Any
     existing_run: Any | None
+    current_user: User
     parent_run: Any | None = None
 
 
@@ -726,6 +771,11 @@ async def persist_agent_run_record(
                 input_message_id=persisted_input_message.id,
             )
             persisted_input_message.run_id = run_id
+            manifest = input_payload.get(RUN_MANIFEST_INPUT_KEY)
+            if manifest is not None:
+                run.manifest = manifest
+                run.manifest_fingerprint = compute_manifest_fingerprint(manifest)
+                run.manifest_recorded_at = utc_now_naive()
             await db.flush()
     except IntegrityError:
         run_repo = AgentRunRepository(db)
@@ -853,6 +903,7 @@ async def prepare_agent_run_creation_scope(
         agent_item=agent_item,
         agent_backend=agent_backend,
         existing_run=existing,
+        current_user=current_user,
         parent_run=parent_run,
     )
 

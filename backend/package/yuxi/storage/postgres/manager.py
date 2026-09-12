@@ -23,7 +23,7 @@ from yuxi.utils.singleton import SingletonMeta
 # 合并两个 Base
 CombinedBase = declarative_base()
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
-BUSINESS_SCHEMA_VERSION = 4
+BUSINESS_SCHEMA_VERSION = 5
 KNOWLEDGE_SCHEMA_VERSION = 4
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
@@ -796,6 +796,36 @@ class PostgresManager(metaclass=SingletonMeta):
         """确保业务 schema 包含后续新增字段（运行时 schema 演进）。"""
         self._check_initialized()
         stmts = [
+            "ALTER TABLE IF EXISTS model_providers ADD COLUMN IF NOT EXISTS resource_id VARCHAR(36)",
+            "ALTER TABLE IF EXISTS model_providers ADD COLUMN IF NOT EXISTS share_config JSONB",
+            "UPDATE model_providers SET resource_id = md5('model-provider:' || id::text) WHERE resource_id IS NULL",
+            (
+                "UPDATE model_providers SET share_config = jsonb_build_object("
+                "'version', 2, 'read_scope', jsonb_build_object("
+                "'access_level', 'global', 'department_ids', jsonb_build_array(), "
+                "'user_uids', jsonb_build_array()), 'manage_scope', NULL) "
+                "WHERE share_config IS NULL"
+            ),
+            "ALTER TABLE IF EXISTS model_providers ALTER COLUMN resource_id SET NOT NULL",
+            "ALTER TABLE IF EXISTS model_providers ALTER COLUMN share_config SET NOT NULL",
+            "ALTER TABLE IF EXISTS model_providers DROP CONSTRAINT IF EXISTS model_providers_provider_id_key",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_model_providers_resource_id ON model_providers(resource_id)",
+            "ALTER TABLE IF EXISTS mcp_servers ADD COLUMN IF NOT EXISTS resource_id VARCHAR(36)",
+            "ALTER TABLE IF EXISTS mcp_servers ADD COLUMN IF NOT EXISTS share_config JSONB",
+            "UPDATE mcp_servers SET resource_id = md5('mcp-server:' || id::text) WHERE resource_id IS NULL",
+            (
+                "UPDATE mcp_servers SET share_config = jsonb_build_object("
+                "'version', 2, 'read_scope', jsonb_build_object("
+                "'access_level', 'global', 'department_ids', jsonb_build_array(), "
+                "'user_uids', jsonb_build_array()), 'manage_scope', NULL) "
+                "WHERE share_config IS NULL"
+            ),
+            "ALTER TABLE IF EXISTS mcp_servers ALTER COLUMN resource_id SET NOT NULL",
+            "ALTER TABLE IF EXISTS mcp_servers ALTER COLUMN share_config SET NOT NULL",
+            "ALTER TABLE IF EXISTS mcp_servers DROP CONSTRAINT IF EXISTS mcp_servers_slug_key",
+            "DROP INDEX IF EXISTS ix_mcp_servers_slug",
+            "CREATE INDEX IF NOT EXISTS ix_mcp_servers_slug ON mcp_servers(slug)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_mcp_servers_resource_id ON mcp_servers(resource_id)",
             "ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS tool_dependencies JSONB DEFAULT '[]'::jsonb",
             "ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS mcp_dependencies JSONB DEFAULT '[]'::jsonb",
             "ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS skill_dependencies JSONB DEFAULT '[]'::jsonb",
@@ -941,7 +971,7 @@ class PostgresManager(metaclass=SingletonMeta):
             """
             CREATE TABLE IF NOT EXISTS model_providers (
                 id SERIAL PRIMARY KEY,
-                provider_id VARCHAR(100) NOT NULL UNIQUE,
+                provider_id VARCHAR(100) NOT NULL,
                 display_name VARCHAR(100) NOT NULL,
                 provider_type VARCHAR(32) NOT NULL DEFAULT 'openai',
                 default_protocol VARCHAR(64),
@@ -1221,7 +1251,8 @@ class PostgresManager(metaclass=SingletonMeta):
             WHERE status NOT IN ({AGENT_RUN_TERMINAL_STATUS_SQL})
             """,
             "CREATE INDEX IF NOT EXISTS ix_conversations_is_pinned ON conversations(is_pinned)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_model_providers_provider_id ON model_providers(provider_id)",
+            "DROP INDEX IF EXISTS ix_model_providers_provider_id",
+            "CREATE INDEX IF NOT EXISTS ix_model_providers_provider_id ON model_providers(provider_id)",
             "CREATE INDEX IF NOT EXISTS ix_model_providers_is_enabled ON model_providers(is_enabled)",
             """
             CREATE TABLE IF NOT EXISTS agent_run_requests (
@@ -1300,6 +1331,7 @@ class PostgresManager(metaclass=SingletonMeta):
             ),
         ]
         async with self.async_engine.begin() as conn:
+            await conn.run_sync(BusinessBase.metadata.tables["run_resource_snapshots"].create, checkfirst=True)
             # 历史未绑定用户的 API Key 会在下方迁移语句里被静默删除，先计数告警
             # 便于运维凭据失效时回溯；DELETE 之后无法再查询这些 Key。
             try:
