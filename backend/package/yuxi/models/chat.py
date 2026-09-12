@@ -151,9 +151,8 @@ class AgentScopeChatAdapter:
             response = await model(messages, **self._call_options())
             return GeneralResponse(_response_text(response))
         except Exception as exc:
-            err = f"Error calling model: {exc}, URL: {self.base_url}, Model: {self.model_name}"
-            logger.error(err)
-            raise RuntimeError(err) from exc
+            logger.error(f"Error calling model: type={type(exc).__name__}, Model: {self.model_name}")
+            raise RuntimeError(f"模型调用失败: {self.model_name}") from exc
 
     async def _stream_response(self, model, messages: list[Msg]) -> AsyncIterator[GeneralResponse]:
         response = await model(messages, **self._call_options())
@@ -231,7 +230,8 @@ def select_model(model_spec: str, **kwargs) -> AgentScopeChatAdapter:
     if not model_spec:
         raise ValueError("model_spec 不能为空")
 
-    info = model_cache.get_model_info(model_spec)
+    canonical_spec = model_cache.canonicalize_spec(model_spec)
+    info = model_cache.get_model_info(canonical_spec) if canonical_spec else None
     if not info:
         available = model_cache.get_all_specs("chat")
         available_ids = [item.spec for item in available[:10]]
@@ -239,18 +239,21 @@ def select_model(model_spec: str, **kwargs) -> AgentScopeChatAdapter:
     if info.model_type != "chat":
         raise ValueError(f"Model {model_spec} is not a chat model (type={info.model_type})")
 
-    logger.info(f"Selecting model: {model_spec} (provider_type={info.provider_type})")
+    logger.info(f"Selecting model: {canonical_spec} (provider_type={info.provider_type})")
     return AgentScopeChatAdapter(info, **kwargs)
 
 
 async def test_chat_model_status_by_spec(spec: str) -> dict:
     try:
         logger.debug(f"Testing model status by spec: {spec}")
-        model = select_model(model_spec=spec)
+        canonical_spec = model_cache.canonicalize_spec(spec)
+        if canonical_spec is None:
+            raise ValueError(f"模型资源 {spec} 不存在或存在歧义")
+        model = select_model(model_spec=canonical_spec)
         response = await model.call([{"role": "user", "content": "Say 1"}], stream=False)
         if response and response.content:
-            return {"spec": spec, "status": "available", "message": "连接正常"}
-        return {"spec": spec, "status": "unavailable", "message": "响应无效"}
+            return {"spec": canonical_spec, "status": "available", "message": "连接正常"}
+        return {"spec": canonical_spec, "status": "unavailable", "message": "响应无效"}
     except Exception as exc:
         logger.error(f"测试模型状态失败 {spec}: {exc}")
         return {"spec": spec, "status": "error", "message": str(exc)}

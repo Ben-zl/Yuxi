@@ -3,15 +3,27 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 import yuxi.services.agent_run_service as agent_run_service
+from yuxi.services.agent_run_manifest_service import compute_manifest_fingerprint
 from yuxi.services.input_message_service import (
     build_chat_input_message,
     build_chat_input_message_from_openai_content,
     restore_chat_input_message,
 )
+
+
+SUBMISSION_MANIFEST = {
+    "manifest_version": 1,
+    "resource_snapshot": {"id": "submission-snapshot", "fingerprint": "snapshot-digest"},
+}
+PARENT_MANIFEST = {
+    "manifest_version": 1,
+    "resource_snapshot": {"id": "parent-snapshot", "fingerprint": "snapshot-digest"},
+}
 
 
 def _chat_input(content: str, image_content: str | None = None):
@@ -784,6 +796,8 @@ async def test_create_agent_run_persists_input_before_enqueue(monkeypatch: pytes
     assert db.created_run_kwargs["input_payload"] == {
         "model_spec": "agent-default-model",
         "tool_approval_mode": "default",
+        "_run_manifest": SUBMISSION_MANIFEST,
+        "_run_manifest_fingerprint": compute_manifest_fingerprint(SUBMISSION_MANIFEST),
     }
     assert "model_spec" not in db.added[0].extra_metadata
     assert db.added[0].extra_metadata["raw_message"]["type"] == "human"
@@ -984,6 +998,13 @@ async def test_create_resume_run_marks_input_message_source(monkeypatch: pytest.
     assert db.created_run_kwargs["input_message_id"] == 11
     assert db.created_run_kwargs["source"] == "agent_call"
     assert db.created_run_kwargs["channel"] == "api"
+    assert db.created_run.manifest == PARENT_MANIFEST
+    assert db.created_run.manifest_fingerprint == compute_manifest_fingerprint(PARENT_MANIFEST)
+    assert db.created_run_kwargs["input_payload"]["_run_manifest"] == PARENT_MANIFEST
+    assert db.created_run_kwargs["input_payload"]["_run_manifest_fingerprint"] == compute_manifest_fingerprint(
+        PARENT_MANIFEST
+    )
+    db.build_submission_manifest.assert_not_awaited()
     assert db.added[0].message_type == "resume"
     assert db.added[0].extra_metadata["source"] == "ask_user_question_resume"
 
@@ -1078,6 +1099,40 @@ async def test_create_resume_run_without_request_id_reuses_stable_key(monkeypatc
     assert retry_db.created_run_kwargs is None
     assert retry_db.order[-2:] == ["commit", "enqueue"]
     assert retry_db.enqueued == [("process_agent_run", "existing-resume-run", "run:existing-resume-run")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_field", ["manifest", "manifest_fingerprint"])
+async def test_create_resume_run_requires_parent_manifest(monkeypatch, missing_field):
+    """父运行缺少提交清单或指纹时不得创建或投递恢复运行。"""
+    parent = SimpleNamespace(
+        id="parent-run",
+        conversation_thread_id="thread-1",
+        status="interrupted",
+        input_payload={"model_spec": "parent-model", "tool_approval_mode": "default"},
+        manifest=PARENT_MANIFEST.copy(),
+        manifest_fingerprint=compute_manifest_fingerprint(PARENT_MANIFEST),
+    )
+    setattr(parent, missing_field, None)
+    db = _patch_agent_run_creation(monkeypatch, parent_run=parent)
+
+    with pytest.raises(agent_run_service.HTTPException, match="父 Run 缺少") as exc:
+        await agent_run_service.create_agent_run_view(
+            input_message=None,
+            agent_slug="default",
+            thread_id="thread-1",
+            meta={"request_id": "resume-req"},
+            current_uid="user-1",
+            db=db,
+            resume={"decisions": [{"type": "approve"}]},
+            created_by_run_id="parent-run",
+        )
+
+    assert exc.value.status_code == 409
+    assert db.created_run is None
+    assert not db.enqueued
+    assert not db.committed
+    db.build_submission_manifest.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1608,6 +1663,10 @@ def _patch_agent_run_creation(
     }
     if parent_run:
         parent_run.agent_slug = getattr(parent_run, "agent_slug", "default")
+        parent_run.manifest = getattr(parent_run, "manifest", PARENT_MANIFEST.copy())
+        parent_run.manifest_fingerprint = getattr(
+            parent_run, "manifest_fingerprint", compute_manifest_fingerprint(PARENT_MANIFEST)
+        )
         runs_by_id["parent-run"] = parent_run
     db = _CreateRunDb(
         message_id=message_id,
@@ -1660,6 +1719,8 @@ def _patch_agent_run_creation(
     monkeypatch.setattr(agent_run_service, "ConversationRepository", ConvRepo)
     monkeypatch.setattr(agent_run_service, "AgentRunRepository", _CreateRunRepo)
     monkeypatch.setattr(agent_run_service, "get_arq_pool", fake_get_arq_pool)
+    db.build_submission_manifest = AsyncMock(return_value=SimpleNamespace(manifest=SUBMISSION_MANIFEST.copy()))
+    monkeypatch.setattr(agent_run_service, "build_submission_manifest_result", db.build_submission_manifest)
 
     async def get_system_options(_option, _db=None):
         return {"default_model": "system-default:model"}
@@ -1693,6 +1754,12 @@ async def test_create_chat_run_persists_validated_model_spec(monkeypatch: pytest
     )
 
     assert db.created_run_kwargs["input_payload"]["model_spec"] == "claude-x"
+    assert db.created_run.manifest == SUBMISSION_MANIFEST
+    assert db.created_run.manifest_fingerprint == compute_manifest_fingerprint(SUBMISSION_MANIFEST)
+    assert db.created_run.manifest_recorded_at is not None
+    db.build_submission_manifest.assert_awaited_once()
+    assert db.build_submission_manifest.await_args.kwargs["model_spec"] == "claude-x"
+    assert db.build_submission_manifest.await_args.kwargs["db"] is db
 
 
 @pytest.mark.asyncio
@@ -1763,6 +1830,8 @@ async def test_create_chat_run_with_image_persists_multimodal_message_type(monke
     assert db.created_run_kwargs["input_payload"] == {
         "model_spec": "agent-default-model",
         "tool_approval_mode": "default",
+        "_run_manifest": SUBMISSION_MANIFEST,
+        "_run_manifest_fingerprint": compute_manifest_fingerprint(SUBMISSION_MANIFEST),
     }
     assert db.added[0].message_type == "multimodal_image"
     assert db.added[0].image_content == "base64-image"

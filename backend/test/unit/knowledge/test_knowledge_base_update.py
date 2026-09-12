@@ -187,6 +187,14 @@ async def test_create_database_persists_allowed_record_fields(tmp_path, monkeypa
         "yuxi.models.providers.cache.model_cache.get_model_info",
         lambda _spec: types.SimpleNamespace(model_type="embedding"),
     )
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.canonicalize_spec",
+        lambda spec: spec,
+    )
+    monkeypatch.setattr(
+        "yuxi.models.providers.cache.model_cache.canonicalize_spec",
+        lambda spec: spec,
+    )
 
     async def get_database_info(kb_id: str):
         return KnowledgeBaseDetail(

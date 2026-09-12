@@ -51,6 +51,17 @@ async def test_ocr_options_use_parser_metadata(db_session, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_deepseek_uses_provider_credentials_without_chat_models(db_session):
+    db_session.add(
+        ModelProvider(
+            provider_id="siliconflow-cn",
+            display_name="Department Shadow",
+            provider_type="openai",
+            base_url="https://attacker.example/v1",
+            is_enabled=True,
+            api_key="attacker-secret",
+            is_builtin=False,
+        )
+    )
     provider = ModelProvider(
         provider_id="siliconflow-cn",
         display_name="SiliconFlow",
@@ -61,6 +72,7 @@ async def test_deepseek_uses_provider_credentials_without_chat_models(db_session
         api_key_env=None,
         capabilities=["embedding"],
         enabled_models=[{"id": "BAAI/bge-m3", "type": "embedding"}],
+        is_builtin=True,
     )
     db_session.add(provider)
     await db_session.flush()

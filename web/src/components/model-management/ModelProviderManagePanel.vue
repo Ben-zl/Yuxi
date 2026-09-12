@@ -21,6 +21,7 @@ import {
 
 import { modelProviderApi } from '@/apis/system_api'
 import { useConfigStore } from '@/stores/config'
+import { useUserStore } from '@/stores/user'
 import { modelAvatars } from '@/utils/modelIcon'
 import {
   formatModelPriceDisplay,
@@ -31,8 +32,10 @@ import {
 import PageShoulder from '@/components/shared/PageShoulder.vue'
 import InfoCard from '@/components/shared/InfoCard.vue'
 import ExtensionCardGrid from '@/components/extensions/ExtensionCardGrid.vue'
+import ShareConfigForm from '@/components/ShareConfigForm.vue'
 
 const configStore = useConfigStore()
+const userStore = useUserStore()
 const loading = ref(false)
 const remoteLoading = ref(false)
 const saving = ref(false)
@@ -58,7 +61,33 @@ const REQUEST_BODY_OVERRIDES_PLACEHOLDER = '{\n  "enable_thinking": false\n}'
 // Provider form state
 const showProviderModal = ref(false)
 const editingProviderId = ref(null) // null = creating, string = editing
+const shareConfigFormRef = ref(null)
+const createDefaultShareConfig = () => ({
+  version: 2,
+  read_scope: {
+    access_level: userStore.isSuperAdmin ? 'global' : 'department',
+    department_ids:
+      !userStore.isSuperAdmin && userStore.departmentId != null
+        ? [Number(userStore.departmentId)]
+        : [],
+    user_uids: []
+  },
+  manage_scope: null
+})
+const maskedProviderFieldChanges = reactive({
+  base_url: false,
+  embedding_base_url: false,
+  rerank_base_url: false,
+  models_endpoint: false,
+  embedding_models_endpoint: false,
+  rerank_models_endpoint: false,
+  api_key_env: false,
+  api_key: false,
+  headers_json: false,
+  extra_json: false
+})
 const providerForm = reactive({
+  resource_id: '',
   provider_id: '',
   display_name: '',
   provider_type: 'openai',
@@ -74,8 +103,18 @@ const providerForm = reactive({
   capabilities: ['chat'],
   is_enabled: true,
   headers_text: '{}',
-  extra_text: '{}'
+  extra_text: '{}',
+  share_config: createDefaultShareConfig()
 })
+const isGlobalScopeReadOnly = computed(
+  () =>
+    !userStore.isSuperAdmin &&
+    Boolean(editingProviderId.value) &&
+    providerForm.share_config?.read_scope?.access_level === 'global'
+)
+const allowedShareAccessLevels = computed(() =>
+  userStore.isSuperAdmin || isGlobalScopeReadOnly.value ? ['global', 'department'] : ['department']
+)
 
 // Model form state
 const showModelModal = ref(false)
@@ -160,6 +199,7 @@ const getModelId = (model) => {
   return model.id
 }
 
+const providerResourceId = (provider) => provider?.resource_id || ''
 const buildModelSpec = (providerId, modelId) => `${providerId}:${modelId}`
 
 const defaultModelSpec = computed(() => configStore.config?.default_model || '')
@@ -237,7 +277,7 @@ const isModelStale = (model, providerId) => {
 // Remote models filtered by search query per provider
 const filteredRemoteModels = computed(() => {
   if (!currentProviderForModels.value) return []
-  const providerId = currentProviderForModels.value.provider_id
+  const providerId = providerResourceId(currentProviderForModels.value)
   const query = (remoteModelSearch.value[providerId] || '').trim().toLowerCase()
   const typeFilter = remoteModelTypeFilter.value[providerId] || 'all'
   const models = remoteModelsMap.value[providerId] || []
@@ -250,7 +290,7 @@ const filteredRemoteModels = computed(() => {
 
 const remoteModelTypeOptions = computed(() => {
   if (!currentProviderForModels.value) return [{ label: '全部', value: 'all' }]
-  const providerId = currentProviderForModels.value.provider_id
+  const providerId = providerResourceId(currentProviderForModels.value)
   const models = remoteModelsMap.value[providerId] || []
   const counts = models.reduce((acc, model) => {
     const type = model.type || 'chat'
@@ -289,6 +329,17 @@ const parseJsonObject = (text, label) => {
 }
 
 const formatJsonText = (value) => JSON.stringify(value || {}, null, 2)
+
+const resetMaskedProviderFieldChanges = () => {
+  for (const field of Object.keys(maskedProviderFieldChanges)) {
+    maskedProviderFieldChanges[field] = false
+  }
+}
+
+const markMaskedProviderFieldChanged = (field) => {
+  maskedProviderFieldChanges[field] = true
+}
+
 const loadProviders = async () => {
   loading.value = true
   try {
@@ -318,6 +369,7 @@ function getProviderStatus(provider) {
 
 const openCreateProviderModal = () => {
   editingProviderId.value = null
+  resetMaskedProviderFieldChanges()
   Object.assign(providerForm, {
     provider_id: '',
     display_name: '',
@@ -334,14 +386,18 @@ const openCreateProviderModal = () => {
     capabilities: ['chat'],
     is_enabled: true,
     headers_text: '{}',
-    extra_text: '{}'
+    extra_text: '{}',
+    resource_id: '',
+    share_config: createDefaultShareConfig()
   })
   showProviderModal.value = true
 }
 
 const openEditProviderModal = (provider) => {
-  editingProviderId.value = provider.provider_id
+  editingProviderId.value = providerResourceId(provider)
+  resetMaskedProviderFieldChanges()
   Object.assign(providerForm, {
+    resource_id: provider.resource_id || '',
     provider_id: provider.provider_id,
     display_name: provider.display_name,
     provider_type: provider.provider_type || 'openai',
@@ -352,34 +408,62 @@ const openEditProviderModal = (provider) => {
     models_endpoint: provider.models_endpoint ?? '',
     embedding_models_endpoint: provider.embedding_models_endpoint ?? '',
     rerank_models_endpoint: provider.rerank_models_endpoint ?? '',
-    api_key_env: provider.api_key_env || '',
-    api_key: provider.api_key || '',
+    api_key_env: provider.api_key_env,
+    api_key: provider.api_key,
     capabilities: provider.capabilities?.length ? provider.capabilities : ['chat'],
     is_enabled: provider.is_enabled !== false,
-    headers_text: formatJsonText(provider.headers_json),
-    extra_text: formatJsonText(provider.extra_json)
+    headers_text:
+      provider.headers_json === undefined ? undefined : formatJsonText(provider.headers_json),
+    extra_text: provider.extra_json === undefined ? undefined : formatJsonText(provider.extra_json),
+    share_config: provider.share_config
+      ? JSON.parse(JSON.stringify(provider.share_config))
+      : createDefaultShareConfig()
   })
   showProviderModal.value = true
 }
 
-const buildProviderPayload = () => ({
-  provider_id: providerForm.provider_id || undefined,
-  display_name: providerForm.display_name,
-  provider_type: providerForm.provider_type,
-  default_protocol: null,
-  base_url: providerForm.base_url,
-  embedding_base_url: providerForm.embedding_base_url || null,
-  rerank_base_url: providerForm.rerank_base_url || null,
-  models_endpoint: providerForm.models_endpoint || null,
-  embedding_models_endpoint: providerForm.embedding_models_endpoint || null,
-  rerank_models_endpoint: providerForm.rerank_models_endpoint || null,
-  api_key_env: providerForm.api_key_env || null,
-  api_key: providerForm.api_key || null,
-  capabilities: providerForm.capabilities,
-  is_enabled: providerForm.is_enabled,
-  headers_json: parseJsonObject(providerForm.headers_text, '请求头'),
-  extra_json: parseJsonObject(providerForm.extra_text, '扩展配置')
-})
+const buildProviderPayload = () => {
+  const validation = shareConfigFormRef.value?.validate()
+  if (validation && !validation.valid) throw new Error(validation.message)
+  const payload = {
+    provider_id: providerForm.provider_id || undefined,
+    display_name: providerForm.display_name,
+    provider_type: providerForm.provider_type,
+    default_protocol: null,
+    capabilities: providerForm.capabilities,
+    is_enabled: providerForm.is_enabled,
+    share_config: providerForm.share_config
+  }
+  const isCreatingProvider = !editingProviderId.value
+
+  for (const field of [
+    'base_url',
+    'embedding_base_url',
+    'rerank_base_url',
+    'models_endpoint',
+    'embedding_models_endpoint',
+    'rerank_models_endpoint'
+  ]) {
+    if (isCreatingProvider || maskedProviderFieldChanges[field]) {
+      payload[field] = field === 'base_url' ? providerForm[field] : providerForm[field] || null
+    }
+  }
+
+  if (isCreatingProvider || maskedProviderFieldChanges.api_key_env) {
+    payload.api_key_env = providerForm.api_key_env || null
+  }
+  if (isCreatingProvider || maskedProviderFieldChanges.api_key) {
+    payload.api_key = providerForm.api_key || null
+  }
+  if (isCreatingProvider || maskedProviderFieldChanges.headers_json) {
+    payload.headers_json = parseJsonObject(providerForm.headers_text, '请求头')
+  }
+  if (isCreatingProvider || maskedProviderFieldChanges.extra_json) {
+    payload.extra_json = parseJsonObject(providerForm.extra_text, '扩展配置')
+  }
+
+  return payload
+}
 
 const createProvider = async () => {
   saving.value = true
@@ -398,7 +482,7 @@ const createProvider = async () => {
 const saveProvider = async () => {
   if (
     editingProviderId.value &&
-    providerContainsDefaultModel(providerForm.provider_id) &&
+    providerContainsDefaultModel(providerForm.resource_id) &&
     providerForm.is_enabled === false
   ) {
     warnDefaultModelProtected()
@@ -407,7 +491,7 @@ const saveProvider = async () => {
 
   saving.value = true
   try {
-    await modelProviderApi.updateProvider(providerForm.provider_id, buildProviderPayload())
+    await modelProviderApi.updateProvider(providerForm.resource_id, buildProviderPayload())
     message.success('供应商已保存')
     showProviderModal.value = false
     await loadProviders()
@@ -422,7 +506,7 @@ const saveProviderAndEnable = async () => {
   saving.value = true
   try {
     const payload = { ...buildProviderPayload(), is_enabled: true }
-    await modelProviderApi.updateProvider(providerForm.provider_id, payload)
+    await modelProviderApi.updateProvider(providerForm.resource_id, payload)
     message.success('供应商已保存并启用')
     showProviderModal.value = false
     await loadProviders()
@@ -434,7 +518,7 @@ const saveProviderAndEnable = async () => {
 }
 
 const deleteProvider = async (provider) => {
-  if (providerContainsDefaultModel(provider.provider_id)) {
+  if (providerContainsDefaultModel(providerResourceId(provider))) {
     warnDefaultModelProtected()
     return
   }
@@ -447,13 +531,13 @@ const deleteProvider = async (provider) => {
     cancelText: '取消',
     async onOk() {
       try {
-        await modelProviderApi.deleteProvider(provider.provider_id)
+        await modelProviderApi.deleteProvider(providerResourceId(provider))
         message.success('已删除')
-        if (currentProviderForModels.value?.provider_id === provider.provider_id) {
+        if (providerResourceId(currentProviderForModels.value) === providerResourceId(provider)) {
           showModelsModal.value = false
           currentProviderForModels.value = null
         }
-        if (editingProviderId.value === provider.provider_id) {
+        if (editingProviderId.value === providerResourceId(provider)) {
           showProviderModal.value = false
           editingProviderId.value = null
         }
@@ -466,7 +550,9 @@ const deleteProvider = async (provider) => {
 }
 
 const deleteProviderFromEdit = async () => {
-  const provider = providers.value.find((p) => p.provider_id === editingProviderId.value)
+  const provider = providers.value.find(
+    (candidate) => providerResourceId(candidate) === editingProviderId.value
+  )
   if (provider) {
     deleteProvider(provider)
   }
@@ -475,12 +561,12 @@ const deleteProviderFromEdit = async () => {
 // ============ Models Modal Operations ============
 const openModelsModal = (provider) => {
   currentProviderForModels.value = provider
-  if (!remoteModelsLoaded.value[provider.provider_id]) {
-    remoteModelsMap.value[provider.provider_id] = []
+  const providerId = providerResourceId(provider)
+  if (!remoteModelsLoaded.value[providerId]) {
+    remoteModelsMap.value[providerId] = []
   }
-  remoteModelSearch.value[provider.provider_id] =
-    remoteModelSearch.value[provider.provider_id] || ''
-  remoteModelTypeFilter.value[provider.provider_id] = 'all'
+  remoteModelSearch.value[providerId] = remoteModelSearch.value[providerId] || ''
+  remoteModelTypeFilter.value[providerId] = 'all'
   showModelsModal.value = true
   loadModelMetadata()
 }
@@ -555,7 +641,7 @@ const testModelConnection = async (providerId, model) => {
 }
 
 const addModelFromRemote = async (providerId, remoteModel) => {
-  const provider = providers.value.find((p) => p.provider_id === providerId)
+  const provider = providers.value.find((p) => providerResourceId(p) === providerId)
   if (!provider) return
 
   const enabledModels = provider.enabled_models || []
@@ -570,12 +656,17 @@ const addModelFromRemote = async (providerId, remoteModel) => {
   const newEnabledModels = [...enabledModels, newModel]
 
   try {
-    await modelProviderApi.updateProvider(providerId, { enabled_models: newEnabledModels })
+    await modelProviderApi.updateProvider(
+      providerResourceId(providers.value.find((p) => providerResourceId(p) === providerId)),
+      { enabled_models: newEnabledModels }
+    )
     message.success(`已添加模型 ${remoteModel.id}`)
     await loadProviders()
     // Refresh current provider reference if modal is open
-    if (currentProviderForModels.value?.provider_id === providerId) {
-      currentProviderForModels.value = providers.value.find((p) => p.provider_id === providerId)
+    if (providerResourceId(currentProviderForModels.value) === providerId) {
+      currentProviderForModels.value = providers.value.find(
+        (p) => providerResourceId(p) === providerId
+      )
     }
   } catch (error) {
     message.error(error.message || '添加模型失败')
@@ -632,7 +723,7 @@ const saveModelConfig = async () => {
   saving.value = true
   try {
     const provider = providers.value.find(
-      (p) => p.provider_id === currentProviderForModels.value.provider_id
+      (p) => providerResourceId(p) === providerResourceId(currentProviderForModels.value)
     )
     if (!provider) return
 
@@ -656,7 +747,7 @@ const saveModelConfig = async () => {
       )
     }
 
-    await modelProviderApi.updateProvider(currentProviderForModels.value.provider_id, {
+    await modelProviderApi.updateProvider(providerResourceId(currentProviderForModels.value), {
       enabled_models: enabledModels
     })
     message.success(isCreating.value ? '模型已添加' : '模型配置已保存')
@@ -665,7 +756,7 @@ const saveModelConfig = async () => {
     await loadProviders()
     // Refresh current provider reference
     currentProviderForModels.value = providers.value.find(
-      (p) => p.provider_id === currentProviderForModels.value.provider_id
+      (p) => providerResourceId(p) === providerResourceId(currentProviderForModels.value)
     )
   } catch (error) {
     message.error(error.message || '保存失败')
@@ -675,7 +766,7 @@ const saveModelConfig = async () => {
 }
 
 const removeModel = async (providerId, modelId) => {
-  const provider = providers.value.find((p) => p.provider_id === providerId)
+  const provider = providers.value.find((p) => providerResourceId(p) === providerId)
   if (!provider) return
   if (isDefaultModel(providerId, modelId)) {
     warnDefaultModelProtected()
@@ -695,8 +786,10 @@ const removeModel = async (providerId, modelId) => {
         message.success('模型已移除')
         await loadProviders()
         // Refresh current provider reference if modal is open
-        if (currentProviderForModels.value?.provider_id === providerId) {
-          currentProviderForModels.value = providers.value.find((p) => p.provider_id === providerId)
+        if (providerResourceId(currentProviderForModels.value) === providerId) {
+          currentProviderForModels.value = providers.value.find(
+            (p) => providerResourceId(p) === providerId
+          )
         }
       } catch (error) {
         message.error(error.message || '移除失败')
@@ -745,9 +838,9 @@ defineExpose({
       <ExtensionCardGrid v-if="enabledProviders.length" :min-width="320">
         <InfoCard
           v-for="provider in enabledProviders"
-          :key="provider.provider_id"
+          :key="provider.resource_id"
           :title="provider.display_name"
-          :subtitle="provider.provider_id"
+          :subtitle="`${provider.provider_id} · ${provider.share_config?.read_scope?.access_level || 'global'}`"
           :default-icon="Globe"
           :info="getProviderInfo(provider)"
           :status="getProviderStatus(provider)"
@@ -785,10 +878,10 @@ defineExpose({
       <ExtensionCardGrid v-if="disabledProviders.length" :min-width="320">
         <InfoCard
           v-for="provider in disabledProviders"
-          :key="provider.provider_id"
+          :key="provider.resource_id"
           variant="mini"
           :title="provider.display_name"
-          :description="provider.provider_id"
+          :description="`${provider.provider_id} · ${provider.share_config?.read_scope?.access_level || 'global'}`"
           @click="openEditProviderModal(provider)"
         >
           <template #icon>
@@ -873,8 +966,13 @@ defineExpose({
             <span>Base URL</span>
             <a-input
               v-model:value="providerForm.base_url"
-              placeholder="https://api.example.com/v1"
+              :placeholder="
+                editingProviderId && providerForm.base_url === ''
+                  ? '已配置（地址已隐藏）'
+                  : 'https://api.example.com/v1'
+              "
               autocomplete="off"
+              @change="markMaskedProviderFieldChanged('base_url')"
             />
           </label>
           <label class="form-label">
@@ -898,6 +996,7 @@ defineExpose({
               v-model:value="providerForm.api_key_env"
               placeholder="环境变量名"
               autocomplete="off"
+              @change="markMaskedProviderFieldChanged('api_key_env')"
             />
           </label>
           <label class="form-label">
@@ -908,6 +1007,7 @@ defineExpose({
               autocapitalize="none"
               autocorrect="off"
               spellcheck="false"
+              @change="markMaskedProviderFieldChanged('api_key')"
             />
           </label>
         </div>
@@ -915,7 +1015,11 @@ defineExpose({
         <div class="form-row">
           <label class="form-label">
             <span>Models Endpoint</span>
-            <a-input v-model:value="providerForm.models_endpoint" placeholder="/models" />
+            <a-input
+              v-model:value="providerForm.models_endpoint"
+              placeholder="/models"
+              @change="markMaskedProviderFieldChanged('models_endpoint')"
+            />
           </label>
         </div>
 
@@ -926,6 +1030,7 @@ defineExpose({
               <a-input
                 v-model:value="providerForm.embedding_base_url"
                 placeholder="https://api.example.com/v1/embeddings"
+                @change="markMaskedProviderFieldChanged('embedding_base_url')"
               />
             </label>
             <label class="form-label">
@@ -933,6 +1038,7 @@ defineExpose({
               <a-input
                 v-model:value="providerForm.embedding_models_endpoint"
                 placeholder="/embeddings/models"
+                @change="markMaskedProviderFieldChanged('embedding_models_endpoint')"
               />
             </label>
           </div>
@@ -945,6 +1051,7 @@ defineExpose({
               <a-input
                 v-model:value="providerForm.rerank_base_url"
                 placeholder="https://api.example.com/v1/rerank"
+                @change="markMaskedProviderFieldChanged('rerank_base_url')"
               />
             </label>
             <label class="form-label">
@@ -952,6 +1059,7 @@ defineExpose({
               <a-input
                 v-model:value="providerForm.rerank_models_endpoint"
                 placeholder="按供应商文档填写，留空则不自动加载"
+                @change="markMaskedProviderFieldChanged('rerank_models_endpoint')"
               />
             </label>
           </div>
@@ -975,16 +1083,34 @@ defineExpose({
           />
         </div>
 
+        <ShareConfigForm
+          ref="shareConfigFormRef"
+          v-model="providerForm.share_config"
+          :allowed-access-levels="allowedShareAccessLevels"
+          :require-read-scope="true"
+          :disabled="isGlobalScopeReadOnly"
+        />
+
         <a-collapse expand-icon-position="end" :ghost="true" class="advanced-collapse">
           <a-collapse-panel key="advanced" header="高级配置">
             <label class="form-label full-width">
               <span>请求头 JSON</span>
-              <a-textarea v-model:value="providerForm.headers_text" :rows="4" placeholder="{}" />
+              <a-textarea
+                v-model:value="providerForm.headers_text"
+                :rows="4"
+                placeholder="{}"
+                @change="markMaskedProviderFieldChanged('headers_json')"
+              />
             </label>
 
             <label class="form-label full-width">
               <span>扩展配置 JSON</span>
-              <a-textarea v-model:value="providerForm.extra_text" :rows="4" placeholder="{}" />
+              <a-textarea
+                v-model:value="providerForm.extra_text"
+                :rows="4"
+                placeholder="{}"
+                @change="markMaskedProviderFieldChanged('extra_json')"
+              />
             </label>
           </a-collapse-panel>
         </a-collapse>
@@ -1014,7 +1140,7 @@ defineExpose({
                 type="primary"
                 class="lucide-icon-btn"
                 :loading="remoteLoading"
-                @click="fetchRemoteModels(currentProviderForModels.provider_id)"
+                @click="fetchRemoteModels(providerResourceId(currentProviderForModels))"
               >
                 获取远程模型
               </a-button>
@@ -1040,7 +1166,7 @@ defineExpose({
               v-for="model in currentProviderForModels.enabled_models"
               :key="model.id"
               class="table-row"
-              :class="{ stale: isModelStale(model, currentProviderForModels.provider_id) }"
+              :class="{ stale: isModelStale(model, providerResourceId(currentProviderForModels)) }"
             >
               <div class="model-info">
                 <span class="model-name">{{ getModelDisplayName(model) }}</span>
@@ -1059,8 +1185,8 @@ defineExpose({
               </span>
               <span class="col-context">
                 {{
-                  getProviderModelInfo(currentProviderForModels.provider_id, model).contextLabel ||
-                  '-'
+                  getProviderModelInfo(providerResourceId(currentProviderForModels), model)
+                    .contextLabel || '-'
                 }}
               </span>
               <span class="col-dim">
@@ -1077,15 +1203,20 @@ defineExpose({
                   size="small"
                   class="model-test-button"
                   :class="{
-                    'is-testing': isModelTesting(currentProviderForModels.provider_id, model.id)
+                    'is-testing': isModelTesting(
+                      providerResourceId(currentProviderForModels),
+                      model.id
+                    )
                   }"
                   aria-label="测试模型连接"
-                  :aria-busy="isModelTesting(currentProviderForModels.provider_id, model.id)"
-                  :title="getModelTestTitle(currentProviderForModels.provider_id, model)"
-                  @click="testModelConnection(currentProviderForModels.provider_id, model)"
+                  :aria-busy="
+                    isModelTesting(providerResourceId(currentProviderForModels), model.id)
+                  "
+                  :title="getModelTestTitle(providerResourceId(currentProviderForModels), model)"
+                  @click="testModelConnection(providerResourceId(currentProviderForModels), model)"
                 >
                   <LoaderCircle
-                    v-if="isModelTesting(currentProviderForModels.provider_id, model.id)"
+                    v-if="isModelTesting(providerResourceId(currentProviderForModels), model.id)"
                     :size="13"
                     class="spinning"
                   />
@@ -1106,7 +1237,7 @@ defineExpose({
                   class="lucide-icon-btn"
                   :title="`移除 ${getModelDisplayName(model)}`"
                   :aria-label="`移除 ${getModelDisplayName(model)}`"
-                  @click="removeModel(currentProviderForModels.provider_id, model.id)"
+                  @click="removeModel(providerResourceId(currentProviderForModels), model.id)"
                 >
                   <Trash2 :size="13" />
                 </a-button>
@@ -1121,11 +1252,11 @@ defineExpose({
           <div class="remote-header">
             <h4 class="models-section-title">远端候选模型 ({{ filteredRemoteModels.length }})</h4>
             <div
-              v-if="remoteModelsMap[currentProviderForModels.provider_id]?.length"
+              v-if="remoteModelsMap[providerResourceId(currentProviderForModels)]?.length"
               class="remote-controls"
             >
               <a-input
-                v-model:value="remoteModelSearch[currentProviderForModels.provider_id]"
+                v-model:value="remoteModelSearch[providerResourceId(currentProviderForModels)]"
                 class="remote-search-input"
                 placeholder="搜索模型..."
                 allow-clear
@@ -1150,7 +1281,7 @@ defineExpose({
                 {{ priceCurrency === 'CNY' ? '¥' : '$' }}
               </button>
               <a-segmented
-                v-model:value="remoteModelTypeFilter[currentProviderForModels.provider_id]"
+                v-model:value="remoteModelTypeFilter[providerResourceId(currentProviderForModels)]"
                 :options="remoteModelTypeOptions"
                 class="remote-type-filter"
               />
@@ -1158,7 +1289,7 @@ defineExpose({
           </div>
           <div
             class="remote-list"
-            v-if="remoteModelsMap[currentProviderForModels.provider_id]?.length"
+            v-if="remoteModelsMap[providerResourceId(currentProviderForModels)]?.length"
           >
             <div
               v-for="remoteModel in filteredRemoteModels"
@@ -1169,7 +1300,7 @@ defineExpose({
               <div class="remote-tags">
                 <template
                   v-for="mod in getProviderModelInfo(
-                    currentProviderForModels.provider_id,
+                    providerResourceId(currentProviderForModels),
                     remoteModel
                   ).inputModalities"
                   :key="mod"
@@ -1189,14 +1320,24 @@ defineExpose({
                 </span>
               </div>
               <span class="remote-context">{{
-                getProviderModelInfo(currentProviderForModels.provider_id, remoteModel)
+                getProviderModelInfo(providerResourceId(currentProviderForModels), remoteModel)
                   .contextLabel || '-'
               }}</span>
               <span
-                v-if="getRemoteModelPriceDisplay(currentProviderForModels.provider_id, remoteModel)"
+                v-if="
+                  getRemoteModelPriceDisplay(
+                    providerResourceId(currentProviderForModels),
+                    remoteModel
+                  )
+                "
                 class="remote-price"
               >
-                {{ getRemoteModelPriceDisplay(currentProviderForModels.provider_id, remoteModel) }}
+                {{
+                  getRemoteModelPriceDisplay(
+                    providerResourceId(currentProviderForModels),
+                    remoteModel
+                  )
+                }}
               </span>
               <span v-else class="remote-price placeholder">N/A</span>
               <a-button
@@ -1220,7 +1361,9 @@ defineExpose({
                 :disabled="
                   currentProviderForModels.enabled_models?.some((m) => m.id === remoteModel.id)
                 "
-                @click="addModelFromRemote(currentProviderForModels.provider_id, remoteModel)"
+                @click="
+                  addModelFromRemote(providerResourceId(currentProviderForModels), remoteModel)
+                "
               >
                 <CheckCircle2
                   :size="13"

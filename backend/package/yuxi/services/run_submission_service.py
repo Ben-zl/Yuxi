@@ -201,6 +201,7 @@ async def submit_run_command(
             model_spec=command.model_spec,
             tool_approval_mode=command.tool_approval_mode,
             meta=request_metadata,
+            user=current_user,
         )
         await finalize_intake(
             db=db,

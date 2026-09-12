@@ -348,7 +348,8 @@ class MilvusKB(KnowledgeBase):
         if not embedding_model_spec:
             raise ValueError(f"Embedding model spec not found for database {kb_id}")
 
-        embedding_info = model_cache.get_model_info(embedding_model_spec)
+        canonical_spec = model_cache.canonicalize_spec(embedding_model_spec)
+        embedding_info = model_cache.get_model_info(canonical_spec) if canonical_spec else None
         if not embedding_info or embedding_info.model_type != "embedding":
             raise ValueError(f"Unsupported embedding model: {embedding_model_spec}")
 

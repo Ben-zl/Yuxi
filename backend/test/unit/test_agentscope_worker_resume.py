@@ -28,6 +28,10 @@ async def test_worker_preserves_mixed_approval_decisions(monkeypatch):
         conversation_thread_id="thread",
         agent_slug="agent",
         input_payload={},
+        manifest={
+            "manifest_version": 1,
+            "resource_snapshot": {"id": "resume-snapshot", "fingerprint": "snapshot-digest"},
+        },
     )
     message = SimpleNamespace(extra_metadata={"resume": {"decisions": [{"type": "approve"}, {"type": "reject"}]}})
     mapping = SimpleNamespace(
@@ -46,16 +50,22 @@ async def test_worker_preserves_mixed_approval_decisions(monkeypatch):
         return GatewayRoundResult("completed", "ok", "", 1)
 
     monkeypatch.setattr(worker_job, "ensure_thread_session", AsyncMock(return_value=mapping))
-    monkeypatch.setattr(worker_job, "_verify_run_manifest", AsyncMock())
+    projection = SimpleNamespace(model_spec="snapshot:model")
+    load_resources = AsyncMock(return_value=projection)
+    monkeypatch.setattr(worker_job, "load_run_resources", load_resources)
     monkeypatch.setattr(worker_job, "load_pending_confirm", AsyncMock(return_value=pending))
     monkeypatch.setattr(worker_job, "_resume_and_collect", _resume)
     monkeypatch.setattr(worker_job, "finalize_run", AsyncMock())
     clear = AsyncMock()
     monkeypatch.setattr(worker_job, "clear_pending_confirm", clear)
 
-    await worker_job._execute_resume(SimpleNamespace(), _MinimalClient(), run, message)
+    db = SimpleNamespace()
+    await worker_job._execute_resume(db, _MinimalClient(), run, message)
 
     assert captured == [True, False]
+    load_resources.assert_awaited_once_with(db, uid="u", manifest=run.manifest, agent_slug="agent")
+    assert load_resources.await_args.kwargs["manifest"] is run.manifest
+    assert worker_job.ensure_thread_session.await_args.kwargs["projection"] is projection
     clear.assert_awaited_once_with("thread")
 
 
@@ -67,6 +77,10 @@ async def test_resume_failure_keeps_pending_confirmation(monkeypatch):
         conversation_thread_id="thread",
         agent_slug="agent",
         input_payload={},
+        manifest={
+            "manifest_version": 1,
+            "resource_snapshot": {"id": "resume-snapshot", "fingerprint": "snapshot-digest"},
+        },
     )
     message = SimpleNamespace(extra_metadata={"resume": {"decisions": [{"type": "approve"}]}})
     mapping = SimpleNamespace(
@@ -79,7 +93,7 @@ async def test_resume_failure_keeps_pending_confirmation(monkeypatch):
         "tool_calls": [{"id": "one"}],
     }
     monkeypatch.setattr(worker_job, "ensure_thread_session", AsyncMock(return_value=mapping))
-    monkeypatch.setattr(worker_job, "_verify_run_manifest", AsyncMock())
+    monkeypatch.setattr(worker_job, "load_run_resources", AsyncMock(return_value=SimpleNamespace()))
     monkeypatch.setattr(worker_job, "load_pending_confirm", AsyncMock(return_value=pending))
     monkeypatch.setattr(
         worker_job,
@@ -262,10 +276,14 @@ async def test_permission_resume_requires_decisions(monkeypatch):
         conversation_thread_id="thread",
         agent_slug="agent",
         input_payload={},
+        manifest={
+            "manifest_version": 1,
+            "resource_snapshot": {"id": "resume-snapshot", "fingerprint": "snapshot-digest"},
+        },
     )
     mapping = SimpleNamespace(agentscope_agent_id="agent-id", agentscope_session_id="session-id")
     monkeypatch.setattr(worker_job, "ensure_thread_session", AsyncMock(return_value=mapping))
-    monkeypatch.setattr(worker_job, "_verify_run_manifest", AsyncMock())
+    monkeypatch.setattr(worker_job, "load_run_resources", AsyncMock(return_value=SimpleNamespace()))
     monkeypatch.setattr(
         worker_job,
         "load_pending_confirm",
@@ -385,6 +403,10 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
         input_message_id=1,
         run_type="chat",
         input_payload={},
+        manifest={
+            "manifest_version": 1,
+            "resource_snapshot": {"id": "resume-snapshot", "fingerprint": "snapshot-digest"},
+        },
         conversation_id=1,
         request_id="request",
         conversation_thread_id="thread",
@@ -423,7 +445,7 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
     monkeypatch.setattr(worker_job, "_record_run_manifest", AsyncMock())
     monkeypatch.setattr(
         worker_job,
-        "ensure_thread_session",
+        "load_run_resources",
         AsyncMock(side_effect=ValueError("模型供应商 disabled 未启用")),
     )
     emit = AsyncMock()
@@ -452,6 +474,10 @@ async def test_worker_persists_reasoning_and_tool_calls(monkeypatch):
         input_message_id=1,
         run_type="chat",
         input_payload={},
+        manifest={
+            "manifest_version": 1,
+            "resource_snapshot": {"id": "resume-snapshot", "fingerprint": "snapshot-digest"},
+        },
         conversation_id=1,
         request_id="request",
         conversation_thread_id="thread",
@@ -504,7 +530,7 @@ async def test_worker_persists_reasoning_and_tool_calls(monkeypatch):
     monkeypatch.setattr(worker_job, "_record_run_manifest", AsyncMock())
     monkeypatch.setattr(execution, "ConversationRepository", lambda current_db: conv_repo)
     monkeypatch.setattr(worker_job, "ensure_thread_session", AsyncMock(return_value=mapping))
-    monkeypatch.setattr(worker_job, "_verify_run_manifest", AsyncMock())
+    monkeypatch.setattr(worker_job, "load_run_resources", AsyncMock(return_value=SimpleNamespace()))
     monkeypatch.setattr(worker_job, "_apply_permission_mode", AsyncMock())
     monkeypatch.setattr(worker_job, "execute_run", AsyncMock(return_value=result))
     monkeypatch.setattr(worker_job, "dispatch_next_request", AsyncMock())

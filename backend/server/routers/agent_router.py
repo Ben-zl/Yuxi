@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import uuid
 import os
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
@@ -12,11 +12,14 @@ from yuxi.agents.buildin import agent_manager
 from yuxi.agents.context import filter_config_by_role
 from yuxi.repositories.agent_repository import (
     AgentRepository,
+    get_allowed_agent_access_levels,
     is_builtin_agent,
+    normalize_agent_share_config,
     user_can_access_agent,
     user_can_manage_agent,
 )
 from yuxi.repositories.agent_task_repository import AgentTaskRepository
+from yuxi.services.agent_config_resource_service import authorize_agent_config_resources
 from yuxi.services.agent_request_queue_service import (
     cancel_queued_request as cancel_queued_request_svc,
     continue_thread_queue,
@@ -182,6 +185,24 @@ async def create_agent(
 
     repo = AgentRepository(db)
     try:
+        owner_uid = str(current_user.uid)
+        default_share_config = {
+            "version": 2,
+            "read_scope": {"access_level": "user", "department_ids": [], "user_uids": [owner_uid]},
+            "manage_scope": None,
+        }
+        share_config = normalize_agent_share_config(
+            payload.share_config or default_share_config,
+            allowed_access_levels=get_allowed_agent_access_levels(current_user),
+        )
+        filtered_config = _filter_agent_config_json(payload.backend_id, payload.config_json, current_user.role)
+        config_json = await authorize_agent_config_resources(
+            filtered_config,
+            db=db,
+            user=current_user,
+            agent_share_config=share_config,
+            owner_uid=owner_uid,
+        )
         item = await repo.create(
             name=payload.name,
             slug=payload.slug,
@@ -189,8 +210,8 @@ async def create_agent(
             description=payload.description,
             icon=payload.icon,
             pics=payload.pics,
-            config_json=_filter_agent_config_json(payload.backend_id, payload.config_json, current_user.role),
-            share_config=payload.share_config,
+            config_json=config_json,
+            share_config=share_config,
             is_default=payload.set_default,
             is_subagent=payload.is_subagent,
             created_by=str(current_user.uid),
@@ -233,16 +254,30 @@ async def update_agent(
         if "icon" in fields_set and payload.icon is None:
             item.icon = None
 
+        share_config = normalize_agent_share_config(
+            payload.share_config if payload.share_config is not None else item.share_config,
+            allowed_access_levels=get_allowed_agent_access_levels(current_user),
+        )
+        candidate_config = (
+            _filter_agent_config_json(item.backend_id, payload.config_json, current_user.role)
+            if payload.config_json is not None
+            else item.config_json
+        )
+        validated_config = await authorize_agent_config_resources(
+            candidate_config,
+            db=db,
+            user=current_user,
+            agent_share_config=share_config,
+            owner_uid=str(item.created_by or current_user.uid),
+        )
         updated = await repo.update(
             item,
             name=payload.name,
             description=payload.description,
             icon=payload.icon,
             pics=payload.pics,
-            config_json=_filter_agent_config_json(item.backend_id, payload.config_json, current_user.role)
-            if payload.config_json is not None
-            else None,
-            share_config=payload.share_config,
+            config_json=validated_config,
+            share_config=share_config if payload.share_config is not None else None,
             is_subagent=payload.is_subagent,
             updated_by=str(current_user.uid),
             updater=current_user,

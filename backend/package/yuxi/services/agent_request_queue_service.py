@@ -27,6 +27,11 @@ from yuxi.services.agent_run_service import (
     reenqueue_agent_run,
     resolve_agent_run_config,
 )
+from yuxi.services.agent_run_manifest_service import (
+    RUN_MANIFEST_INPUT_KEY,
+    build_submission_manifest_result,
+    compute_manifest_fingerprint,
+)
 from yuxi.services.input_message_service import AgentRunInputMessage
 from yuxi.services.workdir_service import resolve_conversation_workdir_binding
 from yuxi.storage.postgres.manager import pg_manager
@@ -127,6 +132,7 @@ async def intake_request(
     model_spec: str | None = None,
     tool_approval_mode: str | None = None,
     meta: dict | None = None,
+    user: Any | None = None,
 ) -> IntakeResult:
     """创建 request + Message，尝试立即派发。
 
@@ -216,6 +222,7 @@ async def intake_request(
             agent_item,
             agent_backend,
             db,
+            user=user,
         )
         if inspect.isawaitable(resolved_config):
             resolved_config = await resolved_config
@@ -224,6 +231,19 @@ async def intake_request(
             "model_spec": resolved_model_spec,
             "tool_approval_mode": resolved_tool_approval_mode,
         }
+        if user is None:
+            raise HTTPException(status_code=500, detail="Run 提交缺少当前用户授权上下文")
+        submission_manifest = await build_submission_manifest_result(
+            agent_item=agent_item,
+            agent_backend=agent_backend,
+            user=user,
+            db=db,
+            model_spec=resolved_model_spec,
+            tool_approval_mode=resolved_tool_approval_mode,
+            thread_id=thread_id,
+        )
+        input_payload[RUN_MANIFEST_INPUT_KEY] = submission_manifest.manifest
+        input_payload["_run_manifest_fingerprint"] = compute_manifest_fingerprint(submission_manifest.manifest)
 
     run_input_message = input_message.with_metadata(
         _build_message_metadata(request_id=request_id, source=source, input_message=input_message, meta=meta)
@@ -938,6 +958,14 @@ async def _dispatch_locked_head(
                 run_type="chat",
                 input_message_id=head.input_message_id,
             )
+            run = await run_repo.get_run(run_id)
+            manifest = (head.input_payload or {}).get(RUN_MANIFEST_INPUT_KEY)
+            fingerprint = (head.input_payload or {}).get("_run_manifest_fingerprint")
+            if run is not None and isinstance(manifest, dict) and isinstance(fingerprint, str):
+                run.manifest = manifest
+                run.manifest_fingerprint = fingerprint
+                run.manifest_recorded_at = utc_now_naive()
+                await db.flush()
             msg = await db.get(Message, head.input_message_id)
             if msg:
                 msg.run_id = run_id

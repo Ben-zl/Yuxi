@@ -169,10 +169,18 @@ class KnowledgeBaseManager:
         executor = self._get_or_create_kb_instance(kb_type)
         additional_params = executor.normalize_additional_params(snapshot.get("additional_params"))
         additional_params.pop("stats", None)
+        embedding_model_spec = snapshot.get("embedding_model_spec")
+        if embedding_model_spec:
+            from yuxi.models.providers.cache import model_cache
+
+            embedding_model_spec = model_cache.canonicalize_spec(embedding_model_spec)
+            if embedding_model_spec is None:
+                raise ValueError(f"知识库 embedding 模型 {snapshot.get('embedding_model_spec')} 不存在或存在歧义")
+
         return KnowledgeBaseConfig(
             kb_id=kb_id,
             kb_type=kb_type,
-            embedding_model_spec=snapshot.get("embedding_model_spec"),
+            embedding_model_spec=embedding_model_spec,
             query_params=snapshot.get("query_params") or executor.get_default_query_params(kb_id),
             additional_params=additional_params,
         )
@@ -514,9 +522,11 @@ class KnowledgeBaseManager:
 
             from yuxi.models.providers.cache import model_cache
 
-            info = model_cache.get_model_info(embedding_model_spec)
+            canonical_spec = model_cache.canonicalize_spec(embedding_model_spec)
+            info = model_cache.get_model_info(canonical_spec) if canonical_spec else None
             if not info or info.model_type != "embedding":
                 raise ValueError(f"不支持的 embedding 模型: {embedding_model_spec}")
+            embedding_model_spec = canonical_spec
         else:
             embedding_model_spec = None
 

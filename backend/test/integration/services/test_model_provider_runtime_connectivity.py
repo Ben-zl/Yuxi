@@ -14,8 +14,8 @@ from yuxi.models.providers.cache import ModelInfo
 from yuxi.models.providers.service import (
     resolve_api_key,
     ensure_builtin_model_providers_in_db,
-    get_model_provider_by_id,
 )
+from yuxi.models.providers.repository import get_builtin_model_provider
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import ModelProvider
 
@@ -78,7 +78,7 @@ async def _load_provider() -> ModelProvider:
 
     async with pg_manager.get_async_session_context() as db:
         await ensure_builtin_model_providers_in_db(db)
-        provider = await get_model_provider_by_id(db, provider_id)
+        provider = await get_builtin_model_provider(db, provider_id)
         if provider is None:
             pytest.skip(f"Provider {provider_id} is not configured.")
         return provider

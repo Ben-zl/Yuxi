@@ -140,10 +140,10 @@ async def _startup(app: FastAPI) -> None:
         """用 PostgreSQL 当前供应商事实重建进程内模型缓存。"""
 
         from yuxi.models.providers.cache import model_cache
-        from yuxi.models.providers.service import get_all_model_providers
+        from yuxi.models.providers.service import get_all_model_providers_internal
 
         async with pg_manager.get_async_session_context() as session:
-            providers = await get_all_model_providers(session)
+            providers = await get_all_model_providers_internal(session)
             model_cache.rebuild(providers)
 
     await _initialize_startup_component(

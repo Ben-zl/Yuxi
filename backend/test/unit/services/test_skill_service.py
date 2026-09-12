@@ -999,9 +999,11 @@ async def test_get_skill_dependency_options(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(tool_service, "get_tool_metadata", fake_get_tool_metadata)
 
-    async def fake_get_enabled_mcp_server_slugs(db=None):
-        del db
-        return ["mcp-a", "mcp-b"]
+    async def fake_get_enabled_mcp_server_slugs(db=None, user=None, use_resource_ids=False):
+        assert db is None
+        assert user.uid == "user"
+        assert use_resource_ids is True
+        return ["mcp-resource-a", "mcp-resource-b"]
 
     monkeypatch.setattr(svc, "get_enabled_mcp_server_slugs", fake_get_enabled_mcp_server_slugs)
 
@@ -1015,7 +1017,7 @@ async def test_get_skill_dependency_options(monkeypatch: pytest.MonkeyPatch):
 
     result = await svc.get_skill_dependency_options(None, user)
     assert result["tools"] == [{"slug": "calculator", "name": "Calculator"}, {"slug": "search", "name": "Search"}]
-    assert result["mcps"] == ["mcp-a", "mcp-b"]
+    assert result["mcps"] == ["mcp-resource-a", "mcp-resource-b"]
     assert result["skills"] == ["alpha", "beta"]
 
 
@@ -1414,11 +1416,14 @@ async def test_update_skill_dependencies(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(tool_service, "get_tool_metadata", fake_get_tool_metadata)
 
-    async def fake_get_enabled_mcp_server_slugs(db=None):
-        del db
-        return ["mcp-a"]
+    async def fake_get_enabled_mcp_server_config(reference, *, db, user):
+        assert db is not None
+        assert user.uid == "root"
+        if reference == "mcp-a":
+            return {"resource_id": "mcp-resource-a", "slug": "mcp-a"}
+        return None
 
-    monkeypatch.setattr(svc, "get_enabled_mcp_server_slugs", fake_get_enabled_mcp_server_slugs)
+    monkeypatch.setattr(svc, "get_enabled_mcp_server_config", fake_get_enabled_mcp_server_config)
 
     async def fake_get_skill_or_raise(_db, _operator, slug: str):
         assert slug == "alpha"
@@ -1467,10 +1472,58 @@ async def test_update_skill_dependencies(monkeypatch: pytest.MonkeyPatch):
         operator=_user("root"),
     )
     assert captured["tool_dependencies"] == ["calculator"]
-    assert captured["mcp_dependencies"] == ["mcp-a"]
+    assert captured["mcp_dependencies"] == ["mcp-resource-a"]
     assert captured["skill_dependencies"] == ["beta"]
     assert captured["updated_by"] == "root"
     assert updated.skill_dependencies == ["beta"]
+
+
+@pytest.mark.asyncio
+async def test_update_skill_dependencies_rejects_invisible_or_ambiguous_mcp(monkeypatch: pytest.MonkeyPatch):
+    item = Skill(
+        slug="alpha",
+        name="alpha",
+        description="alpha",
+        source_type="upload",
+        dir_path="shared/alpha",
+        created_by="root",
+        share_config={
+            "version": 2,
+            "read_scope": {"access_level": "user", "user_uids": ["root"]},
+            "manage_scope": {"access_level": "user", "user_uids": ["root"]},
+        },
+        enabled=True,
+        tool_dependencies=[],
+        mcp_dependencies=[],
+        skill_dependencies=[],
+    )
+
+    monkeypatch.setattr(tool_service, "get_tool_metadata", lambda category=None: [])
+
+    async def fake_get_skill_or_raise(_db, _operator, _slug):
+        return item
+
+    async def fake_list_accessible_shared_skills(_db, _operator):
+        return [item]
+
+    async def fake_get_enabled_mcp_server_config(_reference, *, db, user):
+        assert db is not None
+        assert user.uid == "root"
+        return None
+
+    monkeypatch.setattr(svc, "get_manageable_skill_or_raise", fake_get_skill_or_raise)
+    monkeypatch.setattr(svc, "_list_accessible_shared_skills", fake_list_accessible_shared_skills)
+    monkeypatch.setattr(svc, "get_enabled_mcp_server_config", fake_get_enabled_mcp_server_config)
+
+    with pytest.raises(ValueError, match="无效、不可访问或歧义"):
+        await svc.update_skill_dependencies(
+            _UnitOfWork(),
+            slug="alpha",
+            tool_dependencies=[],
+            mcp_dependencies=["duplicate-or-cross-department"],
+            skill_dependencies=[],
+            operator=_user("root"),
+        )
 
 
 def test_skill_dependency_scope_covers_read_and_manage_audiences():

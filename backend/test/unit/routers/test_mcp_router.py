@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from yuxi.agents.mcp.service import MCPServerNotFoundError
-from yuxi.storage.postgres.models_business import User
+from yuxi.storage.postgres.models_business import MCPServer, User
 
 from server.routers.mcp_router import mcp
 from server.utils.auth_middleware import get_admin_user, get_db, get_required_user
 
 
-def _build_app(*, allow_admin: bool = True) -> FastAPI:
+def _build_app(*, allow_admin: bool = True, superadmin: bool = False) -> FastAPI:
     app = FastAPI()
     app.include_router(mcp, prefix="/api")
 
@@ -25,7 +26,7 @@ def _build_app(*, allow_admin: bool = True) -> FastAPI:
             username="admin",
             uid="admin",
             password_hash="x",
-            role="admin",
+            role="superadmin" if superadmin else "admin",
         )
 
     async def fake_required_user():
@@ -33,7 +34,7 @@ def _build_app(*, allow_admin: bool = True) -> FastAPI:
             username="admin" if allow_admin else "user",
             uid="admin" if allow_admin else "user",
             password_hash="x",
-            role="admin" if allow_admin else "user",
+            role=("superadmin" if superadmin else "admin") if allow_admin else "user",
         )
 
     app.dependency_overrides[get_db] = fake_db
@@ -51,10 +52,10 @@ def test_update_mcp_server_status(monkeypatch):
             self.transport = "streamable_http"
             self.enabled = enabled
 
-        def to_dict(self):
+        def to_dict(self, *, sanitize=False):
             return {"name": "demo-mcp", "enabled": self.enabled}
 
-    async def fake_set_server_enabled(db, name, enabled, updated_by=None):
+    async def fake_set_server_enabled(db, name, enabled, updated_by=None, *, operator=None, resource_only=False):
         captured["name"] = name
         captured["enabled"] = enabled
         captured["updated_by"] = updated_by
@@ -73,7 +74,7 @@ def test_update_mcp_server_status(monkeypatch):
 
 
 def test_update_mcp_server_status_not_found(monkeypatch):
-    async def fake_set_server_enabled(db, name, enabled, updated_by=None):
+    async def fake_set_server_enabled(db, name, enabled, updated_by=None, *, operator=None, resource_only=False):
         raise MCPServerNotFoundError(f"Server '{name}' does not exist")
 
     monkeypatch.setattr("server.routers.mcp_router.set_server_enabled", fake_set_server_enabled)
@@ -84,7 +85,7 @@ def test_update_mcp_server_status_not_found(monkeypatch):
 
 
 def test_update_mcp_server_status_rejects_legacy_stdio(monkeypatch):
-    async def fake_set_server_enabled(db, name, enabled, updated_by=None):
+    async def fake_set_server_enabled(db, name, enabled, updated_by=None, *, operator=None, resource_only=False):
         raise ValueError("历史 stdio MCP 已被禁用")
 
     monkeypatch.setattr("server.routers.mcp_router.set_server_enabled", fake_set_server_enabled)
@@ -94,60 +95,130 @@ def test_update_mcp_server_status_rejects_legacy_stdio(monkeypatch):
     assert resp.status_code == 400, resp.text
 
 
-def test_get_mcp_servers_normal_user_is_stripped(monkeypatch):
-    class DummyServer:
-        def __init__(self):
-            self.name = "test-mcp"
-            self.slug = "test-mcp"
-            self.description = "test mcp description"
-            self.transport = "streamable_http"
-            self.url = "http://localhost:8000"
-            self.command = "python"
-            self.args = ["-m", "mcp"]
-            self.env = {"API_KEY": "secret"}
-            self.headers = {"Auth": "Bearer secret"}
-            self.enabled = 1
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "/api/system/mcp-servers/global-resource/test"),
+        ("get", "/api/system/mcp-servers/global-resource/tools"),
+        ("post", "/api/system/mcp-servers/global-resource/tools/refresh"),
+    ],
+)
+def test_department_admin_cannot_run_management_probe_on_global_mcp(monkeypatch, method, path):
+    server = MCPServer(
+        resource_id="global-resource",
+        slug="global",
+        name="Global MCP",
+        transport="streamable_http",
+        url="https://example.test/mcp",
+        enabled=1,
+        created_by="root",
+        updated_by="root",
+        share_config={
+            "version": 2,
+            "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+            "manage_scope": None,
+        },
+    )
 
-        def to_dict(self):
-            return {
-                "name": self.name,
-                "description": self.description,
-                "transport": self.transport,
-                "url": self.url,
-                "command": self.command,
-                "args": self.args,
-                "env": self.env,
-                "headers": self.headers,
-                "enabled": bool(self.enabled),
-            }
+    async def read_server(*_args, **_kwargs):
+        return server
 
-    async def fake_get_all_mcp_servers(db):
-        return [DummyServer()]
+    monkeypatch.setattr("server.routers.mcp_router.get_server_or_404", read_server)
+    response = getattr(TestClient(_build_app()), method)(path)
+    assert response.status_code == 403, response.text
 
-    monkeypatch.setattr("server.routers.mcp_router.get_all_mcp_servers", fake_get_all_mcp_servers)
 
-    # 1. 管理员请求，应该返回全部字段
-    client_admin = TestClient(_build_app(allow_admin=True))
-    resp_admin = client_admin.get("/api/system/mcp-servers")
-    assert resp_admin.status_code == 200
-    data_admin = resp_admin.json()["data"][0]
-    assert data_admin["url"] == "http://localhost:8000"
-    assert data_admin["command"] == "python"
-    assert data_admin["env"] == {"API_KEY": "secret"}
+@pytest.mark.parametrize(
+    "role,operation",
+    [
+        (role, operation)
+        for role in ["user", "admin", "superadmin"]
+        for operation in ["list", "detail", "create", "update", "status"]
+        if role != "user" or operation in {"list", "detail"}
+    ],
+)
+@pytest.mark.parametrize(
+    "url", ["https://example.test/mcp", "https://user:secret@example.test/mcp?token=secret#secret"]
+)
+def test_mcp_http_outputs_use_real_sanitized_serializer(monkeypatch, role, operation, url):
+    """真实 ORM 序列化覆盖所有配置响应，写入仍能接收新凭据。"""
+    server = MCPServer(
+        resource_id="resource-one",
+        slug="same",
+        name="Test MCP",
+        transport="streamable_http",
+        url=url,
+        command="fixture-command",
+        args=["fixture-arg"],
+        env={"KEY": "fixture-env"},
+        headers={"Authorization": "fixture-header"},
+        enabled=1,
+        created_by="admin",
+        updated_by="admin",
+    )
+    captured = {}
 
-    # 2. 普通用户请求，敏感字段及一切非安全白名单字段应该被彻底脱敏
-    client_user = TestClient(_build_app(allow_admin=False))
-    resp_user = client_user.get("/api/system/mcp-servers")
-    assert resp_user.status_code == 200
-    data_user = resp_user.json()["data"][0]
-    assert "url" not in data_user
-    assert "command" not in data_user
-    assert "env" not in data_user
-    assert "headers" not in data_user
-    assert "transport" not in data_user  # NOTE: 进一步验证连 transport 等配置层元数据也一并过滤
-    assert data_user["name"] == "test-mcp"
-    assert data_user["description"] == "test mcp description"
-    assert data_user["enabled"] is True
+    async def read_all(db, **kwargs):
+        return [server]
+
+    async def read_one(*args, **kwargs):
+        return server
+
+    async def write(*args, **kwargs):
+        captured.update(kwargs)
+        if kwargs.get("headers") is not None:
+            server.headers = kwargs["headers"]
+        return server
+
+    async def status(*args, **kwargs):
+        return True, server
+
+    monkeypatch.setattr("server.routers.mcp_router.get_all_mcp_servers", read_all)
+    monkeypatch.setattr("server.routers.mcp_router.get_server_or_404", read_one)
+    monkeypatch.setattr("server.routers.mcp_router.create_mcp_server", write)
+    monkeypatch.setattr("server.routers.mcp_router.update_mcp_server", write)
+    monkeypatch.setattr("server.routers.mcp_router.set_server_enabled", status)
+    client = TestClient(_build_app(allow_admin=role != "user", superadmin=role == "superadmin"))
+    base = "/api/system/mcp-servers"
+    credentials = {"Authorization": "replacement-header"}
+    if operation == "list":
+        response = client.get(base)
+    elif operation == "detail":
+        response = client.get(base + "/resource-one")
+    elif operation == "create":
+        response = client.post(
+            base,
+            json={
+                "slug": "same",
+                "name": "Test MCP",
+                "transport": "streamable_http",
+                "url": "https://example.test/mcp",
+                "headers": credentials,
+            },
+        )
+    elif operation == "update":
+        response = client.put(base + "/resource-one", json={"headers": credentials})
+    else:
+        response = client.put(base + "/resource-one/status", json={"enabled": True})
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    if operation == "list":
+        data = data[0]
+    assert {"headers", "env", "command", "args"}.isdisjoint(data)
+    assert data["resource_id"] == "resource-one"
+    assert data["credential_status"] == "configured"
+    assert data["transport"] == "streamable_http"
+    assert data["url_configured"] is True
+    if "?" in url:
+        assert "url" not in data
+        assert url not in response.text
+    else:
+        assert data["url"] == url
+    if operation in {"create", "update"}:
+        assert captured["headers"] == credentials
+        assert server.headers == credentials
+    else:
+        assert server.headers == {"Authorization": "fixture-header"}
 
 
 def test_create_mcp_server_rejects_extra_config_fields():
@@ -164,6 +235,18 @@ def test_create_mcp_server_rejects_extra_config_fields():
     )
 
     assert resp.status_code == 422, resp.text
+
+
+def test_mcp_unexpected_error_response_is_sanitized(monkeypatch):
+    async def fail_list(*_args, **_kwargs):
+        raise RuntimeError("headers={'Authorization': 'secret'} url=https://user:secret@example.test")
+
+    monkeypatch.setattr("server.routers.mcp_router.get_all_mcp_servers", fail_list)
+    response = TestClient(_build_app()).get("/api/system/mcp-servers")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "获取 MCP 服务器失败"}
+    assert "example.test" not in response.text
+    assert "Authorization" not in response.text
 
 
 def test_create_mcp_server_rejects_stdio_command():

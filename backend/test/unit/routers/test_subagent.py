@@ -5,10 +5,24 @@ from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from server.utils.auth_middleware import get_admin_user, get_db, get_required_user
 
 agent_router_module = importlib.import_module("server.routers.agent_router")
+resource_service = importlib.import_module("yuxi.permissions.agent_config_resource")
+
+
+@pytest.fixture(autouse=True)
+def empty_implicit_resources(monkeypatch):
+    async def no_skills(*_args, **_kwargs):
+        return []
+
+    async def no_mcps(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(resource_service, "list_authorizable_skills", no_skills)
+    monkeypatch.setattr(resource_service, "list_authorizable_mcp_servers", no_mcps)
 
 
 def _user(role: str = "admin"):
@@ -26,9 +40,18 @@ def _agent(slug: str, *, backend_id: str = "ChatbotAgent", is_subagent: bool = F
         icon=None,
         pics=[],
         config_json={},
-        share_config={"access_level": "user", "user_uids": ["admin"]},
+        share_config={
+            "version": 2,
+            "read_scope": {
+                "access_level": "user",
+                "department_ids": [],
+                "user_uids": ["admin"],
+            },
+            "manage_scope": None,
+        },
         is_default=False,
         is_subagent=is_subagent,
+        created_by="admin",
         can_manage=True,
     )
 
@@ -85,6 +108,15 @@ class _CreateRepo(_ListRepo):
 class _RejectingCreateRepo(_ListRepo):
     async def create(self, **_kwargs):
         raise ValueError("SubAgentBackend 与 is_subagent 必须保持一致")
+
+
+class _UpdateRepo(_ListRepo):
+    items = [_agent("chatbot", backend_id="ChatbotAgent")]
+    update_called = False
+
+    async def update(self, *_args, **_kwargs):
+        type(self).update_called = True
+        raise AssertionError("资源授权失败时不应写入 Agent")
 
 
 def _build_app(monkeypatch, repo_cls, *, role: str = "admin") -> TestClient:
@@ -155,7 +187,7 @@ def test_normal_user_can_create_agent(monkeypatch):
             "backend_id": "ChatbotAgent",
             "share_config": {
                 "version": 2,
-                "read_scope": {"access_level": "global"},
+                "read_scope": {"access_level": "user", "user_uids": ["user"]},
                 "manage_scope": None,
             },
         },
@@ -165,9 +197,192 @@ def test_normal_user_can_create_agent(monkeypatch):
     assert _CreateRepo.created_payload["created_by"] == "user"
     assert _CreateRepo.created_payload["share_config"] == {
         "version": 2,
-        "read_scope": {"access_level": "global"},
+        "read_scope": {"access_level": "user", "department_ids": [], "user_uids": ["user"]},
         "manage_scope": None,
     }
+
+
+def test_create_agent_canonicalizes_visible_model_and_mcp_references(monkeypatch):
+    _CreateRepo.created_payload = None
+    global_share = {
+        "version": 2,
+        "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+        "manage_scope": None,
+    }
+    provider = SimpleNamespace(resource_id="model-resource", is_enabled=True, share_config=global_share)
+    mcp_server = SimpleNamespace(resource_id="mcp-resource", share_config=global_share)
+
+    model_types = {
+        "model-resource:chat": "chat",
+        "model-resource:embedding": "embedding",
+        "model-resource:rerank": "rerank",
+    }
+    monkeypatch.setattr(
+        resource_service.model_cache,
+        "canonicalize_spec",
+        lambda spec: f"model-resource:{spec.split(':', 1)[1]}",
+    )
+    monkeypatch.setattr(
+        resource_service.model_cache,
+        "get_model_info",
+        lambda spec: SimpleNamespace(
+            resource_id="model-resource",
+            provider_id="legacy-provider",
+            model_type=model_types[spec],
+        ),
+    )
+
+    async def fake_get_model_provider_for_user(_db, resource_id, user):
+        assert resource_id == "model-resource"
+        assert user.uid == "admin"
+        return provider
+
+    async def fake_get_authorizable_mcp_server(db, reference, *, user):
+        assert reference == "legacy-mcp"
+        assert db is None
+        assert user.uid == "admin"
+        return mcp_server
+
+    monkeypatch.setattr(resource_service, "get_model_provider_for_user", fake_get_model_provider_for_user)
+    monkeypatch.setattr(resource_service, "get_authorizable_mcp_server", fake_get_authorizable_mcp_server)
+
+    async def no_skills(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(resource_service, "list_authorizable_skills", no_skills)
+
+    client = _build_app(monkeypatch, _CreateRepo)
+    response = client.post(
+        "/api/agent",
+        json={
+            "name": "Scoped Bot",
+            "slug": "scoped-bot",
+            "backend_id": "ChatbotAgent",
+            "config_json": {
+                "context": {
+                    "model": "legacy-provider:chat",
+                    "embedding_model_spec": "legacy-provider:embedding",
+                    "reranker_model": "legacy-provider:rerank",
+                    "mcps": ["legacy-mcp"],
+                }
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert _CreateRepo.created_payload["config_json"]["context"] == {
+        "model": "model-resource:chat",
+        "embedding_model_spec": "model-resource:embedding",
+        "reranker_model": "model-resource:rerank",
+        "skills": [],
+        "mcps": ["mcp-resource"],
+    }
+
+
+def test_create_agent_rejects_resource_not_covering_full_read_scope(monkeypatch):
+    _CreateRepo.created_payload = None
+    department_share = {
+        "version": 2,
+        "read_scope": {"access_level": "department", "department_ids": [1], "user_uids": []},
+        "manage_scope": None,
+    }
+    model_info = SimpleNamespace(resource_id="department-model", provider_id="provider", model_type="chat")
+    provider = SimpleNamespace(resource_id="department-model", is_enabled=True, share_config=department_share)
+
+    monkeypatch.setattr(resource_service.model_cache, "canonicalize_spec", lambda spec: "department-model:chat")
+    monkeypatch.setattr(resource_service.model_cache, "get_model_info", lambda spec: model_info)
+
+    async def fake_get_model_provider_for_user(_db, _resource_id, _user):
+        return provider
+
+    monkeypatch.setattr(resource_service, "get_model_provider_for_user", fake_get_model_provider_for_user)
+
+    client = _build_app(monkeypatch, _CreateRepo, role="superadmin")
+    response = client.post(
+        "/api/agent",
+        json={
+            "name": "Global Bot",
+            "slug": "global-bot",
+            "backend_id": "ChatbotAgent",
+            "share_config": {
+                "version": 2,
+                "read_scope": {"access_level": "global"},
+                "manage_scope": None,
+            },
+            "config_json": {"context": {"model": "department-model:chat"}},
+        },
+    )
+
+    assert response.status_code == 422
+    assert "完整读取范围" in response.json()["detail"]
+    assert _CreateRepo.created_payload is None
+
+
+def test_create_agent_rejects_ambiguous_or_invisible_legacy_mcp_slug(monkeypatch):
+    _CreateRepo.created_payload = None
+
+    async def fake_get_authorizable_mcp_server(db, _reference, *, user):
+        assert db is None
+        assert user.uid == "admin"
+        return None
+
+    monkeypatch.setattr(resource_service, "get_authorizable_mcp_server", fake_get_authorizable_mcp_server)
+
+    async def no_skills(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(resource_service, "list_authorizable_skills", no_skills)
+
+    client = _build_app(monkeypatch, _CreateRepo)
+    response = client.post(
+        "/api/agent",
+        json={
+            "name": "Invalid MCP Bot",
+            "slug": "invalid-mcp-bot",
+            "backend_id": "ChatbotAgent",
+            "config_json": {"context": {"mcps": ["duplicate-or-cross-department"]}},
+        },
+    )
+
+    assert response.status_code == 422
+    assert "不可访问或旧 slug 存在歧义" in response.json()["detail"]
+    assert _CreateRepo.created_payload is None
+
+
+def test_update_agent_rechecks_existing_resources_before_expanding_read_scope(monkeypatch):
+    _UpdateRepo.update_called = False
+    _UpdateRepo.items[0].config_json = {"context": {"model": "department-model:chat"}}
+    department_share = {
+        "version": 2,
+        "read_scope": {"access_level": "department", "department_ids": [1], "user_uids": []},
+        "manage_scope": None,
+    }
+    model_info = SimpleNamespace(resource_id="department-model", provider_id="provider", model_type="chat")
+    provider = SimpleNamespace(resource_id="department-model", is_enabled=True, share_config=department_share)
+
+    monkeypatch.setattr(resource_service.model_cache, "canonicalize_spec", lambda spec: spec)
+    monkeypatch.setattr(resource_service.model_cache, "get_model_info", lambda spec: model_info)
+
+    async def fake_get_model_provider_for_user(_db, _resource_id, _user):
+        return provider
+
+    monkeypatch.setattr(resource_service, "get_model_provider_for_user", fake_get_model_provider_for_user)
+
+    client = _build_app(monkeypatch, _UpdateRepo, role="superadmin")
+    response = client.put(
+        "/api/agent/chatbot",
+        json={
+            "share_config": {
+                "version": 2,
+                "read_scope": {"access_level": "global"},
+                "manage_scope": None,
+            }
+        },
+    )
+
+    assert response.status_code == 422
+    assert "完整读取范围" in response.json()["detail"]
+    assert _UpdateRepo.update_called is False
 
 
 def test_create_subagent_backend_agent_sets_subagent_flag(monkeypatch):

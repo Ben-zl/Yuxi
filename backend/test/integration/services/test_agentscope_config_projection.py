@@ -6,29 +6,53 @@
 """
 
 import os
+from contextlib import asynccontextmanager
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.agentscope.config_projection import project_runtime
 from yuxi.config import config
 from yuxi.repositories.agent_repository import DEFAULT_SHARE_CONFIG
-from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Agent, MCPServer, ModelProvider, Skill, User
+from yuxi.storage.postgres.models_business import Agent, Base, MCPServer, ModelProvider, Skill, User
 
 CHATBOT_SLUG = "it-proj-chatbot"
 SUBAGENT_SLUG = "it-proj-subagent"
 PROVIDER_ID = "it-proj-openai-mock"
-MODEL_SPEC = f"{PROVIDER_ID}:mock-chat-model"
+PROVIDER_RESOURCE_ID = "11111111-1111-4111-8111-111111111111"
+MCP_RESOURCE_ID = "22222222-2222-4222-8222-222222222222"
+MODEL_SPEC = f"{PROVIDER_RESOURCE_ID}:mock-chat-model"
 
 pytestmark = pytest.mark.integration
 
 
+@asynccontextmanager
+async def isolated_projection_session():
+    """投影夹具仅写随机 schema，不执行实时库升级或删除共享数据。"""
+    schema = "test_mcp_projection_" + uuid4().hex
+    engine = create_async_engine(os.environ["POSTGRES_URL"])
+    isolated = create_async_engine(
+        os.environ["POSTGRES_URL"], connect_args={"server_settings": {"search_path": schema}}
+    )
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+        async with isolated.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with async_sessionmaker(isolated, expire_on_commit=False)() as session:
+            yield session
+    finally:
+        await isolated.dispose()
+        async with engine.begin() as conn:
+            await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await engine.dispose()
+
+
 @pytest.fixture
 async def db_session():
-    pg_manager.initialize()
-    await pg_manager.ensure_business_schema()
-    async with pg_manager.get_async_session_context() as session:
+    async with isolated_projection_session() as session:
         session.add_all(
             [
                 User(
@@ -62,6 +86,7 @@ async def db_session():
                     share_config=DEFAULT_SHARE_CONFIG,
                 ),
                 ModelProvider(
+                    resource_id=PROVIDER_RESOURCE_ID,
                     provider_id=PROVIDER_ID,
                     display_name="投影测试供应商",
                     provider_type="openai",
@@ -81,6 +106,7 @@ async def db_session():
                     is_enabled=True,
                 ),
                 MCPServer(
+                    resource_id=MCP_RESOURCE_ID,
                     slug="it-proj-mcp",
                     name="投影测试 MCP",
                     transport="streamable_http",
@@ -110,8 +136,6 @@ async def db_session():
         await session.execute(delete(Skill).where(Skill.slug == "it-proj-skill"))
         await session.execute(delete(User).where(User.uid == "it-proj-user"))
         await session.commit()
-    await pg_manager.close()
-    pg_manager._initialized = False
     from yuxi.storage.redis.manager import close_async_redis_client
 
     await close_async_redis_client()
@@ -141,6 +165,7 @@ async def test_project_runtime_covers_all_components(db_session):
     assert projection.mcp_servers == [
         {
             "slug": "it-proj-mcp",
+            "resource_id": MCP_RESOURCE_ID,
             "transport": "streamable_http",
             "url": "http://mcp-mock:8000/mcp",
         }
@@ -148,10 +173,44 @@ async def test_project_runtime_covers_all_components(db_session):
     assert projection.knowledge_slugs == ["kb-a"]
     assert projection.tool_slugs is None
     assert projection.skill_tool_dependencies["it-proj-skill"] == ["ask_user_question"]
-    assert projection.skill_mcp_dependencies["it-proj-skill"] == ["it-proj-mcp"]
+    assert projection.skill_mcp_dependencies["it-proj-skill"] == [MCP_RESOURCE_ID]
 
     template_types = {t["type"] for t in projection.subagent_templates}
     assert SUBAGENT_SLUG in template_types
+
+
+async def test_projection_duplicate_logical_slugs_resolve_only_by_resource_id(db_session):
+    """同名 MCP 不能串用，Skill 依赖和基础工具均投影资源 ID。"""
+    from sqlalchemy import select
+
+    second_id = "33333333-3333-4333-8333-333333333333"
+    db_session.add(
+        MCPServer(
+            resource_id=second_id,
+            slug="it-proj-mcp",
+            name="Second MCP",
+            transport="streamable_http",
+            url="https://second.example.test/mcp",
+            enabled=1,
+            created_by="integration",
+            updated_by="integration",
+        )
+    )
+    agent = await db_session.scalar(select(Agent).where(Agent.slug == CHATBOT_SLUG))
+    skill = await db_session.scalar(select(Skill).where(Skill.slug == "it-proj-skill"))
+    context = {**agent.config_json["context"], "mcps": [MCP_RESOURCE_ID, second_id]}
+    agent.config_json = {"context": context}
+    skill.mcp_dependencies = [second_id]
+    await db_session.commit()
+    projection = await project_runtime(db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
+    assert [item["resource_id"] for item in projection.mcp_servers] == [MCP_RESOURCE_ID, second_id]
+    assert {item["slug"] for item in projection.mcp_servers} == {"it-proj-mcp"}
+    assert projection.skill_mcp_dependencies["it-proj-skill"] == [second_id]
+    assert [item["resource_id"] for item in projection.skill_mcp_servers["it-proj-skill"]] == [second_id]
+    agent.config_json = {"context": {**context, "mcps": ["it-proj-mcp"]}}
+    await db_session.commit()
+    with pytest.raises(ValueError, match="MCP"):
+        await project_runtime(db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
 
 
 async def test_project_runtime_lite_trims_knowledge(db_session, monkeypatch):
@@ -171,8 +230,9 @@ async def test_project_runtime_fails_explicitly(db_session, monkeypatch):
     from yuxi.agentscope import projection as proj
 
     monkeypatch.setattr(proj, "_resolve_api_key", lambda provider: "test-key")
+    monkeypatch.setattr(config, "default_model", MODEL_SPEC)
     projection = await project_runtime(db_session, uid="it-proj-user", agent_slug=SUBAGENT_SLUG)
-    assert projection.model_spec == config.default_model
+    assert projection.model_spec == MODEL_SPEC
     with pytest.raises(ValueError, match="不存在"):
         await project_runtime(
             db_session,

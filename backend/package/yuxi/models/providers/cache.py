@@ -3,7 +3,7 @@
 本模块将数据库中的 model_providers 表数据序列化到 Redis，
 供 API 和 Worker 等多进程同步读取，避免在同步函数中查询异步数据库。
 
-模型 spec 格式: provider_id:model_id（冒号分隔）。model_id 允许包含斜杠。
+模型 spec 格式: provider_resource_id:model_id（冒号分隔）。model_id 允许包含斜杠。
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ class ModelInfo:
     api_key: str
     base_url: str
     provider_type: str  # openai / anthropic / gemini / openrouter
+    resource_id: str = ""
 
     # 可选配置
     headers: dict[str, str] = field(default_factory=dict)
@@ -46,11 +47,12 @@ class ModelInfo:
 
     @property
     def spec(self) -> str:
-        return f"{self.provider_id}:{self.model_id}"
+        return f"{self.resource_id or self.provider_id}:{self.model_id}"
 
     def to_dict(self) -> dict:
         return {
             "provider_id": self.provider_id,
+            "resource_id": self.resource_id or self.provider_id,
             "model_id": self.model_id,
             "model_type": self.model_type,
             "display_name": self.display_name,
@@ -68,6 +70,7 @@ class ModelInfo:
     def from_dict(cls, data: dict) -> ModelInfo:
         return cls(
             provider_id=data["provider_id"],
+            resource_id=data.get("resource_id") or data["provider_id"],
             model_id=data["model_id"],
             model_type=data["model_type"],
             display_name=data["display_name"],
@@ -120,6 +123,20 @@ class ModelCache:
         cache = self._load_cache()
         return cache.get(spec)
 
+    def canonicalize_spec(self, spec: str) -> str | None:
+        """将唯一可判定的历史 provider_id spec 转换为资源 ID spec。"""
+        if spec in self._load_cache():
+            return spec
+        if ":" not in spec:
+            return None
+        provider_id, model_id = spec.split(":", 1)
+        matches = [
+            info
+            for info in self._load_cache().values()
+            if info.provider_id == provider_id and info.model_id == model_id
+        ]
+        return matches[0].spec if len(matches) == 1 else None
+
     def get_all_specs(self, model_type: str | None = None) -> list[ModelInfo]:
         cache = self._load_cache()
         if model_type is None:
@@ -132,7 +149,7 @@ class ModelCache:
         for info in cache.values():
             if info.model_type != model_type:
                 continue
-            grouped.setdefault(info.provider_id, []).append(info)
+            grouped.setdefault(info.resource_id or info.provider_id, []).append(info)
         return grouped
 
     def rebuild(self, providers: list[Any]) -> None:
@@ -152,6 +169,7 @@ class ModelCache:
 
                 info = ModelInfo(
                     provider_id=provider.provider_id,
+                    resource_id=getattr(provider, "resource_id", None) or provider.provider_id,
                     model_id=model["id"],
                     model_type=model_type,
                     display_name=model.get("display_name", model["id"]),

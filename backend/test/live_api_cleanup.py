@@ -642,6 +642,12 @@ async def _delete_test_conversation_rows(conn: asyncpg.Connection, thread_ids_li
     await conn.execute("DELETE FROM messages WHERE id = ANY($1::int[])", message_ids)
     await conn.execute("DELETE FROM agent_runs WHERE id = ANY($1::text[])", run_ids)
     await conn.execute(
+        "DELETE FROM agentscope_team_worker_bindings WHERE subagent_thread_relation_id IN "
+        "(SELECT id FROM subagent_threads WHERE parent_conversation_id = ANY($1::int[]) "
+        "OR child_conversation_id = ANY($1::int[]))",
+        conversation_ids,
+    )
+    await conn.execute(
         "DELETE FROM subagent_threads "
         "WHERE parent_conversation_id = ANY($1::int[]) "
         "OR child_conversation_id = ANY($1::int[])",

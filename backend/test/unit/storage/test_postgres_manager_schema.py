@@ -13,6 +13,10 @@ class _RecordingConnection:
     async def execute(self, statement, params=None):
         self.statements.append(str(statement))
 
+    async def run_sync(self, function, **kwargs):
+        """记录 ORM 建表调用，真实 DDL 由隔离 PostgreSQL 测试覆盖。"""
+        self.statements.append(f"CREATE TABLE {function.__self__.name}")
+
 
 class _RecordingBegin:
     def __init__(self, connection: _RecordingConnection):
@@ -294,6 +298,8 @@ async def test_share_config_migration_wraps_legacy_scopes_as_read_only():
     assert "UPDATE agents SET share_config = jsonb_build_object" in statements
     assert "UPDATE skills SET share_config = jsonb_build_object" in statements
     assert "UPDATE knowledge_bases SET share_config = jsonb_build_object" in statements
+    assert "UPDATE model_providers SET share_config = jsonb_build_object" in statements
+    assert "UPDATE mcp_servers SET share_config = jsonb_build_object" in statements
     assert "'read_scope'" in statements
     assert "'manage_scope', NULL" in statements
     assert "ALTER TABLE IF EXISTS agents ALTER COLUMN share_config TYPE JSONB USING share_config::jsonb" in statements

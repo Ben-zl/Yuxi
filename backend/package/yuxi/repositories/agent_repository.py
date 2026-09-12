@@ -9,6 +9,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.permissions import ResourcePermission, normalize_permission_config, resolve_agent_permission
+from yuxi.permissions.agent_config_resource import authorize_agent_config_resources
 from yuxi.storage.postgres.models_business import Agent, User
 from yuxi.utils.datetime_utils import utc_now_naive
 
@@ -406,10 +407,12 @@ class AgentRepository:
         created_by: str | None = None,
         creator: User | None = None,
     ) -> Agent:
+        if creator is None:
+            raise ValueError("保存智能体必须提供当前操作者 creator")
         resolved_is_subagent = resolve_agent_is_subagent(backend_id, is_subagent)
         if resolved_is_subagent and is_default:
             raise ValueError("子智能体不能设为默认智能体")
-        owner_uid = str(created_by or "")
+        owner_uid = str(created_by or creator.uid)
         default_share_config = {
             "version": 2,
             "read_scope": {
@@ -419,7 +422,7 @@ class AgentRepository:
             },
             "manage_scope": None,
         }
-        allowed_access_levels = get_allowed_agent_access_levels(creator) if creator else None
+        allowed_access_levels = get_allowed_agent_access_levels(creator)
         normalized_share_config = normalize_agent_share_config(
             share_config or default_share_config,
             allowed_access_levels=allowed_access_levels,
@@ -427,6 +430,13 @@ class AgentRepository:
         if is_default and (normalized_share_config.get("read_scope") or {}).get("access_level") != "global":
             raise ValueError("默认智能体必须全局共享")
 
+        config_json = await authorize_agent_config_resources(
+            config_json or {"context": {}},
+            db=self.db,
+            user=creator,
+            agent_share_config=normalized_share_config,
+            owner_uid=owner_uid,
+        )
         agent = Agent(
             slug=await self._unique_slug(slug, name),
             backend_id=backend_id,
@@ -438,8 +448,8 @@ class AgentRepository:
             share_config=normalized_share_config,
             is_default=False,
             is_subagent=resolved_is_subagent,
-            created_by=created_by,
-            updated_by=created_by,
+            created_by=owner_uid,
+            updated_by=str(creator.uid),
             created_at=utc_now_naive(),
             updated_at=utc_now_naive(),
         )
@@ -464,6 +474,24 @@ class AgentRepository:
         updated_by: str | None = None,
         updater: User | None = None,
     ) -> Agent:
+        if updater is None:
+            raise ValueError("保存智能体必须提供当前操作者 updater")
+        candidate_share_config = agent.share_config
+        if share_config is not None:
+            candidate_share_config = (
+                DEFAULT_SHARE_CONFIG.copy()
+                if is_builtin_agent(agent)
+                else normalize_agent_share_config(
+                    share_config, allowed_access_levels=get_allowed_agent_access_levels(updater)
+                )
+            )
+        validated_config = await authorize_agent_config_resources(
+            config_json if config_json is not None else agent.config_json,
+            db=self.db,
+            user=updater,
+            agent_share_config=candidate_share_config,
+            owner_uid=str(agent.created_by or updater.uid),
+        )
         if is_subagent is not None:
             agent.is_subagent = resolve_agent_is_subagent(agent.backend_id, is_subagent)
         if name is not None:
@@ -474,17 +502,9 @@ class AgentRepository:
             agent.icon = icon
         if pics is not None:
             agent.pics = pics
-        if config_json is not None:
-            agent.config_json = config_json
+        agent.config_json = validated_config
         if share_config is not None:
-            if is_builtin_agent(agent):
-                agent.share_config = DEFAULT_SHARE_CONFIG.copy()
-            else:
-                allowed_access_levels = get_allowed_agent_access_levels(updater) if updater else None
-                agent.share_config = normalize_agent_share_config(
-                    share_config,
-                    allowed_access_levels=allowed_access_levels,
-                )
+            agent.share_config = candidate_share_config
 
         agent.updated_by = updated_by
         agent.updated_at = utc_now_naive()

@@ -29,10 +29,10 @@
       <ExtensionCardGrid v-if="filteredEnabledServers.length" :min-width="300">
         <InfoCard
           v-for="server in filteredEnabledServers"
-          :key="server.slug"
+          :key="server.resource_id || server.slug"
           variant="mini"
           :title="formatExtensionCardTitle(server.name)"
-          :description="server.description || '暂无描述'"
+          :description="`${server.description || '暂无描述'} · ${server.share_config?.read_scope?.access_level || 'global'}`"
           @click="handleCardClick(server)"
         >
           <template #icon>
@@ -57,7 +57,7 @@
       <ExtensionCardGrid v-if="filteredDisabledServers.length" :min-width="300">
         <InfoCard
           v-for="server in filteredDisabledServers"
-          :key="server.slug"
+          :key="server.resource_id || server.slug"
           variant="mini"
           :title="formatExtensionCardTitle(server.name)"
           :description="
@@ -202,8 +202,10 @@ const filteredDisabledServers = computed(() =>
   filteredServers.value.filter((item) => !item.enabled)
 )
 
+const serverResourceId = (server) => server?.resource_id || server?.slug
+
 const navigateToDetail = (server) => {
-  router.push({ path: `/extensions/mcp/${encodeURIComponent(server.slug)}` })
+  router.push({ path: `/extensions/mcp/${encodeURIComponent(serverResourceId(server))}` })
 }
 
 const handleCardClick = (server) => {
@@ -224,7 +226,7 @@ const closeBasicInfo = () => {
   previewServer.value = null
 }
 
-const isActionLoading = (server) => actionLoadingSlug.value === server?.slug
+const isActionLoading = (server) => actionLoadingSlug.value === serverResourceId(server)
 
 const handleMcpAdd = () => {
   formModalVisible.value = true
@@ -237,8 +239,8 @@ const handleFormSubmitted = async () => {
 
 const handleSetServerEnabled = async (server, enabled) => {
   try {
-    actionLoadingSlug.value = server.slug
-    const result = await mcpApi.updateMcpServerStatus(server.slug, enabled)
+    actionLoadingSlug.value = serverResourceId(server)
+    const result = await mcpApi.updateMcpServerStatus(serverResourceId(server), enabled)
     if (result.success) {
       message.success(result.message || `MCP 已${enabled ? '添加' : '移除'}`)
       if (enabled) closeBasicInfo()
@@ -270,8 +272,8 @@ const confirmDeleteServer = (server) => {
     cancelText: '取消',
     async onOk() {
       try {
-        actionLoadingSlug.value = server.slug
-        const result = await mcpApi.deleteMcpServer(server.slug)
+        actionLoadingSlug.value = serverResourceId(server)
+        const result = await mcpApi.deleteMcpServer(serverResourceId(server))
         if (result.success) {
           message.success('MCP 删除成功')
           await fetchServers()

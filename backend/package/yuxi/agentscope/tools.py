@@ -254,12 +254,12 @@ async def build_mcp_tools(
 
     tools = []
     for config in mcp_servers:
-        slug = config["slug"]
-        server_config = {key: value for key, value in config.items() if key != "slug"}
+        resource_id = config["resource_id"]
+        server_config = dict(config)
         tools.extend(
             await get_mcp_tools(
-                slug,
-                additional_servers={slug: server_config},
+                resource_id,
+                additional_servers={resource_id: server_config},
                 disabled_tools=list(server_config.get("disabled_tools") or []),
             )
         )

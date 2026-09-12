@@ -1,7 +1,7 @@
 """AgentRun 运行清单与执行指纹。
 
-在 worker 取得执行所有权后、真正构造 AgentScope 运行时投影前，从数据库
-解析本次运行实际采用的运行资产，生成只含稳定标识与非敏感摘要的 manifest，
+在提交事务中从数据库解析本次运行实际采用的运行资产，
+生成只含稳定标识与非敏感摘要的 manifest，
 并以规范化 JSON 的 SHA-256 作为指纹。manifest 由 AgentRun 行拥有，
 write-once 固化后不得改写；历史 Run 保持 NULL 表示 unknown。
 """
@@ -24,6 +24,7 @@ from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.storage.postgres.models_business import AgentRun, Skill, User
 
 MANIFEST_SCHEMA_VERSION = 1
+RUN_MANIFEST_INPUT_KEY = "_run_manifest"
 # 直接进入 manifest 的关键 limit 字段；未列出的 context 字段只以 config_digest 形式存在。
 MANIFEST_LIMIT_FIELDS = (
     "max_execution_steps",
@@ -80,6 +81,18 @@ def build_manifest_payload(
 
     limits 由调用方传入实际生效值（含 schema 默认值），不在此处解析。
     """
+    resources = {
+        "tools": _resource_keys(normalized_context.get("tools")),
+        "mcps": _resource_keys(normalized_context.get("mcps")),
+        "skills": skill_entries,
+    }
+    if resources["mcps"]:
+        resources["mcp_resources"] = [{"resource_id": item} for item in resources["mcps"]]
+
+    model = {"spec": model_spec if isinstance(model_spec, str) and model_spec else None}
+    if isinstance(model_spec, str) and ":" in model_spec:
+        model["resource_id"] = model_spec.split(":", 1)[0]
+
     return {
         "manifest_version": MANIFEST_SCHEMA_VERSION,
         "run_type": run_type,
@@ -87,15 +100,9 @@ def build_manifest_payload(
             "slug": agent_slug,
             "backend_id": backend_id,
         },
-        "model": {
-            "spec": model_spec if isinstance(model_spec, str) and model_spec else None,
-        },
+        "model": model,
         "tool_approval_mode": tool_approval_mode,
-        "resources": {
-            "tools": _resource_keys(normalized_context.get("tools")),
-            "mcps": _resource_keys(normalized_context.get("mcps")),
-            "skills": skill_entries,
-        },
+        "resources": resources,
         "limits": limits,
         "config_digest": compute_config_digest(normalized_context),
         "code_revision": code_revision or "unresolved",
@@ -170,33 +177,55 @@ async def build_run_manifest_result(*, run: AgentRun, user: User, db: AsyncSessi
         kind="subagent" if run.run_type == "subagent" else "main",
     )
     backend = agent_manager.get_agent(agent_item.backend_id) if agent_item else None
+    return await build_submission_manifest_result(
+        agent_item=agent_item,
+        agent_backend=backend,
+        user=user,
+        db=db,
+        model_spec=(run.input_payload or {}).get("model_spec"),
+        tool_approval_mode=(run.input_payload or {}).get("tool_approval_mode"),
+        run_type=run.run_type,
+    )
+
+
+async def build_submission_manifest_result(
+    *,
+    agent_item,
+    agent_backend,
+    user: User,
+    db: AsyncSession,
+    model_spec: str | None,
+    tool_approval_mode: str | None,
+    run_type: str = "chat",
+    thread_id: str | None = None,
+) -> RunManifestBuildResult:
+    """在提交事务内按当前授权构建可安全持久化的运行快照。"""
     normalized_context: dict = {}
-    if agent_item and backend:
+    if agent_item and agent_backend:
         normalized_context = await normalize_agent_context_config(
             (agent_item.config_json or {}).get("context", {}),
             db=db,
             user=user,
-            context_schema=backend.context_schema,
+            context_schema=agent_backend.context_schema,
         )
 
     runtime_skill_snapshot: dict[str, Any] = {}
     skill_slugs = _resource_keys(normalized_context.get("skills"))
     preload_hashes: dict[str, str] = {}
     personal_slugs: set[str] = set()
-    if backend:
-        context_instance = backend.context_schema()
+    if agent_backend:
+        context_instance = agent_backend.context_schema()
         context_instance.update_from_dict(dict(normalized_context))
         runtime_skill_snapshot = await resolve_runtime_skills_for_context(context_instance, db=db, user=user)
         skill_slugs, preload_hashes, personal_slugs = _manifest_skill_scope(normalized_context, runtime_skill_snapshot)
 
-    payload = run.input_payload if isinstance(run.input_payload, dict) else {}
-    effective_limits = _effective_limits(backend, normalized_context)
+    effective_limits = _effective_limits(agent_backend, normalized_context)
     manifest = build_manifest_payload(
-        run_type=run.run_type,
-        agent_slug=run.agent_slug,
+        run_type=run_type,
+        agent_slug=agent_item.slug if agent_item else "",
         backend_id=agent_item.backend_id if agent_item else None,
-        model_spec=payload.get("model_spec"),
-        tool_approval_mode=payload.get("tool_approval_mode"),
+        model_spec=model_spec,
+        tool_approval_mode=tool_approval_mode,
         normalized_context=normalized_context,
         limits=effective_limits,
         skill_entries=await resolve_skill_entries(
@@ -206,6 +235,13 @@ async def build_run_manifest_result(*, run: AgentRun, user: User, db: AsyncSessi
             personal_skill_slugs=personal_slugs,
         ),
         code_revision=resolve_code_revision(),
+    )
+    from yuxi.services.run_resource_snapshot_service import capture_run_resources
+
+    if agent_item is None or not model_spec:
+        raise ValueError("Run 提交缺少 Agent 或模型")
+    manifest["runtime_snapshot"] = await capture_run_resources(
+        db, uid=str(user.uid), agent_slug=agent_item.slug, model_spec=model_spec, thread_id=thread_id,
     )
     return RunManifestBuildResult(
         manifest=manifest,

@@ -123,12 +123,12 @@ export const modelProviderApi = {
     return apiAdminPost('/api/system/model-providers', payload)
   },
 
-  updateProvider: async (providerId, payload) => {
-    return apiAdminPut(`/api/system/model-providers/${encodeURIComponent(providerId)}`, payload)
+  updateProvider: async (resourceId, payload) => {
+    return apiAdminPut(`/api/system/model-providers/${encodeURIComponent(resourceId)}`, payload)
   },
 
-  deleteProvider: async (providerId) => {
-    return apiAdminDelete(`/api/system/model-providers/${encodeURIComponent(providerId)}`)
+  deleteProvider: async (resourceId) => {
+    return apiAdminDelete(`/api/system/model-providers/${encodeURIComponent(resourceId)}`)
   },
 
   fetchRemoteModels: async (providerId) => {

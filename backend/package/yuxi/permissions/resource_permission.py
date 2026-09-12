@@ -32,6 +32,7 @@ class ResourcePermissionPolicy:
     """声明资源类型允许的角色上限，不包含共享范围匹配逻辑。"""
 
     role_ceiling: dict[str, ResourcePermission]
+    owner_requires_current_scope: bool = False
 
 
 RESOURCE_PERMISSION_ORDER = {
@@ -56,6 +57,15 @@ AGENT_PERMISSION_POLICY = ResourcePermissionPolicy(
     }
 )
 SKILL_PERMISSION_POLICY = AGENT_PERMISSION_POLICY
+MODEL_PROVIDER_PERMISSION_POLICY = ResourcePermissionPolicy(
+    owner_requires_current_scope=True,
+    role_ceiling={
+        "user": ResourcePermission.READ,
+        "admin": ResourcePermission.MANAGE,
+        "superadmin": ResourcePermission.MANAGE,
+    },
+)
+MCP_PERMISSION_POLICY = MODEL_PROVIDER_PERMISSION_POLICY
 
 
 def _normalize_scope(scope: dict | None) -> dict | None:
@@ -181,9 +191,17 @@ def resolve_resource_permission(
     config = normalize_permission_config(
         raw_share_config,
     )
-    if str(_value(resource, "created_by", "") or "") == str(_value(user, "uid", "") or ""):
+    is_owner = str(_value(resource, "created_by", "") or "") == str(_value(user, "uid", "") or "")
+    if policy.owner_requires_current_scope:
+        if not scope_matches(user, config["read_scope"]):
+            return ResourcePermission.NONE
+        if config["read_scope"]["access_level"] == "global":
+            return ResourcePermission.READ
+        if is_owner:
+            return policy.role_ceiling.get(_value(user, "role"), ResourcePermission.READ)
+    elif is_owner:
         return ResourcePermission.MANAGE
-    elif scope_matches(user, config["manage_scope"]) and (
+    if scope_matches(user, config["manage_scope"]) and (
         config["read_scope"] is None or scope_matches(user, config["read_scope"])
     ):
         granted = ResourcePermission.MANAGE
@@ -251,3 +269,13 @@ def resolve_skill_permission(user: Any, resource: ShareableResource) -> Resource
         resource,
         SKILL_PERMISSION_POLICY,
     )
+
+
+def resolve_model_provider_permission(user: Any, resource: ShareableResource) -> ResourcePermission:
+    """解析模型供应商对当前用户的有效权限。"""
+    return resolve_resource_permission(user, resource, MODEL_PROVIDER_PERMISSION_POLICY)
+
+
+def resolve_mcp_permission(user: Any, resource: ShareableResource) -> ResourcePermission:
+    """解析 MCP 对当前用户的有效权限。"""
+    return resolve_resource_permission(user, resource, MCP_PERMISSION_POLICY)

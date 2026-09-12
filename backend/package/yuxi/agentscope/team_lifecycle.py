@@ -9,7 +9,6 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
 
 from yuxi.agentscope.protocol import ToolEventConverter, event_to_chunks, make_chunk, reply_end_to_terminal
 from yuxi.agentscope.run_lease import (
@@ -25,10 +24,11 @@ from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerReposi
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session_by_agentscope_context
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.repositories.subagent_thread_repository import SubagentThreadRepository
-from yuxi.services.agent_run_manifest_service import build_run_manifest_result, compute_manifest_fingerprint
+from yuxi.services.agent_run_manifest_service import compute_manifest_fingerprint
+from yuxi.services.run_resource_snapshot_service import load_run_resources
 from yuxi.services.run_queue_service import append_run_stream_event
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Conversation, Message, ToolCall, User
+from yuxi.storage.postgres.models_business import Conversation, Message, ToolCall
 from yuxi.utils.hash_utils import hash_id, subagent_child_thread_id
 from yuxi.utils.logging_config import logger
 
@@ -37,15 +37,26 @@ TEAM_MEMBER_MAX_NUDGES = 3
 
 
 async def _record_team_run_manifest(db, run, *, worker_id: str) -> None:
-    """在 Team child Run 进入 AgentScope worker 前固化运行资产。"""
-    user = await db.scalar(select(User).where(User.uid == run.uid))
-    if user is None:
-        raise RuntimeError("Run 所属用户不存在")
-    projected = await build_run_manifest_result(run=run, user=user, db=db)
-    fingerprint = compute_manifest_fingerprint(projected.manifest)
+    """子 Run 只继承明确父 Run 的快照，重复 Reply 校验同一份清单。"""
+    if run.manifest is not None:
+        if compute_manifest_fingerprint(run.manifest) != run.manifest_fingerprint:
+            raise RuntimeError("Team child Run manifest 指纹不一致")
+        await load_run_resources(db, uid=run.uid, manifest=run.manifest, agent_slug=run.agent_slug)
+        return
+    parent = await AgentRunRepository(db).get_run_for_user(run.created_by_run_id, run.uid)
+    if parent is None or not parent.manifest:
+        raise RuntimeError("Team child Run 缺少父 Run 提交快照")
+    if compute_manifest_fingerprint(parent.manifest) != parent.manifest_fingerprint:
+        raise RuntimeError("Team 父 Run manifest 指纹不一致")
+    await load_run_resources(db, uid=run.uid, manifest=parent.manifest, agent_slug=run.agent_slug)
+    manifest = {
+        **parent.manifest, "run_type": "subagent",
+        "agent": {**parent.manifest["agent"], "slug": run.agent_slug},
+    }
+    fingerprint = compute_manifest_fingerprint(manifest)
     persisted, _recorded = await AgentRunRepository(db).record_run_manifest(
         run.id,
-        manifest=projected.manifest,
+        manifest=manifest,
         fingerprint=fingerprint,
         worker_id=worker_id,
     )
@@ -607,7 +618,14 @@ class TeamLifecycleModule:
             )
             db.add(message)
             await db.flush()
-            parent = await runs.get_latest_run_by_thread_for_user(binding.parent_thread_id, self.uid)
+            creator = await runs.get_run_for_user(binding.created_by_run_id, self.uid)
+            if creator is None:
+                raise ValueError("Team worker continuation 缺少创建者 Run")
+            parent = await runs.get_active_run_by_thread_for_user(
+                agent_slug=creator.agent_slug, conversation_thread_id=binding.parent_thread_id, uid=self.uid,
+            )
+            if parent is None or parent.status != "running":
+                raise ValueError("Team worker continuation 缺少正在执行的父 Run")
             run = await runs.create_run(
                 run_id=str(uuid.uuid4()),
                 conversation_thread_id=binding.child_thread_id,

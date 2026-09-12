@@ -9,7 +9,6 @@ import asyncio
 import os
 from pathlib import Path
 
-from sqlalchemy import select
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
 from yuxi.agentscope.execution import execute_run, finalize_run, has_active_child_runs, persist_run_output
@@ -41,12 +40,10 @@ from yuxi.repositories.agent_run_repository import (
 )
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.services.agent_request_queue_service import dispatch_next_request
-from yuxi.services.agent_run_manifest_service import (
-    build_run_manifest_result,
-    compute_manifest_fingerprint,
-)
+from yuxi.services.agent_run_manifest_service import compute_manifest_fingerprint
+from yuxi.services.run_resource_snapshot_service import load_run_resources
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Message, User
+from yuxi.storage.postgres.models_business import Message
 from yuxi.utils import logger
 
 WORKER_ID = DEFAULT_WORKER_ID
@@ -142,8 +139,10 @@ async def execute_agent_run_job(run_id: str) -> None:
                     thread_id=run.conversation_thread_id,
                     agent_slug=run.agent_slug,
                     model_spec=model_spec,
+                    projection=await load_run_resources(
+                        db, uid=run.uid, manifest=run.manifest, agent_slug=run.agent_slug,
+                    ),
                 )
-                await _verify_run_manifest(db, run)
                 text = await _materialize_run_attachments(
                     conv_repo,
                     client,
@@ -232,42 +231,15 @@ async def execute_agent_run_job(run_id: str) -> None:
 
 
 async def _record_run_manifest(db, run_repo, run, *, worker_id: str | None) -> None:
-    """在 AgentScope 执行前固化当前 Run 的实际运行资产。"""
+    """验证提交清单完整性；缺失快照的历史 Run 必须重新提交。"""
 
     if not worker_id:
         raise RuntimeError("Run 缺少有效 lease owner")
-    user = await db.scalar(select(User).where(User.uid == run.uid))
-    if user is None:
-        raise RuntimeError("Run 所属用户不存在")
-    result = await build_run_manifest_result(run=run, user=user, db=db)
-    fingerprint = compute_manifest_fingerprint(result.manifest)
-    persisted, recorded = await run_repo.record_run_manifest(
-        run.id,
-        manifest=result.manifest,
-        fingerprint=fingerprint,
-        worker_id=worker_id,
-    )
-    if persisted is None:
-        raise RuntimeError("运行清单对应的 Run 不存在")
-    persisted_fingerprint = getattr(persisted, "manifest_fingerprint", fingerprint)
-    if persisted_fingerprint != fingerprint:
-        raise RuntimeError("运行清单已由其他配置固化，拒绝覆盖")
-    if not recorded:
-        # write-once 幂等重投只能复用同一持久化指纹，不能以当前配置覆盖内存。
-        run.manifest_fingerprint = persisted_fingerprint
-        return
-    run.manifest_fingerprint = persisted_fingerprint
-
-
-async def _verify_run_manifest(db, run) -> None:
-    """在模型或工具执行前拒绝已偏离固化清单的运行时配置。"""
-
-    user = await db.scalar(select(User).where(User.uid == run.uid))
-    if user is None:
-        raise RuntimeError("Run 所属用户不存在")
-    current = await build_run_manifest_result(run=run, user=user, db=db)
-    if compute_manifest_fingerprint(current.manifest) != run.manifest_fingerprint:
-        raise RuntimeError("运行时配置已在 manifest 固化后变化，请重新提交请求")
+    if not run.manifest or not run.manifest_fingerprint:
+        raise RuntimeError("Run 缺少提交时固化的运行清单")
+    if compute_manifest_fingerprint(run.manifest) != run.manifest_fingerprint:
+        raise RuntimeError("Run 运行清单指纹不一致")
+    await load_run_resources(db, uid=run.uid, manifest=run.manifest, agent_slug=run.agent_slug)
 
 
 async def _notify_agent_task(run_id: str, run_status: str) -> None:
@@ -538,8 +510,8 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
         thread_id=run.conversation_thread_id,
         agent_slug=run.agent_slug,
         model_spec=(run.input_payload or {}).get("model_spec"),
+        projection=await load_run_resources(db, uid=run.uid, manifest=run.manifest, agent_slug=run.agent_slug),
     )
-    await _verify_run_manifest(db, run)
     await _apply_permission_mode(client, run, mapping)
     resume_input = (input_message.extra_metadata or {}).get("resume") or {}
 

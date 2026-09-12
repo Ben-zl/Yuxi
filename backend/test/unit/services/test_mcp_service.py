@@ -60,6 +60,41 @@ class _FakeClient:
         return self._tools
 
 
+def _superadmin():
+    return SimpleNamespace(uid="root", role="superadmin", department_id=None)
+
+
+async def test_sanitized_read_keeps_credentials_editable(monkeypatch, mcp_session):
+    """脱敏读取不改凭据，省略更新保留，显式更新可持久化。"""
+    server = MCPServer(
+        slug="editable",
+        name="Editable",
+        transport="streamable_http",
+        url="https://example.test/mcp",
+        headers={"Authorization": "old-fixture"},
+        created_by="admin",
+        updated_by="admin",
+        enabled=1,
+    )
+    mcp_session.add(server)
+    await mcp_session.commit()
+    assert "headers" not in server.to_dict(sanitize=True)
+    await mcp_service.update_mcp_server(
+        mcp_session, slug=server.resource_id, name="Renamed", operator=_superadmin()
+    )
+    await mcp_session.refresh(server)
+    assert server.headers == {"Authorization": "old-fixture"}
+    await mcp_service.update_mcp_server(
+        mcp_session,
+        slug=server.resource_id,
+        headers={"Authorization": "new-fixture"},
+        operator=_superadmin(),
+    )
+    await mcp_session.refresh(server)
+    assert server.headers == {"Authorization": "new-fixture"}
+    assert "headers" not in server.to_dict(sanitize=True)
+
+
 async def test_ensure_builtin_mcp_servers_removes_retired_system_server(monkeypatch, mcp_session):
     retired_server = MCPServer(
         slug="sequentialthinking",
@@ -199,8 +234,9 @@ async def test_runtime_configs_exclude_user_created_stdio_servers(mcp_session):
     )
     await mcp_session.commit()
 
-    configs = await mcp_service.load_enabled_mcp_server_configs(db=mcp_session)
-    slugs = await mcp_service.get_enabled_mcp_server_slugs(db=mcp_session)
+    user = SimpleNamespace(uid="root", role="superadmin", department_id=None)
+    configs = await mcp_service.load_enabled_mcp_server_configs(db=mcp_session, user=user)
+    slugs = await mcp_service.get_enabled_mcp_server_slugs(db=mcp_session, user=user)
 
     assert set(configs) == {"mcp-server-chart", "remote-http"}
     assert set(slugs) == {"mcp-server-chart", "remote-http"}
@@ -208,6 +244,21 @@ async def test_runtime_configs_exclude_user_created_stdio_servers(mcp_session):
     assert configs["mcp-server-chart"]["args"] == ["-y", "@antv/mcp-server-chart"]
     assert "command" not in configs["remote-http"]
     assert "args" not in configs["remote-http"]
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [mcp_service.load_enabled_mcp_server_configs, mcp_service.get_enabled_mcp_server_slugs],
+)
+async def test_authorized_mcp_loaders_require_user_context(loader, mcp_session):
+    """运行时与选择器入口缺少用户时必须 fail closed。"""
+    with pytest.raises(PermissionError, match="当前用户"):
+        await loader(db=mcp_session)
+
+
+async def test_mcp_management_list_requires_user_context(mcp_session):
+    with pytest.raises(PermissionError, match="当前用户"):
+        await mcp_service.get_all_mcp_servers(mcp_session)
 
 
 async def test_create_mcp_server_rejects_user_created_stdio(mcp_session):
@@ -218,6 +269,7 @@ async def test_create_mcp_server_rejects_user_created_stdio(mcp_session):
             name="Unsafe MCP",
             transport="stdio",
             created_by="admin",
+            operator=_superadmin(),
         )
 
     server = await mcp_session.scalar(select(MCPServer).where(MCPServer.slug == "unsafe-mcp"))
@@ -233,6 +285,7 @@ async def test_create_mcp_server_rejects_builtin_slug(mcp_session):
             transport="streamable_http",
             url="https://example.com/mcp",
             created_by="admin",
+            operator=_superadmin(),
         )
 
 
@@ -256,6 +309,7 @@ async def test_update_builtin_mcp_server_rejects_connection_changes(mcp_session)
             transport="streamable_http",
             url="https://example.com/mcp",
             updated_by="admin",
+            operator=_superadmin(),
         )
 
     await mcp_session.refresh(server)
@@ -282,6 +336,7 @@ async def test_update_legacy_stdio_requires_remote_url(mcp_session):
             slug="legacy-stdio",
             transport="streamable_http",
             updated_by="admin",
+            operator=_superadmin(),
         )
 
     await mcp_session.refresh(legacy_server)
@@ -289,13 +344,32 @@ async def test_update_legacy_stdio_requires_remote_url(mcp_session):
     assert legacy_server.command == "python3"
 
 
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda db: mcp_service.create_mcp_server(
+            db, slug="missing-operator", name="Missing", transport="streamable_http", url="https://example.test"
+        ),
+        lambda db: mcp_service.update_mcp_server(db, slug="missing-operator", name="Missing"),
+        lambda db: mcp_service.delete_mcp_server(db, slug="missing-operator"),
+        lambda db: mcp_service.set_server_enabled(db, "missing-operator", True),
+        lambda db: mcp_service.toggle_tool_enabled(db, "missing-operator", "tool"),
+    ],
+)
+async def test_mcp_mutations_require_operator_before_database_access(mcp_session, operation):
+    with pytest.raises(PermissionError, match="当前操作者"):
+        await operation(mcp_session)
+
+
 async def test_get_enabled_mcp_tools_loads_latest_config_from_db(monkeypatch):
     captured: list[dict] = []
+    user = SimpleNamespace(uid="user-1", role="user")
 
-    async def fake_get_enabled_mcp_server_config(server_name: str, db=None):
+    async def fake_get_enabled_mcp_server_config(server_name: str, db=None, user=None):
         del db
         assert server_name == "demo"
-        return {"transport": "stdio", "command": "demo", "disabled_tools": ["tool_b"]}
+        assert user is not None
+        return {"resource_id": "mcp-demo", "transport": "stdio", "command": "demo", "disabled_tools": ["tool_b"]}
 
     async def fake_get_mcp_tools(server_name: str, additional_servers=None, disabled_tools=None, **kwargs):
         del kwargs
@@ -311,13 +385,20 @@ async def test_get_enabled_mcp_tools_loads_latest_config_from_db(monkeypatch):
     monkeypatch.setattr(mcp_service, "get_enabled_mcp_server_config", fake_get_enabled_mcp_server_config)
     monkeypatch.setattr(mcp_service, "get_mcp_tools", fake_get_mcp_tools)
 
-    tools = await mcp_service.get_enabled_mcp_tools("demo")
+    tools = await mcp_service.get_enabled_mcp_tools("demo", user=user)
 
     assert tools == ["tool-a"]
     assert captured == [
         {
             "server_name": "demo",
-            "additional_servers": {"demo": {"transport": "stdio", "command": "demo", "disabled_tools": ["tool_b"]}},
+            "additional_servers": {
+                "demo": {
+                    "resource_id": "mcp-demo",
+                    "transport": "stdio",
+                    "command": "demo",
+                    "disabled_tools": ["tool_b"],
+                }
+            },
             "disabled_tools": ["tool_b"],
         }
     ]
@@ -327,18 +408,18 @@ async def test_get_mcp_tools_rebuilds_cache_when_config_hash_changes(monkeypatch
     mcp_service.clear_mcp_cache()
 
     configs = [
-        {"transport": "streamable_http", "url": "http://demo-v1/mcp", "disabled_tools": []},
-        {"transport": "streamable_http", "url": "http://demo-v2/mcp", "disabled_tools": []},
+        {"resource_id": "mcp-demo", "transport": "streamable_http", "url": "http://demo-v1/mcp", "disabled_tools": []},
+        {"resource_id": "mcp-demo", "transport": "streamable_http", "url": "http://demo-v2/mcp", "disabled_tools": []},
     ]
     build_calls: list[str] = []
 
-    async def fake_get_enabled_mcp_server_config(server_name: str, db=None):
-        del db
+    async def fake_get_enabled_mcp_server_config(server_name: str, db=None, user=None):
+        del db, user
         assert server_name == "demo"
         return configs[0]
 
     async def fake_get_mcp_client(server_configs):
-        config = server_configs["demo"]
+        config = server_configs["mcp-demo"]
         version = config["url"].split("//", maxsplit=1)[1].split("/", maxsplit=1)[0]
         build_calls.append(version)
         return _FakeClient([SimpleNamespace(name=f"tool_for_{version}", metadata={})])
@@ -346,11 +427,12 @@ async def test_get_mcp_tools_rebuilds_cache_when_config_hash_changes(monkeypatch
     monkeypatch.setattr(mcp_service, "get_enabled_mcp_server_config", fake_get_enabled_mcp_server_config)
     monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
 
-    tools_v1_first = await mcp_service.get_mcp_tools("demo")
-    tools_v1_second = await mcp_service.get_mcp_tools("demo")
+    user = SimpleNamespace(uid="user-1", role="user")
+    tools_v1_first = await mcp_service.get_mcp_tools("demo", user=user)
+    tools_v1_second = await mcp_service.get_mcp_tools("demo", user=user)
 
     configs[0] = configs[1]
-    tools_v2 = await mcp_service.get_mcp_tools("demo")
+    tools_v2 = await mcp_service.get_mcp_tools("demo", user=user)
 
     assert [tool.name for tool in tools_v1_first] == ["tool_for_demo-v1"]
     assert [tool.name for tool in tools_v1_second] == ["tool_for_demo-v1"]
@@ -362,13 +444,13 @@ async def test_get_mcp_tools_rebuilds_cache_when_config_hash_changes(monkeypatch
 
 async def test_get_tools_from_all_servers_loads_names_from_db_once(monkeypatch):
     server_configs = {
-        "alpha": {"transport": "stdio", "command": "cmd-a", "disabled_tools": []},
-        "beta": {"transport": "stdio", "command": "cmd-b", "disabled_tools": []},
+        "alpha": {"resource_id": "mcp-alpha", "transport": "stdio", "command": "cmd-a", "disabled_tools": []},
+        "beta": {"resource_id": "mcp-beta", "transport": "stdio", "command": "cmd-b", "disabled_tools": []},
     }
     calls: list[tuple[str, dict[str, dict]]] = []
 
-    async def fake_load_enabled_mcp_server_configs(*, names=None, db=None):
-        del names, db
+    async def fake_load_enabled_mcp_server_configs(*, names=None, db=None, user=None, use_resource_ids=False):
+        del names, db, user, use_resource_ids
         return server_configs
 
     async def fake_get_mcp_tools(server_name: str, additional_servers=None, **kwargs):
@@ -379,7 +461,7 @@ async def test_get_tools_from_all_servers_loads_names_from_db_once(monkeypatch):
     monkeypatch.setattr(mcp_service, "load_enabled_mcp_server_configs", fake_load_enabled_mcp_server_configs)
     monkeypatch.setattr(mcp_service, "get_mcp_tools", fake_get_mcp_tools)
 
-    tools = await mcp_service.get_tools_from_all_servers()
+    tools = await mcp_service.get_tools_from_all_servers(user=SimpleNamespace(uid="user-1", role="user"))
 
     assert tools == ["alpha", "beta"]
     assert calls == [
@@ -391,10 +473,15 @@ async def test_get_tools_from_all_servers_loads_names_from_db_once(monkeypatch):
 async def test_get_mcp_tools_sets_stable_management_id(monkeypatch):
     mcp_service.clear_mcp_cache()
 
-    config = {"transport": "streamable_http", "url": "http://demo-tool/mcp", "disabled_tools": []}
+    config = {
+        "resource_id": "mcp-demo",
+        "transport": "streamable_http",
+        "url": "http://demo-tool/mcp",
+        "disabled_tools": [],
+    }
 
-    async def fake_get_enabled_mcp_server_config(server_name: str, db=None):
-        del server_name, db
+    async def fake_get_enabled_mcp_server_config(server_name: str, db=None, user=None):
+        del server_name, db, user
         return config
 
     async def fake_get_mcp_client(_server_configs):
@@ -404,9 +491,9 @@ async def test_get_mcp_tools_sets_stable_management_id(monkeypatch):
     monkeypatch.setattr(mcp_service, "get_enabled_mcp_server_config", fake_get_enabled_mcp_server_config)
     monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
 
-    tools = await mcp_service.get_mcp_tools("demo")
+    tools = await mcp_service.get_mcp_tools("demo", user=SimpleNamespace(uid="user-1", role="user"))
     assert len(tools) == 1
-    assert tools[0].metadata["id"] == "mcp__demo__demoTool"
+    assert tools[0].metadata["id"] == "mcp__mcpDemo__demoTool"
     assert tools[0].metadata["mcp_tool_name"] == "demo_tool"
 
     mcp_service.clear_mcp_cache()
@@ -417,7 +504,7 @@ async def test_get_mcp_tools_filters_by_original_remote_name(monkeypatch):
     mcp_service.clear_mcp_cache()
 
     async def fake_get_mcp_client(_server_configs):
-        return _FakeClient([SimpleNamespace(name="mcp__demo__echo", metadata={})])
+        return _FakeClient([SimpleNamespace(name="mcp__mcp-demo__echo", metadata={})])
 
     monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
 
@@ -426,6 +513,7 @@ async def test_get_mcp_tools_filters_by_original_remote_name(monkeypatch):
         additional_servers={
             "demo": {
                 "transport": "streamable_http",
+                "resource_id": "mcp-demo",
                 "url": "http://demo-tool/mcp",
                 "disabled_tools": ["echo"],
             }
@@ -442,9 +530,9 @@ async def test_get_mcp_tools_does_not_connect_stateless_http_client(monkeypatch)
     mcp_service.clear_mcp_cache()
     client = _FakeClient([SimpleNamespace(name="echo", metadata={})])
 
-    async def fake_get_enabled_mcp_server_config(server_name: str, db=None):
-        del server_name, db
-        return {"transport": "streamable_http", "url": "http://mcp.example/mcp"}
+    async def fake_get_enabled_mcp_server_config(server_name: str, db=None, user=None):
+        del server_name, db, user
+        return {"resource_id": "mcp-remote", "transport": "streamable_http", "url": "http://mcp.example/mcp"}
 
     async def fake_get_mcp_client(_server_configs):
         return client
@@ -452,11 +540,27 @@ async def test_get_mcp_tools_does_not_connect_stateless_http_client(monkeypatch)
     monkeypatch.setattr(mcp_service, "get_enabled_mcp_server_config", fake_get_enabled_mcp_server_config)
     monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
 
-    await mcp_service.get_mcp_tools("remote")
+    await mcp_service.get_mcp_tools("remote", user=SimpleNamespace(uid="user-1", role="user"))
     assert client.connect_count == 0
 
     mcp_service.clear_mcp_cache()
     assert client.close_count == 0
+
+
+@pytest.mark.asyncio
+async def test_public_mcp_tool_entrypoint_requires_user_context():
+    with pytest.raises(PermissionError, match="用户授权上下文"):
+        await mcp_service.get_mcp_tools("mcp-resource")
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_cache_requires_immutable_resource_id(monkeypatch):
+    with pytest.raises(PermissionError, match="resource_id"):
+        await mcp_service.get_mcp_tools(
+            "legacy-slug",
+            additional_servers={"legacy-slug": {"transport": "streamable_http", "url": "http://example.test/mcp"}},
+            user=SimpleNamespace(uid="user-1", role="user"),
+        )
 
 
 async def test_builtin_stdio_tools_open_and_close_within_discovery_and_call(monkeypatch):
