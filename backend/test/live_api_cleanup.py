@@ -23,7 +23,7 @@ LEGACY_TEST_CONVERSATION_TITLE_PATTERNS = (
     re.compile(
         r"^(?:agent-async-e2e|agent-steer-e2e|attachment-state-e2e|attachment-workdir-e2e|"
         r"chat-router-test|deterministic-e2e|ocr-config-e2e|personal-skill-e2e|"
-        r"pytest-channel|pytest-queue|read-file-e2e|skill-artifact-admin|skill-artifact-user|"
+        r"pytest-channel|pytest-queue|read-file-e2e|skill-artifact-admin|skill-artifact-user|snapshot|"
         r"viewer|viewer-security-test)-[0-9a-f]{8}$"
     ),
 )
@@ -42,8 +42,10 @@ E2E_THREAD_TEST_MARKERS = frozenset(
     }
 )
 E2E_AGENT_SLUG_PREFIXES = (
+    "ci-deterministic-",
     "e2e-agent-call-",
     "e2e-async-agent-",
+    "e2e-linked-agent-",
     "e2e-main-",
     "e2e-personal-skill-",
     "e2e-read-file-",
@@ -53,6 +55,20 @@ E2E_AGENT_SLUG_PREFIXES = (
     "pytest-personal-agent-",
 )
 SAFE_THREAD_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+SAFE_STATIC_TEST_UID = re.compile(r"^e2e[-_][A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+LEGACY_SNAPSHOT_TEST_UID = re.compile(r"^snap_[0-9a-f]{8}$")
+STRICT_STATIC_TEST_UID_PATTERNS = (
+    re.compile(r"^codexe2e[0-9]{10}$"),
+    re.compile(r"^codex-e2e-admin$"),
+    re.compile(r"^team(?:loop|reg|final)_[0-9]{10}_[0-9]{1,5}$"),
+    re.compile(r"^task-it-user$"),
+)
+STRICT_ORPHAN_TEST_WORKSPACE_UID_PATTERNS = (
+    re.compile(r"^pytest-(?:user|lock-user)-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$"),
+    re.compile(r"^pytest-project-recreate-[0-9a-f]{32}$"),
+    re.compile(r"^snapshot-[0-9a-f]{8,10}$"),
+)
+SNAPSHOT_TEST_DEPARTMENT_NAME = re.compile(r"^snapshot-[0-9a-f]{8}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,10 +156,10 @@ async def cleanup_provisioned_sandboxes(
         raise RuntimeError("; ".join(failures))
 
 
-async def list_test_sandbox_ids(owner_uid: str) -> set[str]:
+async def list_test_sandbox_ids(owner_uid: str, *, include_all_owned: bool = False) -> set[str]:
     """从测试 Run 的持久化 runtime scope 推导其唯一 Sandbox 标识。"""
 
-    resources = await list_test_conversation_resources(owner_uid)
+    resources = await list_test_conversation_resources(owner_uid, include_all_owned=include_all_owned)
     if not resources:
         return set()
     conn = await asyncpg.connect(_postgres_dsn())
@@ -305,6 +321,108 @@ def remove_test_workdir(uid: str, workdir_path: str) -> None:
         raise RuntimeError(f"Test conversation cleanup left Workdir behind: {workdir}")
 
 
+def _require_static_test_uid(uid: str) -> str:
+    """只允许清理显式 E2E 前缀的专用测试身份。"""
+    value = str(uid or "")
+    if not _is_static_test_uid(value):
+        raise RuntimeError(f"Static test cleanup requires an explicit test UID: {value!r}")
+    return value
+
+
+def _is_static_test_uid(uid: str) -> bool:
+    """识别当前 E2E UID 及历史 snapshot 测试 UID。"""
+    return (
+        SAFE_STATIC_TEST_UID.fullmatch(uid) is not None
+        or LEGACY_SNAPSHOT_TEST_UID.fullmatch(uid) is not None
+        or any(pattern.fullmatch(uid) is not None for pattern in STRICT_STATIC_TEST_UID_PATTERNS)
+    )
+
+
+def is_static_test_uid(uid: str) -> bool:
+    """公开测试身份判断，供会话 provisioning 与 final cleanup 共用。"""
+    return _is_static_test_uid(uid)
+
+
+async def ensure_static_test_admin_identity(uid: str, password: str) -> None:
+    """幂等创建严格命名的临时 E2E 超级管理员。"""
+    uid = _require_static_test_uid(uid)
+    if not password:
+        raise RuntimeError("Static E2E admin password cannot be empty")
+
+    from yuxi.utils.auth_utils import AuthUtils
+
+    conn = await asyncpg.connect(_postgres_dsn())
+    try:
+        async with conn.transaction():
+            department_id = await conn.fetchval("SELECT id FROM departments ORDER BY id LIMIT 1")
+            await conn.execute(
+                """
+                INSERT INTO users (
+                    username, uid, password_hash, role, department_id,
+                    login_failed_count, is_deleted, deleted_at, created_at
+                )
+                VALUES ($1, $1, $2, 'superadmin', $3, 0, 0, NULL, NOW())
+                ON CONFLICT (uid) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    password_hash = EXCLUDED.password_hash,
+                    role = 'superadmin',
+                    department_id = COALESCE(users.department_id, EXCLUDED.department_id),
+                    login_failed_count = 0,
+                    last_failed_login = NULL,
+                    login_locked_until = NULL,
+                    is_deleted = 0,
+                    deleted_at = NULL,
+                    created_at = COALESCE(users.created_at, EXCLUDED.created_at)
+                """,
+                uid,
+                AuthUtils.hash_password(password),
+                department_id,
+            )
+    finally:
+        await conn.close()
+
+
+def _is_orphan_test_workspace_uid(uid: str) -> bool:
+    """识别无用户行但由 integration fixture 创建的严格 Workspace 根。"""
+    return _is_static_test_uid(uid) or any(
+        pattern.fullmatch(uid) is not None for pattern in STRICT_ORPHAN_TEST_WORKSPACE_UID_PATTERNS
+    )
+
+
+def remove_test_user_workspace_root(uid: str) -> None:
+    """删除已确认无 Project 的严格测试 Workspace 根，拒绝任何 symlink。"""
+    uid = str(uid or "")
+    if not _is_orphan_test_workspace_uid(uid):
+        raise RuntimeError(f"Static test cleanup requires an explicit test UID: {uid!r}")
+    data_root = get_user_data_dir()
+    shared_root = data_root / "shared"
+    if data_root.is_symlink() or shared_root.is_symlink():
+        raise RuntimeError("Static test cleanup refuses symlink workspace root")
+
+    target = shared_root / uid
+    if target.is_symlink():
+        raise RuntimeError(f"Static test cleanup refuses symlink UID root: {target}")
+    if not target.exists():
+        return
+    if not target.is_dir():
+        raise RuntimeError(f"Static test cleanup UID root is not a directory: {target}")
+
+    resolved_shared = shared_root.resolve()
+    resolved_target = target.resolve()
+    if resolved_target.parent != resolved_shared:
+        raise RuntimeError(f"Static test cleanup path escaped shared root: {resolved_target}")
+    for current_root, directory_names, file_names in os.walk(target, followlinks=False):
+        current = Path(current_root)
+        for name in [*directory_names, *file_names]:
+            candidate = current / name
+            if candidate.is_symlink():
+                raise RuntimeError(f"Static test cleanup refuses symlink: {candidate}")
+
+    shutil.rmtree(target)
+    if target.exists() or target.is_symlink():
+        raise RuntimeError(f"Static test cleanup left UID root behind: {target}")
+
+
 async def delete_e2e_run_rows(thread_ids: set[str]) -> None:
     """删除 E2E 测试线程对应的 agent_runs 审计行。
 
@@ -347,7 +465,11 @@ async def delete_e2e_run_rows(thread_ids: set[str]) -> None:
         await conn.close()
 
 
-async def list_test_conversation_resources(owner_uid: str) -> dict[str, CleanupConversationResource]:
+async def list_test_conversation_resources(
+    owner_uid: str,
+    *,
+    include_all_owned: bool = False,
+) -> dict[str, CleanupConversationResource]:
     """读取当前测试用户的测试 Conversation、状态和真实 Workdir。"""
 
     conn = await asyncpg.connect(_postgres_dsn())
@@ -375,7 +497,7 @@ async def list_test_conversation_resources(owner_uid: str) -> dict[str, CleanupC
         resources: dict[str, CleanupConversationResource] = {}
         for row in rows:
             thread_id = str(row["thread_id"] or "")
-            if (
+            if not include_all_owned and (
                 not _is_test_thread(
                     {
                         "title": row["title"],
@@ -616,17 +738,40 @@ async def _delete_test_conversation_rows(conn: asyncpg.Connection, thread_ids_li
         if row["project_id"] and row["selection_status"] == "implicit"
     ]
     run_rows = await conn.fetch(
-        "SELECT id FROM agent_runs WHERE conversation_thread_id = ANY($1::text[]) OR conversation_id = ANY($2::int[])",
+        "SELECT id, uid, manifest FROM agent_runs "
+        "WHERE conversation_thread_id = ANY($1::text[]) OR conversation_id = ANY($2::int[])",
         thread_ids_list,
         conversation_ids,
     )
     run_ids = [str(row["id"]) for row in run_rows]
+    snapshot_ids_by_uid: dict[str, set[str]] = {}
+    for row in run_rows:
+        runtime_snapshot = _parse_metadata(row["manifest"]).get("runtime_snapshot")
+        snapshot_id = runtime_snapshot.get("id") if isinstance(runtime_snapshot, dict) else None
+        if isinstance(snapshot_id, str) and snapshot_id:
+            snapshot_ids_by_uid.setdefault(str(row["uid"]), set()).add(snapshot_id)
     message_rows = await conn.fetch(
         "SELECT id FROM messages WHERE conversation_id = ANY($1::int[]) OR run_id = ANY($2::text[])",
         conversation_ids,
         run_ids,
     )
     message_ids = [int(row["id"]) for row in message_rows]
+    request_rows = await conn.fetch(
+        "SELECT uid, input_payload FROM agent_run_requests "
+        "WHERE conversation_thread_id = ANY($1::text[]) "
+        "OR input_message_id = ANY($2::int[]) "
+        "OR dispatched_run_id = ANY($3::text[])",
+        thread_ids_list,
+        message_ids,
+        run_ids,
+    )
+    for row in request_rows:
+        payload = _parse_metadata(row["input_payload"])
+        manifest = _parse_metadata(payload.get("_run_manifest"))
+        runtime_snapshot = manifest.get("runtime_snapshot")
+        snapshot_id = runtime_snapshot.get("id") if isinstance(runtime_snapshot, dict) else None
+        if isinstance(snapshot_id, str) and snapshot_id:
+            snapshot_ids_by_uid.setdefault(str(row["uid"]), set()).add(snapshot_id)
 
     await conn.execute(
         "DELETE FROM agent_run_requests "
@@ -638,9 +783,18 @@ async def _delete_test_conversation_rows(conn: asyncpg.Connection, thread_ids_li
         run_ids,
     )
     await conn.execute("DELETE FROM tool_calls WHERE message_id = ANY($1::int[])", message_ids)
-    await conn.execute("DELETE FROM message_feedbacks WHERE message_id = ANY($1::int[])", message_ids)
+    await conn.execute(
+        "DELETE FROM message_feedbacks WHERE message_id = ANY($1::int[])",
+        message_ids,
+    )
     await conn.execute("DELETE FROM messages WHERE id = ANY($1::int[])", message_ids)
     await conn.execute("DELETE FROM agent_runs WHERE id = ANY($1::text[])", run_ids)
+    for uid, snapshot_ids in snapshot_ids_by_uid.items():
+        await conn.execute(
+            "DELETE FROM run_resource_snapshots WHERE uid = $1 AND id = ANY($2::text[])",
+            uid,
+            sorted(snapshot_ids),
+        )
     await conn.execute(
         "DELETE FROM agentscope_team_worker_bindings WHERE subagent_thread_relation_id IN "
         "(SELECT id FROM subagent_threads WHERE parent_conversation_id = ANY($1::int[]) "
@@ -679,6 +833,220 @@ async def delete_orphaned_test_projects(owner_uid: str) -> None:
         )
     finally:
         await conn.close()
+
+
+async def _assert_test_user_has_no_projects(owner_uid: str) -> None:
+    """回读确认专用测试 UID 已无任何 Project Owner。"""
+    conn = await asyncpg.connect(_postgres_dsn())
+    try:
+        rows = await conn.fetch("SELECT id FROM projects WHERE uid = $1 ORDER BY id", owner_uid)
+        if rows:
+            raise RuntimeError(
+                f"Static test cleanup left Projects behind for {owner_uid}: "
+                + ", ".join(str(row["id"]) for row in rows)
+            )
+    finally:
+        await conn.close()
+
+
+async def _static_test_user_exists(owner_uid: str) -> bool:
+    """从数据库判断测试身份是否仍拥有自己的 Workspace 根。"""
+    conn = await asyncpg.connect(_postgres_dsn())
+    try:
+        return bool(await conn.fetchval("SELECT 1 FROM users WHERE uid = $1", owner_uid))
+    finally:
+        await conn.close()
+
+
+async def list_static_test_user_uids() -> list[str]:
+    """列出数据库中的专用 E2E 用户，供全局会话清理回收失败残留。"""
+    conn = await asyncpg.connect(_postgres_dsn())
+    try:
+        rows = await conn.fetch("SELECT uid FROM users ORDER BY uid")
+        return [str(row["uid"]) for row in rows if _is_static_test_uid(str(row["uid"] or ""))]
+    finally:
+        await conn.close()
+
+
+def list_static_test_workspace_uids() -> list[str]:
+    """从共享目录枚举严格命名的 E2E UID 根，包括已无用户行的孤儿。"""
+    data_root = get_user_data_dir()
+    shared_root = data_root / "shared"
+    if data_root.is_symlink() or shared_root.is_symlink():
+        raise RuntimeError("Static test cleanup refuses symlink workspace root")
+    if not shared_root.exists():
+        return []
+    if not shared_root.is_dir():
+        raise RuntimeError(f"Static test cleanup shared root is not a directory: {shared_root}")
+    return sorted(
+        candidate.name for candidate in shared_root.iterdir() if _is_orphan_test_workspace_uid(candidate.name)
+    )
+
+
+async def cleanup_orphaned_static_test_user_workspace_roots() -> None:
+    """只删除已无 User 和 Project 的 E2E Workspace 根。"""
+    for uid in list_static_test_workspace_uids():
+        if await _static_test_user_exists(uid):
+            continue
+        await _assert_test_user_has_no_projects(uid)
+        remove_test_user_workspace_root(uid)
+
+
+async def cleanup_orphaned_static_test_departments() -> None:
+    """删除无用户和 API Key 引用的严格 snapshot 测试部门。"""
+    conn = await asyncpg.connect(_postgres_dsn())
+    try:
+        async with conn.transaction():
+            rows = await conn.fetch("SELECT id, name FROM departments ORDER BY id FOR UPDATE")
+            for row in rows:
+                if not SNAPSHOT_TEST_DEPARTMENT_NAME.fullmatch(str(row["name"] or "")):
+                    continue
+                await conn.execute(
+                    "DELETE FROM departments AS department "
+                    "WHERE department.id = $1 "
+                    "AND NOT EXISTS (SELECT 1 FROM users WHERE department_id = department.id) "
+                    "AND NOT EXISTS (SELECT 1 FROM api_keys WHERE department_id = department.id)",
+                    int(row["id"]),
+                )
+    finally:
+        await conn.close()
+
+
+async def cleanup_test_agentscope_thread_resources(owner_uid: str, thread_ids: set[str]) -> None:
+    """在删除 Yuxi 映射前销毁测试线程的 AgentScope Session 与 Workspace。"""
+    if not thread_ids:
+        return
+
+    from yuxi.services.conversation_service import _delete_agentscope_thread_resources
+    from yuxi.storage.postgres.manager import pg_manager
+
+    pg_manager.initialize()
+    async with pg_manager.get_async_session_context() as db:
+        for thread_id in sorted(thread_ids):
+            await _delete_agentscope_thread_resources(
+                db,
+                uid=owner_uid,
+                thread_id=thread_id,
+            )
+
+
+async def _delete_static_test_user_record(owner_uid: str) -> None:
+    """物理删除专用 E2E 用户及全部用户级持久化依赖。"""
+    owner_uid = _require_static_test_uid(owner_uid)
+    conn = await asyncpg.connect(_postgres_dsn())
+    try:
+        async with conn.transaction():
+            user_id = await conn.fetchval(
+                "SELECT id FROM users WHERE uid = $1 FOR UPDATE",
+                owner_uid,
+            )
+            run_ids = [
+                str(row["id"])
+                for row in await conn.fetch(
+                    "SELECT id FROM agent_runs WHERE uid = $1",
+                    owner_uid,
+                )
+            ]
+            message_ids = [
+                int(row["id"])
+                for row in await conn.fetch(
+                    "SELECT id FROM messages WHERE run_id = ANY($1::text[])",
+                    run_ids,
+                )
+            ]
+
+            await conn.execute(
+                "DELETE FROM agent_run_requests WHERE uid = $1 OR dispatched_run_id = ANY($2::text[])",
+                owner_uid,
+                run_ids,
+            )
+            await conn.execute("DELETE FROM tool_calls WHERE message_id = ANY($1::int[])", message_ids)
+            await conn.execute(
+                "DELETE FROM message_feedbacks WHERE uid = $1 OR message_id = ANY($2::int[])",
+                owner_uid,
+                message_ids,
+            )
+            await conn.execute("DELETE FROM messages WHERE id = ANY($1::int[])", message_ids)
+            await conn.execute("DELETE FROM agent_runs WHERE id = ANY($1::text[])", run_ids)
+
+            await conn.execute(
+                "DELETE FROM agentscope_team_worker_bindings WHERE uid = $1",
+                owner_uid,
+            )
+            await conn.execute("DELETE FROM subagent_threads WHERE uid = $1", owner_uid)
+            await conn.execute("DELETE FROM agentscope_thread_sessions WHERE uid = $1", owner_uid)
+            await conn.execute(
+                "DELETE FROM task_executions WHERE triggered_by_uid = $1 OR execution_principal_uid = $1",
+                owner_uid,
+            )
+            await conn.execute("DELETE FROM agent_tasks WHERE owner_uid = $1", owner_uid)
+            await conn.execute(
+                "DELETE FROM agentscope_channel_bindings WHERE owner_uid = $1",
+                owner_uid,
+            )
+            await conn.execute(
+                "DELETE FROM agents WHERE created_by = $1 AND is_default IS NOT TRUE",
+                owner_uid,
+            )
+            await conn.execute("DELETE FROM thread_artifacts WHERE uid = $1", owner_uid)
+            await conn.execute("DELETE FROM run_resource_snapshots WHERE uid = $1", owner_uid)
+            await conn.execute("DELETE FROM agent_memory_scopes WHERE uid = $1", owner_uid)
+            await conn.execute("DELETE FROM agent_envs WHERE uid = $1", owner_uid)
+            await conn.execute("DELETE FROM user_config WHERE uid = $1", owner_uid)
+
+            if user_id is not None:
+                await conn.execute(
+                    "DELETE FROM cli_auth_sessions "
+                    "WHERE approved_user_id = $1 "
+                    "OR api_key_id IN (SELECT id FROM api_keys WHERE user_id = $1)",
+                    user_id,
+                )
+                await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM operation_logs WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM users WHERE uid = $1", owner_uid)
+
+            remaining = await conn.fetchrow(
+                "SELECT "
+                "(SELECT count(*) FROM users WHERE uid = $1) AS users, "
+                "(SELECT count(*) FROM agent_runs WHERE uid = $1) AS runs, "
+                "(SELECT count(*) FROM agent_run_requests WHERE uid = $1) AS requests, "
+                "(SELECT count(*) FROM run_resource_snapshots WHERE uid = $1) AS snapshots, "
+                "(SELECT count(*) FROM agent_memory_scopes WHERE uid = $1) AS memory_scopes, "
+                "(SELECT count(*) FROM agentscope_thread_sessions WHERE uid = $1) AS thread_sessions, "
+                "(SELECT count(*) FROM user_config WHERE uid = $1) AS user_configs, "
+                "(SELECT count(*) FROM agent_envs WHERE uid = $1) AS agent_envs",
+                owner_uid,
+            )
+            leftovers = {name: int(count) for name, count in dict(remaining).items() if int(count)}
+            if leftovers:
+                raise RuntimeError(f"Static test user cleanup left database rows for {owner_uid}: {leftovers}")
+    finally:
+        await conn.close()
+
+
+async def cleanup_static_test_user_resources(owner_uid: str) -> None:
+    """清理专用 E2E UID 的完整业务、执行与 Workspace 事实。"""
+    owner_uid = _require_static_test_uid(owner_uid)
+    resources = await list_test_conversation_resources(owner_uid, include_all_owned=True)
+    thread_ids = set(resources)
+    workdir_targets: dict[tuple[str, str], set[str]] = {}
+    for resource in resources.values():
+        if not SAFE_THREAD_ID.fullmatch(resource.thread_id):
+            raise RuntimeError(f"Static test cleanup received an unsafe thread id: {resource.thread_id!r}")
+        _resolve_e2e_thread_storage(resource.thread_id)
+        if resource.workdir_path:
+            _resolve_test_workdir(resource.uid, resource.workdir_path)
+            workdir_targets.setdefault((resource.uid, resource.workdir_path), set()).add(resource.project_id)
+
+    workdir_project_ids = {project_id for project_ids in workdir_targets.values() for project_id in project_ids}
+    await validate_test_workdirs_exclusive(workdir_targets, workdir_project_ids)
+    await validate_test_runs_terminal(thread_ids)
+    await cleanup_test_agentscope_thread_resources(owner_uid, thread_ids)
+    await delete_test_conversation_resources(workdir_targets, thread_ids, workdir_project_ids)
+    await delete_orphaned_test_projects(owner_uid)
+    await _assert_test_user_has_no_projects(owner_uid)
+    await _delete_static_test_user_record(owner_uid)
+    remove_test_user_workspace_root(owner_uid)
 
 
 async def _assert_test_conversations_deleted(conn: asyncpg.Connection, thread_ids_list: list[str]) -> None:

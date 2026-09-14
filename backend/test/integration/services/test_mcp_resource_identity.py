@@ -2,6 +2,7 @@
 
 import os
 from uuid import uuid4
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,7 +24,8 @@ async def test_same_slug_tools_remain_distinct_over_real_mcp():
                     "url": os.getenv("MCP_MOCK_URL", "http://mcp-mock:9000/mcp"),
                 }
                 for resource_id in resource_ids
-            ]
+            ],
+            user=SimpleNamespace(uid="mcp-integration"),
         )
         assert len(tools) == 2
         assert len({tool.name: tool for tool in tools}) == 2

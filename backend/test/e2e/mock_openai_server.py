@@ -10,6 +10,7 @@ POST /v1/chat/completions 支持 stream 与非 stream 两种响应。
 
 import asyncio
 import json
+import re
 import time
 
 from fastapi import FastAPI, Header, HTTPException
@@ -47,7 +48,6 @@ TOOL_TRIGGERS = {
     "SLOW_TOOL": ("Bash", {"command": "sleep 12 && echo TOOL_FINISHED"}),
     "写文件": ("Write", {"file_path": WRITE_FILE_PATH, "content": WRITE_FILE_CONTENT}),
     "列出知识库": ("list_kbs", {}),
-    "调用回声": ("mcp__e2e-echo-mcp__echo", {"text": "hi-mcp"}),
     "查看技能": ("Skill", {"skill": "e2e-skill-demo"}),
     "需要确认方案": (
         "ask_user_question",
@@ -121,10 +121,34 @@ def _subagent_types(body: dict) -> list[str]:
     return []
 
 
+def _subagent_file_paths(context: str) -> tuple[str | None, str | None]:
+    """从子智能体任务中提取父输入和子产物路径。"""
+
+    root_pattern = r"(?:/home/gem/user-data/projects/[^/\s，；。`]+|/workspace)"
+    parent_match = re.search(rf"({root_pattern}/outputs/parent-input\.txt)", context)
+    output_match = re.search(rf"({root_pattern}/outputs/subagents\.txt)", context)
+    return (
+        parent_match.group(1) if parent_match else None,
+        output_match.group(1) if output_match else None,
+    )
+
+
 def _team_next_call(body: dict):
     """团队编排：TeamCreate → AgentCreate → TeamDelete → 总结。"""
     called = _assistant_tool_names(body)
     context = json.dumps(body.get("messages") or [], ensure_ascii=False)
+    parent_path, output_path = _subagent_file_paths(context)
+    if "/tmp/yuxi-execution-tree-" in context and parent_path and output_path and "AgentCreate" not in called:
+        if "Bash" not in called:
+            command_match = re.search(r"用 execute 执行 `([^`]+)`", context)
+            if command_match:
+                return "Bash", {"command": command_match.group(1)}
+        if "Write" not in called:
+            content_match = re.search(r"内容只有一行“([^”]+)”", context)
+            return "Write", {
+                "file_path": parent_path,
+                "content": f"{content_match.group(1) if content_match else '由这个子智能体创建'}\n",
+            }
     if "worker 缺参回报验证" in context:
         subagent_types = _subagent_types(body)
         if "TeamCreate" not in called:
@@ -176,16 +200,41 @@ def _team_next_call(body: dict):
         )
         if "TeamDelete" not in called and worker_reported:
             return "TeamDelete", {}
+        if worker_reported and output_path:
+            if "Read" not in called:
+                return "Read", {"file_path": output_path}
+            if (
+                "present_artifacts"
+                in {str((tool.get("function") or {}).get("name") or "") for tool in body.get("tools") or []}
+                and "present_artifacts" not in called
+            ):
+                return "present_artifacts", {"filepaths": [output_path]}
         return None
     if "TeamCreate" in called:
         subagent_types = _subagent_types(body)
         subagent_type = subagent_types[0] if subagent_types else "e2e-team-sub"
+        if "/tmp/yuxi-execution-tree-" in context and (
+            "/home/gem/user-data/projects/" in context or "/workspace/" in context
+        ):
+            runtime_match = re.search(r"cat '([^']+)'", context)
+            content_match = re.search(r"内容只有一行“([^”]+)”", context)
+            if runtime_match and parent_path and output_path:
+                child_prompt = (
+                    f"先用 execute 执行 `cat '{runtime_match.group(1)}'`，确认内容后，"
+                    f"再用 read_file 读取 {parent_path}，"
+                    f"并用 write_file 将完全相同的内容写入 {output_path}。"
+                    f"写入内容必须是“{content_match.group(1) if content_match else '由这个子智能体创建'}”。"
+                )
+            else:
+                child_prompt = "完成示例任务"
+        else:
+            child_prompt = "完成示例任务"
         return (
             "AgentCreate",
             {
                 "name": "worker-1",
                 "description": "e2e 子智能体",
-                "prompt": "完成示例任务",
+                "prompt": child_prompt,
                 "subagent_type": subagent_type,
             },
         )
@@ -240,6 +289,35 @@ def _matched_tool_trigger(body: dict):
     ]
     joined = user_texts[-1] if user_texts else ""
     tool_names = {str((tool.get("function") or {}).get("name") or "") for tool in body.get("tools") or []}
+    serialized_messages = json.dumps(messages, ensure_ascii=False)
+    if (
+        joined.startswith("<team-message")
+        and "先用 execute 执行 `cat '" in serialized_messages
+        and "AgentCreate" not in tool_names
+    ):
+        called = _assistant_tool_names(body)
+        if "Bash" not in called:
+            runtime_match = re.search(r"先用 execute 执行 `cat '([^']+)'`", serialized_messages)
+            if runtime_match:
+                return "Bash", {"command": f"cat '{runtime_match.group(1)}'"}
+        if "Read" not in called:
+            parent_path, _ = _subagent_file_paths(serialized_messages)
+            if parent_path:
+                return "Read", {"file_path": parent_path}
+        if "Write" not in called:
+            _, output_path = _subagent_file_paths(serialized_messages)
+            content_match = re.search(r"内容必须是“([^”]+)”", serialized_messages)
+            if output_path:
+                return "Write", {
+                    "file_path": output_path,
+                    "content": f"{content_match.group(1) if content_match else '由这个子智能体创建'}\n",
+                }
+        if "TeamSay" in tool_names and "TeamSay" not in called:
+            return "TeamSay", {
+                "content": "已完成运行时校验、父文件读取和子产物写入。",
+                "to": None,
+            }
+        return None
     if "generate_structured_output" in tool_names:
         return (
             "generate_structured_output",
@@ -251,7 +329,12 @@ def _matched_tool_trigger(body: dict):
                 "context_to_preserve": "使用中文回答。",
             },
         )
-    if "<team-message" in joined and "TeamSay" in tool_names and "AgentCreate" not in tool_names:
+    if (
+        "<team-message" in joined
+        and "TeamSay" in tool_names
+        and "AgentCreate" not in tool_names
+        and "先用 execute 执行 `cat '" not in joined
+    ):
         if "TeamSay" not in _assistant_tool_names(body):
             if "worker 缺参回报验证" in joined:
                 if "ask_user_question" in tool_names:
@@ -268,12 +351,30 @@ def _matched_tool_trigger(body: dict):
         or "简短调研" in joined
         or "双 worker 回环验证" in joined
         or "worker 缺参回报验证" in joined
+        or "通过 task 调用子智能体" in joined
+        or "通过 task 调用子智能体" in json.dumps(messages, ensure_ascii=False)
     ):
         return _team_next_call(body)
     if "调用技能依赖" in joined:
         return _skill_gateway_next_call(body)
+    if "personal Skill marker" in joined and "Skill" in tool_names:
+        match = re.search(r"/agents/skills/([^/]+)/SKILL\.md", json.dumps(messages, ensure_ascii=False))
+        if match and "Skill" not in _assistant_tool_names(body):
+            return "Skill", {"skill": match.group(1)}
     if "编辑已有文件" in joined:
         return _edit_existing_file_next_call(body)
+    if "调用失败回声" in joined:
+        mcp_tool = next((name for name in tool_names if name.startswith("mcp__") and name.endswith("__echo")), None)
+        if mcp_tool:
+            if mcp_tool in _assistant_tool_names(body):
+                return None
+            return mcp_tool, {"text": "raise-sensitive"}
+    if "调用回声" in joined:
+        mcp_tool = next((name for name in tool_names if name.startswith("mcp__") and name.endswith("__echo")), None)
+        if mcp_tool:
+            if mcp_tool in _assistant_tool_names(body):
+                return None
+            return mcp_tool, {"text": "hi-mcp"}
     if any(m.get("role") == "tool" for m in messages):
         return None
     for keyword, (name, args) in TOOL_TRIGGERS.items():
@@ -289,13 +390,21 @@ def _has_tool_result(body: dict) -> bool:
 
 def _reply_text(body: dict) -> str:
     """按 E2E 场景返回可断言的最终正文。"""
-    if "编辑已有文件" in _last_user_text(body) and _has_tool_result(body):
+    last_user = _last_user_text(body)
+    serialized_messages = json.dumps(body.get("messages") or [], ensure_ascii=False)
+    for marker in ("ASYNC_AGENT_E2E_OK", "AGENT_EVAL_E2E_OK", "AGENT_CALL_E2E_OK"):
+        if marker in serialized_messages:
+            return marker
+    personal_skill_marker = re.search(r"PERSONAL_SKILL_E2E_[A-F0-9]+", serialized_messages)
+    if personal_skill_marker:
+        return personal_skill_marker.group(0)
+    if "编辑已有文件" in last_user and _has_tool_result(body):
         return EDIT_REPLY_TEXT
-    if "STEER" in _last_user_text(body):
+    if "STEER" in last_user:
         context = json.dumps(body.get("messages") or [], ensure_ascii=False)
         suffix = "TOOL_CONTEXT_OK" if "TOOL_FINISHED" in context else "TOOL_CONTEXT_MISSING"
         return f"STEER_COMPLETE {suffix}"
-    if "worker-1" in json.dumps(body.get("messages") or [], ensure_ascii=False) and _has_tool_result(body):
+    if "worker-1" in serialized_messages and _has_tool_result(body):
         return TEAM_DONE_TEXT
     return TOOL_REPLY_TEXT if _has_tool_result(body) else REPLY_TEXT
 

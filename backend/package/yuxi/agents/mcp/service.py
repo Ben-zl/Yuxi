@@ -14,8 +14,9 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from agentscope.message import TextBlock, ToolResultState
 from agentscope.mcp import HttpMCPConfig, MCPClient, StdioMCPConfig
-from agentscope.tool import MCPTool
+from agentscope.tool import MCPTool, ToolChunk
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from sqlalchemy import select
@@ -45,6 +46,7 @@ _mcp_tools_cache: dict[str, list[Callable[..., Any]]] = {}
 # MCP tools statistics (for reporting enabled/disabled counts)
 _mcp_tools_stats: dict[str, dict[str, int]] = {}
 _USER_CONFIGURABLE_TRANSPORTS = ("sse", "streamable_http")
+_MCP_UNAVAILABLE_MESSAGE = "所选 MCP 暂不可用"
 
 
 class MCPServerNotFoundError(ValueError):
@@ -227,6 +229,43 @@ async def _build_stdio_mcp_tools(server_slug: str, config: dict[str, Any]) -> li
     ]
 
 
+def _wrap_mcp_tool_call(tool: MCPTool, *, resource_id: str) -> MCPTool:
+    """在 MCP 实际调用边界截断底层连接异常和敏感上下文。"""
+    if getattr(tool, "_yuxi_call_error_redacted", False):
+        return tool
+
+    original_call = tool.call
+
+    async def redacted_call(**kwargs: Any) -> ToolChunk:
+        try:
+            result = await original_call(**kwargs)
+        except Exception as exc:
+            logger.error(
+                "Failed to call MCP tool resource_id={} exception_type={}",
+                resource_id,
+                type(exc).__name__,
+            )
+            return ToolChunk(
+                content=[TextBlock(text=_MCP_UNAVAILABLE_MESSAGE)],
+                state=ToolResultState.ERROR,
+            )
+        if result.state == ToolResultState.ERROR:
+            logger.error(
+                "Failed to call MCP tool resource_id={} exception_type={}",
+                resource_id,
+                "MCPToolErrorResult",
+            )
+            return ToolChunk(
+                content=[TextBlock(text=_MCP_UNAVAILABLE_MESSAGE)],
+                state=ToolResultState.ERROR,
+            )
+        return result
+
+    tool.call = redacted_call
+    tool._yuxi_call_error_redacted = True
+    return tool
+
+
 def to_camel_case(s: str) -> str:
     """Convert string to lowerCamelCase."""
 
@@ -330,6 +369,10 @@ async def get_mcp_tools(
         force_refresh: Whether to force a refresh from the server (default: False)
     """
     if additional_servers and server_slug in additional_servers:
+        if user is None:
+            raise PermissionError("MCP 工具入口需要当前用户授权上下文")
+        # projection 已在业务库按用户完成授权；这里保留提交时的配置快照，
+        # 但仍强制调用方携带用户上下文，避免无授权上下文的旁路装配。
         server_config = additional_servers[server_slug]
     else:
         if user is None:
@@ -379,6 +422,8 @@ async def get_mcp_tools(
                 metadata["id"] = unique_id
                 metadata["mcp_tool_name"] = original_name
                 tool.metadata = metadata
+                if isinstance(tool, MCPTool):
+                    tool = _wrap_mcp_tool_call(tool, resource_id=resource_id)
                 all_processed_tools.append(tool)
 
             if cache:
@@ -410,9 +455,13 @@ async def get_mcp_tools(
                     f"{len(all_processed_tools)} tools loaded."
                 )
 
-        except Exception as e:
-            logger.exception(f"Failed to load tools from MCP server '{server_slug}': {e}")
-            raise RuntimeError(f"MCP server '{server_slug}' is unavailable: {e}") from e
+        except Exception as exc:
+            logger.error(
+                "Failed to load MCP tools resource_id={} exception_type={}",
+                resource_id,
+                type(exc).__name__,
+            )
+            raise RuntimeError(_MCP_UNAVAILABLE_MESSAGE) from None
 
     # 3. Filtering (Apply to Return Value Only)
     if disabled_tools:
@@ -437,7 +486,11 @@ async def get_tools_from_all_servers(*, user=None) -> list[Callable[..., Any]]:
     server_configs = await load_enabled_mcp_server_configs(user=user, use_resource_ids=True)
     all_tools = []
     for server_slug in server_configs:
-        tools = await get_mcp_tools(server_slug, additional_servers=server_configs)
+        tools = await get_mcp_tools(
+            server_slug,
+            additional_servers=server_configs,
+            user=user,
+        )
         all_tools.extend(tools)
     return all_tools
 

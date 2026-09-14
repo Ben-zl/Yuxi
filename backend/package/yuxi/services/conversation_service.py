@@ -1,36 +1,48 @@
+import asyncio
+import os
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import HTTPException, UploadFile
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agents.backends.sandbox import (
     ensure_thread_dirs,
     sandbox_uploads_dir,
 )
 from yuxi.config import config as app_config
-from yuxi.agents.backends.paths import VIRTUAL_PATH_UPLOADS
+from yuxi.agents.backends.paths import (
+    VIRTUAL_PATH_UPLOADS,
+    runtime_path_for_workdir_scope,
+    workdir_scope_from_runtime_path,
+)
 from yuxi.agentscope.run_lease import stop_run_lease_heartbeat
 from yuxi.knowledge.parser.factory import DocumentProcessorFactory
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_repository import AgentRunRepository
+from yuxi.repositories.agent_run_request_repository import AgentRunRequestRepository
 from yuxi.repositories.conversation_repository import HIDDEN_USER_CONVERSATION_SOURCES, ConversationRepository
 from yuxi.repositories.project_repository import ProjectRepository
 from yuxi.services.mention_search_service import invalidate_mention_cache
 from yuxi.services.ocr_service import parse_document
-from yuxi.services.project_service import create_implicit_project
+from yuxi.services.project_service import create_implicit_project, lock_project_workdir_changes
 from yuxi.services.workdir_service import ensure_conversation_workdir_available, resolve_conversation_workdir_path
 from yuxi.storage.minio import StorageError, get_minio_client
-from yuxi.storage.postgres.models_business import AGENT_RUN_TERMINAL_STATUSES, AgentRun, User
+from yuxi.storage.postgres.models_business import AGENT_RUN_TERMINAL_STATUSES, AgentRun, Project, User
+from yuxi.storage.postgres.manager import pg_manager
 from yuxi.utils.datetime_utils import format_utc_datetime, utc_isoformat
+from yuxi.utils.async_cleanup import await_cleanup_completion
 from yuxi.utils.logging_config import logger
 from yuxi.utils.upload_utils import read_upload_with_limit, write_upload_to_path
-from yuxi.workspace.paths import ensure_bound_user_workdir
+from yuxi.workspace.paths import ensure_bound_user_workdir, strictly_overlapping_workdirs
 from yuxi.workspace.workdir import Workdir
+from yuxi.utils.paths import open_directory_fd, open_regular_file_fd
 
 ATTACHMENT_ALLOWED_EXTENSIONS: tuple[str, ...] = ()
 MAX_ATTACHMENT_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -109,9 +121,7 @@ def _require_matching_thread_creation_intent(
     if conversation.status == "deleted" or project is None or project.status == "deleted":
         raise HTTPException(status_code=409, detail="request_id 已用于已删除的 Conversation")
     same_project_intent = (
-        conversation.project_id == project_id
-        if project_id
-        else project.selection_status == "implicit"
+        conversation.project_id == project_id if project_id else project.selection_status == "implicit"
     )
     if conversation.agent_id != agent_slug or not same_project_intent:
         raise HTTPException(status_code=409, detail="request_id 已用于其他 Conversation 创建意图")
@@ -198,16 +208,132 @@ def _make_attachment_path(file_name: str) -> str:
     return f"{safe_name}.md"
 
 
-def _build_attachment_storage_path(*, uid: str, thread_id: str, file_name: str) -> tuple[str, Path]:
+def _write_workdir_file(workdir: Workdir, scope_path: str, content: bytes) -> None:
+    """通过 Workdir capability 创建或覆盖文件。"""
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="yuxi-attachment-", delete=False) as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(content)
+        workdir.copy_file_from_path(scope_path, temp_path)
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+
+
+def _delete_workdir_scopes(workdir: Workdir, scope_paths: list[str]) -> None:
+    """逐项清理本次附件文件，并报告非缺失错误。"""
+    failures: list[Exception] = []
+    for scope_path in dict.fromkeys(scope_paths):
+        try:
+            workdir.delete(scope_path)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            failures.append(exc)
+    if failures:
+        raise ExceptionGroup("Attachment file cleanup failed", failures)
+
+
+async def _require_rollback_workdir_owner(db: AsyncSession, *, workdir: Workdir, uid: str, project_id: str) -> None:
+    """重获路径锁并确认附件目录未转交其他 Project。"""
+    await lock_project_workdir_changes(db=db, uid=uid)
+    result = await db.execute(select(Project.id, Project.workdir_path, Project.status).where(Project.uid == uid))
+    owners = [
+        (owner_id, owner_path, status)
+        for owner_id, owner_path, status in result.all()
+        if owner_path == workdir.relative_path or strictly_overlapping_workdirs(owner_path, workdir.relative_path)
+    ]
+    if owners != [(project_id, workdir.relative_path, "active")]:
+        raise RuntimeError("Attachment Workdir owner changed")
+
+
+async def _rollback_materialized_attachments(
+    db: AsyncSession,
+    workdir: Workdir,
+    scope_paths: list[str],
+    primary_error: BaseException,
+    *,
+    uid: str,
+    project_id: str,
+) -> None:
+    """保留原始异常，尝试回滚数据库和本次预定的附件文件。"""
+    try:
+        await await_cleanup_completion(db.rollback())
+    except BaseException as exc:
+        primary_error.add_note(f"Attachment database rollback also failed: {type(exc).__name__}")
+    try:
+        await await_cleanup_completion(
+            _require_rollback_workdir_owner(db, workdir=workdir, uid=uid, project_id=project_id)
+        )
+    except BaseException as exc:
+        primary_error.add_note(f"Attachment Workdir owner recheck failed: {type(exc).__name__}")
+        return
+    try:
+        await await_cleanup_completion(asyncio.to_thread(_delete_workdir_scopes, workdir, scope_paths))
+    except BaseException as exc:
+        primary_error.add_note(f"Attachment file cleanup also failed: {type(exc).__name__}")
+
+
+async def _committed_attachment_visible(*, thread_id: str, uid: str, file_id: str, original_path: str) -> bool | None:
+    """独立回读附件 Owner；无法判断提交结果时不删除文件。"""
+    try:
+        async with pg_manager.get_async_session_context() as reader:
+            repository = ConversationRepository(reader)
+            conversation = await repository.get_conversation_by_thread_id(thread_id)
+            if conversation is None:
+                return False
+            if str(conversation.uid) != uid:
+                return None
+            for record in await repository.get_attachments(conversation.id):
+                if record.get("file_id") == file_id:
+                    return record.get("original_path") == original_path or None
+            return False
+    except BaseException:
+        return None
+
+
+def _delete_legacy_thread_attachment(thread_id: str, candidate: str) -> bool:
+    """只删除当前线程旧 uploads 根内的普通文件。"""
+    path = Path(candidate)
+    if not path.is_absolute() or ".." in path.parts:
+        return False
+    root = sandbox_uploads_dir(thread_id)
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    with open_regular_file_fd(root, parts):
+        pass
+    parent_fd = open_directory_fd(root, parts[:-1])
+    try:
+        os.unlink(parts[-1], dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    return True
+
+
+def _build_attachment_storage_path(
+    *,
+    uid: str,
+    thread_id: str,
+    file_name: str,
+    workdir: Workdir | None = None,
+) -> tuple[str, Path]:
     """返回附件虚拟路径和宿主机落盘路径。"""
     relative_name = _make_attachment_path(file_name)
-    virtual_path = f"{VIRTUAL_PATH_UPLOADS}/attachments/{relative_name}"
+    if workdir is not None:
+        scope_path = f"/uploads/attachments/{relative_name}"
+        return runtime_path_for_workdir_scope(workdir.relative_path, scope_path), Path(scope_path)
 
     host_dir = sandbox_uploads_dir(thread_id) / "attachments"
     host_dir.mkdir(parents=True, exist_ok=True)
     host_path = host_dir / relative_name
 
-    return virtual_path, host_path
+    return f"{VIRTUAL_PATH_UPLOADS}/attachments/{relative_name}", host_path
 
 
 def _artifact_url(thread_id: str, virtual_path: str) -> str:
@@ -312,26 +438,35 @@ async def _materialize_attachment_files(
     *,
     thread_id: str,
     uid: str,
+    file_id: str,
     upload: UploadFile,
     file_name: str,
     file_content: bytes,
+    workdir: Workdir | None = None,
 ) -> dict:
     """将原始附件与可选 markdown 副本落盘到线程 user-data。"""
-    ensure_thread_dirs(thread_id, uid)
-
-    upload_virtual_path = _make_upload_virtual_path(file_name)
-    uploads_dir = sandbox_uploads_dir(thread_id)
-    upload_actual_path = uploads_dir / Path(upload_virtual_path).name
-    upload_actual_path.write_bytes(file_content)
+    storage_name = f"{file_id}_{_safe_file_name(file_name)}"
+    if workdir is None:
+        ensure_thread_dirs(thread_id, uid)
+        upload_virtual_path = _make_upload_virtual_path(storage_name)
+        uploads_dir = sandbox_uploads_dir(thread_id)
+        upload_actual_path = uploads_dir / Path(upload_virtual_path).name
+        upload_actual_path.write_bytes(file_content)
+        upload_storage_path = str(upload_actual_path)
+    else:
+        upload_scope_path = f"/uploads/{storage_name}"
+        _write_workdir_file(workdir, upload_scope_path, file_content)
+        upload_virtual_path = runtime_path_for_workdir_scope(workdir.relative_path, upload_scope_path)
+        upload_storage_path = upload_virtual_path
 
     record = {
         "status": "uploaded",
         "path": upload_virtual_path,
         "artifact_url": _artifact_url(thread_id, upload_virtual_path),
-        "storage_path": str(upload_actual_path),
+        "storage_path": upload_storage_path,
         "original_path": upload_virtual_path,
         "original_artifact_url": _artifact_url(thread_id, upload_virtual_path),
-        "original_storage_path": str(upload_actual_path),
+        "original_storage_path": upload_storage_path,
         "minio_url": None,
     }
 
@@ -340,6 +475,8 @@ async def _materialize_attachment_files(
         conversion = await _convert_upload_to_markdown(upload)
     except ValueError:
         return record
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"Attachment markdown materialization failed for {file_name}: {exc}")
         return record
@@ -347,20 +484,27 @@ async def _materialize_attachment_files(
     markdown_virtual_path, markdown_host_path = _build_attachment_storage_path(
         uid=uid,
         thread_id=thread_id,
-        file_name=file_name,
+        file_name=storage_name,
+        workdir=workdir,
     )
-    markdown_host_path.write_text(conversion.markdown, encoding="utf-8")
+    if workdir is None:
+        markdown_host_path.write_text(conversion.markdown, encoding="utf-8")
+        markdown_storage_path = str(markdown_host_path)
+    else:
+        markdown_scope_path = str(markdown_host_path)
+        _write_workdir_file(workdir, markdown_scope_path, conversion.markdown.encode("utf-8"))
+        markdown_storage_path = markdown_virtual_path
 
     record.update(
         {
             "status": "parsed",
             "path": markdown_virtual_path,
             "artifact_url": _artifact_url(thread_id, markdown_virtual_path),
-            "storage_path": str(markdown_host_path),
+            "storage_path": markdown_storage_path,
             "file_path": markdown_virtual_path,
             "markdown": conversion.markdown,
             "truncated": conversion.truncated,
-            "markdown_storage_path": str(markdown_host_path),
+            "markdown_storage_path": markdown_storage_path,
         }
     )
     return record
@@ -375,24 +519,31 @@ def _materialize_tmp_attachment_files(
     file_content: bytes,
     parsed_markdown: str | None = None,
     truncated: bool = False,
+    workdir: Workdir | None = None,
 ) -> dict:
     """将 tmp 附件复制到线程目录，不主动删除 tmp 对象。"""
-    ensure_thread_dirs(thread_id, uid)
-
     storage_name = f"{file_id}_{file_name}"
-    upload_virtual_path = _make_upload_virtual_path(storage_name)
-    uploads_dir = sandbox_uploads_dir(thread_id)
-    upload_actual_path = uploads_dir / Path(upload_virtual_path).name
-    upload_actual_path.write_bytes(file_content)
+    if workdir is None:
+        ensure_thread_dirs(thread_id, uid)
+        upload_virtual_path = _make_upload_virtual_path(storage_name)
+        uploads_dir = sandbox_uploads_dir(thread_id)
+        upload_actual_path = uploads_dir / Path(upload_virtual_path).name
+        upload_actual_path.write_bytes(file_content)
+        upload_storage_path = str(upload_actual_path)
+    else:
+        upload_scope_path = f"/uploads/{storage_name}"
+        _write_workdir_file(workdir, upload_scope_path, file_content)
+        upload_virtual_path = runtime_path_for_workdir_scope(workdir.relative_path, upload_scope_path)
+        upload_storage_path = upload_virtual_path
 
     record = {
         "status": "uploaded",
         "path": upload_virtual_path,
         "artifact_url": _artifact_url(thread_id, upload_virtual_path),
-        "storage_path": str(upload_actual_path),
+        "storage_path": upload_storage_path,
         "original_path": upload_virtual_path,
         "original_artifact_url": _artifact_url(thread_id, upload_virtual_path),
-        "original_storage_path": str(upload_actual_path),
+        "original_storage_path": upload_storage_path,
         "minio_url": None,
     }
 
@@ -403,18 +554,25 @@ def _materialize_tmp_attachment_files(
         uid=uid,
         thread_id=thread_id,
         file_name=storage_name,
+        workdir=workdir,
     )
-    markdown_host_path.write_text(parsed_markdown, encoding="utf-8")
+    if workdir is None:
+        markdown_host_path.write_text(parsed_markdown, encoding="utf-8")
+        markdown_storage_path = str(markdown_host_path)
+    else:
+        markdown_scope_path = str(markdown_host_path)
+        _write_workdir_file(workdir, markdown_scope_path, parsed_markdown.encode("utf-8"))
+        markdown_storage_path = markdown_virtual_path
     record.update(
         {
             "status": "parsed",
             "path": markdown_virtual_path,
             "artifact_url": _artifact_url(thread_id, markdown_virtual_path),
-            "storage_path": str(markdown_host_path),
+            "storage_path": markdown_storage_path,
             "file_path": markdown_virtual_path,
             "markdown": parsed_markdown,
             "truncated": truncated,
-            "markdown_storage_path": str(markdown_host_path),
+            "markdown_storage_path": markdown_storage_path,
         }
     )
     return record
@@ -434,6 +592,7 @@ async def create_thread_view(
     if metadata and "attachments" in metadata:
         raise HTTPException(status_code=400, detail="metadata.attachments 是服务端保留字段")
 
+    await lock_project_workdir_changes(db=db, uid=str(current_uid))
     user_result = await db.execute(select(User).where(User.uid == str(current_uid)))
     current_user = user_result.scalar_one_or_none()
     if not current_user:
@@ -474,6 +633,11 @@ async def create_thread_view(
             Workdir.open_existing(str(current_uid), project.workdir_path)
         except (FileNotFoundError, NotADirectoryError, PermissionError, OSError, ValueError) as exc:
             raise HTTPException(status_code=409, detail="项目目录不可用") from exc
+        await resolve_conversation_workdir_path(
+            conversation=SimpleNamespace(project_id=project.id),
+            uid=str(current_uid),
+            db=db,
+        )
     else:
         try:
             project = await create_implicit_project(
@@ -577,11 +741,7 @@ async def list_threads_view(
                 conv.last_viewed_run_id,
             ),
             db=db,
-            workdir_path=(
-                conv.project.workdir_path
-                if getattr(conv, "project", None) is not None
-                else None
-            ),
+            workdir_path=(conv.project.workdir_path if getattr(conv, "project", None) is not None else None),
         )
         for conv in conversations
     ]
@@ -671,7 +831,7 @@ async def _delete_agentscope_thread_resources(db: AsyncSession, *, uid: str, thr
     """删除线程独占的 AgentScope 资源与持久 workspace。"""
     import os
 
-    from yuxi.agentscope.client import AgentScopeServiceClient
+    from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError
     from yuxi.repositories.agentscope_team_workers import AgentScopeTeamWorkerRepository
     from yuxi.repositories.agentscope_thread_sessions import (
         delete_thread_session,
@@ -691,28 +851,38 @@ async def _delete_agentscope_thread_resources(db: AsyncSession, *, uid: str, thr
     )
 
     if not mapping.agentscope_workspace_id:
-        workspace_id = await client.get_session_workspace_id(
-            uid,
-            mapping.agentscope_agent_id,
-            mapping.agentscope_session_id,
-        )
-        await set_thread_session_workspace_id(
-            db,
-            mapping,
-            agentscope_workspace_id=workspace_id,
-        )
+        try:
+            workspace_id = await client.get_session_workspace_id(
+                uid,
+                mapping.agentscope_agent_id,
+                mapping.agentscope_session_id,
+            )
+        except AgentScopeServiceError as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            await set_thread_session_workspace_id(
+                db,
+                mapping,
+                agentscope_workspace_id=workspace_id,
+            )
     for binding in bindings:
         if binding.agentscope_workspace_id:
             continue
-        workspace_id = await client.get_session_workspace_id(
-            uid,
-            binding.worker_agent_id,
-            binding.worker_session_id,
-        )
-        await binding_repo.set_workspace_id(
-            binding,
-            agentscope_workspace_id=workspace_id,
-        )
+        try:
+            workspace_id = await client.get_session_workspace_id(
+                uid,
+                binding.worker_agent_id,
+                binding.worker_session_id,
+            )
+        except AgentScopeServiceError as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            await binding_repo.set_workspace_id(
+                binding,
+                agentscope_workspace_id=workspace_id,
+            )
     await db.commit()
 
     await client.delete_session(
@@ -904,8 +1074,15 @@ async def confirm_tmp_thread_attachments_view(
     if not attachments:
         raise HTTPException(status_code=400, detail="请选择要添加的附件")
 
+    await lock_project_workdir_changes(db=db, uid=str(current_uid))
     conv_repo = ConversationRepository(db)
     conversation = await require_user_conversation(conv_repo, thread_id, str(current_uid))
+    workdir_path = await ensure_conversation_workdir_available(
+        conversation=conversation,
+        uid=str(current_uid),
+        db=db,
+    )
+    workdir = Workdir.open_existing(str(current_uid), workdir_path)
     minio_client = get_minio_client()
     expected_bucket = _get_tmp_attachment_bucket()
     prepared_items: list[dict] = []
@@ -952,22 +1129,127 @@ async def confirm_tmp_thread_attachments_view(
         )
 
     added_records: list[dict] = []
-    for prepared in prepared_items:
-        file_id = uuid.uuid4().hex
-        materialized = _materialize_tmp_attachment_files(
+    cleanup_scopes: list[str] = []
+    commit_started = False
+    try:
+        for prepared in prepared_items:
+            file_id = uuid.uuid4().hex
+            storage_name = f"{file_id}_{prepared['file_name']}"
+            cleanup_scopes.extend(
+                [f"/uploads/{storage_name}", f"/uploads/attachments/{_make_attachment_path(storage_name)}"]
+            )
+            materialized = _materialize_tmp_attachment_files(
+                thread_id=thread_id,
+                uid=str(conversation.uid),
+                file_id=file_id,
+                file_name=prepared["file_name"],
+                file_content=prepared["file_content"],
+                parsed_markdown=prepared["parsed_markdown"],
+                truncated=prepared["truncated"],
+                workdir=workdir,
+            )
+            attachment_record = {
+                "file_id": file_id,
+                "file_name": prepared["file_name"],
+                "file_type": prepared["file_type"],
+                "file_size": len(prepared["file_content"]),
+                "status": materialized["status"],
+                "uploaded_at": utc_isoformat(),
+                "path": materialized["path"],
+                "artifact_url": materialized["artifact_url"],
+                "storage_path": materialized["storage_path"],
+                "original_path": materialized["original_path"],
+                "original_artifact_url": materialized["original_artifact_url"],
+                "original_storage_path": materialized["original_storage_path"],
+                "minio_url": materialized["minio_url"],
+            }
+            for optional_key in ("file_path", "markdown", "truncated", "markdown_storage_path"):
+                if optional_key in materialized:
+                    attachment_record[optional_key] = materialized[optional_key]
+            added_records.append(attachment_record)
+
+        await conv_repo.add_attachments(conversation.id, added_records)
+        await invalidate_mention_cache(thread_id)
+        commit_started = True
+        await db.commit()
+    except BaseException as exc:
+        if commit_started:
+            states = [
+                await await_cleanup_completion(
+                    _committed_attachment_visible(
+                        thread_id=thread_id,
+                        uid=str(current_uid),
+                        file_id=record["file_id"],
+                        original_path=record["original_path"],
+                    )
+                )
+                for record in added_records
+            ]
+            if (
+                not states
+                or any(state is not False for state in states)
+                or isinstance(exc, (asyncio.CancelledError, OSError, DBAPIError))
+                and not isinstance(exc, IntegrityError)
+            ):
+                exc.add_note("Attachment commit outcome is not safely reversible; files were preserved")
+                raise
+        await _rollback_materialized_attachments(
+            db, workdir, cleanup_scopes, exc, uid=str(current_uid), project_id=conversation.project_id
+        )
+        raise
+
+    return {"attachments": [serialize_attachment(item) for item in added_records]}
+
+
+async def upload_thread_attachment_view(
+    *,
+    thread_id: str,
+    file: UploadFile,
+    db: AsyncSession,
+    current_uid: str,
+) -> dict:
+    await lock_project_workdir_changes(db=db, uid=str(current_uid))
+    conv_repo = ConversationRepository(db)
+    conversation = await require_user_conversation(conv_repo, thread_id, str(current_uid))
+    workdir_path = await ensure_conversation_workdir_available(
+        conversation=conversation,
+        uid=str(current_uid),
+        db=db,
+    )
+    workdir = Workdir.open_existing(str(current_uid), workdir_path)
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="无法识别的文件名")
+
+    file_name = Path(file.filename).name
+    await file.seek(0)
+    file_content = await file.read()
+    file_size = len(file_content)
+    if file_size > MAX_ATTACHMENT_SIZE_BYTES:
+        max_size_mb = MAX_ATTACHMENT_SIZE_BYTES // (1024 * 1024)
+        raise HTTPException(status_code=400, detail=f"附件过大，当前仅支持 {max_size_mb} MB 以内的文件")
+    file_id = uuid.uuid4().hex
+    storage_name = f"{file_id}_{_safe_file_name(file_name)}"
+    cleanup_scopes = [
+        f"/uploads/{storage_name}",
+        f"/uploads/attachments/{_make_attachment_path(storage_name)}",
+    ]
+    commit_started = False
+    try:
+        materialized = await _materialize_attachment_files(
             thread_id=thread_id,
             uid=str(conversation.uid),
             file_id=file_id,
-            file_name=prepared["file_name"],
-            file_content=prepared["file_content"],
-            parsed_markdown=prepared["parsed_markdown"],
-            truncated=prepared["truncated"],
+            upload=file,
+            file_name=file_name,
+            file_content=file_content,
+            workdir=workdir,
         )
+
         attachment_record = {
             "file_id": file_id,
-            "file_name": prepared["file_name"],
-            "file_type": prepared["file_type"],
-            "file_size": len(prepared["file_content"]),
+            "file_name": file_name,
+            "file_type": file.content_type,
+            "file_size": file_size,
             "status": materialized["status"],
             "uploaded_at": utc_isoformat(),
             "path": materialized["path"],
@@ -981,62 +1263,30 @@ async def confirm_tmp_thread_attachments_view(
         for optional_key in ("file_path", "markdown", "truncated", "markdown_storage_path"):
             if optional_key in materialized:
                 attachment_record[optional_key] = materialized[optional_key]
-        added_records.append(attachment_record)
 
-    await conv_repo.add_attachments(conversation.id, added_records)
-    await invalidate_mention_cache(thread_id)
-
-    return {"attachments": [serialize_attachment(item) for item in added_records]}
-
-
-async def upload_thread_attachment_view(
-    *,
-    thread_id: str,
-    file: UploadFile,
-    db: AsyncSession,
-    current_uid: str,
-) -> dict:
-    conv_repo = ConversationRepository(db)
-    conversation = await require_user_conversation(conv_repo, thread_id, str(current_uid))
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="无法识别的文件名")
-
-    file_name = Path(file.filename).name
-    await file.seek(0)
-    file_content = await file.read()
-    file_size = len(file_content)
-    if file_size > MAX_ATTACHMENT_SIZE_BYTES:
-        max_size_mb = MAX_ATTACHMENT_SIZE_BYTES // (1024 * 1024)
-        raise HTTPException(status_code=400, detail=f"附件过大，当前仅支持 {max_size_mb} MB 以内的文件")
-    materialized = await _materialize_attachment_files(
-        thread_id=thread_id,
-        uid=str(conversation.uid),
-        upload=file,
-        file_name=file_name,
-        file_content=file_content,
-    )
-
-    attachment_record = {
-        "file_id": uuid.uuid4().hex,
-        "file_name": file_name,
-        "file_type": file.content_type,
-        "file_size": file_size,
-        "status": materialized["status"],
-        "uploaded_at": utc_isoformat(),
-        "path": materialized["path"],
-        "artifact_url": materialized["artifact_url"],
-        "storage_path": materialized["storage_path"],
-        "original_path": materialized["original_path"],
-        "original_artifact_url": materialized["original_artifact_url"],
-        "original_storage_path": materialized["original_storage_path"],
-        "minio_url": materialized["minio_url"],
-    }
-    for optional_key in ("file_path", "markdown", "truncated", "markdown_storage_path"):
-        if optional_key in materialized:
-            attachment_record[optional_key] = materialized[optional_key]
-
-    await conv_repo.add_attachment(conversation.id, attachment_record)
-    await invalidate_mention_cache(thread_id)
+        await conv_repo.add_attachment(conversation.id, attachment_record)
+        await invalidate_mention_cache(thread_id)
+        commit_started = True
+        await db.commit()
+    except BaseException as exc:
+        if commit_started:
+            state = await await_cleanup_completion(
+                _committed_attachment_visible(
+                    thread_id=thread_id,
+                    uid=str(current_uid),
+                    file_id=file_id,
+                    original_path=runtime_path_for_workdir_scope(workdir.relative_path, cleanup_scopes[0]),
+                )
+            )
+            if state is not False or (
+                isinstance(exc, (asyncio.CancelledError, OSError, DBAPIError)) and not isinstance(exc, IntegrityError)
+            ):
+                exc.add_note("Attachment commit outcome is not safely reversible; files were preserved")
+                raise
+        await _rollback_materialized_attachments(
+            db, workdir, cleanup_scopes, exc, uid=str(current_uid), project_id=conversation.project_id
+        )
+        raise
 
     return serialize_attachment(attachment_record)
 
@@ -1066,20 +1316,61 @@ async def delete_thread_attachment_view(
     db: AsyncSession,
     current_uid: str,
 ) -> dict:
+    await lock_project_workdir_changes(db=db, uid=str(current_uid))
     conv_repo = ConversationRepository(db)
     conversation = await require_user_conversation(conv_repo, thread_id, str(current_uid))
 
-    existing_attachments = await conv_repo.get_attachments(conversation.id)
+    existing_attachments = await conv_repo.lock_attachments(conversation.id)
     target_attachment = next((item for item in existing_attachments if item.get("file_id") == file_id), None)
+    if target_attachment is None:
+        raise HTTPException(status_code=404, detail="附件不存在或已被删除")
+
+    request_id = target_attachment.get("request_id")
+    if isinstance(request_id, str) and request_id:
+        request = await AgentRunRequestRepository(db).get_by_request_id(request_id)
+        if request and request.status == "queued":
+            raise HTTPException(status_code=409, detail="附件正在被请求使用，暂时不能删除")
+
+    if await AgentRunRequestRepository(db).has_queued_attachment_reference(
+        uid=str(current_uid),
+        agent_slug=conversation.agent_id,
+        conversation_thread_id=thread_id,
+        conversation_id=conversation.id,
+        file_id=file_id,
+    ):
+        raise HTTPException(status_code=409, detail="附件正在被请求使用，暂时不能删除")
+
+    active_run = await AgentRunRepository(db).get_active_run_by_thread_for_user(
+        agent_slug=conversation.agent_id,
+        conversation_thread_id=thread_id,
+        uid=str(current_uid),
+    )
+    if active_run:
+        raise HTTPException(status_code=409, detail="对话正在运行，暂时不能删除附件")
 
     removed = await conv_repo.remove_attachment(conversation.id, file_id)
     if not removed:
         raise HTTPException(status_code=404, detail="附件不存在或已被删除")
 
-    if target_attachment:
+    workdir_path = await resolve_conversation_workdir_path(
+        conversation=conversation,
+        uid=str(current_uid),
+        db=db,
+    )
+    workdir = Workdir.open_existing(str(current_uid), workdir_path)
+    await db.commit()
+    try:
+        await _require_rollback_workdir_owner(
+            db, workdir=workdir, uid=str(current_uid), project_id=conversation.project_id
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("附件元数据已删除，但 Workdir Owner 复核失败: thread=%s error=%s", thread_id, exc)
+    else:
         delete_candidates = {
             str(value).strip()
             for value in (
+                target_attachment.get("path"),
+                target_attachment.get("original_path"),
                 target_attachment.get("storage_path"),
                 target_attachment.get("original_storage_path"),
                 target_attachment.get("markdown_storage_path"),
@@ -1088,9 +1379,15 @@ async def delete_thread_attachment_view(
         }
         for candidate in delete_candidates:
             try:
-                file_path = Path(candidate)
-                if file_path.exists():
-                    file_path.unlink()
+                scope_path = workdir_scope_from_runtime_path(workdir.relative_path, candidate)
+                workdir.delete(scope_path)
+            except ValueError:
+                try:
+                    _delete_legacy_thread_attachment(thread_id, candidate)
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Failed to remove legacy attachment file {candidate}: {exc}")
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Failed to remove attachment file {candidate}: {exc}")
 

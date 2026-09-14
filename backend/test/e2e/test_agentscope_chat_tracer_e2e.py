@@ -11,15 +11,17 @@ import uuid
 
 import pytest
 from sqlalchemy import delete
+from e2e_helpers import consume_events, wait_for_run
 from test.e2e.agentscope_e2e_fixtures import (
-    PROVIDER_ID,
+    PROVIDER_RESOURCE_ID,
     cleanup_test_users,
+    open_fixture_http_client,
     seed_test_users,
     upsert_mock_provider,
 )
 
 from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError
-from yuxi.agentscope.runner import collect_chat_round, ensure_thread_session
+from yuxi.agentscope.runner import ensure_thread_session
 from yuxi.repositories.agentscope_thread_sessions import get_thread_session
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Agent
@@ -50,8 +52,11 @@ async def db_session():
                     backend_id="ChatbotAgent",
                     config_json={
                         "context": {
-                            "model": f"{PROVIDER_ID}:mock-chat-model",
+                            "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
                             "mcps": [],
+                            "tools": [],
+                            "skills": [],
+                            "subagents": [],
                             "system_prompt": "你是 e2e 测试助手。",
                         }
                     },
@@ -89,32 +94,41 @@ async def client():
 
 async def test_minimal_chat_roundtrip(db_session, client):
     uid = "e2e-tracer-a"
-    thread_id = f"e2e-tracer-{uuid.uuid4().hex[:12]}"
 
-    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
-    assert mapping.agentscope_session_id
-    assert mapping.model_spec == f"{PROVIDER_ID}:mock-chat-model"
+    http_client, headers = await open_fixture_http_client(uid)
+    try:
+        thread_response = await http_client.post(
+            "/api/chat/thread",
+            json={"agent_id": CHATBOT_SLUG, "title": f"tracer-{uuid.uuid4().hex[:8]}"},
+            headers=headers,
+        )
+        assert thread_response.status_code == 200, thread_response.text
+        run_thread_id = str(thread_response.json().get("thread_id") or thread_response.json()["id"])
+        run_response = await http_client.post(
+            "/api/agent/runs",
+            json={
+                "query": "打个招呼",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": run_thread_id,
+                "meta": {"request_id": f"e2e-tracer-{uuid.uuid4().hex[:8]}"},
+            },
+            headers=headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json()["run_id"])
+        event_counts = await consume_events(http_client, headers, run_id)
+        assert event_counts.get("messages", 0) > 0, event_counts
+        assert event_counts.get("end", 0) == 1, event_counts
+        run = await wait_for_run(http_client, headers, run_id)
+        assert run["status"] == "completed", run
+        result_response = await http_client.get(f"/api/agent/runs/{run_id}/result", headers=headers)
+        assert result_response.status_code == 200, result_response.text
+        assert result_response.json()["output"].startswith(MOCK_REPLY_TEXT)
+    finally:
+        await http_client.aclose()
 
-    result = await collect_chat_round(
-        client,
-        uid=uid,
-        agent_id=mapping.agentscope_agent_id,
-        session_id=mapping.agentscope_session_id,
-        text="打个招呼",
-    )
-    assert result.text.startswith(MOCK_REPLY_TEXT)
-    types = [ev["type"] for ev in result.events]
-    assert "REPLY_START" in types and "TEXT_BLOCK_DELTA" in types
-    assert types[-1] == "REPLY_END"
-
-    messages = await client.list_messages(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)
-    texts = [
-        block.get("text", "") for msg in messages for block in msg.get("content", []) if block.get("type") == "text"
-    ]
-    assert any(text.startswith(MOCK_REPLY_TEXT) for text in texts)
-
-    stored = await get_thread_session(db_session, uid=uid, thread_id=thread_id)
-    assert stored is not None and stored.agentscope_session_id == mapping.agentscope_session_id
+    stored = await get_thread_session(db_session, uid=uid, thread_id=run_thread_id)
+    assert stored is not None and stored.model_spec == f"{PROVIDER_RESOURCE_ID}:mock-chat-model"
 
 
 async def test_thread_session_isolated_per_user(db_session, client):

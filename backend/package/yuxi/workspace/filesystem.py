@@ -312,6 +312,16 @@ class Workspace:
         finally:
             os.close(parent_fd)
 
+    def remove_authorized_empty_directory(self, path: str, *, root: str) -> None:
+        """只删除已授权的空目录，保留任何后续写入的文件。"""
+        self._require_within(path, root, allow_root=False)
+        base, parts = self._resolve_path(path)
+        parent_fd = self._open_directory(base, parts[:-1])
+        try:
+            os.rmdir(parts[-1], dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+
     def _open_regular_file(self, path: str, *, writable: bool):
         """固定父目录与最终普通文件，统一拒绝 symlink、目录和特殊文件。"""
         base, parts = self._resolve_path(path)

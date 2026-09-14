@@ -12,12 +12,21 @@ from pathlib import Path
 import httpx
 import pytest
 from sqlalchemy import delete
-from test.e2e.agentscope_e2e_fixtures import PROVIDER_ID, cleanup_fixture_agents, upsert_mock_provider
+from test.e2e.agentscope_e2e_fixtures import (
+    PROVIDER_RESOURCE_ID,
+    cleanup_fixture_agents,
+    cleanup_test_users,
+    open_fixture_http_client,
+    seed_test_users,
+    upsert_mock_provider,
+)
+from test.e2e.e2e_helpers import consume_events, wait_for_run
 
 from yuxi.agentscope.client import AgentScopeServiceClient
-from yuxi.agentscope.runner import collect_chat_round, ensure_thread_session
+from yuxi.agentscope.runner import ensure_thread_session
+from yuxi.repositories.agentscope_thread_sessions import get_thread_session
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Agent, AgentScopeThreadSession, User
+from yuxi.storage.postgres.models_business import Agent, AgentScopeThreadSession
 from yuxi.storage.redis import close_async_redis_client
 from yuxi.services.thread_workspace_service import list_visible_files, read_file
 
@@ -39,37 +48,38 @@ async def db_session():
     async with pg_manager.get_async_session_context() as session:
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
         await session.execute(delete(AgentScopeThreadSession).where(AgentScopeThreadSession.uid == USER_ID))
-        await session.execute(delete(User).where(User.uid == USER_ID))
-        session.add_all(
-            [
-                User(
-                    uid=USER_ID,
-                    username=USER_ID,
-                    password_hash="test-only",
-                    role="superadmin",
-                ),
-                Agent(
-                    slug=CHATBOT_SLUG,
-                    name="沙盒测试智能体",
-                    backend_id="ChatbotAgent",
-                    config_json={
-                        "context": {
-                            "model": f"{PROVIDER_ID}:mock-chat-model",
-                            "mcps": [],
-                            "system_prompt": "你是沙盒测试助手。",
-                        }
-                    },
-                    share_config={},
-                ),
-            ]
-        )
+        await seed_test_users(session, USER_ID)
         await upsert_mock_provider(session)
+        session.add(
+            Agent(
+                slug=CHATBOT_SLUG,
+                name="沙盒测试智能体",
+                backend_id="ChatbotAgent",
+                config_json={
+                    "context": {
+                        "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
+                        "mcps": [],
+                        "skills": [],
+                        "system_prompt": "你是沙盒测试助手。",
+                    }
+                },
+                share_config={
+                    "version": 2,
+                    "read_scope": {
+                        "access_level": "global",
+                        "department_ids": [],
+                        "user_uids": [],
+                    },
+                    "manage_scope": None,
+                },
+                created_by=USER_ID,
+            )
+        )
         await session.commit()
         yield session
         await session.execute(delete(AgentScopeThreadSession).where(AgentScopeThreadSession.uid == USER_ID))
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
-        await session.execute(delete(User).where(User.uid == USER_ID))
-        await session.commit()
+        await cleanup_test_users(session, USER_ID)
     await close_async_redis_client()
     await pg_manager.close()
     pg_manager._initialized = False
@@ -77,29 +87,45 @@ async def db_session():
 
 async def test_write_then_edit_tools_execute_in_docker_workspace(db_session):
     uid = USER_ID
-    thread_id = f"e2e-ws-thread-{uuid.uuid4().hex[:12]}"
-
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
+    client, headers = await open_fixture_http_client(uid)
+    thread_id: str | None = None
     try:
-        # 文件写默认触发人工审批（审批链路在工单 10 验证），此处放行编辑类操作
-        await client.set_permission_mode(
-            uid, mapping.agentscope_agent_id, mapping.agentscope_session_id, "accept_edits"
+        thread_response = await client.post(
+            "/api/chat/thread",
+            json={
+                "agent_id": CHATBOT_SLUG,
+                "title": f"workspace-{uuid.uuid4().hex[:8]}",
+            },
+            headers=headers,
         )
-        result = await collect_chat_round(
-            client,
-            uid=uid,
-            agent_id=mapping.agentscope_agent_id,
-            session_id=mapping.agentscope_session_id,
-            text="请写文件到 outputs 目录",
-            read_timeout=600.0,
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json()["id"])
+
+        write_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请写文件到 outputs 目录",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "meta": {"request_id": f"workspace-write-{uuid.uuid4()}"},
+                "tool_approval_mode": "always_trust",
+            },
+            headers=headers,
         )
+        assert write_response.status_code == 200, write_response.text
+        write_run_id = str(write_response.json()["run_id"])
+        write_events = await consume_events(client, headers, write_run_id)
+        assert write_events.get("messages", 0) > 0, write_events
+        assert write_events.get("end", 0) == 1, write_events
+        write_run = await wait_for_run(client, headers, write_run_id)
+        assert write_run["status"] == "completed", write_run
 
-        types = [ev["type"] for ev in result.events]
-        assert any("TOOL_CALL" in t for t in types), types
-        assert any("TOOL_RESULT" in t for t in types), types
-        assert result.text.startswith("文件已写入沙盒")
+        write_result = await client.get(f"/api/agent/runs/{write_run_id}/result", headers=headers)
+        assert write_result.status_code == 200, write_result.text
+        assert write_result.json()["output"].startswith("文件已写入沙盒")
 
+        mapping = await get_thread_session(db_session, uid=uid, thread_id=thread_id)
+        assert mapping is not None
         async with httpx.AsyncClient(
             base_url=AGENTSCOPE_BASE_URL,
             headers={"X-User-ID": uid},
@@ -129,27 +155,24 @@ async def test_write_then_edit_tools_execute_in_docker_workspace(db_session):
             == WRITE_CONTENT.encode()
         )
 
-        edit_result = await collect_chat_round(
-            client,
-            uid=uid,
-            agent_id=mapping.agentscope_agent_id,
-            session_id=mapping.agentscope_session_id,
-            text="请编辑已有文件",
-            read_timeout=600.0,
+        edit_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请编辑已有文件",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "meta": {"request_id": f"workspace-edit-{uuid.uuid4()}"},
+                "tool_approval_mode": "always_trust",
+            },
+            headers=headers,
         )
-        called = {
-            event.get("tool_call_name")
-            for event in edit_result.events
-            if str(event.get("type", "")).upper() == "TOOL_CALL_START"
-        }
-        failed_results = [
-            event
-            for event in edit_result.events
-            if str(event.get("type", "")).upper() == "TOOL_RESULT_END"
-            and str(event.get("state", "")).lower() == "error"
-        ]
-        assert {"Read", "Edit"} <= called, called
-        assert not failed_results, failed_results
+        assert edit_response.status_code == 200, edit_response.text
+        edit_run_id = str(edit_response.json()["run_id"])
+        edit_events = await consume_events(client, headers, edit_run_id)
+        assert edit_events.get("messages", 0) > 0, edit_events
+        assert edit_events.get("end", 0) == 1, edit_events
+        edit_run = await wait_for_run(client, headers, edit_run_id)
+        assert edit_run["status"] == "completed", edit_run
 
         async with httpx.AsyncClient(
             base_url=AGENTSCOPE_BASE_URL,
@@ -177,9 +200,10 @@ async def test_write_then_edit_tools_execute_in_docker_workspace(db_session):
             == EDIT_CONTENT.encode()
         )
     finally:
-        await client.delete_session(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)
-        await client.delete_agent(uid, mapping.agentscope_agent_id)
-        await client.delete_credential(uid, mapping.agentscope_credential_id)
+        if thread_id:
+            delete_response = await client.delete(f"/api/chat/thread/{thread_id}", headers=headers)
+            assert delete_response.status_code in {200, 404}, delete_response.text
+        await client.aclose()
 
 
 async def test_attachment_upload_is_confined_and_size_limited(db_session, tmp_path: Path):

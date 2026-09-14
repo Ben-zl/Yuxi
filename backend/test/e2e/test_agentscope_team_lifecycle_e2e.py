@@ -10,7 +10,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from test.e2e.agentscope_e2e_fixtures import PROVIDER_ID, upsert_mock_provider
+from test.e2e.agentscope_e2e_fixtures import PROVIDER_RESOURCE_ID, upsert_mock_provider
 from test.e2e.test_agent_async_e2e import _create_thread, _delete_agent, _wait_for_run
 from test.e2e.test_agent_question_e2e import _consume_until_end
 from yuxi.storage.postgres.manager import pg_manager
@@ -68,7 +68,7 @@ async def test_team_worker_projects_child_thread_run_history_and_binding(
     assert refresh.status_code == 200, refresh.text
 
     base_context = {
-        "model": f"{PROVIDER_ID}:mock-chat-model",
+        "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
         "tools": [],
         "knowledges": [],
         "mcps": [],
@@ -191,7 +191,7 @@ async def test_team_worker_reports_missing_input_without_direct_user_question(
     assert refresh.status_code == 200, refresh.text
 
     base_context = {
-        "model": f"{PROVIDER_ID}:mock-chat-model",
+        "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
         "knowledges": [],
         "mcps": [],
         "skills": [],
@@ -311,7 +311,7 @@ async def test_two_workers_do_not_create_broadcast_acknowledgement_loop(
     assert refresh.status_code == 200, refresh.text
 
     base_context = {
-        "model": f"{PROVIDER_ID}:mock-chat-model",
+        "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
         "tools": [],
         "knowledges": [],
         "mcps": [],

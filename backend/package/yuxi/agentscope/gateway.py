@@ -207,14 +207,17 @@ async def collect_run_events(
             continue
 
         if historical_reply_ids is not None:
-            if not event_reply_id:
+            # AgentScope 的工具事件在部分版本没有 reply_id，但它们仍属于
+            # 当前已确认的新回复；只过滤无归属的普通事件，不能丢失工具调用。
+            is_tool_event = event_type.startswith("TOOL_")
+            if not event_reply_id and not is_tool_event:
                 continue
             if event_type == "REPLY_START":
                 if event_reply_id in historical_reply_ids:
                     continue
                 if active_reply_id is None or pending_terminal is not None:
                     active_reply_id = event_reply_id
-            if active_reply_id is None or event_reply_id != active_reply_id:
+            if active_reply_id is None or (event_reply_id and event_reply_id != active_reply_id):
                 continue
         elif pending_terminal is not None and not event_reply_id:
             continue

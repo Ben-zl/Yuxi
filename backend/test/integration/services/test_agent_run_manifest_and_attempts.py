@@ -132,17 +132,18 @@ async def test_run_fact_schema_evolution_is_idempotent(fact_database):
         attempt_table_exists = await connection.scalar(
             text("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'agent_run_attempts')")
         )
-        unique_index_exists = await connection.scalar(
+        unique_constraint_exists = await connection.scalar(
             text(
-                "SELECT EXISTS (SELECT 1 FROM pg_indexes "
-                "WHERE tablename = 'agent_run_attempts' "
-                "AND indexname = 'uq_agent_run_attempts_run_attempt_no')"
+                "SELECT EXISTS ("
+                "SELECT 1 FROM pg_constraint "
+                "WHERE conrelid = 'agent_run_attempts'::regclass "
+                "AND contype = 'u' "
+                "AND pg_get_constraintdef(oid) = 'UNIQUE (run_id, attempt_no)')"
             )
         )
-
     assert columns == {"manifest", "manifest_fingerprint", "manifest_recorded_at"}
     assert attempt_table_exists is True
-    assert unique_index_exists is True
+    assert unique_constraint_exists is True
 
 
 async def test_attempt_history_survives_retry_takeover_and_reconciliation(fact_database):

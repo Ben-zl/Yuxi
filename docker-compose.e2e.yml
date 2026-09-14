@@ -1,0 +1,39 @@
+services:
+  api:
+    command:
+      - uv
+      - run
+      - --no-sync
+      - --no-dev
+      - uvicorn
+      - server.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5050"
+      - --timeout-graceful-shutdown
+      - "5"
+
+  worker:
+    command:
+      - uv
+      - run
+      - --no-sync
+      - --no-dev
+      - arq
+      - server.worker_main.WorkerSettings
+
+  agentscope:
+    command:
+      - uv
+      - run
+      - --no-sync
+      - --no-dev
+      - uvicorn
+      - server.agentscope_main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8100"
+      - --timeout-graceful-shutdown
+      - "5"

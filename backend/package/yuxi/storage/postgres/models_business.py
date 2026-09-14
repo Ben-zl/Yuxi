@@ -1309,12 +1309,12 @@ class AgentRunAttempt(Base):
         Index("ix_agent_run_attempts_open", "run_id", "finished_at"),
     )
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid4()))
     run_id = Column(String(64), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False)
     attempt_no = Column(Integer, nullable=False)
-    worker_id = Column(String(128), nullable=False)
+    worker_id = Column("owner_id", String(128), nullable=False)
     started_at = Column(DateTime, nullable=False)
-    heartbeat_at = Column(DateTime, nullable=True)
+    heartbeat_at = Column("last_heartbeat_at", DateTime, nullable=True)
     lease_expires_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     outcome = Column(String(32), nullable=True)

@@ -36,11 +36,12 @@ def _json_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
-async def _create_agent(client: httpx.AsyncClient, headers: dict[str, str], uid: str) -> str:
-    default_response = await client.get("/api/agent/default", headers=headers)
-    assert default_response.status_code == 200, default_response.text
-    default_context = ((default_response.json().get("agent") or {}).get("config_json") or {}).get("context") or {}
-
+async def _create_agent(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    uid: str,
+    model_spec: str,
+) -> str:
     slug = f"e2e-agent-call-{uuid.uuid4().hex[:8]}"
     context: dict[str, Any] = {
         "system_prompt": (
@@ -52,8 +53,7 @@ async def _create_agent(client: httpx.AsyncClient, headers: dict[str, str], uid:
         "skills": [],
         "subagents": [],
     }
-    if default_context.get("model"):
-        context["model"] = default_context["model"]
+    context["model"] = model_spec
 
     response = await client.post(
         "/api/agent",
@@ -136,6 +136,10 @@ async def _load_run_metadata(run_id: str) -> dict[str, Any]:
                 ar.status,
                 ar.run_type,
                 ar.agent_slug,
+                ar.source,
+                ar.channel,
+                ar.external_id,
+                ar.origin_metadata,
                 conv.extra_metadata AS conversation_metadata,
                 input_msg.extra_metadata AS input_metadata,
                 input_msg.content AS input_content
@@ -152,6 +156,10 @@ async def _load_run_metadata(run_id: str) -> dict[str, Any]:
             "status": row["status"],
             "run_type": row["run_type"],
             "agent_slug": row["agent_slug"],
+            "source": row["source"],
+            "channel": row["channel"],
+            "external_id": row["external_id"],
+            "origin_metadata": _json_dict(row["origin_metadata"]),
             "conversation_metadata": _json_dict(row["conversation_metadata"]),
             "input_metadata": _json_dict(row["input_metadata"]),
             "input_content": row["input_content"],
@@ -164,9 +172,10 @@ async def test_agent_eval_and_agent_call_entrypoints_share_run_invocation_flow(
     e2e_client: httpx.AsyncClient,
     e2e_headers: dict[str, str],
     e2e_agent_context: dict[str, str],
+    e2e_mock_model_spec: str,
 ):
     uid = e2e_agent_context["uid"]
-    agent_slug = await _create_agent(e2e_client, e2e_headers, uid)
+    agent_slug = await _create_agent(e2e_client, e2e_headers, uid, e2e_mock_model_spec)
     agent_call_run_id: str | None = None
     agent_call_completed = False
 
@@ -207,9 +216,10 @@ async def test_agent_eval_and_agent_call_entrypoints_share_run_invocation_flow(
         eval_run = await _load_run_metadata(str(eval_run_id))
         assert eval_run["status"] == "completed"
         assert eval_run["run_type"] == "chat"
-        assert eval_run["conversation_metadata"]["source"] == "agent_evaluation"
-        assert eval_run["conversation_metadata"]["agent_invocation_meta"] == {"evaluation": eval_metadata}
-        assert eval_run["input_metadata"]["source"] == "agent_evaluation"
+        assert eval_run["source"] == "agent_evaluation"
+        assert eval_run["channel"] == "api"
+        assert eval_run["external_id"] == eval_request_id
+        assert eval_run["origin_metadata"] == {"agent_invocation_meta": {"evaluation": eval_metadata}}
         assert eval_run["input_metadata"]["agent_invocation_meta"] == {"evaluation": eval_metadata}
         assert "evaluation" not in eval_run["input_metadata"]
 
@@ -258,9 +268,10 @@ async def test_agent_eval_and_agent_call_entrypoints_share_run_invocation_flow(
         agent_call_run = await _load_run_metadata(str(agent_call_run_id))
         assert agent_call_run["status"] == "completed"
         assert agent_call_run["run_type"] == "chat"
-        assert agent_call_run["conversation_metadata"]["source"] == "agent_call"
-        assert "agent_invocation_meta" not in agent_call_run["conversation_metadata"]
-        assert agent_call_run["input_metadata"]["source"] == "agent_call"
+        assert agent_call_run["source"] == "agent_call"
+        assert agent_call_run["channel"] == "api"
+        assert agent_call_run["external_id"] == agent_call_request_id
+        assert agent_call_run["origin_metadata"] == {}
         assert "agent_invocation_meta" not in agent_call_run["input_metadata"]
         assert "custom_variables" not in agent_call_run["input_metadata"]
     finally:

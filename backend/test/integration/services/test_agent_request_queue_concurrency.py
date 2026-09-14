@@ -6,6 +6,7 @@ import asyncio
 import os
 import uuid
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -31,11 +32,35 @@ from yuxi.utils.datetime_utils import utc_now_naive
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
+def _patch_intake_runtime_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """并发测试隔离模型与运行快照解析，保留事务、锁和队列持久化语义。"""
+    monkeypatch.setattr(
+        agent_request_queue_service,
+        "resolve_agent_run_config",
+        lambda *args, **kwargs: ("model", "default"),
+    )
+
+    async def _build_manifest(**kwargs):
+        return SimpleNamespace(
+            manifest={
+                "manifest_version": 1,
+                "runtime_snapshot": {
+                    "id": "concurrency-fixture",
+                    "fingerprint": "concurrency-fixture",
+                },
+            }
+        )
+
+    monkeypatch.setattr(
+        agent_request_queue_service,
+        "build_submission_manifest_result",
+        _build_manifest,
+    )
+
+
 async def _cleanup_queue_test_thread(session_factory, engine, thread_id: str) -> None:
     async with session_factory() as db:
-        conversation = await db.scalar(
-            select(Conversation).where(Conversation.thread_id == thread_id)
-        )
+        conversation = await db.scalar(select(Conversation).where(Conversation.thread_id == thread_id))
         conversation_id = conversation.id if conversation is not None else None
         project_id = conversation.project_id if conversation is not None else None
         uid = conversation.uid if conversation is not None else None
@@ -81,7 +106,7 @@ async def test_concurrent_reject_requests_never_enter_queue(monkeypatch: pytest.
     engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
+    _patch_intake_runtime_boundaries(monkeypatch)
 
     async with session_factory() as db:
         project_id = await _add_project_and_user(db, uid)
@@ -97,6 +122,7 @@ async def test_concurrent_reject_requests_never_enter_queue(monkeypatch: pytest.
 
     async def submit(request_id: str):
         async with session_factory() as db:
+            user = await db.scalar(select(User).where(User.uid == uid))
             result = await agent_request_queue_service.intake_request(
                 db=db,
                 request_id=request_id,
@@ -107,6 +133,7 @@ async def test_concurrent_reject_requests_never_enter_queue(monkeypatch: pytest.
                 input_message=build_chat_input_message(request_id),
                 agent_item=MagicMock(),
                 agent_backend=MagicMock(),
+                user=user,
             )
             await db.commit()
             return result
@@ -159,7 +186,7 @@ async def test_concurrent_steer_requests_keep_one_pending(monkeypatch: pytest.Mo
     engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
+    _patch_intake_runtime_boundaries(monkeypatch)
 
     async with session_factory() as db:
         project_id = await _add_project_and_user(db, uid)
@@ -213,6 +240,7 @@ async def test_concurrent_steer_requests_keep_one_pending(monkeypatch: pytest.Mo
     async def submit(request_id: str):
         async with session_factory() as db:
             try:
+                user = await db.scalar(select(User).where(User.uid == uid))
                 result = await agent_request_queue_service.intake_request(
                     db=db,
                     request_id=request_id,
@@ -223,6 +251,7 @@ async def test_concurrent_steer_requests_keep_one_pending(monkeypatch: pytest.Mo
                     input_message=build_chat_input_message(request_id),
                     agent_item=MagicMock(),
                     agent_backend=MagicMock(),
+                    user=user,
                 )
                 await db.commit()
                 return result
@@ -263,7 +292,7 @@ async def test_concurrent_enqueue_dispatches_fifo_head(monkeypatch: pytest.Monke
     engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
+    _patch_intake_runtime_boundaries(monkeypatch)
 
     original_create = AgentRunRequestRepository.create
     first_request_created = asyncio.Event()
@@ -294,6 +323,7 @@ async def test_concurrent_enqueue_dispatches_fifo_head(monkeypatch: pytest.Monke
 
     async def submit(request_id: str):
         async with session_factory() as db:
+            user = await db.scalar(select(User).where(User.uid == uid))
             result = await agent_request_queue_service.intake_request(
                 db=db,
                 request_id=request_id,
@@ -304,6 +334,7 @@ async def test_concurrent_enqueue_dispatches_fifo_head(monkeypatch: pytest.Monke
                 input_message=build_chat_input_message(request_id),
                 agent_item=MagicMock(),
                 agent_backend=MagicMock(),
+                user=user,
             )
             await db.commit()
             if request_id == request_ids[1]:
@@ -657,7 +688,7 @@ async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict
     engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *args: ("model", "default"))
+    _patch_intake_runtime_boundaries(monkeypatch)
 
     async with session_factory() as db:
         db.add(User(username=uid, uid=uid, password_hash="test"))
@@ -680,6 +711,7 @@ async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict
     async def submit(thread_id: str):
         async with session_factory() as db:
             try:
+                user = await db.scalar(select(User).where(User.uid == uid))
                 result = await agent_request_queue_service.intake_request(
                     db=db,
                     request_id=request_id,
@@ -690,6 +722,7 @@ async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict
                     input_message=build_chat_input_message(thread_id),
                     agent_item=MagicMock(),
                     agent_backend=MagicMock(),
+                    user=user,
                 )
                 await db.commit()
                 return result
@@ -721,11 +754,7 @@ async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict
     finally:
         async with session_factory() as db:
             project_ids = list(
-                (
-                    await db.scalars(
-                        select(Conversation.project_id).where(Conversation.thread_id.in_(thread_ids))
-                    )
-                ).all()
+                (await db.scalars(select(Conversation.project_id).where(Conversation.thread_id.in_(thread_ids)))).all()
             )
             now = utc_now_naive()
             await db.execute(

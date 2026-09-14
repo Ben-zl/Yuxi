@@ -10,9 +10,6 @@ from typing import Any
 import httpx
 import pytest
 
-from test.e2e.agentscope_e2e_fixtures import PROVIDER_ID, upsert_mock_provider
-from yuxi.storage.postgres.manager import pg_manager
-
 pytestmark = [pytest.mark.asyncio, pytest.mark.e2e, pytest.mark.slow]
 
 
@@ -36,17 +33,12 @@ async def _create_steer_agent(
     client: httpx.AsyncClient,
     headers: dict[str, str],
     uid: str,
+    model_spec: str,
 ) -> str:
     """创建只开放沙盒基础能力的临时真实模型 Agent。"""
-    pg_manager.initialize()
-    async with pg_manager.get_async_session_context() as db:
-        await upsert_mock_provider(db)
-    refresh = await client.post("/api/system/model-providers/models/cache/refresh", headers=headers)
-    assert refresh.status_code == 200, refresh.text
-
     slug = f"e2e-steer-agent-{uuid.uuid4().hex[:8]}"
     context: dict[str, Any] = {
-        "model": f"{PROVIDER_ID}:mock-chat-model",
+        "model": model_spec,
         "system_prompt": (
             "你是 Steer 端到端测试智能体。用户消息以 SLOW_TOOL 开头时，必须立即且仅调用一次 Bash，"
             "command 必须是 `sleep 12 && echo TOOL_FINISHED`；工具结束后原任务本应回答 OLD_SHOULD_NOT_COMPLETE。"
@@ -142,10 +134,16 @@ async def test_real_tool_steer_runs_next_from_checkpoint(
     e2e_client: httpx.AsyncClient,
     e2e_headers: dict[str, str],
     e2e_agent_context: dict[str, str],
+    e2e_mock_model_spec: str,
 ):
     """工具不中断，安全点后旧 Run 中断并由 Steer 作为下一条请求执行。"""
     uid = e2e_agent_context["uid"]
-    agent_slug = await _create_steer_agent(e2e_client, e2e_headers, uid)
+    agent_slug = await _create_steer_agent(
+        e2e_client,
+        e2e_headers,
+        uid,
+        e2e_mock_model_spec,
+    )
     thread_id = await _create_thread(e2e_client, e2e_headers, agent_slug)
 
     try:

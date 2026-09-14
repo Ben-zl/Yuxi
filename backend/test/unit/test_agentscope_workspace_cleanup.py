@@ -91,6 +91,45 @@ async def test_destroy_rejects_existing_session_and_missing_workspace_id(tmp_pat
         await destroy_thread_workspaces(SimpleNamespace(), **kwargs)
 
 
+async def test_destroy_legacy_docker_path_without_workspace_id_after_session_deleted(tmp_path, monkeypatch):
+    """历史 Docker 映射缺少 workspace_id 时仍按 uid/agent_id 回收目录。"""
+    mapping = SimpleNamespace(
+        agentscope_agent_id="legacy-agent",
+        agentscope_session_id="legacy-session",
+        agentscope_workspace_id=None,
+    )
+    monkeypatch.setattr(workspace_cleanup, "get_thread_session", AsyncMock(return_value=mapping))
+    monkeypatch.setattr(
+        workspace_cleanup,
+        "AgentScopeTeamWorkerRepository",
+        lambda _db: SimpleNamespace(list_for_parent_thread=AsyncMock(return_value=[])),
+    )
+    remove_labeled = AsyncMock(return_value=set())
+    monkeypatch.setattr(workspace_cleanup, "_remove_labeled_containers", remove_labeled)
+    legacy_path = tmp_path / "u" / "legacy-agent"
+    legacy_path.mkdir(parents=True)
+    (legacy_path / "file.txt").write_text("data", encoding="utf-8")
+    manager = SimpleNamespace(close=AsyncMock())
+
+    result = await destroy_thread_workspaces(
+        SimpleNamespace(),
+        storage=SimpleNamespace(get_session=AsyncMock(return_value=None)),
+        workspace_manager=manager,
+        uid="u",
+        thread_id="thread",
+        base_dir=str(tmp_path),
+        backend="docker",
+    )
+
+    assert result == {
+        "destroyed_workspace_ids": [],
+        "already_absent_workspace_ids": [],
+    }
+    assert not legacy_path.exists()
+    manager.close.assert_not_awaited()
+    remove_labeled.assert_awaited_once_with(set())
+
+
 async def test_destroy_rejects_symlink_workspace(tmp_path, monkeypatch):
     """清理不得跟随符号链接删除 base 之外的数据。"""
     outside = tmp_path.parent / f"{tmp_path.name}-outside"

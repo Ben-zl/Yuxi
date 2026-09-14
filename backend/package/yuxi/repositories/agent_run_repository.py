@@ -428,14 +428,11 @@ class AgentRunRepository:
             return run, False
 
         current_time = now or utc_now_naive()
-        expired_claim = (
-            run.status == "running"
-            and (run.lease_expires_at is None or run.lease_expires_at <= current_time)
+        expired_claim = run.status == "running" and (
+            run.lease_expires_at is None or run.lease_expires_at <= current_time
         )
         initial_claim = (
-            run.status == "pending"
-            or (run.status == "cancel_requested" and run.worker_id is None)
-            or expired_claim
+            run.status == "pending" or (run.status == "cancel_requested" and run.worker_id is None) or expired_claim
         )
         same_live_owner = (
             run.status in LEASED_RUN_STATUSES
@@ -655,18 +652,21 @@ class AgentRunRepository:
         run_id: str,
         uid: str,
         cascade_descendants: bool,
-    ) -> tuple[AgentRun | None, list[str]]:
+    ) -> tuple[AgentRun | None, list[str], bool]:
         """按 root 到 descendants 的固定锁顺序取消一棵执行树。"""
         run = await self.lock_run_for_user(run_id, str(uid))
         if run is None:
-            return None, []
+            return None, [], False
+        cancelled_interrupted = run.status == "interrupted" or (
+            run.status == "cancelled" and run.error_type == "cancelled" and run.error_message == "对话已取消"
+        )
         await self._request_cancel_locked(run)
         cancelled_ids = [run.id]
         if cascade_descendants:
             cancelled_ids.extend(
                 child_id for child_id, _thread_id in await self.cancel_active_execution_tree_descendants(run)
             )
-        return run, cancelled_ids
+        return run, cancelled_ids, cancelled_interrupted
 
     async def request_cancel(self, run_id: str) -> AgentRun | None:
         """请求停止一条 Run；执行中的 Run 保留给 owner 收束终态。"""
@@ -679,9 +679,19 @@ class AgentRunRepository:
 
     async def _request_cancel_locked(self, run: AgentRun) -> None:
         """转换一条已由当前事务锁定的 Run。"""
+        current_time = utc_now_naive()
+        if run.status == "interrupted":
+            run.status = "cancelled"
+            run.error_type = "cancelled"
+            run.error_message = "对话已取消"
+            run.finished_at = current_time
+            run.updated_at = current_time
+            run.runtime_cleanup_pending = False
+            await self._project_input_delivery_status(run)
+            await self.db.flush()
+            return
         if run.status in TERMINAL_RUN_STATUSES:
             return
-        current_time = utc_now_naive()
         if run.status == "pending" and run.worker_id is None and run.started_at is None:
             run.status = "cancelled"
             run.error_type = "cancelled"
@@ -970,10 +980,7 @@ class AgentRunRepository:
     async def _lock_run(self, run_id: str) -> AgentRun | None:
         """加锁并以 PostgreSQL 当前行刷新长会话中的陈旧 Run 状态。"""
         statement = (
-            select(AgentRun)
-            .where(AgentRun.id == run_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
+            select(AgentRun).where(AgentRun.id == run_id).with_for_update().execution_options(populate_existing=True)
         )
         result = await self.db.execute(statement)
         return result.scalar_one_or_none()

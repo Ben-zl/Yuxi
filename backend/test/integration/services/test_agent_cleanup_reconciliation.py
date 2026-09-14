@@ -48,13 +48,15 @@ async def test_deleted_agent_memory_is_durable_retried_and_slug_isolated():
 
     try:
         async with pg_manager.get_async_session_context() as db:
-            db.add(User(username=uid, uid=uid, password_hash="test-only", role="user"))
+            creator = User(username=uid, uid=uid, password_hash="test-only", role="user")
+            db.add(creator)
             await db.flush()
             agent = await AgentRepository(db).create(
                 name="cleanup source",
                 slug=agent_slug,
                 backend_id="ChatbotAgent",
                 created_by=uid,
+                creator=creator,
             )
             created_slugs.append(agent.slug)
 
@@ -84,11 +86,13 @@ async def test_deleted_agent_memory_is_durable_retried_and_slug_isolated():
             assert await db.scalar(
                 select(AgentMemoryScope.workspace_id).where(AgentMemoryScope.agent_slug == agent_slug)
             ) == memory_scope_identity(uid, agent_slug)
+            creator = await db.scalar(select(User).where(User.uid == uid))
             replacement = await AgentRepository(db).create(
                 name="cleanup replacement",
                 slug=agent_slug,
                 backend_id="ChatbotAgent",
                 created_by=uid,
+                creator=creator,
             )
             created_slugs.append(replacement.slug)
 
@@ -103,11 +107,13 @@ async def test_deleted_agent_memory_is_durable_retried_and_slug_isolated():
                 await db.scalar(select(AgentMemoryScope.workspace_id).where(AgentMemoryScope.agent_slug == agent_slug))
                 is None
             )
+            creator = await db.scalar(select(User).where(User.uid == uid))
             reused = await AgentRepository(db).create(
                 name="cleanup reused",
                 slug=agent_slug,
                 backend_id="ChatbotAgent",
                 created_by=uid,
+                creator=creator,
             )
             created_slugs.append(reused.slug)
 

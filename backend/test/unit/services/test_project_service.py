@@ -12,9 +12,10 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 class _Db:
-    def __init__(self):
+    def __init__(self, active_workdirs=None):
         self.items = []
         self.commits = 0
+        self.active_workdirs = active_workdirs or []
 
     def add(self, item):
         self.items.append(item)
@@ -29,7 +30,7 @@ class _Db:
         return None
 
     async def execute(self, _statement, _params=None):
-        return None
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: self.active_workdirs))
 
     async def scalar(self, _statement):
         return None
@@ -121,6 +122,31 @@ async def test_multiple_projects_can_share_one_existing_directory(monkeypatch, t
 
     assert first["id"] != second["id"]
     assert first["workdir_path"] == second["workdir_path"] == "shared"
+
+
+@pytest.mark.parametrize(
+    ("existing", "candidate"),
+    [
+        ("clients", "clients/acme"),
+        ("clients/acme", "clients"),
+        ("saved_artifacts", "saved_artifacts/client"),
+    ],
+)
+async def test_linked_project_rejects_strictly_overlapping_owner(monkeypatch, tmp_path, existing, candidate):
+    """不同 Project 不能把祖先和子目录都挂为可写 Workdir。"""
+    monkeypatch.setattr("yuxi.workspace.paths.get_user_data_dir", lambda: tmp_path)
+    ensure_user_workspace("user-1")
+    (user_workspace_dir("user-1") / candidate).mkdir(parents=True, exist_ok=True)
+    with pytest.raises(HTTPException) as exc:
+        await svc.create_project_view(
+            uid="user-1",
+            request_id="overlap",
+            name="Overlap",
+            directory_mode="linked",
+            workdir_path=candidate,
+            db=_Db(active_workdirs=[existing]),
+        )
+    assert exc.value.status_code == 409
 
 
 @pytest.mark.parametrize(

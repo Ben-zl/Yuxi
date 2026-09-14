@@ -36,8 +36,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agents.buildin import agent_manager
 from yuxi.agents.tool_approval import DEFAULT_TOOL_APPROVAL_MODE, normalize_tool_approval_mode
 from yuxi.config.options import system_options
-from yuxi.models.providers.cache import model_cache
+from yuxi.models.providers.cache import ModelInfo, model_cache
 from yuxi.models.providers.repository import get_model_provider_by_resource_id
+from yuxi.models.providers.service import resolve_api_key
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_output_repository import AgentRunOutputRepository
 from yuxi.repositories.agent_run_repository import TERMINAL_RUN_STATUSES, AgentRunRepository
@@ -105,6 +106,14 @@ class AgentRunWaitTimeout(Exception):
         super().__init__(f"agent run {run_id} is still {status} after waiting")
 
 
+class AgentRunWaitUnavailable(RuntimeError):
+    """同步等待依赖暂时不可用，不能归类为运行超时。"""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 def load_agent_run_context(agent_item, agent_backend):
     """用 Agent 配置的 context 片段实例化并填充运行上下文，供 run 解析器读取配置字段。"""
     context = agent_backend.context_schema()
@@ -140,6 +149,35 @@ async def resolve_agent_run_model_spec(
     if info is None:
         canonical_spec = model_cache.canonicalize_spec(model_spec)
         info = model_cache.get_model_info(canonical_spec) if canonical_spec else None
+    if info is None and db is not None and user is not None and ":" in model_spec:
+        resource_id, model_id = model_spec.split(":", 1)
+        from yuxi.models.providers.repository import get_model_provider_for_user
+
+        provider = await get_model_provider_for_user(db, resource_id, user)
+        if provider is not None and provider.is_enabled:
+            configured_model = next(
+                (
+                    item
+                    for item in (provider.enabled_models or [])
+                    if isinstance(item, dict) and item.get("id") == model_id
+                ),
+                None,
+            )
+            if configured_model is not None and configured_model.get("type", "chat") == "chat":
+                info = ModelInfo(
+                    provider_id=provider.provider_id,
+                    resource_id=provider.resource_id,
+                    model_id=model_id,
+                    model_type="chat",
+                    display_name=configured_model.get("display_name", model_id),
+                    api_key=resolve_api_key(provider) or "",
+                    base_url=configured_model.get("base_url_override") or provider.base_url,
+                    provider_type=provider.provider_type,
+                    headers=dict(provider.headers_json or {}),
+                    extra=dict(provider.extra_json or {}),
+                    request_body_overrides=dict(configured_model.get("request_body_overrides") or {}),
+                    input_modalities=tuple(configured_model.get("input_modalities") or ()),
+                )
     if not info or info.model_type != "chat":
         raise HTTPException(status_code=422, detail=f"未找到可用聊天模型: '{model_spec}'")
     if user is not None and db is not None and hasattr(info, "resource_id"):
@@ -1013,7 +1051,13 @@ async def await_agent_run_result(*, run_id: str, current_uid: str) -> dict:
     因此排空即等待，无需额外轮询。等待上限继承事件流内部的 ``SSE_MAX_CONNECTION_MINUTES``。
     如果等待结束后 run 仍非终态，抛出 ``AgentRunWaitTimeout``，避免调用方把非终态误当最终结果。
     """
-    async for _ in stream_agent_run_events(run_id=run_id, after_seq="0-0", current_uid=current_uid, verbose=False):
+    async for _ in stream_agent_run_events(
+        run_id=run_id,
+        after_seq="0-0",
+        current_uid=current_uid,
+        verbose=False,
+        raise_on_error=True,
+    ):
         pass
     result = await load_agent_run_result(run_id=run_id, current_uid=current_uid)
     if str(result.get("status") or "") not in TERMINAL_RUN_STATUSES:
@@ -1030,7 +1074,7 @@ async def request_cancel_agent_run(
 ):
     """请求取消一个 run，并可同时向仍活跃的子 run 发布取消信号。"""
     repo = AgentRunRepository(db)
-    run, cancelled_ids = await repo.request_cancel_execution_tree(
+    run, cancelled_ids, cancelled_interrupted = await repo.request_cancel_execution_tree(
         run_id=run_id,
         uid=str(current_uid),
         cascade_descendants=cascade_children,
@@ -1038,6 +1082,19 @@ async def request_cancel_agent_run(
     if run is None:
         raise HTTPException(status_code=404, detail="运行任务不存在")
     await db.commit()
+    pending_clear_error = None
+    if getattr(run, "conversation_thread_id", None):
+        from yuxi.agentscope.thread_guard import clear_pending_confirm
+
+        try:
+            await clear_pending_confirm(
+                run.conversation_thread_id,
+                expected_run_id=run.id,
+                include_legacy=cancelled_interrupted,
+            )
+        except Exception as exc:
+            logger.warning("取消审批缓存清理失败 run={} type={}", run.id, type(exc).__name__)
+            pending_clear_error = exc
     from yuxi.agentscope.team_lifecycle import interrupt_team_worker_runs
 
     try:
@@ -1046,6 +1103,18 @@ async def request_cancel_agent_run(
         # 取消事实已经提交；worker 中断属于尽力而为的外部信号，失败时仍需继续发布 ARQ 取消信号。
         logger.warning("转发 Team worker 取消信号失败：%s", exc)
     await asyncio.gather(*(publish_cancel_signal(cid) for cid in cancelled_ids))
+    if pending_clear_error is not None:
+        raise HTTPException(status_code=503, detail="取消已提交，审批缓存清理暂不可用；请重试")
+    if cancelled_interrupted or (
+        run.status == "cancelled" and run.error_type == "cancelled" and run.error_message == "对话已在执行前取消"
+    ):
+        from yuxi.services.agent_request_queue_service import dispatch_next_request
+
+        await dispatch_next_request(
+            uid=str(current_uid),
+            agent_slug=run.agent_slug,
+            thread_id=run.conversation_thread_id,
+        )
     return run
 
 
@@ -1061,6 +1130,7 @@ async def stream_agent_run_events(
     after_seq: str,
     current_uid: str,
     verbose: bool = True,
+    raise_on_error: bool = False,
 ) -> AsyncIterator[str]:
     """按 SSE 格式读取 run 事件流；终结事件缺失时根据数据库状态补发 end。"""
     started_at = utc_now_naive()
@@ -1075,12 +1145,18 @@ async def stream_agent_run_events(
                     repo = AgentRunRepository(db)
                     run = await repo.get_run_for_user(run_id, str(current_uid))
                     if not run:
+                        if raise_on_error:
+                            raise AgentRunWaitUnavailable("run_not_found")
                         yield format_sse({"run_id": run_id, "message": "运行任务不存在"}, event="error")
                         return
             except asyncio.CancelledError:
                 raise
+            except AgentRunWaitUnavailable:
+                raise
             except Exception as e:
                 logger.warning(f"Run SSE DB error for run {run_id}: {e}")
+                if raise_on_error:
+                    raise AgentRunWaitUnavailable("db_error") from None
                 yield format_sse(
                     {
                         "run_id": run_id,
@@ -1095,6 +1171,8 @@ async def stream_agent_run_events(
                 events = await list_run_stream_events(run_id, after_seq=last_seq, limit=200)
             except Exception as e:
                 logger.warning(f"Run SSE redis error for run {run_id}: {e}")
+                if raise_on_error:
+                    raise AgentRunWaitUnavailable("redis_error") from None
                 yield format_sse(
                     {
                         "run_id": run_id,
@@ -1111,6 +1189,16 @@ async def stream_agent_run_events(
                 last_seq = seq
                 event_type = event.get("event_type") or "message"
                 envelope = event.get("payload") or {}
+                if event_type == "end":
+                    payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                    event_status = payload.get("status") if isinstance(payload, dict) else None
+                    accepted_statuses = {run.status, "error"} if run.status == "failed" else {run.status}
+                    if (
+                        run.status not in TERMINAL_RUN_STATUSES
+                        or bool(getattr(run, "runtime_cleanup_pending", False))
+                        or event_status not in accepted_statuses
+                    ):
+                        continue
                 if not verbose and isinstance(envelope, dict):
                     envelope = _compact_run_event_envelope(envelope)
                     if envelope is None:
@@ -1160,7 +1248,7 @@ async def stream_agent_run_events(
 
             await asyncio.sleep(SSE_POLL_INTERVAL_SECONDS)
     except asyncio.CancelledError:
-        return
+        raise
 
 
 async def get_active_run_by_thread(*, thread_id: str, current_uid: str, db: AsyncSession) -> dict:

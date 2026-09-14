@@ -240,6 +240,7 @@ class TeamLifecycleModule:
             run = await AgentRunRepository(db).create_run(
                 run_id=str(uuid.uuid4()),
                 conversation_thread_id=child_thread_id,
+                runtime_scope_id=getattr(parent_run, "runtime_scope_id", None) or leader.thread_id,
                 agent_slug=subagent_slug,
                 uid=self.uid,
                 request_id=request_id,
@@ -632,6 +633,7 @@ class TeamLifecycleModule:
             run = await runs.create_run(
                 run_id=str(uuid.uuid4()),
                 conversation_thread_id=binding.child_thread_id,
+                runtime_scope_id=getattr(parent, "runtime_scope_id", None) or binding.parent_thread_id,
                 agent_slug=binding.subagent_slug,
                 uid=self.uid,
                 request_id=request_id,

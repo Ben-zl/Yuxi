@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agents.backends.paths import VIRTUAL_PERSONAL_SKILLS_PATH, VIRTUAL_SKILLS_PATH
 from yuxi.agents.skills.service import list_accessible_skills, normalize_string_list
+from yuxi.agentscope.skill_snapshot import MAX_SKILL_SNAPSHOT_BYTES
 from yuxi.config.runtime import lite_mode_enabled
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.logging_config import logger
@@ -134,6 +135,7 @@ def _read_preloaded_skill_contents(slugs: list[str], skill_items: dict[str, Any]
     """从授权解析得到的真实来源读取根级 SKILL.md。"""
 
     contents: dict[str, str] = {}
+    total_bytes = 0
     for slug in slugs:
         try:
             source_dir = Path(skill_items[slug].source_dir)
@@ -142,9 +144,16 @@ def _read_preloaded_skill_contents(slugs: list[str], skill_items: dict[str, Any]
             with open_regular_file_fd(
                 Path(source_dir.anchor),
                 (*source_dir.parts[1:], "SKILL.md"),
-            ) as (file_fd, _file_stat):
-                with os.fdopen(os.dup(file_fd), encoding="utf-8") as skill_file:
-                    contents[slug] = skill_file.read()
+            ) as (file_fd, file_stat):
+                if total_bytes + file_stat.st_size > MAX_SKILL_SNAPSHOT_BYTES:
+                    raise ValueError("预加载 Skill 总大小超限")
+                chunks = []
+                while chunk := os.read(file_fd, min(1024 * 1024, MAX_SKILL_SNAPSHOT_BYTES - total_bytes + 1)):
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_SKILL_SNAPSHOT_BYTES:
+                        raise ValueError("预加载 Skill 总大小超限")
+                    chunks.append(chunk)
+                contents[slug] = b"".join(chunks).decode("utf-8")
         except (OSError, UnicodeError) as exc:
             raise RuntimeError(f"预加载 Skill '{slug}' 失败：根级 SKILL.md 不可读") from exc
     return contents

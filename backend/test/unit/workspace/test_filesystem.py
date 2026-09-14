@@ -88,6 +88,43 @@ def test_upload_without_parent_creation_rejects_missing_directory(
     assert not (workspace_root / "missing").exists()
 
 
+def test_remove_empty_managed_directory_preserves_unrelated_file(tmp_path: Path, monkeypatch) -> None:
+    """补偿删除只允许空目录，不得递归删除后来写入的用户文件。"""
+    workspace_root = tmp_path / "workspace"
+    project = workspace_root / "projects" / "11111111-1111-4111-8111-111111111111"
+    project.mkdir(parents=True)
+    note = project / "user-note.txt"
+    note.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(workspace_filesystem_module, "user_workspace_dir", lambda _uid: workspace_root)
+
+    with pytest.raises(OSError):
+        Workspace("user-1").remove_authorized_empty_directory(
+            "/projects/11111111-1111-4111-8111-111111111111",
+            root="/projects",
+        )
+
+    assert note.read_text(encoding="utf-8") == "keep"
+
+
+def test_remove_empty_managed_directory_rejects_symlink(tmp_path: Path, monkeypatch) -> None:
+    """空目录删除不得跟随最终路径符号链接。"""
+    workspace_root = tmp_path / "workspace"
+    projects = workspace_root / "projects"
+    projects.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (projects / "11111111-1111-4111-8111-111111111111").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(workspace_filesystem_module, "user_workspace_dir", lambda _uid: workspace_root)
+
+    with pytest.raises(OSError):
+        Workspace("user-1").remove_authorized_empty_directory(
+            "/projects/11111111-1111-4111-8111-111111111111",
+            root="/projects",
+        )
+
+    assert outside.is_dir()
+
+
 def test_create_authorized_directory_uses_owner_only_mode(
     tmp_path: Path,
     monkeypatch,

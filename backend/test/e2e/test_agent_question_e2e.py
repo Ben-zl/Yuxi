@@ -10,9 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
-from test.e2e.agentscope_e2e_fixtures import PROVIDER_ID, upsert_mock_provider
 from test.e2e.test_agent_async_e2e import _create_thread, _delete_agent, _iter_sse, _wait_for_run
-from yuxi.storage.postgres.manager import pg_manager
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.e2e]
 
@@ -21,17 +19,12 @@ async def _create_question_agent(
     client: httpx.AsyncClient,
     headers: dict[str, str],
     uid: str,
+    model_spec: str,
 ) -> str:
     """创建只开放主动提问工具的 mock 模型 Agent。"""
-    pg_manager.initialize()
-    async with pg_manager.get_async_session_context() as db:
-        await upsert_mock_provider(db)
-    refresh = await client.post("/api/system/model-providers/models/cache/refresh", headers=headers)
-    assert refresh.status_code == 200, refresh.text
-
     slug = f"e2e-question-agent-{uuid.uuid4().hex[:8]}"
     context: dict[str, Any] = {
-        "model": f"{PROVIDER_ID}:mock-chat-model",
+        "model": model_spec,
         "system_prompt": "需要用户选择时必须调用 ask_user_question；得到回答后简短确认。",
         "tools": ["ask_user_question"],
         "knowledges": [],
@@ -73,9 +66,15 @@ async def test_question_survives_refresh_and_answer_resumes_same_reply(
     e2e_client: httpx.AsyncClient,
     e2e_headers: dict[str, str],
     e2e_agent_context: dict[str, str],
+    e2e_mock_model_spec: str,
 ):
     uid = e2e_agent_context["uid"]
-    agent_slug = await _create_question_agent(e2e_client, e2e_headers, uid)
+    agent_slug = await _create_question_agent(
+        e2e_client,
+        e2e_headers,
+        uid,
+        e2e_mock_model_spec,
+    )
     thread_id = await _create_thread(e2e_client, e2e_headers, agent_slug)
 
     try:

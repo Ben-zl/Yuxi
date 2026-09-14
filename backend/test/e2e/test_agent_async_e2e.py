@@ -23,11 +23,12 @@ def _postgres_dsn() -> str:
     )
 
 
-async def _create_agent(client: httpx.AsyncClient, headers: dict[str, str], uid: str) -> str:
-    default_response = await client.get("/api/agent/default", headers=headers)
-    assert default_response.status_code == 200, default_response.text
-    default_context = ((default_response.json().get("agent") or {}).get("config_json") or {}).get("context") or {}
-
+async def _create_agent(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    uid: str,
+    model_spec: str,
+) -> str:
     slug = f"e2e-async-agent-{uuid.uuid4().hex[:8]}"
     context: dict[str, Any] = {
         "system_prompt": f"你是端到端测试专用智能体。不要调用任何工具，只输出 {EXPECTED_OUTPUT}。",
@@ -37,9 +38,7 @@ async def _create_agent(client: httpx.AsyncClient, headers: dict[str, str], uid:
         "skills": [],
         "subagents": [],
     }
-    model_spec = os.getenv("E2E_MODEL_SPEC") or default_context.get("model")
-    if model_spec:
-        context["model"] = model_spec
+    context["model"] = model_spec
 
     response = await client.post(
         "/api/agent",
@@ -229,9 +228,10 @@ async def test_async_agent_run_stream_result_and_persistence(
     e2e_client: httpx.AsyncClient,
     e2e_headers: dict[str, str],
     e2e_agent_context: dict[str, str],
+    e2e_mock_model_spec: str,
 ):
     uid = e2e_agent_context["uid"]
-    agent_slug = await _create_agent(e2e_client, e2e_headers, uid)
+    agent_slug = await _create_agent(e2e_client, e2e_headers, uid, e2e_mock_model_spec)
     run_id: str | None = None
     run_completed = False
 

@@ -287,6 +287,105 @@ async def test_plain_round_unchanged_first_reply_end(capture_events):
     assert len([p for name, p in capture_events if name == "end"]) == 1
 
 
+async def test_historical_filter_keeps_unscoped_tool_events_for_new_reply(capture_events):
+    """历史消息过滤不能丢弃当前新回复中没有 reply_id 的工具事件。"""
+    queue = asyncio.Queue()
+    for event in [
+        {"type": "REPLY_START", "reply_id": "new-reply"},
+        {
+            "type": "TOOL_CALL_START",
+            "tool_call_id": "tool-1",
+            "tool_call_name": "present_artifacts",
+        },
+        {
+            "type": "TOOL_CALL_DELTA",
+            "tool_call_id": "tool-1",
+            "delta": '{"filepaths":["/workspace/outputs/a.txt"]}',
+        },
+        {"type": "TOOL_CALL_END", "tool_call_id": "tool-1"},
+        {
+            "type": "TOOL_RESULT_START",
+            "tool_call_id": "tool-1",
+            "tool_call_name": "present_artifacts",
+        },
+        {
+            "type": "TOOL_RESULT_TEXT_DELTA",
+            "tool_call_id": "tool-1",
+            "delta": '{"filepaths":["/workspace/outputs/a.txt"]}',
+        },
+        {"type": "TOOL_RESULT_END", "tool_call_id": "tool-1", "state": "success"},
+        {"type": "TEXT_BLOCK_DELTA", "reply_id": "new-reply", "delta": "完成"},
+        {"type": "REPLY_END", "reply_id": "new-reply", "finished_reason": "completed"},
+    ]:
+        queue.put_nowait(event)
+
+    result = await gateway.collect_run_events(
+        queue,
+        _StubClient([]),
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        run_id="run-tools",
+        request_id="req-tools",
+        thread_id="th-tools",
+        read_timeout=5.0,
+        historical_reply_ids={"old-reply"},
+    )
+
+    assert result.text == "完成"
+    assert result.tool_calls == [
+        {
+            "id": "tool-1",
+            "name": "present_artifacts",
+            "args": {"filepaths": ["/workspace/outputs/a.txt"]},
+            "output": '{"filepaths":["/workspace/outputs/a.txt"]}',
+            "status": "success",
+            "error_message": None,
+            "metadata": {},
+        }
+    ]
+
+
+async def test_historical_filter_rejects_tool_events_from_non_active_reply(capture_events):
+    """带 reply_id 的迟到工具事件不得归入当前 Run。"""
+    queue = asyncio.Queue()
+    for event in [
+        {"type": "REPLY_START", "reply_id": "new-reply"},
+        {
+            "type": "TOOL_CALL_START",
+            "reply_id": "old-reply",
+            "tool_call_id": "old-tool",
+            "tool_call_name": "present_artifacts",
+        },
+        {
+            "type": "TOOL_CALL_DELTA",
+            "reply_id": "old-reply",
+            "tool_call_id": "old-tool",
+            "delta": '{"filepaths":["/workspace/outputs/old.txt"]}',
+        },
+        {"type": "TOOL_CALL_END", "reply_id": "old-reply", "tool_call_id": "old-tool"},
+        {"type": "TEXT_BLOCK_DELTA", "reply_id": "new-reply", "delta": "当前回复"},
+        {"type": "REPLY_END", "reply_id": "new-reply", "finished_reason": "completed"},
+    ]:
+        queue.put_nowait(event)
+
+    result = await gateway.collect_run_events(
+        queue,
+        _StubClient([]),
+        uid="u",
+        agent_id="a",
+        session_id="s",
+        run_id="run-tools-filter",
+        request_id="req-tools-filter",
+        thread_id="th-tools-filter",
+        read_timeout=5.0,
+        historical_reply_ids={"old-reply"},
+    )
+
+    assert result.text == "当前回复"
+    assert result.tool_calls == []
+
+
 async def test_replyless_state_update_emits_agent_state(capture_events):
     """AgentScope 独立 state_updated 事件必须驱动实时 Todo/文件面板。"""
     client = _StubClient(
@@ -577,6 +676,7 @@ async def test_client_preserves_mixed_confirmation_decisions(monkeypatch):
     assert [item["confirmed"] for item in results] == [True, False]
     with pytest.raises(ValueError, match="数量不一致"):
         await client.resume_confirm("u", "a", "s", reply_id="r", tool_calls=calls, confirmed=[True])
+
 
 async def test_cancel_watcher_unblocks_event_collection_without_reply_end(monkeypatch):
     """AgentScope 中断不回 REPLY_END 时，取消监听仍须立即唤醒收集器。"""

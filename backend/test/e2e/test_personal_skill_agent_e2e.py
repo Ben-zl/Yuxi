@@ -22,6 +22,7 @@ async def test_main_agent_reads_personal_skill_directly_from_user_workspace(
     e2e_client: httpx.AsyncClient,
     e2e_headers: dict[str, str],
     e2e_agent_context: dict[str, str],
+    e2e_mock_model_spec: str,
 ):
     """真实主 Agent 应从 UserWorkspace 直接读取个人 SKILL.md。"""
     uid = e2e_agent_context["uid"]
@@ -51,10 +52,8 @@ async def test_main_agent_reads_personal_skill_directly_from_user_workspace(
     assert confirm_response.status_code == 200, confirm_response.text
 
     try:
-        default_response = await e2e_client.get("/api/agent/default", headers=e2e_headers)
-        assert default_response.status_code == 200, default_response.text
-        default_context = ((default_response.json().get("agent") or {}).get("config_json") or {}).get("context") or {}
         context: dict[str, Any] = {
+            "model": e2e_mock_model_spec,
             "system_prompt": (
                 f"收到请求后必须先读取 {VIRTUAL_PERSONAL_SKILLS_PATH}/{slug}/SKILL.md，"
                 "然后严格遵循其中的 Verification 指令，不要添加解释。"
@@ -65,8 +64,6 @@ async def test_main_agent_reads_personal_skill_directly_from_user_workspace(
             "skills": [slug],
             "subagents": [],
         }
-        if default_context.get("model"):
-            context["model"] = default_context["model"]
 
         agent_response = await e2e_client.post(
             "/api/agent",

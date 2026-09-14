@@ -61,6 +61,13 @@ def normalize_linked_workdir_path(workdir_path: str) -> str:
     return normalize_workdir_path(workdir_path)
 
 
+def strictly_overlapping_workdirs(first: str, second: str) -> bool:
+    """判断两个不同 Workdir 是否形成严格父子关系。"""
+    left = normalize_workdir_path(first)
+    right = normalize_workdir_path(second)
+    return left != right and (left.startswith(f"{right}/") or right.startswith(f"{left}/"))
+
+
 def normalize_managed_workdir_path(workdir_path: str) -> str:
     """规范化服务端管理的 ``projects/<uuid>`` Workdir 路径。"""
     raw = str(workdir_path or "").strip()

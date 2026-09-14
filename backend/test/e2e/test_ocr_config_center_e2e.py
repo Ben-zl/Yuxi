@@ -73,6 +73,8 @@ async def test_admin_ocr_config_drives_real_tmp_attachment_parse(
             "/api/chat/attachments/tmp/parse",
             json={
                 "object_name": uploaded["object_name"],
+                "file_name": uploaded["file_name"],
+                "bucket_name": uploaded["bucket_name"],
                 "parse_method": None,
             },
             headers=e2e_headers,
@@ -86,7 +88,9 @@ async def test_admin_ocr_config_drives_real_tmp_attachment_parse(
             json={
                 "attachments": [
                     {
+                        "file_name": uploaded["file_name"],
                         "file_type": uploaded["file_type"],
+                        "bucket_name": uploaded["bucket_name"],
                         "object_name": uploaded["object_name"],
                         "parsed_object_name": parsed["parsed_object_name"],
                     }

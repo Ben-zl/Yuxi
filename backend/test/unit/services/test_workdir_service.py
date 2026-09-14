@@ -75,6 +75,9 @@ async def test_binding_uses_project_workdir(monkeypatch: pytest.MonkeyPatch):
                 directory_mode="managed",
             )
 
+        async def list_active_workdir_paths_for_user(self, _uid):
+            return ["projects/11111111-1111-4111-8111-111111111111"]
+
     monkeypatch.setattr(svc, "ConversationRepository", _ConversationRepository)
     monkeypatch.setattr(svc, "ProjectRepository", _ProjectRepository)
     monkeypatch.setattr(svc, "Workdir", _Workdir)
@@ -85,6 +88,28 @@ async def test_binding_uses_project_workdir(monkeypatch: pytest.MonkeyPatch):
     assert binding.workdir.root_path == "/projects/11111111-1111-4111-8111-111111111111"
     assert binding.workdir.workspace.uid == "user-1"
     assert opened == {"uid": "user-1", "workdir_path": "projects/11111111-1111-4111-8111-111111111111"}
+
+
+@pytest.mark.asyncio
+async def test_existing_overlapping_project_binding_fails_closed(monkeypatch):
+    """历史父子 Project 重叠时，运行期不能挂载整个父目录。"""
+
+    class Repo:
+        def __init__(self, _db):
+            pass
+
+        async def get_for_user(self, _project_id, _uid):
+            return SimpleNamespace(id="parent", workdir_path="clients", directory_mode="linked")
+
+        async def list_active_workdir_paths_for_user(self, _uid):
+            return ["clients", "clients/acme"]
+
+    monkeypatch.setattr(svc, "ProjectRepository", Repo)
+    with pytest.raises(HTTPException) as exc:
+        await svc.resolve_conversation_workdir_binding(
+            conversation=SimpleNamespace(project_id="parent"), uid="user-1", db=object()
+        )
+    assert exc.value.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -140,6 +165,9 @@ async def test_binding_resolves_project_workdir_without_conversation_path(monkey
                 workdir_path="client/demo",
                 directory_mode="linked",
             )
+
+        async def list_active_workdir_paths_for_user(self, _uid):
+            return ["client/demo"]
 
     class _Workdir:
         relative_path = "client/demo"

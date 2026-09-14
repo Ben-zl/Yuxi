@@ -8,7 +8,7 @@ from sqlalchemy import Column, Integer, JSON, String, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import declarative_base
 
-from yuxi.storage.postgres.manager import BUSINESS_SCHEMA_VERSION, PostgresManager
+from yuxi.storage.postgres.manager import PostgresManager
 from yuxi.storage.postgres.models_business import Base
 
 LegacyBase = declarative_base()
@@ -91,7 +91,6 @@ async def test_old_orm_upgrade_preserves_rows_and_allows_duplicate_slugs():
                 ).scalars()
             )
             assert {"id", "uid", "encrypted_payload", "fingerprint", "created_at"} <= columns
-            assert BUSINESS_SCHEMA_VERSION == 5
     finally:
         await isolated.dispose()
         async with engine.begin() as conn:

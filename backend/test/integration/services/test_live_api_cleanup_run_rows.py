@@ -10,14 +10,16 @@ import uuid
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from test import live_api_cleanup as cleanup_module
 from test.live_api_cleanup import (
+    cleanup_static_test_user_resources,
     delete_e2e_run_rows,
     delete_test_conversation_resources,
     delete_test_conversation_rows,
+    list_test_sandbox_ids,
     list_test_conversation_resources,
     make_test_conversation_metadata,
     make_test_conversation_title,
@@ -26,16 +28,24 @@ from test.live_api_cleanup import (
 )
 from yuxi.services import project_service
 from yuxi.storage.postgres.models_business import (
+    APIKey,
+    AgentEnv,
+    AgentMemoryScope,
     AgentRun,
     AgentRunRequest,
+    AgentScopeThreadSession,
     Conversation,
     ConversationStats,
     Message,
     MessageFeedback,
+    OperationLog,
     Project,
+    RunResourceSnapshot,
     ToolCall,
     User,
+    UserConfig,
 )
+from yuxi.config import get_user_data_dir
 from yuxi.workspace.paths import ensure_bound_user_workdir, user_workdir_host_dir
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -293,6 +303,255 @@ async def test_delete_test_conversation_rows_removes_history_and_preserves_neigh
         await _cleanup_seed(session_factory, [target, neighbor])
 
 
+async def test_delete_test_conversation_rows_removes_only_referenced_runtime_snapshot(cleanup_database):
+    """删除目标 Run 和未派发 Request 的快照，保留同 UID 无关快照。"""
+
+    session_factory = cleanup_database
+    target = await _seed_thread(session_factory, thread_prefix="pytest-snapshot-target")
+    referenced_snapshot_id = str(uuid.uuid4())
+    queued_snapshot_id = str(uuid.uuid4())
+    cancelled_snapshot_id = str(uuid.uuid4())
+    unrelated_snapshot_id = str(uuid.uuid4())
+    try:
+        async with session_factory() as db:
+            db.add_all(
+                [
+                    RunResourceSnapshot(
+                        id=referenced_snapshot_id,
+                        uid=target["uid"],
+                        encrypted_payload="referenced",
+                        fingerprint="a" * 64,
+                    ),
+                    RunResourceSnapshot(
+                        id=queued_snapshot_id,
+                        uid=target["uid"],
+                        encrypted_payload="queued",
+                        fingerprint="c" * 64,
+                    ),
+                    RunResourceSnapshot(
+                        id=cancelled_snapshot_id,
+                        uid=target["uid"],
+                        encrypted_payload="cancelled",
+                        fingerprint="d" * 64,
+                    ),
+                    RunResourceSnapshot(
+                        id=unrelated_snapshot_id,
+                        uid=target["uid"],
+                        encrypted_payload="unrelated",
+                        fingerprint="b" * 64,
+                    ),
+                ]
+            )
+            run = await db.get(AgentRun, target["run_id"])
+            assert run is not None
+            run.manifest = {"runtime_snapshot": {"id": referenced_snapshot_id}}
+            for status, snapshot_id in [("queued", queued_snapshot_id), ("cancelled", cancelled_snapshot_id)]:
+                message = Message(conversation_id=target["conversation_id"], role="user", content=status)
+                db.add(message)
+                await db.flush()
+                db.add(
+                    AgentRunRequest(
+                        request_id=f"cleanup-{status}-{uuid.uuid4()}",
+                        uid=target["uid"],
+                        agent_slug="main",
+                        conversation_thread_id=target["thread_id"],
+                        input_message_id=message.id,
+                        input_payload={"_run_manifest": {"runtime_snapshot": {"id": snapshot_id}}},
+                        status=status,
+                    )
+                )
+            await db.commit()
+
+        await delete_test_conversation_rows({target["thread_id"]})
+
+        async with session_factory() as db:
+            assert await db.get(RunResourceSnapshot, referenced_snapshot_id) is None
+            assert await db.get(RunResourceSnapshot, queued_snapshot_id) is None
+            assert await db.get(RunResourceSnapshot, cancelled_snapshot_id) is None
+            assert await db.get(RunResourceSnapshot, unrelated_snapshot_id) is not None
+    finally:
+        async with session_factory() as db:
+            await db.execute(
+                delete(RunResourceSnapshot).where(
+                    RunResourceSnapshot.id.in_(
+                        [referenced_snapshot_id, queued_snapshot_id, cancelled_snapshot_id, unrelated_snapshot_id]
+                    )
+                )
+            )
+            await db.commit()
+        await _cleanup_seed(session_factory, [target])
+
+
+async def test_list_static_sandbox_ids_includes_unmarked_owned_thread(cleanup_database):
+    """静态 UID 全量删除前的 Sandbox 枚举须覆盖未标记 Conversation。"""
+    from yuxi.agents.backends.sandbox.provider import sandbox_id_for_thread
+
+    session_factory = cleanup_database
+    target = await _seed_thread(session_factory, thread_prefix="pytest-sandbox-owner")
+    try:
+        async with session_factory() as db:
+            conversation = await db.scalar(select(Conversation).where(Conversation.thread_id == target["thread_id"]))
+            conversation.title = "ordinary conversation"
+            conversation.extra_metadata = {}
+            await db.commit()
+
+        assert await list_test_sandbox_ids(target["uid"]) == set()
+        assert await list_test_sandbox_ids(target["uid"], include_all_owned=True) == {
+            sandbox_id_for_thread(target["thread_id"], uid=target["uid"])
+        }
+    finally:
+        await _cleanup_seed(session_factory, [target])
+
+
+async def test_static_test_user_cleanup_physically_deletes_user_dependencies(cleanup_database):
+    """专用 E2E 用户清理必须物理删除直接依赖、Memory/Snapshot 和 Workspace。"""
+
+    session_factory = cleanup_database
+    uid = f"e2e_cleanup_{uuid.uuid4().hex[:12]}"
+    workspace_root = get_user_data_dir() / "shared" / uid
+    workspace_root.joinpath("workspace", "memory").mkdir(parents=True)
+    try:
+        async with session_factory() as db:
+            user = User(username=uid, uid=uid, password_hash="test", department_id=1)
+            db.add(user)
+            await db.flush()
+            db.add_all(
+                [
+                    APIKey(
+                        key_hash=uuid.uuid4().hex,
+                        key_prefix="e2e-cleanup",
+                        name="E2E cleanup",
+                        user_id=user.id,
+                        created_by=uid,
+                    ),
+                    AgentEnv(uid=uid, env={"E2E": "1"}),
+                    UserConfig(uid=uid, enable_memory=True),
+                    AgentMemoryScope(
+                        uid=uid,
+                        agent_slug="default-chatbot",
+                        workspace_id=f"e2e-memory-{uuid.uuid4()}",
+                    ),
+                    RunResourceSnapshot(
+                        id=str(uuid.uuid4()),
+                        uid=uid,
+                        encrypted_payload="test-only",
+                        fingerprint="c" * 64,
+                    ),
+                    AgentScopeThreadSession(
+                        uid=uid,
+                        thread_id=f"e2e-thread-{uuid.uuid4()}",
+                        agent_slug="default-chatbot",
+                        model_spec="e2e-provider:model",
+                        agentscope_agent_id=f"agent-{uuid.uuid4()}",
+                        agentscope_credential_id=f"credential-{uuid.uuid4()}",
+                        agentscope_session_id=f"session-{uuid.uuid4()}",
+                    ),
+                    OperationLog(
+                        user_id=user.id,
+                        operation="e2e cleanup",
+                        details=f"cleanup-owner:{uid}",
+                    ),
+                ]
+            )
+            await db.commit()
+
+        await cleanup_static_test_user_resources(uid)
+
+        async with session_factory() as db:
+            assert await db.scalar(select(User).where(User.uid == uid)) is None
+            assert await db.scalar(select(APIKey).where(APIKey.created_by == uid)) is None
+            assert await db.scalar(select(AgentEnv).where(AgentEnv.uid == uid)) is None
+            assert await db.scalar(select(UserConfig).where(UserConfig.uid == uid)) is None
+            assert await db.scalar(select(AgentMemoryScope).where(AgentMemoryScope.uid == uid)) is None
+            assert await db.scalar(select(RunResourceSnapshot).where(RunResourceSnapshot.uid == uid)) is None
+            assert await db.scalar(select(AgentScopeThreadSession).where(AgentScopeThreadSession.uid == uid)) is None
+            assert not (
+                await db.scalars(
+                    select(OperationLog).where(
+                        OperationLog.details == f"cleanup-owner:{uid}",
+                    )
+                )
+            ).all()
+        assert not workspace_root.exists()
+    finally:
+        async with session_factory() as db:
+            user_id = select(User.id).where(User.uid == uid)
+            await db.execute(delete(OperationLog).where(OperationLog.user_id.in_(user_id)))
+            await db.execute(delete(APIKey).where(APIKey.user_id.in_(user_id)))
+            await db.execute(delete(AgentEnv).where(AgentEnv.uid == uid))
+            await db.execute(delete(UserConfig).where(UserConfig.uid == uid))
+            await db.execute(delete(AgentMemoryScope).where(AgentMemoryScope.uid == uid))
+            await db.execute(delete(RunResourceSnapshot).where(RunResourceSnapshot.uid == uid))
+            await db.execute(delete(AgentScopeThreadSession).where(AgentScopeThreadSession.uid == uid))
+            await db.execute(delete(User).where(User.uid == uid))
+            await db.commit()
+        if workspace_root.exists():
+            cleanup_module.remove_test_user_workspace_root(uid)
+
+
+async def test_orphaned_snapshot_department_cleanup_is_exact_and_reference_safe(cleanup_database):
+    """只删除无用户和 API Key 引用的严格 snapshot 测试部门。"""
+
+    session_factory = cleanup_database
+    suffix = uuid.uuid4().hex[:8]
+    target_name = f"snapshot-{suffix}"
+    neighbor_name = f"snapshot-{suffix}-production"
+    blocked_name = f"snapshot-{uuid.uuid4().hex[:8]}"
+    blocked_uid = f"department-holder-{uuid.uuid4()}"
+    target_id = neighbor_id = blocked_id = None
+    try:
+        async with session_factory() as db:
+            target_id = await db.scalar(
+                text(
+                    "INSERT INTO departments (name, description) VALUES (:name, 'e2e cleanup target') RETURNING id"
+                ).bindparams(name=target_name)
+            )
+            neighbor_id = await db.scalar(
+                text(
+                    "INSERT INTO departments (name, description) VALUES (:name, 'must remain') RETURNING id"
+                ).bindparams(name=neighbor_name)
+            )
+            blocked_id = await db.scalar(
+                text(
+                    "INSERT INTO departments (name, description) "
+                    "VALUES (:name, 'referenced snapshot-like department') RETURNING id"
+                ).bindparams(name=blocked_name)
+            )
+            db.add(
+                User(
+                    username=blocked_uid,
+                    uid=blocked_uid,
+                    password_hash="test",
+                    department_id=blocked_id,
+                )
+            )
+            await db.commit()
+
+        await cleanup_module.cleanup_orphaned_static_test_departments()
+
+        async with session_factory() as db:
+            assert (
+                await db.scalar(text("SELECT count(*) FROM departments WHERE id = :id").bindparams(id=target_id)) == 0
+            )
+            assert (
+                await db.scalar(text("SELECT count(*) FROM departments WHERE id = :id").bindparams(id=neighbor_id)) == 1
+            )
+            assert (
+                await db.scalar(text("SELECT count(*) FROM departments WHERE id = :id").bindparams(id=blocked_id)) == 1
+            )
+    finally:
+        async with session_factory() as db:
+            await db.execute(delete(User).where(User.uid == blocked_uid))
+            await db.execute(
+                text("DELETE FROM departments WHERE id IN (:target_id, :neighbor_id, :blocked_id)").bindparams(
+                    target_id=target_id or -1,
+                    neighbor_id=neighbor_id or -1,
+                    blocked_id=blocked_id or -1,
+                )
+            )
+            await db.commit()
+
+
 async def test_delete_test_conversation_rows_preserves_selectable_project(cleanup_database):
     """删除最后一个 Conversation 时不得连带删除用户可选择的 Project。"""
 
@@ -534,14 +793,14 @@ async def test_resource_cleanup_lock_makes_overlapping_linked_project_revalidate
     creation_result: dict[str, object] = {}
     lock_attempted = threading.Event()
     worker_holder: dict[str, threading.Thread] = {}
-    original_lock = project_service._lock_project_workdir_changes
+    original_lock = project_service.lock_project_workdir_changes
     original_remove = cleanup_module.remove_test_workdir
 
     async def observed_lock(**kwargs) -> None:
         lock_attempted.set()
         await original_lock(**kwargs)
 
-    monkeypatch.setattr(project_service, "_lock_project_workdir_changes", observed_lock)
+    monkeypatch.setattr(project_service, "lock_project_workdir_changes", observed_lock)
 
     def remove_while_project_waits(_uid: str, _workdir_path: str) -> None:
         """启动真实 Project 创建，并在其等待路径锁时删除目录。"""

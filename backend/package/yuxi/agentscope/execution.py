@@ -12,7 +12,6 @@ from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
 from yuxi.agentscope.gateway import GatewayRoundResult, stream_round_to_run_events
 from yuxi.agentscope.protocol import split_embedded_reasoning
 from yuxi.agentscope.runner import ensure_thread_session, recover_untracked_pending_session
-from yuxi.agentscope.thread_guard import has_pending_confirm
 from yuxi.repositories.agentscope_thread_sessions import AgentScopeThreadSession
 from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.repositories.conversation_repository import ConversationRepository
@@ -48,13 +47,12 @@ async def execute_run(
             agent_slug=run.agent_slug,
             model_spec=model_spec,
         )
-    if not await has_pending_confirm(run.conversation_thread_id):
-        await recover_untracked_pending_session(
-            client,
-            uid=run.uid,
-            agent_id=mapping.agentscope_agent_id,
-            session_id=mapping.agentscope_session_id,
-        )
+    await recover_untracked_pending_session(
+        client,
+        uid=run.uid,
+        agent_id=mapping.agentscope_agent_id,
+        session_id=mapping.agentscope_session_id,
+    )
     result = await stream_round_to_run_events(
         client,
         uid=run.uid,
@@ -147,11 +145,22 @@ async def finalize_run(
     if result.run_status != "completed" and await has_cancel_signal(run.id):
         await clear_cancel_signal(run.id)
         result.run_status = "cancelled"
-    await AgentRunRepository(db).set_terminal_status(
+    error_type = result.error_type
+    if result.parked == "permission":
+        error_type = "human_approval_required"
+    elif result.parked == "external":
+        error_type = "external_execution_required"
+    persisted_run, transitioned = await AgentRunRepository(db).set_terminal_status(
         run.id,
         status=result.run_status,
-        error_type=result.error_type,
+        error_type=error_type,
         error_message=_terminal_error_message(result),
         token_usage=result.usage or {},
         worker_id=worker_id,
+        cancel_requested_as_cancelled=True,
     )
+    if persisted_run is None or (
+        not transitioned and persisted_run.status not in {"completed", "failed", "cancelled", "interrupted"}
+    ):
+        raise RuntimeError("Run 终态未能由当前 Worker 写入")
+    result.run_status = persisted_run.status

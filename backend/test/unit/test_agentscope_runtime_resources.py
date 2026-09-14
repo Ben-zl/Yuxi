@@ -265,6 +265,41 @@ async def test_runtime_skills_keep_current_projected_skill(tmp_path):
     workspace.add_skill.assert_not_awaited()
 
 
+async def test_runtime_snapshot_reinstalls_skill_when_non_manifest_files_may_differ():
+    """完整 Run 快照不能因 SKILL.md 相同而复用上一轮可能不同的脚本。"""
+    workspace = SimpleNamespace(
+        list_skills=AsyncMock(return_value=[SimpleNamespace(name="reporter", markdown="# same\n")]),
+        remove_skill=AsyncMock(),
+        add_skill=AsyncMock(),
+    )
+    projection = SimpleNamespace(
+        skills=[
+            {
+                "slug": "reporter",
+                "name": "Reporter",
+                "snapshot_directories": ["scripts"],
+                "snapshot_files": [
+                    {
+                        "path": "SKILL.md",
+                        "content_base64": "IyBzYW1lCg==",
+                        "executable": False,
+                    },
+                    {
+                        "path": "scripts/run.sh",
+                        "content_base64": "ZWNobyBzdWJtaXR0ZWQK",
+                        "executable": True,
+                    },
+                ],
+            }
+        ]
+    )
+
+    await runtime_resources.sync_runtime_skills(workspace, projection, agent_id="runtime-agent")
+
+    workspace.remove_skill.assert_awaited_once_with("reporter", agent_id="runtime-agent")
+    workspace.add_skill.assert_awaited_once()
+
+
 async def test_unmapped_non_team_session_fails_explicitly(monkeypatch):
     """伪造或孤立 session 不得静默获得空工具集。"""
     monkeypatch.setattr(

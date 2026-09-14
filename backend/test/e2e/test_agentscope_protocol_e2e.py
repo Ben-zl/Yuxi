@@ -9,17 +9,16 @@ import os
 import uuid
 
 import pytest
+from e2e_helpers import consume_events, wait_for_run
 from test.e2e.agentscope_e2e_fixtures import (
-    PROVIDER_ID,
+    PROVIDER_RESOURCE_ID,
     cleanup_fixture_agents,
     cleanup_test_users,
+    open_fixture_http_client,
     seed_test_users,
     upsert_mock_provider,
 )
 
-from yuxi.agentscope.client import AgentScopeServiceClient
-from yuxi.agentscope.gateway import stream_round_to_run_events
-from yuxi.agentscope.runner import ensure_thread_session
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Agent
 from yuxi.storage.redis.manager import close_async_redis_client, get_async_redis_client
@@ -46,8 +45,11 @@ async def db_session():
                     backend_id="ChatbotAgent",
                     config_json={
                         "context": {
-                            "model": f"{PROVIDER_ID}:mock-chat-model",
+                            "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
                             "mcps": [],
+                            "tools": [],
+                            "skills": [],
+                            "subagents": [],
                             "system_prompt": "你是协议测试助手。",
                         }
                     },
@@ -67,66 +69,75 @@ async def db_session():
 
 async def test_round_written_as_run_events_with_reconnect(db_session):
     uid = USER_ID
-    run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
     request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
-
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
-    result = await stream_round_to_run_events(
-        client,
-        uid=uid,
-        agent_id=mapping.agentscope_agent_id,
-        session_id=mapping.agentscope_session_id,
-        text="打个招呼",
-        run_id=run_id,
-        request_id=request_id,
-        thread_id=thread_id,
-    )
-    assert result.run_status == "completed"
-    assert result.text.startswith("你好，我是 e2e mock 模型")
-
-    redis_client = await get_async_redis_client()
-    stream_key = f"run:events:{run_id}"
+    client, headers = await open_fixture_http_client(uid)
     try:
-        frames = await redis_client.xrange(stream_key)
-        assert frames, "run 事件流不应为空"
-
-        event_names = [entry["event_type"] for _, entry in frames]
-        assert event_names[0] == "metadata"
-        assert "messages" in event_names
-        assert event_names[-1] == "end"
-
-        # 终态帧：end 载荷含 run 状态与 finished chunk
-        import json
-
-        end_envelope = json.loads(frames[-1][1]["payload"])
-        assert end_envelope["schema_version"] == 1
-        assert end_envelope["run_id"] == run_id
-        end_payload = end_envelope["payload"]
-        assert end_payload["status"] == "completed"
-        assert end_payload["chunk"]["status"] == "finished"
-
-        # init chunk 携带用户消息；loading chunk 携带 AIMessageChunk 文本增量
-        all_chunks = []
-        for _, entry in frames:
-            if entry["event_type"] != "messages":
-                continue
-            all_chunks.extend(json.loads(entry["payload"])["payload"]["items"])
-        statuses = [c["status"] for c in all_chunks]
-        assert statuses[0] == "init"
-        assert all_chunks[0]["msg"]["content"] == "打个招呼"
-        assert "loading" in statuses
-        joined_text = "".join(
-            c["msg"].get("content", "") for c in all_chunks if c["status"] == "loading" and c["msg"].get("content")
+        thread_response = await client.post(
+            "/api/chat/thread",
+            json={"agent_id": CHATBOT_SLUG, "title": f"protocol-{uuid.uuid4().hex[:8]}"},
+            headers=headers,
         )
-        assert joined_text.startswith("你好，我是 e2e mock 模型")
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json().get("id"))
+        run_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "打个招呼",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "meta": {"request_id": request_id},
+            },
+            headers=headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json()["run_id"])
+        event_counts = await consume_events(client, headers, run_id)
+        assert event_counts.get("messages", 0) > 0, event_counts
+        assert event_counts.get("end", 0) == 1, event_counts
+        run = await wait_for_run(client, headers, run_id)
+        assert run["status"] == "completed", run
+        result_response = await client.get(f"/api/agent/runs/{run_id}/result", headers=headers)
+        assert result_response.status_code == 200, result_response.text
+        assert result_response.json()["output"].startswith("你好，我是 e2e mock 模型")
 
-        # 模拟断线重连：从序列中点之后续读，剩余帧完整可续传
-        midpoint_seq = frames[len(frames) // 2][0]
-        tail = await redis_client.xrange(stream_key, min=f"({midpoint_seq}", max="+")
-        assert tail, "断线重连应能续读到剩余帧"
-        assert tail[-1][1]["event_type"] == "end"
+        redis_client = await get_async_redis_client()
+        stream_key = f"run:events:{run_id}"
+        try:
+            frames = await redis_client.xrange(stream_key)
+            assert frames, "run 事件流不应为空"
+            event_names = [entry["event_type"] for _, entry in frames]
+            assert event_names[0] == "metadata"
+            assert "messages" in event_names
+            assert event_names[-1] == "end"
+
+            import json
+
+            end_envelope = json.loads(frames[-1][1]["payload"])
+            assert end_envelope["schema_version"] == 1
+            assert end_envelope["run_id"] == run_id
+            end_payload = end_envelope["payload"]
+            assert end_payload["status"] == "completed"
+            assert end_payload["chunk"]["status"] == "finished"
+
+            all_chunks = []
+            for _, entry in frames:
+                if entry["event_type"] == "messages":
+                    all_chunks.extend(json.loads(entry["payload"])["payload"]["items"])
+            statuses = [c["status"] for c in all_chunks]
+            assert statuses[0] == "init"
+            assert all_chunks[0]["msg"]["content"] == "打个招呼"
+            assert "loading" in statuses
+            joined_text = "".join(
+                c["msg"].get("content", "") for c in all_chunks if c["status"] == "loading" and c["msg"].get("content")
+            )
+            assert joined_text.startswith("你好，我是 e2e mock 模型")
+
+            midpoint_seq = frames[len(frames) // 2][0]
+            tail = await redis_client.xrange(stream_key, min=f"({midpoint_seq}", max="+")
+            assert tail, "断线重连应能续读到剩余帧"
+            assert tail[-1][1]["event_type"] == "end"
+        finally:
+            await redis_client.delete(stream_key)
+            await close_async_redis_client()
     finally:
-        await redis_client.delete(stream_key)
-        await close_async_redis_client()
+        await client.aclose()

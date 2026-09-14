@@ -5,10 +5,10 @@ Conversation thread status mapping and viewed-marking unit tests.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from types import SimpleNamespace
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.repositories.conversation_repository import ConversationRepository, UNVIEWED_RUN_MARKER
@@ -16,6 +16,12 @@ from yuxi.services import conversation_service as svc
 from yuxi.storage.postgres.models_business import AgentRun, Base, Conversation, Project
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
+
+
+@pytest.fixture(autouse=True)
+def isolate_project_path_lock(monkeypatch):
+    """线程单测的内存数据库不模拟 PostgreSQL 路径锁。"""
+    monkeypatch.setattr(svc, "lock_project_workdir_changes", AsyncMock())
 
 
 async def test_delete_agentscope_thread_resources_uses_retryable_order(monkeypatch):
@@ -114,6 +120,85 @@ async def test_delete_agentscope_thread_resources_uses_retryable_order(monkeypat
     ]
     assert calls[2][-1] == {"missing_ok": True}
     assert ("stop_heartbeat", "child-run-1") in calls
+
+
+@pytest.mark.parametrize("missing_target", ["parent", "worker"])
+async def test_delete_agentscope_thread_resources_continues_after_missing_session_workspace(
+    monkeypatch,
+    missing_target,
+):
+    """历史 Session 已删除时仍必须进入底层 Docker workspace 清理。"""
+    from yuxi.agentscope import client as client_module
+    from yuxi.repositories import agentscope_team_workers as team_repo
+    from yuxi.repositories import agentscope_thread_sessions as mapping_repo
+
+    mapping = SimpleNamespace(
+        agentscope_agent_id="parent-agent",
+        agentscope_session_id="parent-session",
+        agentscope_credential_id="credential-1",
+        agentscope_workspace_id=None if missing_target == "parent" else "parent-workspace",
+    )
+    worker = SimpleNamespace(
+        worker_agent_id="worker-agent",
+        worker_session_id="worker-session",
+        agentscope_workspace_id=None,
+    )
+    calls = []
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def get_session_workspace_id(self, _uid, agent_id, _session_id):
+            if agent_id == ("parent-agent" if missing_target == "parent" else "worker-agent"):
+                raise client_module.AgentScopeServiceError("missing", status_code=404)
+            return "resolved-workspace"
+
+        async def delete_session(self, *_args, **_kwargs):
+            calls.append("delete_session")
+
+        async def destroy_thread_workspaces(self, *_args):
+            calls.append("destroy_thread_workspaces")
+
+        async def delete_agent(self, *_args, **_kwargs):
+            calls.append("delete_agent")
+
+        async def delete_credential(self, *_args, **_kwargs):
+            calls.append("delete_credential")
+
+    class TeamWorkerRepository:
+        def __init__(self, _db):
+            pass
+
+        async def list_for_parent_thread(self, **_kwargs):
+            return [worker] if missing_target == "worker" else []
+
+        async def set_workspace_id(self, binding, *, agentscope_workspace_id):
+            binding.agentscope_workspace_id = agentscope_workspace_id
+
+        async def deactivate_parent_runtime(self, **_kwargs):
+            return []
+
+    class FakeDB:
+        async def commit(self):
+            calls.append("commit")
+
+        async def flush(self):
+            calls.append("flush")
+
+    monkeypatch.setattr(client_module, "AgentScopeServiceClient", Client)
+    monkeypatch.setattr(mapping_repo, "get_thread_session", AsyncMock(return_value=mapping))
+    monkeypatch.setattr(mapping_repo, "set_thread_session_workspace_id", AsyncMock())
+    monkeypatch.setattr(mapping_repo, "delete_thread_session", AsyncMock())
+    monkeypatch.setattr(team_repo, "AgentScopeTeamWorkerRepository", TeamWorkerRepository)
+
+    await svc._delete_agentscope_thread_resources(
+        FakeDB(),
+        uid="user-1",
+        thread_id="thread-1",
+    )
+
+    assert "destroy_thread_workspaces" in calls
 
 
 @pytest_asyncio.fixture()
@@ -379,6 +464,7 @@ async def test_explicit_project_creation_locks_project_until_commit(monkeypatch)
     monkeypatch.setattr(svc, "ProjectRepository", _ProjectRepository)
     monkeypatch.setattr(svc, "ConversationRepository", _ConversationRepository)
     monkeypatch.setattr(svc.Workdir, "open_existing", lambda *_args: None)
+    monkeypatch.setattr(svc, "resolve_conversation_workdir_path", AsyncMock(return_value="clients/acme"))
     monkeypatch.setattr(svc, "_serialize_thread", serialize_thread)
 
     result = await svc.create_thread_view(
@@ -393,6 +479,86 @@ async def test_explicit_project_creation_locks_project_until_commit(monkeypatch)
 
     assert result == {"id": "thread-1"}
     assert lock_calls == [("project-1", "user-1", True)]
+
+
+async def test_create_thread_rejects_historical_overlapping_project_before_insert(monkeypatch):
+    """历史父子 Workdir 冲突不能先提交不可用的 Conversation。"""
+    from yuxi.services import workdir_service
+
+    project = SimpleNamespace(
+        id="project-1",
+        uid="user-1",
+        status="active",
+        selection_status="selectable",
+        directory_mode="linked",
+        workdir_path="clients",
+    )
+
+    class Db:
+        commits = 0
+
+        async def execute(self, _statement):
+            return SimpleNamespace(scalar_one_or_none=lambda: SimpleNamespace(uid="user-1"))
+
+        async def commit(self):
+            self.commits += 1
+
+    class AgentRepo:
+        def __init__(self, _db):
+            pass
+
+        async def get_visible_by_slug(self, **_kwargs):
+            return SimpleNamespace(slug="main", backend_id="ChatbotAgent")
+
+    class ProjectRepo:
+        def __init__(self, _db):
+            pass
+
+        async def lock_active_selectable_for_user(self, _project_id, _uid):
+            return project
+
+        async def get_for_user(self, _project_id, _uid):
+            return project
+
+        async def list_active_workdir_paths_for_user(self, _uid):
+            return ["clients", "clients/acme"]
+
+    inserted = []
+
+    class ConversationRepo:
+        def __init__(self, _db):
+            pass
+
+        async def add_conversation(self, **kwargs):
+            inserted.append(kwargs)
+            return SimpleNamespace(
+                thread_id="thread-1",
+                uid="user-1",
+                agent_id="main",
+                title="Blocked",
+                is_pinned=False,
+                project_id=project.id,
+            )
+
+    monkeypatch.setattr(svc, "AgentRepository", AgentRepo)
+    monkeypatch.setattr(svc, "ProjectRepository", ProjectRepo)
+    monkeypatch.setattr(workdir_service, "ProjectRepository", ProjectRepo)
+    monkeypatch.setattr(svc, "ConversationRepository", ConversationRepo)
+    monkeypatch.setattr(svc.Workdir, "open_existing", lambda *_args: None)
+    db = Db()
+    with pytest.raises(svc.HTTPException) as exc:
+        await svc.create_thread_view(
+            agent_slug="main",
+            request_id=None,
+            title="Blocked",
+            metadata={},
+            project_id=project.id,
+            db=db,
+            current_uid="user-1",
+        )
+    assert exc.value.status_code == 409
+    assert db.commits == 0
+    assert inserted == []
 
 
 async def test_create_thread_replay_restores_managed_workdir(monkeypatch):

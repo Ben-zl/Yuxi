@@ -445,26 +445,29 @@ async def test_get_tools_from_all_servers_loads_names_from_db_once(monkeypatch):
         "alpha": {"resource_id": "mcp-alpha", "transport": "stdio", "command": "cmd-a", "disabled_tools": []},
         "beta": {"resource_id": "mcp-beta", "transport": "stdio", "command": "cmd-b", "disabled_tools": []},
     }
-    calls: list[tuple[str, dict[str, dict]]] = []
+    user = SimpleNamespace(uid="user-1", role="user")
+    calls: list[tuple[str, dict[str, dict], object]] = []
 
     async def fake_load_enabled_mcp_server_configs(*, names=None, db=None, user=None, use_resource_ids=False):
-        del names, db, user, use_resource_ids
+        del names, db
+        assert user is not None
+        assert use_resource_ids is True
         return server_configs
 
-    async def fake_get_mcp_tools(server_name: str, additional_servers=None, **kwargs):
+    async def fake_get_mcp_tools(server_name: str, additional_servers=None, user=None, **kwargs):
         del kwargs
-        calls.append((server_name, additional_servers or {}))
+        calls.append((server_name, additional_servers or {}, user))
         return [server_name]
 
     monkeypatch.setattr(mcp_service, "load_enabled_mcp_server_configs", fake_load_enabled_mcp_server_configs)
     monkeypatch.setattr(mcp_service, "get_mcp_tools", fake_get_mcp_tools)
 
-    tools = await mcp_service.get_tools_from_all_servers(user=SimpleNamespace(uid="user-1", role="user"))
+    tools = await mcp_service.get_tools_from_all_servers(user=user)
 
     assert tools == ["alpha", "beta"]
     assert calls == [
-        ("alpha", server_configs),
-        ("beta", server_configs),
+        ("alpha", server_configs, user),
+        ("beta", server_configs, user),
     ]
 
 
@@ -517,6 +520,7 @@ async def test_get_mcp_tools_filters_by_original_remote_name(monkeypatch):
             }
         },
         disabled_tools=["echo"],
+        user=SimpleNamespace(uid="user-1", role="user"),
     )
 
     assert tools == []
@@ -543,6 +547,200 @@ async def test_get_mcp_tools_does_not_connect_stateless_http_client(monkeypatch)
 
     mcp_service.clear_mcp_cache()
     assert client.close_count == 0
+
+
+async def test_get_mcp_tools_redacts_client_failure_from_error_and_logs(monkeypatch):
+    """MCP 客户端异常不得进入日志或向上传播的错误文本。"""
+    mcp_service.clear_mcp_cache()
+    sensitive_marker = "synthetic-sensitive-url-token"
+
+    class FailingClient:
+        async def list_tools(self):
+            raise RuntimeError(sensitive_marker)
+
+    async def fake_get_mcp_client(_server_configs):
+        return FailingClient()
+
+    messages: list[str] = []
+    sink_id = mcp_service.logger.add(
+        lambda message: messages.append(str(message)),
+        format="{message}\n{exception}",
+        enqueue=False,
+    )
+    monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
+    try:
+        with pytest.raises(RuntimeError, match="所选 MCP 暂不可用") as caught:
+            await mcp_service.get_mcp_tools(
+                "mcp-sensitive",
+                additional_servers={
+                    "mcp-sensitive": {
+                        "resource_id": "mcp-sensitive",
+                        "transport": "streamable_http",
+                        "url": "https://example.test/mcp",
+                    }
+                },
+                user=SimpleNamespace(uid="user-1", role="user"),
+            )
+    finally:
+        mcp_service.logger.remove(sink_id)
+        mcp_service.clear_mcp_cache()
+
+    assert sensitive_marker not in str(caught.value)
+    assert sensitive_marker not in "".join(messages)
+
+
+async def test_discovered_mcp_tool_redacts_call_failure_from_result_and_logs(monkeypatch):
+    """MCP 工具发现成功后的调用异常也必须在工具边界脱敏。"""
+    from agentscope.message import ToolResultState
+    from agentscope.tool import MCPTool
+    from mcp.types import Tool
+
+    mcp_service.clear_mcp_cache()
+    sensitive_marker = "https://user:token@example.test/mcp?api_key=synthetic-secret"
+
+    @asynccontextmanager
+    async def fake_transport():
+        yield (object(), object())
+
+    raw_tool = MCPTool(
+        mcp_name="mcp-sensitive",
+        tool=Tool(
+            name="echo",
+            description="Echo input",
+            inputSchema={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
+        ),
+        client_gen=fake_transport,
+    )
+
+    class DiscoveryClient:
+        async def list_tools(self):
+            return [raw_tool]
+
+    class FailingCallSession:
+        def __init__(self, *_args):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, *_args, **_kwargs):
+            raise RuntimeError(sensitive_marker)
+
+    async def fake_get_mcp_client(_server_configs):
+        return DiscoveryClient()
+
+    messages: list[str] = []
+    sink_id = mcp_service.logger.add(
+        lambda message: messages.append(str(message)),
+        format="{message}\n{exception}",
+        enqueue=False,
+    )
+    monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
+    monkeypatch.setattr("agentscope.tool._adapters.ClientSession", FailingCallSession)
+    try:
+        [tool] = await mcp_service.get_mcp_tools(
+            "mcp-sensitive",
+            additional_servers={
+                "mcp-sensitive": {
+                    "resource_id": "mcp-sensitive",
+                    "transport": "streamable_http",
+                    "url": "https://example.test/mcp",
+                }
+            },
+            cache=False,
+            user=SimpleNamespace(uid="user-1", role="user"),
+        )
+        result = await tool(value="hello")
+    finally:
+        mcp_service.logger.remove(sink_id)
+        mcp_service.clear_mcp_cache()
+
+    assert result.state == ToolResultState.ERROR
+    assert [block.text for block in result.content] == ["所选 MCP 暂不可用"]
+    assert sensitive_marker not in "".join(messages)
+
+
+async def test_discovered_mcp_tool_redacts_error_chunk_content(monkeypatch):
+    """MCP 协议返回的错误正文也不能进入工具结果。"""
+    from agentscope.message import ToolResultState
+    from agentscope.tool import MCPTool
+    from mcp.types import TextContent, Tool
+
+    mcp_service.clear_mcp_cache()
+    sensitive_marker = "https://user:token@example.test/mcp?api_key=protocol-secret"
+
+    @asynccontextmanager
+    async def fake_transport():
+        yield (object(), object())
+
+    raw_tool = MCPTool(
+        mcp_name="mcp-sensitive",
+        tool=Tool(
+            name="echo",
+            description="Echo input",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        client_gen=fake_transport,
+    )
+
+    class DiscoveryClient:
+        async def list_tools(self):
+            return [raw_tool]
+
+    class ErrorResultSession:
+        def __init__(self, *_args):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                content=[TextContent(type="text", text=sensitive_marker)],
+                isError=True,
+            )
+
+    async def fake_get_mcp_client(_server_configs):
+        return DiscoveryClient()
+
+    monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
+    monkeypatch.setattr("agentscope.tool._adapters.ClientSession", ErrorResultSession)
+    try:
+        [tool] = await mcp_service.get_mcp_tools(
+            "mcp-sensitive",
+            additional_servers={
+                "mcp-sensitive": {
+                    "resource_id": "mcp-sensitive",
+                    "transport": "streamable_http",
+                    "url": "https://example.test/mcp",
+                }
+            },
+            cache=False,
+            user=SimpleNamespace(uid="user-1", role="user"),
+        )
+        result = await tool()
+    finally:
+        mcp_service.clear_mcp_cache()
+
+    assert result.state == ToolResultState.ERROR
+    assert [block.text for block in result.content] == ["所选 MCP 暂不可用"]
+    assert sensitive_marker not in repr(result)
 
 
 @pytest.mark.asyncio

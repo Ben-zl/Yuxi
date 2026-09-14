@@ -117,6 +117,36 @@ async def test_preload_reads_authorized_dependency_closure(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_preload_rejects_oversized_root_before_reading_all_bytes(tmp_path, monkeypatch):
+    item = _skill(tmp_path, "alpha", content="0123456789")
+    monkeypatch.setattr(skill_runtime, "MAX_SKILL_SNAPSHOT_BYTES", 5, raising=False)
+    monkeypatch.setattr(skill_runtime, "list_accessible_skills", lambda _db, _user: _async_value([item]))
+
+    with pytest.raises(ValueError, match="大小"):
+        await resolve_runtime_skills_for_context(
+            SimpleNamespace(skills=["alpha"], preload_skills=["alpha"]), db=object(), user=object()
+        )
+
+
+@pytest.mark.asyncio
+async def test_preload_rejects_aggregate_contents_before_next_skill(tmp_path, monkeypatch):
+    items = [_skill(tmp_path, slug, content="1234") for slug in ("alpha", "beta", "gamma")]
+    monkeypatch.setattr(skill_runtime, "MAX_SKILL_SNAPSHOT_BYTES", 5, raising=False)
+    monkeypatch.setattr(skill_runtime, "list_accessible_skills", lambda _db, _user: _async_value(items))
+
+    with pytest.raises(ValueError, match="大小"):
+        await resolve_runtime_skills_for_context(
+            SimpleNamespace(skills=["alpha", "beta", "gamma"], preload_skills=["alpha", "beta", "gamma"]),
+            db=object(),
+            user=object(),
+        )
+
+
+async def _async_value(value):
+    return value
+
+
+@pytest.mark.asyncio
 async def test_preload_rejects_symlinked_source_ancestor(tmp_path, monkeypatch):
     real_parent = tmp_path / "real"
     real_parent.mkdir()

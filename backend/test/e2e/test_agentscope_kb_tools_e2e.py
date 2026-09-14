@@ -13,15 +13,13 @@ import pytest
 from sqlalchemy import select
 
 from test.e2e.agentscope_e2e_fixtures import (
-    PROVIDER_ID,
+    PROVIDER_RESOURCE_ID,
     cleanup_fixture_agents,
     cleanup_test_users,
+    open_fixture_http_client,
     seed_test_users,
     upsert_mock_provider,
 )
-from yuxi.agentscope.client import AgentScopeServiceClient
-from yuxi.agentscope.gateway import stream_round_to_run_events
-from yuxi.agentscope.runner import ensure_thread_session
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Agent
 from yuxi.storage.redis.manager import close_async_redis_client, get_async_redis_client
@@ -47,8 +45,11 @@ async def db_session():
                 backend_id="ChatbotAgent",
                 config_json={
                     "context": {
-                        "model": f"{PROVIDER_ID}:mock-chat-model",
+                        "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
                         "mcps": [],
+                        "tools": [],
+                        "skills": [],
+                        "subagents": [],
                         "system_prompt": "你是工具测试助手。",
                     }
                 },
@@ -65,25 +66,35 @@ async def db_session():
 
 
 async def test_kb_tool_round_executes_and_streams(db_session):
-    uid = USER_ID
-    run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
-    request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
+    client, headers = await open_fixture_http_client(USER_ID)
+    try:
+        thread_response = await client.post(
+            "/api/chat/thread",
+            json={"agent_id": CHATBOT_SLUG, "title": f"kb-{uuid.uuid4().hex[:8]}"},
+            headers=headers,
+        )
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json()["id"])
+        run_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请列出知识库",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "meta": {"request_id": f"e2e-req-{uuid.uuid4().hex[:8]}"},
+            },
+            headers=headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json()["run_id"])
+        from e2e_helpers import consume_events, wait_for_run
 
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
-    result = await stream_round_to_run_events(
-        client,
-        uid=uid,
-        agent_id=mapping.agentscope_agent_id,
-        session_id=mapping.agentscope_session_id,
-        text="请列出知识库",
-        run_id=run_id,
-        request_id=request_id,
-        thread_id=thread_id,
-        read_timeout=300.0,
-    )
-    assert result.run_status == "completed"
+        event_counts = await consume_events(client, headers, run_id)
+        assert event_counts.get("end", 0) == 1, event_counts
+        run = await wait_for_run(client, headers, run_id)
+        assert run["status"] == "completed", run
+    finally:
+        await client.aclose()
 
     # 工具调用在事件流中呈现（TOOL_CALL/TOOL_RESULT）
     redis_client = await get_async_redis_client()
@@ -115,39 +126,37 @@ async def test_max_iters_keeps_partial_text_and_failed_terminal(db_session):
     agent.config_json = {"context": {**context, "max_execution_steps": 1}}
     await db_session.commit()
 
-    run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
-    request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = await ensure_thread_session(
-        db_session,
-        client,
-        uid=USER_ID,
-        thread_id=thread_id,
-        agent_slug=CHATBOT_SLUG,
-    )
-    await client.set_permission_mode(
-        USER_ID,
-        mapping.agentscope_agent_id,
-        mapping.agentscope_session_id,
-        "bypass",
-    )
+    client, headers = await open_fixture_http_client(USER_ID)
     try:
-        result = await stream_round_to_run_events(
-            client,
-            uid=USER_ID,
-            agent_id=mapping.agentscope_agent_id,
-            session_id=mapping.agentscope_session_id,
-            text="请列出知识库",
-            run_id=run_id,
-            request_id=request_id,
-            thread_id=thread_id,
-            read_timeout=300.0,
+        thread_response = await client.post(
+            "/api/chat/thread",
+            json={"agent_id": CHATBOT_SLUG, "title": f"kb-limit-{uuid.uuid4().hex[:8]}"},
+            headers=headers,
         )
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json()["id"])
+        run_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请列出知识库",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "meta": {"request_id": f"e2e-req-{uuid.uuid4().hex[:8]}"},
+            },
+            headers=headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json()["run_id"])
+        from e2e_helpers import consume_events, wait_for_run
 
-        assert result.run_status == "failed"
-        assert result.error_type == "exceed_max_iters"
-        assert result.text, "达到最大迭代时应保留 AgentScope 已产生的最终文本"
+        event_counts = await consume_events(client, headers, run_id)
+        assert event_counts.get("end", 0) == 1, event_counts
+        result = await wait_for_run(client, headers, run_id)
+        assert result["status"] == "failed", result
+        assert result["error_type"] == "exceed_max_iters", result
+        result_response = await client.get(f"/api/agent/runs/{run_id}/result", headers=headers)
+        assert result_response.status_code == 200, result_response.text
+        assert result_response.json()["output"], "达到最大迭代时应保留 AgentScope 已产生的最终文本"
 
         redis_client = await get_async_redis_client()
         try:
@@ -155,21 +164,9 @@ async def test_max_iters_keeps_partial_text_and_failed_terminal(db_session):
             assert frames[-1][1]["event_type"] == "end"
             end_envelope = json.loads(frames[-1][1]["payload"])
             assert end_envelope["payload"]["status"] == "failed"
-            assert end_envelope["payload"]["chunk"]["error_type"] == "exceed_max_iters"
+            assert end_envelope["payload"].get("chunk") is None
         finally:
             await redis_client.delete(f"run:events:{run_id}")
             await close_async_redis_client()
     finally:
-        await client.delete_session(
-            USER_ID,
-            mapping.agentscope_agent_id,
-            mapping.agentscope_session_id,
-            missing_ok=True,
-        )
-        await client.destroy_thread_workspaces(USER_ID, thread_id)
-        await client.delete_agent(USER_ID, mapping.agentscope_agent_id, missing_ok=True)
-        await client.delete_credential(
-            USER_ID,
-            mapping.agentscope_credential_id,
-            missing_ok=True,
-        )
+        await client.aclose()

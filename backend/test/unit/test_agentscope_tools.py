@@ -1,6 +1,7 @@
 """知识库工具可见性与 LITE 门控单测（迁移工单 07）。"""
 
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -81,11 +82,12 @@ async def test_build_mcp_tools_runs_http_client_in_service_process(monkeypatch):
     requests = []
     exposed_tool = SimpleNamespace(name="mcp__internal-mcp__echo")
 
-    async def fake_get_mcp_tools(slug, additional_servers=None, disabled_tools=None):
-        requests.append((slug, additional_servers, disabled_tools))
+    async def fake_get_mcp_tools(slug, additional_servers=None, disabled_tools=None, user=None):
+        requests.append((slug, additional_servers, disabled_tools, user))
         return [exposed_tool]
 
     monkeypatch.setattr("yuxi.agents.mcp.service.get_mcp_tools", fake_get_mcp_tools)
+    user = SimpleNamespace(uid="u1")
 
     result = await tools.build_mcp_tools(
         mcp_servers=[
@@ -99,6 +101,7 @@ async def test_build_mcp_tools_runs_http_client_in_service_process(monkeypatch):
                 "disabled_tools": ["admin"],
             }
         ],
+        user=user,
     )
 
     assert result == [exposed_tool]
@@ -117,6 +120,7 @@ async def test_build_mcp_tools_runs_http_client_in_service_process(monkeypatch):
                 }
             },
             ["admin"],
+            user,
         )
     ]
 
@@ -124,8 +128,8 @@ async def test_build_mcp_tools_runs_http_client_in_service_process(monkeypatch):
 async def test_build_mcp_tools_propagates_health_failure(monkeypatch):
     """已配置 MCP 不可达时显式终止本轮，不静默撤掉工具。"""
 
-    async def fake_get_mcp_tools(_slug, additional_servers=None, disabled_tools=None):
-        del additional_servers, disabled_tools
+    async def fake_get_mcp_tools(_slug, additional_servers=None, disabled_tools=None, user=None):
+        del additional_servers, disabled_tools, user
         raise RuntimeError("mcp unavailable")
 
     monkeypatch.setattr("yuxi.agents.mcp.service.get_mcp_tools", fake_get_mcp_tools)
@@ -139,7 +143,8 @@ async def test_build_mcp_tools_propagates_health_failure(monkeypatch):
                     "transport": "streamable_http",
                     "url": "http://broken:9000/mcp",
                 }
-            ]
+            ],
+            user=SimpleNamespace(uid="u1"),
         )
 
 
@@ -148,11 +153,12 @@ async def test_build_mcp_tools_starts_registered_builtin_stdio(monkeypatch):
     requests = []
     exposed_tool = SimpleNamespace(name="mcp__mcpServerChart__generateChart")
 
-    async def fake_get_mcp_tools(slug, additional_servers=None, disabled_tools=None):
-        requests.append((slug, additional_servers, disabled_tools))
+    async def fake_get_mcp_tools(slug, additional_servers=None, disabled_tools=None, user=None):
+        requests.append((slug, additional_servers, disabled_tools, user))
         return [exposed_tool]
 
     monkeypatch.setattr("yuxi.agents.mcp.service.get_mcp_tools", fake_get_mcp_tools)
+    user = SimpleNamespace(uid="u1")
     result = await tools.build_mcp_tools(
         mcp_servers=[
             {
@@ -162,7 +168,8 @@ async def test_build_mcp_tools_starts_registered_builtin_stdio(monkeypatch):
                 "command": "npx",
                 "args": ["-y", "@antv/mcp-server-chart"],
             }
-        ]
+        ],
+        user=user,
     )
 
     assert result == [exposed_tool]
@@ -179,6 +186,7 @@ async def test_build_mcp_tools_starts_registered_builtin_stdio(monkeypatch):
                 }
             },
             [],
+            user,
         )
     ]
 
@@ -208,7 +216,13 @@ async def test_duplicate_mcp_slugs_keep_distinct_sdk_tool_names(monkeypatch):
         for resource_id in ["resource-a", "resource-b"]
     ]
     try:
-        result = await tools.build_mcp_tools(mcp_servers=configs)
+
+        async def authorized_config(resource_id, *, user):
+            assert user.uid == "u1"
+            return next(config for config in configs if config["resource_id"] == resource_id)
+
+        monkeypatch.setattr(service, "get_enabled_mcp_server_config", authorized_config)
+        result = await tools.build_mcp_tools(mcp_servers=configs, user=SimpleNamespace(uid="u1"))
         assert clients == ["resource-a", "resource-b"]
         assert {tool.name for tool in result} == {"mcp__resource-a__echo", "mcp__resource-b__echo"}
         assert len({tool.metadata["id"] for tool in result}) == 2
@@ -460,6 +474,191 @@ async def test_skill_dependency_gateway_requires_activation_and_dispatches(monke
     assert result.content[0].text == "result:AgentScope"
 
 
+async def test_preloaded_skill_mcp_dependency_is_available_on_first_round(monkeypatch):
+    """preload 正文已进入首轮提示时，其非外部 MCP 依赖必须可直接通过 Gateway 调用。"""
+    from agentscope.tool import FunctionTool
+
+    async def echo(value: str) -> str:
+        return f"echo:{value}"
+
+    dependency_tool = FunctionTool(echo, name="mcp__resource__echo", is_read_only=True)
+    monkeypatch.setattr(tools, "build_dependency_tools", AsyncMock(return_value=[]))
+    monkeypatch.setattr(tools, "build_mcp_tools", AsyncMock(return_value=[dependency_tool]))
+    projection = SimpleNamespace(
+        preloaded_skills=["research"],
+        skill_tool_dependencies={"research": []},
+        skill_mcp_servers={"research": [{"resource_id": "resource"}]},
+        knowledge_slugs=[],
+    )
+    workspace = SimpleNamespace(
+        list_skills=AsyncMock(return_value=[SimpleNamespace(name="research", markdown="# Research")])
+    )
+
+    extensions = await tools.build_skill_dependency_gateway(
+        projection=projection,
+        workspace=workspace,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+    )
+
+    gateway = next(tool for tool in extensions if tool.name == "skill_dependency_gateway")
+    assert "mcp__resource__echo" in gateway.description
+    assert "skill_dependency_gateway" in gateway.description
+    state = SimpleNamespace(tool_context=SimpleNamespace(activated_groups=[]))
+    result = await gateway.call(
+        skill="research",
+        tool_name="mcp__resource__echo",
+        arguments={"value": "first"},
+        _agent_state=state,
+    )
+
+    assert result.content[0].text == "echo:first"
+    assert state.tool_context.activated_groups == ["skill__research"]
+
+
+async def test_preloaded_skill_mcp_dependency_redacts_call_failure(monkeypatch):
+    """Skill Gateway 必须复用 MCP 实际调用阶段的脱敏包装。"""
+    from agentscope.tool import MCPTool
+    from mcp.types import Tool
+
+    from yuxi.agents.mcp import service as mcp_service
+
+    sensitive_marker = "https://user:token@example.test/mcp?api_key=gateway-secret"
+
+    @asynccontextmanager
+    async def fake_transport():
+        yield (object(), object())
+
+    raw_tool = MCPTool(
+        mcp_name="resource",
+        tool=Tool(
+            name="echo",
+            description="Echo input",
+            inputSchema={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
+        ),
+        client_gen=fake_transport,
+    )
+
+    class DiscoveryClient:
+        async def list_tools(self):
+            return [raw_tool]
+
+    class FailingCallSession:
+        def __init__(self, *_args):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, *_args, **_kwargs):
+            raise RuntimeError(sensitive_marker)
+
+    async def fake_get_mcp_client(_server_configs):
+        return DiscoveryClient()
+
+    mcp_service.clear_mcp_cache()
+    monkeypatch.setattr(mcp_service, "get_mcp_client", fake_get_mcp_client)
+    monkeypatch.setattr("agentscope.tool._adapters.ClientSession", FailingCallSession)
+    try:
+        [dependency_tool] = await mcp_service.get_mcp_tools(
+            "resource",
+            additional_servers={
+                "resource": {
+                    "resource_id": "resource",
+                    "transport": "streamable_http",
+                    "url": "https://example.test/mcp",
+                }
+            },
+            cache=False,
+            user=SimpleNamespace(uid="u", role="user"),
+        )
+        monkeypatch.setattr(tools, "build_dependency_tools", AsyncMock(return_value=[]))
+        monkeypatch.setattr(tools, "build_mcp_tools", AsyncMock(return_value=[dependency_tool]))
+        projection = SimpleNamespace(
+            preloaded_skills=["research"],
+            skill_tool_dependencies={"research": []},
+            skill_mcp_servers={"research": [{"resource_id": "resource"}]},
+            knowledge_slugs=[],
+        )
+        workspace = SimpleNamespace(
+            list_skills=AsyncMock(return_value=[SimpleNamespace(name="research", markdown="# Research")])
+        )
+        extensions = await tools.build_skill_dependency_gateway(
+            projection=projection,
+            workspace=workspace,
+            uid="u",
+            agent_id="a",
+            session_id="s",
+            user=SimpleNamespace(uid="u", role="user"),
+        )
+        gateway = next(tool for tool in extensions if tool.name == "skill_dependency_gateway")
+        state = SimpleNamespace(tool_context=SimpleNamespace(activated_groups=[]))
+
+        result = await gateway.call(
+            skill="research",
+            tool_name=dependency_tool.name,
+            arguments={"value": "hello"},
+            _agent_state=state,
+        )
+    finally:
+        mcp_service.clear_mcp_cache()
+
+    assert result.state == "error"
+    assert result.content[0].text == "所选 MCP 暂不可用"
+    assert sensitive_marker not in repr(result)
+
+
+async def test_preloaded_skill_gateway_guidance_preserves_projection_order(monkeypatch):
+    """多个 preload Skill 的首轮 Gateway 说明必须保持投影声明顺序。"""
+    from agentscope.tool import FunctionTool
+
+    async def build_dependency_tools(*, tool_slugs, **_kwargs):
+        slug = tool_slugs[0]
+
+        async def dependency() -> str:
+            return slug
+
+        return [FunctionTool(dependency, name=f"{slug}_tool", is_read_only=True)]
+
+    monkeypatch.setattr(tools, "build_dependency_tools", build_dependency_tools)
+    monkeypatch.setattr(tools, "build_mcp_tools", AsyncMock(return_value=[]))
+    ordered_skills = ["zeta", "alpha", "middle"]
+    projection = SimpleNamespace(
+        preloaded_skills=ordered_skills,
+        skill_tool_dependencies={slug: [slug] for slug in ordered_skills},
+        skill_mcp_servers={slug: [] for slug in ordered_skills},
+        knowledge_slugs=[],
+    )
+    workspace = SimpleNamespace(
+        list_skills=AsyncMock(
+            return_value=[SimpleNamespace(name=slug, markdown=f"# {slug}") for slug in ordered_skills]
+        )
+    )
+
+    extensions = await tools.build_skill_dependency_gateway(
+        projection=projection,
+        workspace=workspace,
+        uid="u",
+        agent_id="a",
+        session_id="s",
+    )
+
+    gateway = next(item for item in extensions if item.name == "skill_dependency_gateway")
+    positions = [gateway.description.index(f"`{slug}_tool`") for slug in ordered_skills]
+    assert positions == sorted(positions)
+
+
 async def test_external_skill_gateway_requires_token_and_preserves_nested_schema(monkeypatch):
     """外部依赖只能使用 Skill 返回的令牌，questions 保持嵌套协议。"""
     import re
@@ -477,6 +676,7 @@ async def test_external_skill_gateway_requires_token_and_preserves_nested_schema
     )
     monkeypatch.setattr(tools, "build_mcp_tools", AsyncMock(return_value=[]))
     projection = SimpleNamespace(
+        preloaded_skills=["research"],
         skill_tool_dependencies={"research": ["ask_user_question"]},
         skill_mcp_servers={"research": []},
         knowledge_slugs=[],

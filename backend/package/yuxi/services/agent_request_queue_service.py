@@ -152,7 +152,7 @@ async def intake_request(
         existing = await repo.get_by_request_id(request_id)
         if not existing:
             return None
-        return await _build_existing_intake_result(
+        return await build_existing_intake_result(
             repo=repo,
             request=existing,
             uid=uid_str,
@@ -357,7 +357,7 @@ async def steer_queued_request(
     if request is None or request.uid != str(current_uid):
         raise HTTPException(status_code=404, detail={"code": "request_not_found", "message": "请求不存在"})
     if request.queue_policy == "steer" and request.status == REQUEST_STATUS_QUEUED:
-        return await _build_existing_intake_result(
+        return await build_existing_intake_result(
             repo=repo,
             request=request,
             uid=request.uid,
@@ -421,6 +421,7 @@ async def finalize_intake(
     uid: str,
     workdir_path: str,
     materialize_managed: bool = False,
+    commit: bool = True,
 ) -> None:
     """提交 intake，物化其 Workdir 后才将 Run 投递到 ARQ。"""
     dispatch = (
@@ -435,16 +436,23 @@ async def finalize_intake(
         else None
     )
     if dispatch is not None:
-        await finalize_dispatch(db=db, dispatch=dispatch)
+        await finalize_dispatch(db=db, dispatch=dispatch, commit=commit)
         return
-    await db.commit()
+    if commit:
+        await db.commit()
     if materialize_managed:
         ensure_bound_user_workdir(str(uid), workdir_path)
 
 
-async def finalize_dispatch(*, db: AsyncSession, dispatch: DispatchResult) -> None:
+async def finalize_dispatch(
+    *,
+    db: AsyncSession,
+    dispatch: DispatchResult,
+    commit: bool = True,
+) -> None:
     """提交事务并物化 Workdir，随后才把已创建的 Run 投入 ARQ。"""
-    await db.commit()
+    if commit:
+        await db.commit()
     if dispatch.materialize_managed:
         ensure_bound_user_workdir(dispatch.uid, dispatch.workdir_path)
     await enqueue_agent_run(dispatch.run_id)
@@ -761,7 +769,7 @@ def _queue_conflict(code: str, message: str) -> HTTPException:
     return HTTPException(status_code=409, detail={"code": code, "message": message})
 
 
-async def _build_existing_intake_result(
+async def build_existing_intake_result(
     *,
     repo: AgentRunRequestRepository,
     request: AgentRunRequest,

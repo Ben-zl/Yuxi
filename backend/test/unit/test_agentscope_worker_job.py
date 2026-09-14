@@ -32,6 +32,8 @@ async def test_fail_run_with_cancel_signal_finishes_as_cancelled(monkeypatch):
     monkeypatch.setattr(worker_job, "_emit_end_event", emit_end)
     sync_delivery = AsyncMock()
     monkeypatch.setattr(worker_job, "_sync_input_delivery_status", sync_delivery)
+    clear_pending = AsyncMock()
+    monkeypatch.setattr(worker_job, "clear_pending_confirm", clear_pending)
     dispatch_next = AsyncMock()
     monkeypatch.setattr(worker_job, "dispatch_next_request", dispatch_next)
     notify_task = AsyncMock()
@@ -53,7 +55,9 @@ async def test_fail_run_with_cancel_signal_finishes_as_cancelled(monkeypatch):
         "run-1",
         status="cancelled",
         error_message=None,
+        cancel_requested_as_cancelled=True,
     )
+    clear_pending.assert_awaited_once_with("thread-1", expected_run_id="run-1")
     emit_end.assert_awaited_once_with(
         "run-1",
         "thread-1",
@@ -174,6 +178,10 @@ async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
         ),
     )
     monkeypatch.setattr(worker_job, "_materialize_run_attachments", AsyncMock(return_value="hello"))
+    from yuxi.agents.skills import service as skill_service
+
+    refresh_skills = AsyncMock()
+    monkeypatch.setattr(skill_service, "refresh_user_skill_projection_async", refresh_skills)
     monkeypatch.setattr(worker_job, "_apply_permission_mode", AsyncMock())
     monkeypatch.setattr(worker_job, "execute_run", AsyncMock(side_effect=RuntimeError("database aborted")))
     fail_run = AsyncMock()
@@ -181,6 +189,7 @@ async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
 
     await worker_job.execute_agent_run_job("run-1")
 
+    refresh_skills.assert_not_awaited()
     db.rollback.assert_awaited_once()
     fail_run.assert_awaited_once_with(
         db,
@@ -386,10 +395,18 @@ async def test_manifest_validation_loads_persisted_snapshot_without_writing(monk
     repo = SimpleNamespace(record_run_manifest=AsyncMock())
     load_resources = AsyncMock()
     monkeypatch.setattr(worker_job, "load_run_resources", load_resources)
+    ensure_projection_root = AsyncMock()
+    monkeypatch.setattr(
+        worker_job,
+        "_ensure_user_skill_projection_root",
+        ensure_projection_root,
+        raising=False,
+    )
 
     await worker_job._record_run_manifest(db, repo, run, worker_id="worker-1")
 
     load_resources.assert_awaited_once_with(db, uid="u", manifest=MANIFEST, agent_slug="agent")
+    ensure_projection_root.assert_awaited_once_with("u")
     assert load_resources.await_args.kwargs["manifest"] is run.manifest
     assert run.manifest == MANIFEST
     assert run.manifest_fingerprint == compute_manifest_fingerprint(MANIFEST)

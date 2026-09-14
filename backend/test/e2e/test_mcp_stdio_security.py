@@ -9,7 +9,7 @@ from sqlalchemy import delete, select
 
 from yuxi.agents.mcp.service import ensure_builtin_mcp_servers_in_db, get_mcp_tools
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import MCPServer
+from yuxi.storage.postgres.models_business import MCPServer, User
 
 pytestmark = pytest.mark.e2e
 
@@ -72,6 +72,10 @@ async def test_legacy_stdio_mcp_is_disabled_without_starting_process(
     marker = Path(f"/tmp/{slug}.marker")
 
     try:
+        me_response = await e2e_client.get("/api/auth/me", headers=e2e_headers)
+        assert me_response.status_code == 200, me_response.text
+        uid = str(me_response.json()["uid"])
+
         async with current_loop_pg_manager.get_async_session_context() as db:
             db.add(
                 MCPServer(
@@ -88,14 +92,29 @@ async def test_legacy_stdio_mcp_is_disabled_without_starting_process(
             await db.commit()
 
         await ensure_builtin_mcp_servers_in_db()
-        assert await get_mcp_tools(slug, cache=False, force_refresh=True) == []
 
         async with current_loop_pg_manager.get_async_session_context() as db:
             server = await db.scalar(select(MCPServer).where(MCPServer.slug == slug))
+            user = await db.scalar(select(User).where(User.uid == uid))
             assert server is not None
+            assert user is not None
             assert server.enabled == 0
+            resource_id = str(server.resource_id)
 
-        test_response = await e2e_client.post(f"/api/system/mcp-servers/{slug}/test", headers=e2e_headers)
+        assert (
+            await get_mcp_tools(
+                resource_id,
+                cache=False,
+                force_refresh=True,
+                user=user,
+            )
+            == []
+        )
+
+        test_response = await e2e_client.post(
+            f"/api/system/mcp-servers/{resource_id}/test",
+            headers=e2e_headers,
+        )
         assert test_response.status_code == 400, test_response.text
         assert not marker.exists(), "legacy stdio MCP created a file in the API container"
     finally:

@@ -10,7 +10,6 @@ from datetime import timedelta
 
 import pytest
 
-from yuxi.agentscope.thread_guard import LEGACY_THREAD_MESSAGE
 from yuxi.repositories.agent_task_repository import (
     AgentTaskRepository,
     TaskExecutionRepository,
@@ -30,39 +29,117 @@ TEST_AGENT_SLUG = "task-center-it-agent"
 
 @pytest.fixture
 async def db_session():
-    from test.e2e.agentscope_e2e_fixtures import cleanup_fixture_agents, upsert_mock_provider
+    from test.e2e.agentscope_e2e_fixtures import (
+        cleanup_fixture_agents,
+        run_e2e_cleanup_steps,
+        upsert_mock_provider,
+    )
+    from test.live_api_cleanup import cleanup_static_test_user_resources
 
-    pg_manager.initialize()
-    await pg_manager.ensure_business_schema()
-    async with pg_manager.get_async_session_context() as session:
-        await cleanup_fixture_agents(session, TEST_AGENT_SLUG)
-        await upsert_mock_provider(session)
-        session.add(
-            Agent(
-                slug=TEST_AGENT_SLUG,
-                name="任务中心测试智能体",
-                backend_id="ChatbotAgent",
-                config_json={"context": {"model": "e2e-openai-mock:mock-chat-model"}},
-                share_config={
-                "version": 2,
-                "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
-                "manage_scope": None,
-            },
-            )
+    primary_error: BaseException | None = None
+    try:
+        pg_manager.initialize()
+        await pg_manager.ensure_business_schema()
+        async with pg_manager.get_async_session_context() as session:
+            try:
+                await cleanup_fixture_agents(session, TEST_AGENT_SLUG)
+                await upsert_mock_provider(session)
+                session.add(
+                    Agent(
+                        slug=TEST_AGENT_SLUG,
+                        name="任务中心测试智能体",
+                        backend_id="ChatbotAgent",
+                        config_json={"context": {"model": "e2e-openai-mock:mock-chat-model"}},
+                        share_config={
+                            "version": 2,
+                            "read_scope": {
+                                "access_level": "global",
+                                "department_ids": [],
+                                "user_uids": [],
+                            },
+                            "manage_scope": None,
+                        },
+                    )
+                )
+                await session.commit()
+                yield session
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                await run_e2e_cleanup_steps(
+                    [
+                        ("agent task active runs", lambda: _settle_task_test_runs(session)),
+                        ("agent task rows", lambda: _cleanup_all(session)),
+                        (
+                            "agent task fixture agent",
+                            lambda: cleanup_fixture_agents(session, TEST_AGENT_SLUG),
+                        ),
+                    ],
+                    primary_error=primary_error,
+                )
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
+    finally:
+        from yuxi.services import run_queue_service
+        from yuxi.storage.redis.manager import close_async_redis_client
+
+        async def close_postgres() -> None:
+            try:
+                await pg_manager.close()
+            finally:
+                pg_manager._initialized = False
+
+        async def close_arq_pool() -> None:
+            if run_queue_service._arq_pool is not None:
+                try:
+                    await run_queue_service._arq_pool.aclose()
+                finally:
+                    run_queue_service._arq_pool = None
+
+        await run_e2e_cleanup_steps(
+            [
+                ("agent task test user", lambda: cleanup_static_test_user_resources("task-it-user")),
+                ("agent task PostgreSQL", close_postgres),
+                ("agent task Redis", close_async_redis_client),
+                ("agent task ARQ pool", close_arq_pool),
+            ],
+            primary_error=primary_error,
         )
-        await session.commit()
-        yield session
-        await _cleanup_all(session)
-        await cleanup_fixture_agents(session, TEST_AGENT_SLUG)
-    await pg_manager.close()
-    pg_manager._initialized = False
-    from yuxi.services import run_queue_service
-    from yuxi.storage.redis.manager import close_async_redis_client
 
-    await close_async_redis_client()
-    if run_queue_service._arq_pool is not None:
-        await run_queue_service._arq_pool.aclose()
-        run_queue_service._arq_pool = None
+
+async def _settle_task_test_runs(db):
+    """先取消测试 UID 的活动 Run，等 Worker 收束后再物理清理。"""
+    from sqlalchemy import select
+
+    from yuxi.repositories.agent_run_repository import TERMINAL_RUN_STATUSES
+    from yuxi.services.agent_run_service import request_cancel_agent_run
+
+    await db.rollback()
+    run_ids = (
+        await db.scalars(
+            select(AgentRun.id).where(AgentRun.uid == "task-it-user", AgentRun.status.notin_(TERMINAL_RUN_STATUSES))
+        )
+    ).all()
+    for run_id in run_ids:
+        await request_cancel_agent_run(run_id=run_id, current_uid="task-it-user", db=db)
+
+    for _ in range(30):
+        await db.rollback()
+        remaining = (
+            await db.scalars(
+                select(AgentRun.id).where(
+                    AgentRun.uid == "task-it-user",
+                    AgentRun.status.notin_(TERMINAL_RUN_STATUSES),
+                )
+            )
+        ).all()
+        if not remaining:
+            return
+        await asyncio.sleep(1)
+    raise RuntimeError(f"Agent task test Runs did not stop: {remaining}")
 
 
 async def _cleanup_all(db):
@@ -116,9 +193,7 @@ async def test_task_crud_and_scope(db_session):
     assert task.agent_slug_snapshot == TEST_AGENT_SLUG
     assert can_view_task(user, task) and can_manage_task(user, task)
 
-    updated = await service.update_task(
-        user=user, task_id=task.id, payload={"prompt": "新提示词", "enabled": False}
-    )
+    updated = await service.update_task(user=user, task_id=task.id, payload={"prompt": "新提示词", "enabled": False})
     assert updated.prompt == "新提示词" and not updated.enabled
 
     # 范围不得超过智能体：全局 Agent 下的个人范围合法；越级 global 之外的非法值被拒
@@ -137,7 +212,9 @@ async def test_manual_trigger_creates_execution_and_run(db_session):
 
     trigger = AgentTaskTriggerService(db_session)
     execution, created = await trigger.trigger(
-        task_id=task.id, user=user, trigger_type="manual",
+        task_id=task.id,
+        user=user,
+        trigger_type="manual",
         idempotency_key=manual_idempotency_key(),
     )
     prompt_snapshot = task.prompt
@@ -171,7 +248,9 @@ async def test_fifo_serializes_and_advances(db_session):
     first_id = None
     for i in range(3):
         execution, _ = await trigger.trigger(
-            task_id=task_id_snapshot, user=user, trigger_type="manual",
+            task_id=task_id_snapshot,
+            user=user,
+            trigger_type="manual",
             idempotency_key=f"it-fifo-{i}",
         )
         if i == 0:
@@ -206,7 +285,9 @@ async def test_disable_cancels_queued(db_session):
     ids = []
     for i in range(3):
         execution, _ = await trigger.trigger(
-            task_id=disable_task_id, user=user, trigger_type="manual",
+            task_id=disable_task_id,
+            user=user,
+            trigger_type="manual",
             idempotency_key=f"it-disable-{i}",
         )
         ids.append(execution.id)
@@ -231,7 +312,9 @@ async def test_disable_cancels_queued(db_session):
     user = await _user(db_session)  # rollback 过期实例，重取
     with pytest.raises(HTTPException) as exc:
         await trigger.trigger(
-            task_id=disable_task_id, user=user, trigger_type="manual",
+            task_id=disable_task_id,
+            user=user,
+            trigger_type="manual",
             idempotency_key=manual_idempotency_key(),
         )
     assert exc.value.status_code == 409
@@ -262,7 +345,6 @@ async def test_api_trigger_idempotent(db_session):
 
 async def test_agent_delete_blocked_by_active_task(db_session):
     """工单 10：未归档任务引用时 Agent 删除 409；归档后允许。"""
-    from fastapi import HTTPException
     from yuxi.repositories.agent_repository import AgentRepository
 
     user = await _user(db_session)
@@ -302,9 +384,7 @@ async def test_agent_delete_blocked_by_active_task(db_session):
 async def test_resume_run_completion_finishes_interrupted_task_execution(db_session):
     """恢复 Run 完成后，任务执行必须从 interrupted 收敛为 succeeded。"""
     user = await _user(db_session)
-    task = await AgentTaskCRUDService(db_session).create_task(
-        user=user, payload=_payload("IT-恢复终态投影")
-    )
+    task = await AgentTaskCRUDService(db_session).create_task(user=user, payload=_payload("IT-恢复终态投影"))
     execution_id = str(uuid.uuid4())
     parent_run_id = str(uuid.uuid4())
     resume_run_id = str(uuid.uuid4())
@@ -361,9 +441,7 @@ async def test_resume_run_completion_finishes_interrupted_task_execution(db_sess
     )
     await db_session.commit()
 
-    handled = await AgentTaskDispatcher(db_session).notify_run_finished(
-        resume_run_id, "completed"
-    )
+    handled = await AgentTaskDispatcher(db_session).notify_run_finished(resume_run_id, "completed")
 
     await db_session.rollback()
     execution = await TaskExecutionRepository(db_session).get(execution_id)
@@ -382,7 +460,9 @@ async def test_execution_id_used_as_run_request_id(db_session):
 
     trigger = AgentTaskTriggerService(db_session)
     execution, _ = await trigger.trigger(
-        task_id=task.id, user=user, trigger_type="manual",
+        task_id=task.id,
+        user=user,
+        trigger_type="manual",
         idempotency_key="it-recovery-req-1",
     )
     execution_id = execution.id
@@ -414,15 +494,15 @@ async def test_recover_stale_reassociates_existing_run(db_session):
     模拟崩溃窗口：submit_run_command 已创建 Run，但 Dispatcher 未回写 agent_run_id。
     recover_stale 按 request_id 反查 Run 并补写关联。
     """
-    from yuxi.repositories.agent_run_repository import AgentRunRepository
-
     user = await _user(db_session)
     crud = AgentTaskCRUDService(db_session)
     task = await crud.create_task(user=user, payload=_payload("IT-恢复-补关联"))
 
     trigger = AgentTaskTriggerService(db_session)
     execution, _ = await trigger.trigger(
-        task_id=task.id, user=user, trigger_type="manual",
+        task_id=task.id,
+        user=user,
+        trigger_type="manual",
         idempotency_key="it-recovery-reassoc-1",
     )
     execution_id = execution.id
@@ -475,7 +555,9 @@ async def test_recover_stale_does_not_duplicate_run(db_session):
 
     trigger = AgentTaskTriggerService(db_session)
     execution, _ = await trigger.trigger(
-        task_id=task.id, user=user, trigger_type="manual",
+        task_id=task.id,
+        user=user,
+        trigger_type="manual",
         idempotency_key="it-recovery-idempotent-1",
     )
     execution_id = execution.id
@@ -521,15 +603,18 @@ async def test_manual_trigger_unique_keys_per_call(db_session):
     task = await crud.create_task(user=user, payload=_payload("IT-幂等键"))
 
     trigger = AgentTaskTriggerService(db_session)
-    exec_repo = TaskExecutionRepository(db_session)
 
     # 连续两次手动触发，使用不同幂等键
     e1, c1 = await trigger.trigger(
-        task_id=task.id, user=user, trigger_type="manual",
+        task_id=task.id,
+        user=user,
+        trigger_type="manual",
         idempotency_key=manual_idempotency_key(),
     )
     e2, c2 = await trigger.trigger(
-        task_id=task.id, user=user, trigger_type="manual",
+        task_id=task.id,
+        user=user,
+        trigger_type="manual",
         idempotency_key=manual_idempotency_key(),
     )
     assert c1 and c2

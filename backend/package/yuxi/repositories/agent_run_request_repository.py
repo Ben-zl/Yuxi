@@ -14,7 +14,7 @@ from __future__ import annotations
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from yuxi.storage.postgres.models_business import AgentRunRequest
+from yuxi.storage.postgres.models_business import AgentRunRequest, Message
 from yuxi.utils.datetime_utils import utc_now_naive
 
 
@@ -135,6 +135,33 @@ class AgentRunRequestRepository:
             self._queued_for_thread_query(uid=uid, agent_slug=agent_slug, conversation_thread_id=conversation_thread_id)
         )
         return list(result.scalars().all())
+
+    async def has_queued_attachment_reference(
+        self,
+        *,
+        uid: str,
+        agent_slug: str,
+        conversation_thread_id: str,
+        conversation_id: int,
+        file_id: str,
+    ) -> bool:
+        """检查尚未由 Worker 绑定的排队输入是否引用指定附件。"""
+        result = await self.db.execute(
+            select(Message.extra_metadata)
+            .join(AgentRunRequest, AgentRunRequest.input_message_id == Message.id)
+            .where(
+                AgentRunRequest.uid == str(uid),
+                AgentRunRequest.agent_slug == agent_slug,
+                AgentRunRequest.conversation_thread_id == conversation_thread_id,
+                AgentRunRequest.status == "queued",
+                Message.conversation_id == conversation_id,
+            )
+        )
+        return any(
+            file_id in metadata.get("attachment_file_ids", [])
+            for metadata in result.scalars()
+            if isinstance(metadata, dict) and isinstance(metadata.get("attachment_file_ids"), list)
+        )
 
     async def get_queue_position_for(self, request: AgentRunRequest) -> int:
         """给定已加载的请求对象，返回 1-based FIFO 位置；不在 queued 队列返回 0。"""

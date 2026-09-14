@@ -25,16 +25,10 @@ from yuxi.services.conversation_service import (
     upload_thread_attachment_view,
     upload_tmp_attachment_view,
 )
-from yuxi.services.artifact_service import resolve_thread_artifact_view
-from yuxi.services.thread_files_service import (
-    list_thread_files_view,
-    read_thread_file_content_view,
-    save_thread_artifact_to_workspace_view,
-)
+from yuxi.services.artifact_service import resolve_thread_artifact_view, save_thread_artifact_to_workspace_view
 from yuxi.services.feedback_service import get_message_feedback_view, submit_message_feedback_view
 from yuxi.utils.logging_config import logger
 from yuxi.utils.image_processor import process_uploaded_image
-from yuxi.agents.backends.paths import VIRTUAL_PATH_PREFIX
 
 
 # TODO：当前文件的功能过于庞杂，路由标签混乱
@@ -230,32 +224,9 @@ class TmpAttachmentConfirmResponse(BaseModel):
     attachments: list[AttachmentResponse]
 
 
-class ThreadFileEntry(BaseModel):
-    path: str
-    name: str
-    is_dir: bool
-    size: int
-    modified_at: str | None = None
-    artifact_url: str | None = None
-
-
-class ThreadFileListResponse(BaseModel):
-    path: str
-    files: list[ThreadFileEntry]
-    truncated: bool = False
-
-
-class ThreadFileContentResponse(BaseModel):
-    path: str
-    content: list[str]
-    offset: int
-    limit: int
-    total_lines: int
-    artifact_url: str
-
-
 class SaveThreadArtifactRequest(BaseModel):
     path: str
+    destination_path: str | None = None
 
 
 class SaveThreadArtifactResponse(BaseModel):
@@ -458,44 +429,6 @@ async def delete_thread_attachment(
     )
 
 
-@chat.get("/thread/{thread_id}/files", response_model=ThreadFileListResponse)
-async def list_thread_files(
-    thread_id: str,
-    path: str = Query(f"{VIRTUAL_PATH_PREFIX}"),
-    recursive: bool = Query(False),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_required_user),
-):
-    """列出线程文件目录。"""
-    return await list_thread_files_view(
-        thread_id=thread_id,
-        current_uid=str(current_user.uid),
-        db=db,
-        path=path,
-        recursive=recursive,
-    )
-
-
-@chat.get("/thread/{thread_id}/files/content", response_model=ThreadFileContentResponse)
-async def read_thread_file_content(
-    thread_id: str,
-    path: str = Query(...),
-    offset: int = Query(0, ge=0),
-    limit: int = Query(2000, ge=1, le=5000),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_required_user),
-):
-    """读取线程文本文件（按行分页）。"""
-    return await read_thread_file_content_view(
-        thread_id=thread_id,
-        current_uid=str(current_user.uid),
-        db=db,
-        path=path,
-        offset=offset,
-        limit=limit,
-    )
-
-
 @chat.get("/thread/{thread_id}/artifacts/{path:path}")
 async def get_thread_artifact(
     thread_id: str,
@@ -523,12 +456,13 @@ async def save_thread_artifact_to_workspace(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_required_user),
 ):
-    """保存交付物到共享 workspace/saved_artifacts 目录。"""
+    """保存交付物到用户选择的 Workdir 目录。"""
     return await save_thread_artifact_to_workspace_view(
         thread_id=thread_id,
         current_uid=str(current_user.uid),
         db=db,
         path=request.path,
+        destination_path=request.destination_path,
     )
 
 

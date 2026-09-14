@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
-from e2e_helpers import cancel_run, delete_agent, skip_if_external_quota
+from e2e_helpers import cancel_run, delete_agent, skip_if_external_quota, wait_for_run
 from test.live_api_cleanup import (
     make_test_conversation_metadata,
     make_test_conversation_title,
@@ -42,7 +42,7 @@ async def _create_thread(
     headers: dict[str, str],
     agent_id: str,
     marker: str,
-) -> tuple[str, str]:
+) -> str:
     response = await client.post(
         "/api/chat/thread",
         json={
@@ -56,9 +56,8 @@ async def _create_thread(
     payload = response.json()
     thread_id = payload.get("thread_id") or payload.get("id")
     assert thread_id, payload
-    workdir_path = payload.get("workdir_path")
-    assert workdir_path, payload
-    return str(thread_id), f"/home/gem/user-data/{workdir_path}"
+    assert payload.get("workdir_path"), payload
+    return str(thread_id)
 
 
 async def _create_run(
@@ -174,6 +173,8 @@ def _find_tool_call_ids(value: Any) -> set[str]:
 def _find_named_tool_call_ids(value: Any, tool_name: str) -> set[str]:
     ids: set[str] = set()
     if isinstance(value, dict):
+        if value.get("tool_name") == tool_name and value.get("langgraph_tool_call_id"):
+            ids.add(str(value["langgraph_tool_call_id"]))
         tool_calls = value.get("tool_calls")
         if isinstance(tool_calls, list):
             for tool_call in tool_calls:
@@ -196,6 +197,8 @@ def _find_tool_result_contents(value: Any, tool_call_ids: set[str]) -> list[str]
     if isinstance(value, dict):
         if str(value.get("tool_call_id") or "") in tool_call_ids and value.get("content") is not None:
             contents.append(str(value["content"]))
+        if str(value.get("langgraph_tool_call_id") or "") in tool_call_ids and value.get("tool_output") is not None:
+            contents.append(str(value["tool_output"]))
         for child in value.values():
             contents.extend(_find_tool_result_contents(child, tool_call_ids))
     elif isinstance(value, list):
@@ -221,16 +224,10 @@ async def _read_viewer_file(
     return content
 
 
-def _viewer_scope_path(project_root: str, runtime_path: str) -> str:
-    """把 Agent runtime 路径转换为 Viewer 的当前 Workdir 相对路径。"""
-    prefix = f"{project_root.rstrip('/')}/"
-    assert runtime_path.startswith(prefix), (project_root, runtime_path)
-    return f"/{runtime_path[len(prefix) :]}"
-
-
 async def test_subagent_stream_records_run_and_shares_output_files(
     e2e_client: httpx.AsyncClient,
     e2e_headers: dict[str, str],
+    e2e_mock_model_spec: str,
 ):
     me_response = await e2e_client.get("/api/auth/me", headers=e2e_headers)
     _assert_ok(me_response)
@@ -257,12 +254,13 @@ async def test_subagent_stream_records_run_and_shares_output_files(
     child_thread_id: str | None = None
     run_completed = False
 
-    default_response = await e2e_client.get("/api/agent/default", headers=e2e_headers)
-    _assert_ok(default_response)
-    default_context = ((default_response.json().get("agent") or {}).get("config_json") or {}).get("context") or {}
-    base_context: dict[str, Any] = {"tools": [], "knowledges": [], "mcps": [], "skills": []}
-    if default_context.get("model"):
-        base_context["model"] = default_context["model"]
+    base_context: dict[str, Any] = {
+        "model": e2e_mock_model_spec,
+        "tools": [],
+        "knowledges": [],
+        "mcps": [],
+        "skills": [],
+    }
 
     share_config = {
         "version": 2,
@@ -307,6 +305,7 @@ async def test_subagent_stream_records_run_and_shares_output_files(
                 "config_json": {
                     "context": {
                         **base_context,
+                        "tools": ["present_artifacts"],
                         "subagents": [sub_slug],
                         "system_prompt": (
                             "你是主智能体。严格按用户给出的工具顺序执行：先用 execute 创建 /tmp 运行时标记，"
@@ -336,11 +335,11 @@ async def test_subagent_stream_records_run_and_shares_output_files(
         }
         assert sub_slug in management_agent_slugs
 
-        thread_id, project_root = await _create_thread(e2e_client, e2e_headers, main_slug, marker)
-        parent_input_path = f"{project_root}/outputs/parent-input.txt"
-        output_path = f"{project_root}/outputs/subagents.txt"
-        parent_input_viewer_path = _viewer_scope_path(project_root, parent_input_path)
-        output_viewer_path = _viewer_scope_path(project_root, output_path)
+        thread_id = await _create_thread(e2e_client, e2e_headers, main_slug, marker)
+        parent_input_path = "/workspace/outputs/parent-input.txt"
+        output_path = "/workspace/outputs/subagents.txt"
+        parent_input_viewer_path = "/home/gem/user-data/outputs/parent-input.txt"
+        output_viewer_path = "/home/gem/user-data/outputs/subagents.txt"
         query = (
             f"请严格依次完成：1）你先用 execute 执行 `printf '%s' '{runtime_content}' > '{runtime_marker}'`；"
             f"2）用 write_file 创建 {parent_input_path}，内容只有一行“{expected_content}”；"
@@ -364,9 +363,7 @@ async def test_subagent_stream_records_run_and_shares_output_files(
         )
         assert event_counts.get("messages", 0) > 0
 
-        run_response = await e2e_client.get(f"/api/agent/runs/{run_id}", headers=e2e_headers)
-        _assert_ok(run_response)
-        parent_run = run_response.json().get("run") or {}
+        parent_run = await wait_for_run(e2e_client, e2e_headers, run_id)
         assert parent_run.get("status") == "completed"
         assert parent_run.get("runtime_scope_id") == thread_id
 
@@ -414,24 +411,23 @@ async def test_subagent_stream_records_run_and_shares_output_files(
         assert child_run.get("runtime_scope_id") == thread_id
         assert child_state_payload.get("messages"), child_state_payload
         child_messages_text = json.dumps(child_state_payload["messages"], ensure_ascii=False, default=str)
-        assert all(
-            marker in child_messages_text for marker in ("read_file", parent_input_path, "write_file", output_path)
-        ), {
+        assert all(marker in child_messages_text for marker in ("Read", parent_input_path, "Write", output_path)), {
             "message": "子智能体未执行父文件读取到子产物写入链路",
             "subagent_run": completed_run,
             "messages": child_state_payload["messages"],
         }
-        child_read_call_ids = _find_named_tool_call_ids(child_state_payload["messages"], "read_file")
+        child_read_call_ids = _find_named_tool_call_ids(child_state_payload["messages"], "Read")
         child_read_results = _find_tool_result_contents(child_state_payload["messages"], child_read_call_ids)
         assert child_read_call_ids and any(expected_content in content for content in child_read_results), {
-            "message": "子智能体 read_file 未从共享 Project Workdir 读到父智能体写入的真实内容",
+            "message": "子智能体 Read 未从共享 Project Workdir 读到父智能体写入的真实内容",
             "tool_call_ids": sorted(child_read_call_ids),
             "tool_results": child_read_results,
+            "messages": child_state_payload["messages"],
         }
-        child_execute_call_ids = _find_named_tool_call_ids(child_state_payload["messages"], "execute")
+        child_execute_call_ids = _find_named_tool_call_ids(child_state_payload["messages"], "Bash")
         child_execute_results = _find_tool_result_contents(child_state_payload["messages"], child_execute_call_ids)
         assert child_execute_call_ids and any(runtime_content in content for content in child_execute_results), {
-            "message": "子智能体未从父智能体的同一 runtime 读取 /tmp 标记",
+            "message": "子智能体 Bash 未从父智能体的同一 runtime 读取 /tmp 标记",
             "tool_call_ids": sorted(child_execute_call_ids),
             "tool_results": child_execute_results,
         }
@@ -444,10 +440,9 @@ async def test_subagent_stream_records_run_and_shares_output_files(
         history_text = json.dumps(history_payload, ensure_ascii=False)
         tool_call_ids = _find_tool_call_ids(history_payload)
         assert str(completed_run["id"]) in tool_call_ids
-        assert child_thread_id in history_text
-        assert "write_file" in history_text and parent_input_path in history_text
-        assert "execute" in history_text and runtime_marker in history_text
-        assert "read_file" in history_text and output_path in history_text
+        assert "Write" in history_text and parent_input_path in history_text
+        assert "Bash" in history_text and runtime_marker in history_text
+        assert "Read" in history_text and output_path in history_text
 
         assert (
             await _read_viewer_file(e2e_client, e2e_headers, thread_id, output_viewer_path)
@@ -457,7 +452,7 @@ async def test_subagent_stream_records_run_and_shares_output_files(
 
         tree_response = await e2e_client.get(
             "/api/viewer/filesystem/tree",
-            params={"thread_id": thread_id, "path": "/outputs"},
+            params={"thread_id": thread_id, "path": "/home/gem/user-data/outputs"},
             headers=e2e_headers,
         )
         _assert_ok(tree_response)
@@ -475,14 +470,6 @@ async def test_subagent_stream_records_run_and_shares_output_files(
     finally:
         if not run_completed:
             await cancel_run(e2e_client, e2e_headers, run_id)
-        if thread_id:
-            for path in (parent_input_viewer_path, output_viewer_path):
-                if path:
-                    await e2e_client.delete(
-                        "/api/viewer/filesystem/file",
-                        params={"thread_id": thread_id, "path": path},
-                        headers=e2e_headers,
-                    )
         for cleanup_thread_id in (thread_id, child_thread_id):
             if cleanup_thread_id:
                 delete_response = await e2e_client.delete(

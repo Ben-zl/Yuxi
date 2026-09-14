@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.services.agent_run_service import (
+    AgentRunWaitUnavailable,
     AgentRunWaitTimeout,
     await_agent_run_result,
     get_agent_run_result,
@@ -124,6 +125,11 @@ async def create_agent_call_run(
         raise HTTPException(
             status_code=504,
             detail={"message": "运行仍在进行中，等待最终结果超时", "run": exc.result},
+        ) from exc
+    except AgentRunWaitUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "运行等待依赖暂时不可用，请稍后查询结果", "reason": exc.reason},
         ) from exc
     return _build_agent_call_response(result)
 

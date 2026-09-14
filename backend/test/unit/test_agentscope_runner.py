@@ -147,6 +147,40 @@ async def test_new_thread_persists_workspace_id_with_mapping(monkeypatch):
     db.commit.assert_awaited_once()
 
 
+async def test_new_thread_defers_encrypted_snapshot_skills_to_agentscope_runtime(monkeypatch):
+    """跨容器 Session 初始化不得重新读取提交时已封存的 Skill 来源目录。"""
+    projection = SimpleNamespace(
+        model_spec="p:model",
+        agent_request={"name": "agent"},
+        credential_data={},
+        chat_model_config={"model": "model"},
+        skills=[
+            {
+                "slug": "reporter",
+                "name": "Reporter",
+                "source_dir": "/deleted/current/reporter",
+                "snapshot_files": [{"path": "SKILL.md", "content_base64": "c3VibWl0dGVk", "executable": False}],
+            }
+        ],
+    )
+    client = SimpleNamespace(
+        create_credential=AsyncMock(return_value="credential"),
+        create_agent=AsyncMock(return_value="agent"),
+        create_session=AsyncMock(return_value="session"),
+        get_session_workspace_id=AsyncMock(return_value="workspace"),
+        add_workspace_skill=AsyncMock(),
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+    monkeypatch.setattr(runner.thread_session_repo, "get_thread_session", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner.thread_session_repo, "create_thread_session", AsyncMock(return_value=SimpleNamespace()))
+    monkeypatch.setattr(runner, "ensure_thread_eligible", AsyncMock())
+    monkeypatch.setattr(runner, "project_runtime", AsyncMock(return_value=projection))
+
+    await runner.ensure_thread_session(db, client, uid="u", thread_id="t", agent_slug="a")
+
+    client.add_workspace_skill.assert_not_awaited()
+
+
 async def test_recover_untracked_external_wait_before_next_user_message(monkeypatch):
     """Yuxi 无 pending 事实时，应清理 AgentScope 后台续写遗留的等待态。"""
     client = SimpleNamespace(

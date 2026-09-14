@@ -7,14 +7,22 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
+import time
 import uuid
+from datetime import UTC, datetime
 
 import asyncpg
 import httpx
 import pytest
 
 from e2e_helpers import cancel_run, consume_events, delete_agent, postgres_dsn, wait_for_run
-from test.live_api_cleanup import make_test_conversation_metadata, make_test_conversation_title
+from test.live_api_cleanup import (
+    make_test_conversation_metadata,
+    make_test_conversation_title,
+    make_test_resource_id,
+)
 from yuxi.agents.backends.sandbox import ProvisionerSandboxBackend, get_sandbox_provider
 from yuxi.workspace.paths import workspace_uid_dirname
 from yuxi.config import get_skill_projection_dir
@@ -23,10 +31,52 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.e2e, pytest.mark.slow]
 
 EXPECTED_OUTPUT = "DETERMINISTIC_AGENT_E2E_OK"
 EXPECTED_PRELOADED_SKILL_MARKER = "# 图片生成技能"
-EXPECTED_PRELOADED_TOOL = "present_artifacts"
+EXPECTED_PRELOADED_TOOL = "skill_dependency_gateway"
+EXPECTED_DEPENDENCY_TOOL = "present_artifacts"
 EXPECTED_TOOL_CALL_ID = "call-preloaded-tool"
 PROVIDER_ID = "ci-replay"
-MODEL_SPEC = f"{PROVIDER_ID}:deterministic-chat"
+
+
+def _as_utc_naive(value: datetime) -> datetime:
+    """将 PostgreSQL 时间值统一为 UTC naive，便于跨驱动比较。"""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def deterministic_replay_server():
+    """在 E2E 进程内启动确定性 replay，覆盖 API 容器 localhost:8765。"""
+    process = subprocess.Popen(
+        [sys.executable, "-m", "test.support.openai_replay_server", "--host", "0.0.0.0", "--port", "8765"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                response = httpx.get("http://127.0.0.1:8765/health", timeout=0.5)
+                if response.status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            if process.poll() is not None:
+                stderr = process.stderr.read() if process.stderr else ""
+                raise RuntimeError(f"deterministic replay server exited early: {stderr}")
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("deterministic replay server did not become ready")
+        yield process
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
 
 async def test_replay_rejects_requests_outside_deterministic_contract() -> None:
@@ -93,7 +143,7 @@ async def test_replay_rejects_requests_outside_deterministic_contract() -> None:
             assert response.json() == {"error": expected_error}
 
 
-async def _create_provider(client: httpx.AsyncClient, headers: dict[str, str]) -> None:
+async def _create_provider(client: httpx.AsyncClient, headers: dict[str, str]) -> tuple[str, str]:
     response = await client.post(
         "/api/system/model-providers",
         json={
@@ -112,15 +162,27 @@ async def _create_provider(client: httpx.AsyncClient, headers: dict[str, str]) -
                 }
             ],
             "is_enabled": True,
+            "share_config": {
+                "version": 2,
+                "read_scope": {
+                    "access_level": "global",
+                    "department_ids": [],
+                    "user_uids": [],
+                },
+                "manage_scope": None,
+            },
         },
         headers=headers,
     )
     assert response.status_code == 200, response.text
-    assert response.json()["data"]["provider_id"] == PROVIDER_ID
+    provider = response.json()["data"]
+    assert provider["provider_id"] == PROVIDER_ID
+    resource_id = str(provider["resource_id"])
+    return resource_id, f"{resource_id}:deterministic-chat"
 
 
-async def _delete_provider(client: httpx.AsyncClient, headers: dict[str, str]) -> None:
-    response = await client.delete(f"/api/system/model-providers/{PROVIDER_ID}", headers=headers)
+async def _delete_provider(client: httpx.AsyncClient, headers: dict[str, str], resource_id: str) -> None:
+    response = await client.delete(f"/api/system/model-providers/{resource_id}", headers=headers)
     assert response.status_code in {200, 404}, response.text
 
 
@@ -140,6 +202,7 @@ async def _run_deterministic(
             "query": f"只输出 {EXPECTED_OUTPUT}",
             "agent_slug": agent_slug,
             "thread_id": thread_id,
+            "tool_approval_mode": "always_trust",
             "meta": {
                 "request_id": request_id,
                 "attachment_file_ids": attachment_file_ids or [],
@@ -153,7 +216,12 @@ async def _run_deterministic(
     return run
 
 
-async def _create_agent(client: httpx.AsyncClient, headers: dict[str, str], uid: str) -> str:
+async def _create_agent(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    uid: str,
+    model_spec: str,
+) -> str:
     slug = f"ci-deterministic-{uuid.uuid4().hex[:8]}"
     response = await client.post(
         "/api/agent",
@@ -164,7 +232,7 @@ async def _create_agent(client: httpx.AsyncClient, headers: dict[str, str], uid:
             "description": "无外部密钥的 assembled-path 测试智能体",
             "config_json": {
                 "context": {
-                    "model": MODEL_SPEC,
+                    "model": model_spec,
                     "system_prompt": f"不要调用工具，只输出 {EXPECTED_OUTPUT}。",
                     "tools": [],
                     "knowledges": [],
@@ -216,16 +284,26 @@ async def _assert_persisted_causality(run_id: str, request_id: str) -> None:
 
         tool_call = await conn.fetchrow(
             """
-            SELECT tc.langgraph_tool_call_id, tc.tool_name, tc.status, tc.tool_output
+            SELECT tc.langgraph_tool_call_id, tc.tool_name, tc.tool_input, tc.status, tc.tool_output
             FROM tool_calls tc
             JOIN messages message ON message.id = tc.message_id
             WHERE message.run_id = $1
+              AND tc.tool_name = $2
+            ORDER BY tc.id DESC
             """,
             run_id,
+            EXPECTED_PRELOADED_TOOL,
         )
         assert tool_call, "预加载工具必须经过真实 ToolNode 执行并持久化"
         assert tool_call["langgraph_tool_call_id"] == EXPECTED_TOOL_CALL_ID
         assert tool_call["tool_name"] == EXPECTED_PRELOADED_TOOL
+        raw_input = tool_call["tool_input"]
+        tool_input = json.loads(raw_input) if isinstance(raw_input, str) else raw_input
+        assert tool_input == {
+            "skill": "image-gen",
+            "tool_name": EXPECTED_DEPENDENCY_TOOL,
+            "arguments": {"filepaths": ["/workspace/outputs/deterministic.txt"]},
+        }
         assert tool_call["status"] == "success"
         assert tool_call["tool_output"]
     finally:
@@ -255,7 +333,11 @@ async def _assert_persistent_workdir_binding(run_id: str, thread_id: str) -> Non
         await conn.close()
 
 
-async def _assert_persisted_execution_facts(run_id: str, agent_slug: str) -> None:
+async def _assert_persisted_execution_facts(
+    run_id: str,
+    agent_slug: str,
+    model_spec: str,
+) -> None:
     """真实 worker 链路固化后的 manifest 指纹与 attempt 终止事实。"""
     conn = await asyncpg.connect(postgres_dsn())
     try:
@@ -273,12 +355,16 @@ async def _assert_persisted_execution_facts(run_id: str, agent_slug: str) -> Non
         assert manifest is not None, "执行完成的 Run 必须已固化运行清单"
         assert manifest["manifest_version"] == 1
         assert manifest["agent"] == {"slug": agent_slug, "backend_id": "ChatbotAgent"}
-        assert manifest["model"] == {"spec": MODEL_SPEC}
+        assert manifest["model"] == {
+            "spec": model_spec,
+            "resource_id": model_spec.split(":", 1)[0],
+        }
         assert len(manifest["resources"]["skills"]) == 1
         assert manifest["resources"]["skills"][0]["slug"] == "image-gen"
         assert manifest["resources"]["skills"][0]["content_hash"]
         assert row["manifest_recorded_at"] is not None
-        assert row["manifest_recorded_at"] >= row["started_at"]
+        # started_at 表示队列取得执行占有的时间；manifest 可以在提交/派发阶段
+        # 固化，因此只要求它存在且不晚于首个 attempt 的执行占有时间。
 
         serialized = json.dumps(manifest, ensure_ascii=False)
         # 用户正文、prompt 与 provider 密钥不得进入 manifest 直接字段。
@@ -295,7 +381,7 @@ async def _assert_persisted_execution_facts(run_id: str, agent_slug: str) -> Non
 
         attempts = await conn.fetch(
             """
-            SELECT attempt_no, worker_id, outcome, finished_at
+            SELECT attempt_no, owner_id, outcome, started_at, finished_at
             FROM agent_run_attempts
             WHERE run_id = $1
             ORDER BY attempt_no
@@ -303,6 +389,7 @@ async def _assert_persisted_execution_facts(run_id: str, agent_slug: str) -> Non
             run_id,
         )
         assert attempts, "completed Run 必须有执行占有事实"
+        assert _as_utc_naive(row["manifest_recorded_at"]) <= _as_utc_naive(attempts[0]["started_at"])
         assert attempts[-1]["outcome"] == "completed"
         assert all(attempt["finished_at"] is not None for attempt in attempts)
         assert [attempt["attempt_no"] for attempt in attempts] == list(range(1, len(attempts) + 1))
@@ -318,17 +405,17 @@ async def test_deterministic_agent_path_reaches_persisted_result(
     assert me_response.status_code == 200, me_response.text
     uid = str(me_response.json()["uid"])
 
-    await _create_provider(e2e_client, e2e_headers)
+    provider_resource_id, model_spec = await _create_provider(e2e_client, e2e_headers)
     agent_slug: str | None = None
     thread_id: str | None = None
     run_id: str | None = None
     run_completed = False
     try:
-        agent_slug = await _create_agent(e2e_client, e2e_headers, uid)
+        agent_slug = await _create_agent(e2e_client, e2e_headers, uid, model_spec)
         projection_root = get_skill_projection_dir() / workspace_uid_dirname(uid)
         shutil.rmtree(projection_root, ignore_errors=True)
         assert not projection_root.exists(), "冷启动用例必须从缺失 uid Skill projection 开始"
-        request_id = f"deterministic-e2e-{uuid.uuid4()}"
+        request_id = make_test_resource_id("deterministic-e2e")
         run_response = await e2e_client.post(
             "/api/agent-invocation/agent-call/runs",
             json={
@@ -336,6 +423,7 @@ async def test_deterministic_agent_path_reaches_persisted_result(
                 "messages": [{"role": "user", "content": f"只输出 {EXPECTED_OUTPUT}"}],
                 "request_id": request_id,
                 "async_mode": True,
+                "tool_approval_mode": "always_trust",
             },
             headers=e2e_headers,
         )
@@ -361,7 +449,7 @@ async def test_deterministic_agent_path_reaches_persisted_result(
 
         await _assert_persisted_causality(run_id, request_id)
         await _assert_persistent_workdir_binding(run_id, thread_id)
-        await _assert_persisted_execution_facts(run_id, agent_slug)
+        await _assert_persisted_execution_facts(run_id, agent_slug, model_spec)
         run_completed = True
     finally:
         if run_id and not run_completed:
@@ -371,7 +459,7 @@ async def test_deterministic_agent_path_reaches_persisted_result(
             assert thread_delete.status_code in {200, 404}, thread_delete.text
         if agent_slug:
             await delete_agent(e2e_client, e2e_headers, agent_slug)
-        await _delete_provider(e2e_client, e2e_headers)
+        await _delete_provider(e2e_client, e2e_headers, provider_resource_id)
 
 
 async def test_attachment_is_written_to_user_workspace_workdir_and_survives_runtime_recreation(
@@ -381,13 +469,13 @@ async def test_attachment_is_written_to_user_workspace_workdir_and_survives_runt
     me_response = await e2e_client.get("/api/auth/me", headers=e2e_headers)
     assert me_response.status_code == 200, me_response.text
     uid = str(me_response.json()["uid"])
-    await _create_provider(e2e_client, e2e_headers)
+    provider_resource_id, model_spec = await _create_provider(e2e_client, e2e_headers)
 
     agent_slug: str | None = None
     thread_id: str | None = None
     workdir_path: str | None = None
     try:
-        agent_slug = await _create_agent(e2e_client, e2e_headers, uid)
+        agent_slug = await _create_agent(e2e_client, e2e_headers, uid, model_spec)
         thread_response = await e2e_client.post(
             "/api/chat/thread",
             json={
@@ -416,7 +504,9 @@ async def test_attachment_is_written_to_user_workspace_workdir_and_survives_runt
             json={
                 "attachments": [
                     {
+                        "file_name": uploaded["file_name"],
                         "file_type": uploaded.get("file_type"),
+                        "bucket_name": uploaded["bucket_name"],
                         "object_name": uploaded["object_name"],
                     }
                 ]
@@ -492,4 +582,4 @@ async def test_attachment_is_written_to_user_workspace_workdir_and_survives_runt
             assert thread_delete.status_code in {200, 404}, thread_delete.text
         if agent_slug:
             await delete_agent(e2e_client, e2e_headers, agent_slug)
-        await _delete_provider(e2e_client, e2e_headers)
+        await _delete_provider(e2e_client, e2e_headers, provider_resource_id)

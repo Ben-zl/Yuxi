@@ -3,13 +3,15 @@
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Integer, String, case, cast, distinct, func, literal, or_, select, text
+from sqlalchemy import String, case, cast, distinct, func, literal, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.storage.minio.client import normalize_public_minio_url
 from yuxi.storage.postgres.models_business import (
+    AGENT_RUN_TERMINAL_STATUSES,
     Agent,
+    AgentRun,
     Conversation,
     ConversationStats,
     Message,
@@ -540,30 +542,32 @@ class DashboardRepository:
             rows = list(result.all())
         elif metric_type == "tokens":
             rows = []
+            run_group = self._time_group_format(AgentRun.finished_at, time_range)
             for token_name in ("input_tokens", "output_tokens"):
+                token_usage_value = func.coalesce(
+                    AgentRun.token_usage["run"]["total"][token_name].as_integer(),
+                    AgentRun.token_usage[token_name].as_integer(),
+                    0,
+                )
                 result = await self.db_session.execute(
                     select(
-                        message_group.label("date"),
-                        func.sum(
-                            func.coalesce(
-                                cast(cast(Message.extra_metadata["usage_metadata"][token_name], String), Integer),
-                                0,
-                            )
-                        ).label("count"),
+                        run_group.label("date"),
+                        func.sum(token_usage_value).label("count"),
                         literal(token_name).label("category"),
                     )
-                    .join(Conversation, Message.conversation_id == Conversation.id)
+                    .select_from(AgentRun)
+                    .join(Conversation, AgentRun.conversation_id == Conversation.id)
                     .join(User, Conversation.uid == User.uid)
-                    .join(Agent, Conversation.agent_id == Agent.slug)
                     .where(
-                        Message.created_at >= query_start_time,
-                        Message.extra_metadata.isnot(None),
-                        Message.extra_metadata["usage_metadata"].isnot(None),
-                        Conversation.status.notin_(("deleted", "subagent")),
+                        AgentRun.finished_at.isnot(None),
+                        AgentRun.finished_at >= query_start_time,
+                        AgentRun.status.in_(AGENT_RUN_TERMINAL_STATUSES),
+                        AgentRun.token_usage.isnot(None),
+                        Conversation.status != "deleted",
                         User.is_deleted == 0,
                     )
-                    .group_by(message_group)
-                    .order_by(message_group)
+                    .group_by(run_group)
+                    .order_by(run_group)
                 )
                 rows.extend(result.all())
         else:

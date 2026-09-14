@@ -311,9 +311,9 @@ async def test_new_pending_event_replaces_old_one(monkeypatch):
     monkeypatch.setattr(worker_job, "store_pending_confirm", store)
     monkeypatch.setattr(worker_job, "clear_pending_confirm", clear)
 
-    await worker_job._replace_pending_confirm("thread", result)
+    await worker_job._replace_pending_confirm("thread", result, run_id="new-run")
 
-    store.assert_awaited_once_with("thread", event)
+    store.assert_awaited_once_with("thread", event, run_id="new-run")
     clear.assert_not_awaited()
 
 
@@ -332,17 +332,33 @@ class _AttachmentRepository:
 
 
 def _attachment_run():
-    return SimpleNamespace(uid="u", conversation_id=1, request_id="request"), SimpleNamespace(
-        agentscope_agent_id="agent", agentscope_session_id="session"
-    )
+    return SimpleNamespace(
+        uid="u",
+        conversation_id=1,
+        conversation_thread_id="thread",
+        request_id="request",
+    ), SimpleNamespace(agentscope_agent_id="agent", agentscope_session_id="session")
 
 
-async def test_attachments_bind_only_after_all_uploads_succeed():
+async def test_attachments_bind_only_after_all_uploads_succeed(monkeypatch, tmp_path):
     """附件上传全部成功后才绑定，并保持用户选择顺序。"""
+    uploads = tmp_path / "shared" / "u" / "workspace" / "projects" / "project-1" / "uploads"
+    uploads.mkdir(parents=True)
+    (uploads / "a.txt").write_text("a", encoding="utf-8")
+    (uploads / "b.pdf").write_bytes(b"b")
+    monkeypatch.setattr(worker_job, "get_user_data_dir", lambda: tmp_path)
     repo = _AttachmentRepository(
         [
-            {"file_id": "a", "file_name": "a.txt", "storage_path": "/tmp/a"},
-            {"file_id": "b", "file_name": "b.pdf", "storage_path": "/tmp/b"},
+            {
+                "file_id": "a",
+                "file_name": "a.txt",
+                "storage_path": "/home/gem/user-data/projects/project-1/uploads/a.txt",
+            },
+            {
+                "file_id": "b",
+                "file_name": "b.pdf",
+                "storage_path": "/home/gem/user-data/projects/project-1/uploads/b.pdf",
+            },
         ]
     )
     client = SimpleNamespace(
@@ -351,7 +367,14 @@ async def test_attachments_bind_only_after_all_uploads_succeed():
     run, mapping = _attachment_run()
     message = SimpleNamespace(content="read", extra_metadata={"attachment_file_ids": ["b", "a"]})
 
-    text = await worker_job._materialize_run_attachments(repo, client, run=run, input_message=message, mapping=mapping)
+    text = await worker_job._materialize_run_attachments(
+        repo,
+        client,
+        run=run,
+        input_message=message,
+        mapping=mapping,
+        workdir_path="projects/project-1",
+    )
 
     assert text.endswith("- /workspace/uploads/b.pdf\n- /workspace/uploads/a.txt")
     repo.bind.assert_awaited_once_with(1, "request", ["b", "a"])
@@ -380,15 +403,34 @@ async def test_attachment_validation_fails_before_binding(file_ids, attachments,
     repo.bind.assert_not_awaited()
 
 
-async def test_upload_failure_does_not_bind_attachment():
+async def test_upload_failure_does_not_bind_attachment(monkeypatch, tmp_path):
     """源文件缺失或远端上传失败时保留附件供重试。"""
-    repo = _AttachmentRepository([{"file_id": "a", "file_name": "a.txt", "storage_path": "/missing/a"}])
+    source = tmp_path / "shared" / "u" / "workspace" / "projects" / "project-1" / "uploads" / "a.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("a", encoding="utf-8")
+    monkeypatch.setattr(worker_job, "get_user_data_dir", lambda: tmp_path)
+    repo = _AttachmentRepository(
+        [
+            {
+                "file_id": "a",
+                "file_name": "a.txt",
+                "storage_path": "/home/gem/user-data/projects/project-1/uploads/a.txt",
+            }
+        ]
+    )
     client = SimpleNamespace(upload_workspace_file=AsyncMock(side_effect=FileNotFoundError("missing")))
     run, mapping = _attachment_run()
     message = SimpleNamespace(content="read", extra_metadata={"attachment_file_ids": ["a"]})
 
     with pytest.raises(FileNotFoundError, match="missing"):
-        await worker_job._materialize_run_attachments(repo, client, run=run, input_message=message, mapping=mapping)
+        await worker_job._materialize_run_attachments(
+            repo,
+            client,
+            run=run,
+            input_message=message,
+            mapping=mapping,
+            workdir_path="projects/project-1",
+        )
     repo.bind.assert_not_awaited()
 
 
@@ -452,12 +494,16 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
     monkeypatch.setattr(worker_job, "_emit_end_event", emit)
     dispatch = AsyncMock()
     monkeypatch.setattr(worker_job, "dispatch_next_request", dispatch)
+    monkeypatch.setattr(worker_job, "clear_pending_confirm", AsyncMock())
     monkeypatch.setattr(run_queue_service, "has_cancel_signal", AsyncMock(return_value=False))
 
     await worker_job.execute_agent_run_job("run")
 
     run_repo.set_terminal_status.assert_awaited_once_with(
-        "run", status="failed", error_message="执行失败: 模型供应商 disabled 未启用"
+        "run",
+        status="failed",
+        error_message="执行失败: 模型供应商 disabled 未启用",
+        cancel_requested_as_cancelled=True,
     )
     emit.assert_awaited_once()
     dispatch.assert_awaited_once_with(uid="u", agent_slug="agent", thread_id="thread")

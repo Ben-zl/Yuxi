@@ -7,35 +7,50 @@ AgentScope MCPClient 真实连接 mock MCP 服务器（streamable-http）→
 
 import json
 import os
-import uuid
 
 import httpx
 import pytest
 from sqlalchemy import delete, select
 
+from e2e_helpers import consume_events, iter_sse, wait_for_run
 from test.e2e.agentscope_e2e_fixtures import (
-    PROVIDER_ID,
+    PROVIDER_RESOURCE_ID,
     cleanup_fixture_agents,
+    cleanup_test_users,
+    open_fixture_http_client,
     upsert_mock_provider,
 )
-from yuxi.agentscope.client import AgentScopeServiceClient
-from yuxi.agentscope.gateway import stream_round_to_run_events
-from yuxi.agentscope.runner import ensure_thread_session
+from test.live_api_cleanup import (
+    make_test_conversation_metadata,
+    make_test_conversation_title,
+    make_test_resource_id,
+)
+from yuxi.repositories.agent_repository import DEFAULT_SHARE_CONFIG
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import (
     Agent,
     AgentScopeThreadSession,
     MCPServer,
+    Message,
+    ToolCall,
     User,
 )
 from yuxi.storage.redis.manager import close_async_redis_client, get_async_redis_client
+from yuxi.utils.auth_utils import AuthUtils
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
 CHATBOT_SLUG = "e2e-mcp-chatbot"
 MCP_SLUG = "e2e-echo-mcp"
-MCP_TOOL_NAME = "mcp__e2e-echo-mcp__echo"
+MCP_RESOURCE_ID = "e2e-echo-mcp-resource"
 USER_ID = "e2e-mcp"
 HEADER_SENTINEL = "mcp-header-must-stay-in-service"
+CALL_ERROR_SENTINEL = "https://user:token@example.test/mcp?api_key=e2e-sensitive-secret"
+
+
+def _mcp_tool_name(resource_id: str) -> str:
+    """按 MCP 全局资源 ID构造运行时命名空间。"""
+    return f"mcp__{resource_id}__echo"
+
 
 pytestmark = pytest.mark.e2e
 
@@ -46,8 +61,7 @@ async def db_session():
     await pg_manager.ensure_business_schema()
     async with pg_manager.get_async_session_context() as session:
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
-        await session.execute(delete(AgentScopeThreadSession).where(AgentScopeThreadSession.uid == USER_ID))
-        await session.execute(delete(User).where(User.uid == USER_ID))
+        await cleanup_test_users(session, USER_ID)
         await session.execute(
             delete(MCPServer).where(MCPServer.slug.in_([MCP_SLUG, "e2e-stdio-mcp", "e2e-disabled-mcp"]))
         )
@@ -57,8 +71,9 @@ async def db_session():
                 User(
                     uid=USER_ID,
                     username=USER_ID,
-                    password_hash="test-only",
+                    password_hash=AuthUtils.hash_password("e2e-fixture-password"),
                     role="superadmin",
+                    department_id=1,
                 ),
                 Agent(
                     slug=CHATBOT_SLUG,
@@ -66,14 +81,18 @@ async def db_session():
                     backend_id="ChatbotAgent",
                     config_json={
                         "context": {
-                            "model": f"{PROVIDER_ID}:mock-chat-model",
+                            "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
                             "system_prompt": "你是 MCP 测试助手。",
-                            "mcps": [MCP_SLUG],
+                            "mcps": [MCP_RESOURCE_ID],
+                            "tools": [],
+                            "skills": [],
+                            "subagents": [],
                         }
                     },
-                    share_config={},
+                    share_config=DEFAULT_SHARE_CONFIG,
                 ),
                 MCPServer(
+                    resource_id=MCP_RESOURCE_ID,
                     slug=MCP_SLUG,
                     name="回声 MCP",
                     description="e2e 回声工具",
@@ -89,11 +108,9 @@ async def db_session():
         )
         await upsert_mock_provider(session)
         yield session
-        await session.execute(delete(AgentScopeThreadSession).where(AgentScopeThreadSession.uid == USER_ID))
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
         await session.execute(delete(MCPServer).where(MCPServer.slug == MCP_SLUG))
-        await session.execute(delete(User).where(User.uid == USER_ID))
-        await session.commit()
+        await cleanup_test_users(session, USER_ID)
     await close_async_redis_client()
     await pg_manager.close()
     pg_manager._initialized = False
@@ -101,58 +118,149 @@ async def db_session():
 
 async def test_mcp_tool_round_executes_over_streamable_http(db_session):
     uid = USER_ID
-    run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
-    request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
-
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = None
-    redis_client = None
-    stream_key = f"run:events:{run_id}"
+    request_id = make_test_resource_id("mcp-round")
+    client, headers = await open_fixture_http_client(uid)
     try:
-        mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
-        # MCP 工具默认走审批门控（与旧栈审批语义一致，链路验证在工单 10）；此处放行
-        await client.set_permission_mode(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id, "bypass")
-        result = await stream_round_to_run_events(
-            client,
-            uid=uid,
-            agent_id=mapping.agentscope_agent_id,
-            session_id=mapping.agentscope_session_id,
-            text="请调用回声工具",
-            run_id=run_id,
-            request_id=request_id,
-            thread_id=thread_id,
-            read_timeout=300.0,
+        server = await db_session.scalar(select(MCPServer).where(MCPServer.slug == MCP_SLUG))
+        assert server is not None
+        mcp_tool_name = _mcp_tool_name(str(server.resource_id))
+        thread_response = await client.post(
+            "/api/chat/thread",
+            json={
+                "agent_id": CHATBOT_SLUG,
+                "title": make_test_conversation_title("mcp-round"),
+                "metadata": make_test_conversation_metadata("mcp-round", e2e=True),
+            },
+            headers=headers,
         )
-        assert result.run_status == "completed"
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json().get("id"))
+        run_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请调用回声工具",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "tool_approval_mode": "always_trust",
+                "meta": {"request_id": request_id},
+            },
+            headers=headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json()["run_id"])
+        event_counts = await consume_events(client, headers, run_id)
+        assert event_counts.get("end", 0) == 1, event_counts
+        run = await wait_for_run(client, headers, run_id)
+        assert run["status"] == "completed", run
 
         redis_client = await get_async_redis_client()
-        frames = await redis_client.xrange(stream_key)
-        all_chunks = []
-        for _, entry in frames:
-            if entry["event_type"] == "messages":
-                all_chunks.extend(json.loads(entry["payload"])["payload"]["items"])
+        stream_key = f"run:events:{run_id}"
+        try:
+            frames = await redis_client.xrange(stream_key)
+            all_chunks = []
+            for _, entry in frames:
+                if entry["event_type"] == "messages":
+                    all_chunks.extend(json.loads(entry["payload"])["payload"]["items"])
 
-        called_names = [
-            frag["name"]
-            for c in all_chunks
-            if c["status"] == "loading" and c["msg"].get("tool_call_chunks")
-            for frag in c["msg"]["tool_call_chunks"]
-        ]
-        assert MCP_TOOL_NAME in called_names, called_names
+            called_names = [
+                frag["name"]
+                for c in all_chunks
+                if c["status"] == "loading" and c["msg"].get("tool_call_chunks")
+                for frag in c["msg"]["tool_call_chunks"]
+            ]
+            assert mcp_tool_name in called_names, called_names
 
-        finished = [c for c in all_chunks if c["status"] == "stream_event"]
-        assert any("echo:" in c["event"]["data"]["output"]["content"] for c in finished)
+            finished = [c for c in all_chunks if c["status"] == "stream_event"]
+            assert any("echo:" in c["event"]["data"]["output"]["content"] for c in finished)
 
-        await _assert_mcp_not_projected_to_workspace(uid, mapping)
-    finally:
-        if redis_client is not None:
+            mapping = await db_session.scalar(
+                select(AgentScopeThreadSession).where(
+                    AgentScopeThreadSession.uid == uid,
+                    AgentScopeThreadSession.thread_id == thread_id,
+                )
+            )
+            assert mapping is not None
+            await _assert_mcp_not_projected_to_workspace(uid, mapping)
+        finally:
             await redis_client.delete(stream_key)
             await close_async_redis_client()
-        if mapping is not None:
-            await client.delete_session(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)
-            await client.delete_agent(uid, mapping.agentscope_agent_id)
-            await client.delete_credential(uid, mapping.agentscope_credential_id)
+    finally:
+        await client.aclose()
+
+
+async def test_mcp_call_error_is_redacted_from_events_history_and_result(db_session):
+    """发现成功后的 MCP 调用错误不得进入 SSE、Redis、历史或结果 API。"""
+    client, headers = await open_fixture_http_client(USER_ID)
+    redis_client = await get_async_redis_client()
+    run_id = None
+    try:
+        thread_response = await client.post(
+            "/api/chat/thread",
+            json={
+                "agent_id": CHATBOT_SLUG,
+                "title": make_test_conversation_title("mcp-error"),
+                "metadata": make_test_conversation_metadata("mcp-error", e2e=True),
+            },
+            headers=headers,
+        )
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json().get("id"))
+        run_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请调用失败回声",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "tool_approval_mode": "always_trust",
+                "meta": {"request_id": make_test_resource_id("mcp-error")},
+            },
+            headers=headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json()["run_id"])
+
+        sse_payloads = []
+        async for event, payload in iter_sse(client, headers, run_id):
+            sse_payloads.append({"event": event, "payload": payload})
+            if event == "end" or payload.get("status") in {"completed", "failed", "cancelled", "interrupted"}:
+                break
+
+        run = await wait_for_run(client, headers, run_id)
+        assert run["status"] == "completed", run
+        result_response = await client.get(f"/api/agent/runs/{run_id}/result", headers=headers)
+        assert result_response.status_code == 200, result_response.text
+        result = result_response.json()
+
+        frames = await redis_client.xrange(f"run:events:{run_id}")
+        tool_calls = (
+            (
+                await db_session.execute(
+                    select(ToolCall).join(Message, ToolCall.message_id == Message.id).where(Message.run_id == run_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        serialized = json.dumps(
+            {
+                "sse": sse_payloads,
+                "redis": frames,
+                "tool_calls": [tool_call.to_dict() for tool_call in tool_calls],
+                "result": result,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+        assert tool_calls
+        assert any(tool_call.status == "error" for tool_call in tool_calls)
+        assert "所选 MCP 暂不可用" in serialized
+        assert CALL_ERROR_SENTINEL not in serialized
+    finally:
+        if run_id:
+            await redis_client.delete(f"run:events:{run_id}")
+        await close_async_redis_client()
+        await client.aclose()
 
 
 async def _assert_mcp_not_projected_to_workspace(uid: str, mapping) -> None:
@@ -179,14 +287,18 @@ async def test_mcp_config_changes_apply_on_next_tool_build(db_session):
     from yuxi.agentscope.config_projection import project_runtime
     from yuxi.agentscope.tools import build_mcp_tools
 
+    user = await db_session.scalar(select(User).where(User.uid == USER_ID))
+    assert user is not None
+
     async def project_tools():
         projection = await project_runtime(db_session, uid=USER_ID, agent_slug=CHATBOT_SLUG)
-        return await build_mcp_tools(mcp_servers=projection.mcp_servers)
+        return await build_mcp_tools(mcp_servers=projection.mcp_servers, user=user)
 
     server = await db_session.scalar(select(MCPServer).where(MCPServer.slug == MCP_SLUG))
     assert server is not None
+    mcp_tool_name = _mcp_tool_name(str(server.resource_id))
     tools = await project_tools()
-    assert [tool.name for tool in tools] == [MCP_TOOL_NAME]
+    assert [tool.name for tool in tools] == [mcp_tool_name]
 
     server.disabled_tools = ["echo"]
     await db_session.commit()

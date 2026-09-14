@@ -709,7 +709,9 @@ async def test_pending_cancel_is_terminal_and_durable_cancel_wins_completion_rac
     try:
         async with session_factory() as db:
             pending_uid = (await db.get(AgentRun, pending_run_id)).uid
-            pending, pending_cancelled_ids = await AgentRunRepository(db).request_cancel_execution_tree(
+            pending, pending_cancelled_ids, pending_interrupted = await AgentRunRepository(
+                db
+            ).request_cancel_execution_tree(
                 run_id=pending_run_id,
                 uid=pending_uid,
                 cascade_descendants=False,
@@ -731,7 +733,9 @@ async def test_pending_cancel_is_terminal_and_durable_cancel_wins_completion_rac
             await db.commit()
         async with session_factory() as db:
             running_uid = (await db.get(AgentRun, running_run_id)).uid
-            requested, running_cancelled_ids = await AgentRunRepository(db).request_cancel_execution_tree(
+            requested, running_cancelled_ids, running_interrupted = await AgentRunRepository(
+                db
+            ).request_cancel_execution_tree(
                 run_id=running_run_id,
                 uid=running_uid,
                 cascade_descendants=False,
@@ -914,7 +918,7 @@ async def test_cancel_execution_tree_locks_root_before_descendants(lease_databas
                 {"name": application_name},
             )
             cancel_started.set()
-            _run, cancelled_ids = await AgentRunRepository(db).request_cancel_execution_tree(
+            _run, cancelled_ids, _interrupted = await AgentRunRepository(db).request_cancel_execution_tree(
                 run_id=root_id,
                 uid=uid,
                 cascade_descendants=True,
@@ -961,6 +965,7 @@ async def test_cancel_execution_tree_locks_root_before_descendants(lease_databas
             cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)
         await _cleanup_runs(session_factory, [root_thread, child_thread])
+
 
 async def test_lock_run_refreshes_lease_renewed_by_heartbeat_session(lease_database):
     """长执行会话必须读取独立 heartbeat 会话续租后的 PostgreSQL 事实。"""

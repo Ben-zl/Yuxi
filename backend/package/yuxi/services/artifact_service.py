@@ -22,6 +22,7 @@ from yuxi.agents.backends.paths import (
 from yuxi.agents.skills.service import ResolvedSkill, list_accessible_skills
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.services.file_preview import render_file_preview
+from yuxi.services.project_service import lock_project_workdir_changes
 from yuxi.services.thread_workspace_service import resolve_thread_workspace
 from yuxi.services.workdir_service import resolve_authorized_workdir
 from yuxi.utils.filepreview import (
@@ -38,16 +39,42 @@ MAX_SAVED_ARTIFACT_NAME_ATTEMPTS = 1000
 DEFAULT_ARTIFACT_DESTINATION = "/saved_artifacts"
 
 
-def _normalize_artifact_path(workdir_path: str, path: str) -> str:
+def _is_agentscope_session_artifact_path(path: str) -> bool:
+    """仅识别 AgentScope Session 实际拥有的根级 uploads/outputs 路径。"""
+    raw = str(path or "").strip()
+    target = PurePosixPath(raw if raw.startswith("/") else f"/{raw}")
+    if ".." in PurePosixPath(raw).parts:
+        return False
+    try:
+        relative = target.relative_to(PurePosixPath(VIRTUAL_PATH_PREFIX.rstrip("/")))
+    except ValueError:
+        return False
+    return len(relative.parts) > 1 and relative.parts[0] in {"uploads", "outputs"}
+
+
+def _normalize_artifact_path(workdir_path: str, path: str, *, project_workdir_paths: tuple[str, ...] = ()) -> str:
     raw = str(path or "").strip()
     normalized = str(PurePosixPath(raw if raw.startswith("/") else f"/{raw}"))
     if ".." in PurePosixPath(raw).parts:
         raise HTTPException(status_code=403, detail="access denied")
-    allowed = normalized.startswith(f"{workdir_path}/") or normalized.startswith(f"{VIRTUAL_PATH_PREFIX.rstrip('/')}/")
-    allowed = allowed or normalized.startswith(f"{VIRTUAL_SKILLS_PATH}/")
+    user_root = VIRTUAL_PATH_PREFIX.rstrip("/")
+    _reject_other_project_path(workdir_path, normalized, project_workdir_paths)
+    relative = PurePosixPath(normalized).relative_to(user_root) if normalized.startswith(f"{user_root}/") else None
+    allowed = normalized.startswith(f"{workdir_path}/") or normalized.startswith(f"{VIRTUAL_SKILLS_PATH}/")
+    if relative is not None:
+        allowed = allowed or len(relative.parts) == 1 or normalized.startswith(f"{user_root}/saved_artifacts/")
     if not allowed:
         raise HTTPException(status_code=403, detail="artifact is outside the current user's visible roots")
     return normalized
+
+
+def _reject_other_project_path(workdir_path: str, normalized: str, project_workdir_paths: tuple[str, ...]) -> None:
+    """其他 active Project 优先于 Session 和用户根兼容路径。"""
+    user_root = VIRTUAL_PATH_PREFIX.rstrip("/")
+    for other in project_workdir_paths:
+        other_root = f"{user_root}/{other}"
+        if other_root != workdir_path and (normalized == other_root or normalized.startswith(f"{other_root}/")):
+            raise HTTPException(status_code=403, detail="artifact access denied")
 
 
 async def _require_skill_artifact_access(
@@ -129,6 +156,37 @@ async def _copy_artifact_to_path(
         raise HTTPException(status_code=404, detail="artifact not found") from exc
 
 
+async def _resolve_session_artifact(*, access, thread_id: str, current_uid: str, db, path: str):
+    """只在路径不属于当前 Workdir 时读取同线程 Session 的根级产物。"""
+    workdir_root = runtime_user_data_path(access.workdir.root_path)
+    raw_path = str(path or "").strip()
+    normalized = str(PurePosixPath(raw_path if raw_path.startswith("/") else f"/{raw_path}"))
+    _reject_other_project_path(workdir_root, normalized, access.project_workdir_paths)
+    if (
+        not _is_agentscope_session_artifact_path(path)
+        or normalized.startswith(f"{workdir_root}/")
+        or await resolve_thread_workspace(db, uid=str(current_uid), thread_id=thread_id) is None
+    ):
+        return None
+    from yuxi.services.thread_files_service import resolve_thread_artifact_by_owner
+
+    source = await resolve_thread_artifact_by_owner(
+        thread_id=thread_id,
+        owner_uid=str(current_uid),
+        db=db,
+        path=path,
+    )
+    if not hasattr(source, "content"):
+        raise HTTPException(status_code=500, detail="AgentScope artifact source is invalid")
+    return source
+
+
+def _write_session_artifact_to_path(content: bytes, target_path: str) -> None:
+    """把已授权 Session 字节写入本次临时文件。"""
+    with open(target_path, "wb") as target:
+        target.write(content)
+
+
 async def resolve_thread_artifact_view(
     *,
     thread_id: str,
@@ -139,19 +197,13 @@ async def resolve_thread_artifact_view(
     preview: bool = False,
 ) -> FileResponse | StreamingResponse | dict:
     """把实时授权文件导出为自动清理的 HTTP 文件响应。"""
-    # AgentScope Session 的 outputs/uploads 不在本地 Project Workdir，必须从同一
-    # Session 读取，避免把旧 Workdir 当成执行产物来源。
-    if await resolve_thread_workspace(db, uid=str(current_uid), thread_id=thread_id) is not None:
-        from yuxi.services.thread_files_service import resolve_thread_artifact_by_owner
-
-        source = await resolve_thread_artifact_by_owner(
-            thread_id=thread_id,
-            owner_uid=str(current_uid),
-            db=db,
-            path=path,
-        )
-        if not hasattr(source, "content"):
-            raise HTTPException(status_code=500, detail="AgentScope artifact source is invalid")
+    await lock_project_workdir_changes(db=db, uid=current_uid)
+    access = await resolve_authorized_workdir(thread_id=thread_id, uid=current_uid, db=db)
+    workdir_root = runtime_user_data_path(access.workdir.root_path)
+    source = await _resolve_session_artifact(
+        access=access, thread_id=thread_id, current_uid=current_uid, db=db, path=path
+    )
+    if source is not None:
         file_name = source.name or PurePosixPath(path).name or "artifact"
         is_preview = preview and not download
         if is_preview:
@@ -166,8 +218,7 @@ async def resolve_thread_artifact_view(
             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(file_name)}"},
         )
 
-    access = await resolve_authorized_workdir(thread_id=thread_id, uid=current_uid, db=db)
-    normalized = _normalize_artifact_path(runtime_user_data_path(access.workdir.root_path), path)
+    normalized = _normalize_artifact_path(workdir_root, path, project_workdir_paths=access.project_workdir_paths)
     skill_source = await _require_skill_artifact_access(normalized_path=normalized, current_uid=current_uid, db=db)
     is_preview = preview and not download
     descriptor, temp_path = tempfile.mkstemp(prefix="yuxi-artifact-", suffix=PurePosixPath(normalized).suffix)
@@ -221,8 +272,18 @@ async def save_thread_artifact_to_workspace_view(
     *, thread_id: str, current_uid: str, db, path: str, destination_path: str | None = None
 ) -> dict[str, str]:
     """把可见 artifact 复制到用户选择的工作区目录。"""
+    await lock_project_workdir_changes(db=db, uid=current_uid)
     access = await resolve_authorized_workdir(thread_id=thread_id, uid=current_uid, db=db)
-    normalized = _normalize_artifact_path(runtime_user_data_path(access.workdir.root_path), path)
+    source = await _resolve_session_artifact(
+        access=access, thread_id=thread_id, current_uid=current_uid, db=db, path=path
+    )
+    if source is None:
+        normalized = _normalize_artifact_path(
+            runtime_user_data_path(access.workdir.root_path), path, project_workdir_paths=access.project_workdir_paths
+        )
+    else:
+        raw_path = str(path or "").strip()
+        normalized = str(PurePosixPath(raw_path if raw_path.startswith("/") else f"/{raw_path}"))
     raw_destination = str(destination_path or DEFAULT_ARTIFACT_DESTINATION).strip()
     destination = PurePosixPath(raw_destination)
     if (
@@ -234,6 +295,16 @@ async def save_thread_artifact_to_workspace_view(
     ):
         raise HTTPException(status_code=403, detail="invalid artifact destination")
     destination_scope = destination.as_posix()
+    file_name = PurePosixPath(normalized).name or "artifact"
+    workdir_root = runtime_user_data_path(access.workdir.root_path)
+    target_scope = f"{destination_scope.rstrip('/')}/{file_name}"
+    target = runtime_user_data_path(target_scope)
+    _reject_other_project_path(workdir_root, target, access.project_workdir_paths)
+    if any(
+        destination_scope == f"/{root}" or destination_scope.startswith(f"/{root}/")
+        for root in ("projects", "uploads", "outputs")
+    ) and not (target == workdir_root or target.startswith(f"{workdir_root}/")):
+        raise HTTPException(status_code=403, detail="artifact destination access denied")
     destination_must_exist = destination_path is not None and destination_scope != DEFAULT_ARTIFACT_DESTINATION
     if destination_must_exist:
         try:
@@ -254,8 +325,12 @@ async def save_thread_artifact_to_workspace_view(
     descriptor, temp_path = tempfile.mkstemp(prefix="yuxi-save-artifact-")
     os.close(descriptor)
     try:
-        await _copy_artifact_to_path(access, normalized, skill_source, temp_path)
-        file_name = PurePosixPath(normalized).name or "artifact"
+        if source is None:
+            await _copy_artifact_to_path(access, normalized, skill_source, temp_path)
+        else:
+            if len(source.content) > MAX_ARTIFACT_DOWNLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="artifact exceeds transfer limit")
+            await asyncio.to_thread(_write_session_artifact_to_path, source.content, temp_path)
         stem = PurePosixPath(file_name).stem
         suffix = PurePosixPath(file_name).suffix
         for index in range(MAX_SAVED_ARTIFACT_NAME_ATTEMPTS + 1):
@@ -288,5 +363,11 @@ async def save_thread_artifact_to_workspace_view(
         "name": PurePosixPath(target).name,
         "source_path": normalized,
         "saved_path": target,
-        "saved_artifact_url": f"/api/chat/thread/{thread_id}/artifacts/{target.lstrip('/')}",
+        "saved_artifact_url": (
+            f"/api/chat/thread/{thread_id}/artifacts/{target.lstrip('/')}"
+            if target.startswith(f"{workdir_root}/")
+            or target.startswith(f"{VIRTUAL_PATH_PREFIX.rstrip('/')}/saved_artifacts/")
+            or PurePosixPath(target_scope).parent == PurePosixPath("/")
+            else f"/api/workspace/download?path={quote(target_scope, safe='/')}"
+        ),
     }

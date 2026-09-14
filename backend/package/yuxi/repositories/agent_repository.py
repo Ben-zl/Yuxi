@@ -582,7 +582,7 @@ class AgentRepository:
     ) -> dict[str, Any]:
         data = agent.to_dict()
         data["share_config"] = normalize_permission_config(
-            agent.share_config,
+            agent.share_config or DEFAULT_SHARE_CONFIG,
         )
         permission = resolve_agent_permission(user, agent)
         is_builtin = is_builtin_agent(agent)

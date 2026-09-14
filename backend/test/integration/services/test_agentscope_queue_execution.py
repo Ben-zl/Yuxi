@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import os
 import uuid
-from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from test.e2e.agentscope_e2e_fixtures import (
+    PROVIDER_RESOURCE_ID,
+    upsert_mock_provider,
+)
 
+from yuxi.agents.buildin import agent_manager
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.execution import execute_run
 from yuxi.repositories.agent_run_repository import AgentRunRepository
@@ -27,7 +31,6 @@ from yuxi.storage.postgres.models_business import (
     AgentRunRequest,
     Conversation,
     Message,
-    ModelProvider,
     Project,
     User,
 )
@@ -36,7 +39,6 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
 AGENT_SLUG_PREFIX = "it-queue-chatbot"
-PROVIDER_ID = "e2e-openai-mock"
 
 
 @pytest.fixture
@@ -48,7 +50,6 @@ async def env(monkeypatch):
     engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    monkeypatch.setattr(agent_request_queue_service, "resolve_agent_run_config", lambda *a: ("model", "default"))
     enqueued: list[str] = []
 
     async def _capture_enqueue(run_id: str) -> None:
@@ -59,6 +60,7 @@ async def env(monkeypatch):
 
     project_id = str(uuid.uuid4())
     async with session_factory() as db:
+        await upsert_mock_provider(db)
         db.add(
             User(
                 uid=uid,
@@ -93,27 +95,23 @@ async def env(monkeypatch):
                 backend_id="ChatbotAgent",
                 config_json={
                     "context": {
-                        "model": f"{PROVIDER_ID}:mock-chat-model",
+                        "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
                         "mcps": [],
+                        "skills": [],
                         "system_prompt": "你是队列测试助手。",
                     }
                 },
-                share_config={},
+                share_config={
+                    "version": 2,
+                    "read_scope": {
+                        "access_level": "global",
+                        "department_ids": [],
+                        "user_uids": [],
+                    },
+                    "manage_scope": None,
+                },
             )
         )
-        provider = await db.scalar(select(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID))
-        if provider is None:
-            provider = ModelProvider(provider_id=PROVIDER_ID)
-            db.add(provider)
-        provider.display_name = "e2e mock provider"
-        provider.provider_type = "openai"
-        provider.base_url = os.getenv(
-            "OPENAI_MOCK_BASE_URL", os.getenv("OPENAI_MOCK_URL", "http://openai-mock:8080/v1")
-        )
-        provider.api_key = "e2e-mock-key"
-        provider.capabilities = ["chat"]
-        provider.enabled_models = [{"id": "mock-chat-model", "type": "chat"}]
-        provider.is_enabled = True
         await db.commit()
 
     yield {
@@ -149,6 +147,8 @@ async def env(monkeypatch):
 async def _intake(env, request_id: str, text: str):
     """intake → 提交事务 → 提交成功后才投递（复刻路由层的两阶段调用序）。"""
     async with env["session_factory"]() as db:
+        user = await db.scalar(select(User).where(User.uid == env["uid"]))
+        agent_item = await db.scalar(select(Agent).where(Agent.slug == env["agent_slug"]))
         result = await agent_request_queue_service.intake_request(
             db=db,
             request_id=request_id,
@@ -157,8 +157,9 @@ async def _intake(env, request_id: str, text: str):
             thread_id=env["thread_id"],
             queue_policy="enqueue",
             input_message=build_chat_input_message(text),
-            agent_item=MagicMock(),
-            agent_backend=MagicMock(),
+            agent_item=agent_item,
+            agent_backend=agent_manager.get_agent(agent_item.backend_id),
+            user=user,
         )
         await agent_request_queue_service.finalize_intake(
             db=db,

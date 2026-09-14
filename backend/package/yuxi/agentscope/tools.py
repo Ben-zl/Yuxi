@@ -256,9 +256,13 @@ def build_web_search_tool():
 async def build_mcp_tools(
     *,
     mcp_servers: list[dict],
+    user=None,
 ) -> list:
     """按统一投影在服务进程装配 HTTP MCP 与内置 stdio MCP 工具。"""
     from yuxi.agents.mcp.service import get_mcp_tools
+
+    if user is None:
+        raise PermissionError("MCP 工具装配需要当前用户授权上下文")
 
     tools = []
     for config in mcp_servers:
@@ -269,6 +273,7 @@ async def build_mcp_tools(
                 resource_id,
                 additional_servers={resource_id: server_config},
                 disabled_tools=list(server_config.get("disabled_tools") or []),
+                user=user,
             )
         )
     return tools
@@ -611,6 +616,7 @@ async def build_skill_dependency_gateway(
     uid: str,
     agent_id: str,
     session_id: str,
+    user=None,
 ) -> list:
     """构建 Skill 激活器和按 Session 隔离的依赖调用 Gateway。"""
     from jsonschema import ValidationError, validate
@@ -633,12 +639,24 @@ async def build_skill_dependency_gateway(
         configured.extend(
             await build_mcp_tools(
                 mcp_servers=projection.skill_mcp_servers.get(skill_slug, []),
+                user=user,
             )
         )
         if configured:
             dependency_tools[skill_slug] = {tool.name: tool for tool in configured}
             if any(tool.is_external_tool for tool in configured):
                 external_tokens[skill_slug] = secrets.token_urlsafe(24)
+    preloaded_skill_order = list(dict.fromkeys(getattr(projection, "preloaded_skills", []) or []))
+    preloaded_skills = set(preloaded_skill_order)
+    preloaded_dependency_guidance = "\n\n".join(
+        _dependency_guidance(
+            skill_slug,
+            {name: tool for name, tool in dependency_tools.get(skill_slug, {}).items() if not tool.is_external_tool},
+            None,
+        ).strip()
+        for skill_slug in preloaded_skill_order
+        if any(not tool.is_external_tool for tool in dependency_tools.get(skill_slug, {}).values())
+    )
 
     async def list_skills() -> dict:
         items = await workspace.list_skills(agent_id=agent_id)
@@ -691,7 +709,11 @@ async def build_skill_dependency_gateway(
         """调用已激活 Skill 的服务端工具或 HTTP MCP。"""
 
         name = "skill_dependency_gateway"
-        description = "调用已通过 Skill 工具激活的依赖工具；参数格式由 Skill 返回内容提供。"
+        description = "调用已通过 Skill 工具激活的依赖工具；参数格式由 Skill 返回内容提供。" + (
+            f"\n\n以下 preload Skill 已在首轮激活：\n{preloaded_dependency_guidance}"
+            if preloaded_dependency_guidance
+            else ""
+        )
         is_state_injected = True
         is_read_only = False
         is_concurrency_safe = False
@@ -739,8 +761,11 @@ async def build_skill_dependency_gateway(
 
         async def call(self, skill: str, tool_name: str, arguments: dict, _agent_state):
             """校验激活状态与原始 schema 后调用依赖。"""
-            if f"skill__{skill}" not in _agent_state.tool_context.activated_groups:
-                return _gateway_error(f"Skill '{skill}' 尚未激活，请先调用 Skill。")
+            group = f"skill__{skill}"
+            if group not in _agent_state.tool_context.activated_groups:
+                if skill not in preloaded_skills:
+                    return _gateway_error(f"Skill '{skill}' 尚未激活，请先调用 Skill。")
+                _agent_state.tool_context.activated_groups.append(group)
             target = _resolve_dependency(
                 dependency_tools,
                 skill,

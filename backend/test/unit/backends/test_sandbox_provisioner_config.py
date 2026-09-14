@@ -318,7 +318,12 @@ def test_docker_mount_checks_reject_uploads_and_outputs_mounts(monkeypatch, tmp_
     container = SimpleNamespace(
         attrs={
             "Mounts": [
-                {"Destination": "/home/gem/user-data", "Source": str(workspace)},
+                {
+                    "Destination": "/home/gem/user-data",
+                    "Source": str(workspace),
+                    "RW": True,
+                    "Mode": "rw",
+                },
                 {"Destination": "/home/gem/skills", "Source": str(skills), "RW": False, "Mode": "ro"},
             ]
         }
@@ -370,11 +375,21 @@ def test_docker_project_workdir_contract_mounts_shared_posix_roots(monkeypatch, 
     )
 
     run_kwargs = captured[0][1]
-    destinations = {mount["bind"] for mount in run_kwargs["volumes"].values()}
+    mounts = {mount["bind"]: (source, mount["mode"]) for source, mount in run_kwargs["volumes"].items()}
+    destinations = set(mounts)
     assert destinations == {
         "/home/gem/user-data",
+        "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111",
         "/home/gem/skills",
     }
+    assert mounts["/home/gem/user-data"] == (
+        str(tmp_path / "shared" / "user-1" / "workspace"),
+        "ro",
+    )
+    assert mounts["/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111"] == (
+        str(workdir),
+        "rw",
+    )
     assert run_kwargs["working_dir"] == "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111"
     assert run_kwargs["labels"]["workdir-path"] == "projects/11111111-1111-4111-8111-111111111111"
     assert {key: run_kwargs["environment"][key] for key in ("USER", "USER_UID", "USER_GID")} == {
@@ -383,6 +398,22 @@ def test_docker_project_workdir_contract_mounts_shared_posix_roots(monkeypatch, 
         "USER_GID": "1000",
     }
     assert record.workdir_path is None  # Fake container has no Docker labels; real discover reads the label.
+
+
+def test_docker_linked_workdir_mounts_only_bound_directory_as_writable(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROVISIONER_BACKEND", "memory")
+    _module, backend, captured = _docker_backend_with_running_container(monkeypatch, tmp_path)
+
+    workdir = tmp_path / "shared" / "user-1" / "workspace" / "clients" / "acme"
+    workdir.mkdir(parents=True)
+    backend.create("sandbox-linked", "root-thread", "user-1", workdir_path="clients/acme")
+
+    mounts = {mount["bind"]: (source, mount["mode"]) for source, mount in captured[0][1]["volumes"].items()}
+    assert mounts["/home/gem/user-data"] == (
+        str(tmp_path / "shared" / "user-1" / "workspace"),
+        "ro",
+    )
+    assert mounts["/home/gem/user-data/clients/acme"] == (str(workdir), "rw")
 
 
 def test_docker_rejects_symlink_in_workspace_identity_path(monkeypatch, tmp_path):
@@ -828,7 +859,19 @@ def test_kubernetes_workdir_contract_uses_user_workspace_subpath(monkeypatch):
     mounts = {mount.mount_path: getattr(mount, "sub_path", None) for mount in sandbox.volume_mounts}
     assert sandbox.working_dir == "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111"
     assert mounts["/home/gem/user-data"] == "shared/user-1/workspace"
+    assert (
+        mounts["/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111"]
+        == "shared/user-1/workspace/projects/11111111-1111-4111-8111-111111111111"
+    )
     assert mounts["/home/gem/skills"] == "skill-projections/user-1"
+    root_mount = next(mount for mount in sandbox.volume_mounts if mount.mount_path == "/home/gem/user-data")
+    workdir_mount = next(
+        mount
+        for mount in sandbox.volume_mounts
+        if mount.mount_path == "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111"
+    )
+    assert root_mount.read_only is True
+    assert workdir_mount.read_only is False
     skills_mount = next(mount for mount in sandbox.volume_mounts if mount.mount_path == "/home/gem/skills")
     assert skills_mount.read_only is True
     assert skills_mount.name == "skills-data"

@@ -122,7 +122,7 @@ async def ensure_thread_session(
                 existing.agentscope_session_id,
             )
         )
-        desired_skills = {item["slug"]: item["source_dir"] for item in projection.skills}
+        desired_skills = {item["slug"]: item for item in projection.skills}
         for slug in sorted(current_skills - desired_skills.keys()):
             await client.remove_workspace_skill(
                 uid,
@@ -131,11 +131,14 @@ async def ensure_thread_session(
                 slug,
             )
         for slug in desired_skills.keys() - current_skills:
+            skill = desired_skills[slug]
+            if "snapshot_files" in skill:
+                continue
             await client.add_workspace_skill(
                 uid,
                 existing.agentscope_agent_id,
                 existing.agentscope_session_id,
-                desired_skills[slug],
+                skill["source_dir"],
             )
         old_credential_id = existing.agentscope_credential_id
         await thread_session_repo.update_thread_session_model(
@@ -163,7 +166,8 @@ async def ensure_thread_session(
     session_id = await client.create_session(uid, agent_id, chat_model_config)
     workspace_id = await client.get_session_workspace_id(uid, agent_id, session_id)
     for skill in projection.skills:
-        await client.add_workspace_skill(uid, agent_id, session_id, skill["source_dir"])
+        if "snapshot_files" not in skill:
+            await client.add_workspace_skill(uid, agent_id, session_id, skill["source_dir"])
     record = await thread_session_repo.create_thread_session(
         db,
         uid=uid,

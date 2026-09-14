@@ -10,13 +10,13 @@ from sqlalchemy.exc import IntegrityError
 from yuxi.repositories.project_repository import ProjectRepository
 from yuxi.storage.postgres.models_business import Project
 from yuxi.utils.datetime_utils import utc_now_naive
-from yuxi.workspace.paths import normalize_linked_workdir_path
+from yuxi.workspace.paths import normalize_linked_workdir_path, strictly_overlapping_workdirs
 from yuxi.workspace.workdir import Workdir
 
 MAX_PROJECT_NAME_LENGTH = 255
 
 
-async def _lock_project_workdir_changes(*, db, uid: str) -> None:
+async def lock_project_workdir_changes(*, db, uid: str) -> None:
     """串行化同一用户的 linked Project 绑定与测试目录删除。"""
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
@@ -60,6 +60,7 @@ async def create_project_record(
         raise HTTPException(status_code=422, detail="selection_status 非法")
 
     project_id = str(uuid.uuid4())
+    await lock_project_workdir_changes(db=db, uid=str(uid))
     if directory_mode == "managed":
         if workdir_path is not None:
             raise HTTPException(status_code=422, detail="managed Project 不接受 workdir_path")
@@ -69,12 +70,15 @@ async def create_project_record(
             raise HTTPException(status_code=422, detail="linked Project 必须指定 workdir_path")
         try:
             normalized_path = normalize_linked_workdir_path(workdir_path)
-            await _lock_project_workdir_changes(db=db, uid=str(uid))
             Workdir.open_existing(str(uid), normalized_path)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="目录不存在") from exc
         except (NotADirectoryError, PermissionError, OSError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    existing_paths = await ProjectRepository(db).list_active_workdir_paths_for_user(str(uid))
+    if any(strictly_overlapping_workdirs(normalized_path, existing) for existing in existing_paths):
+        raise HTTPException(status_code=409, detail="Project Workdir 与已有 Project 目录重叠")
 
     project = Project(
         id=project_id,
@@ -172,6 +176,7 @@ async def rename_project_view(*, uid: str, project_id: str, name: str, db) -> di
 
 async def delete_project_view(*, uid: str, project_id: str, db) -> dict:
     """软删除 Project 及其 Conversation，保留 Workdir 字节。"""
+    await lock_project_workdir_changes(db=db, uid=str(uid))
     repository = ProjectRepository(db)
     project = await repository.lock_active_selectable_for_user(project_id, str(uid))
     if project is None:

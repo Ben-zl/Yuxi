@@ -5,6 +5,7 @@ import importlib
 
 import pytest
 from fastapi import HTTPException
+from yuxi.services.agent_run_service import AgentRunWaitUnavailable
 
 call_router = importlib.import_module("server.routers.agent_invocation_call_router")
 eval_router = importlib.import_module("server.routers.agent_invocation_eval_router")
@@ -138,6 +139,32 @@ async def test_agent_call_adapter_rejects_invalid_sync_policy():
 
 
 @pytest.mark.asyncio
+async def test_agent_call_adapter_maps_wait_dependency_error_to_503(monkeypatch: pytest.MonkeyPatch):
+    async def fake_submit_run_command(**_kwargs):
+        return {"run_id": "run-1", "thread_id": "thread-1", "status": "dispatched", "request_id": "req-1"}
+
+    async def fake_await_agent_run_result(**_kwargs):
+        raise AgentRunWaitUnavailable("redis_error")
+
+    monkeypatch.setattr(call_router, "submit_run_command", fake_submit_run_command)
+    monkeypatch.setattr(call_router, "await_agent_run_result", fake_await_agent_run_result)
+
+    with pytest.raises(HTTPException) as exc:
+        await call_router.create_agent_call_run(
+            call_router.AgentCallRunCreate(
+                agent_slug="translator",
+                messages=[{"role": "user", "content": "Hello"}],
+                request_id="req-1",
+            ),
+            current_user=SimpleNamespace(uid="user-1"),
+            db=object(),
+        )
+
+    assert exc.value.status_code == 503
+    assert exc.value.detail == {"message": "运行等待依赖暂时不可用，请稍后查询结果", "reason": "redis_error"}
+
+
+@pytest.mark.asyncio
 async def test_eval_adapter_submits_evaluation_origin_and_waits(monkeypatch: pytest.MonkeyPatch):
     calls: dict[str, object] = {}
 
@@ -168,6 +195,28 @@ async def test_eval_adapter_submits_evaluation_origin_and_waits(monkeypatch: pyt
     assert command.origin.external_id == "eval-1"
     assert command.origin.metadata == {"agent_invocation_meta": {"evaluation": {"dataset_name": "dataset"}}}
     assert result["output"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_eval_adapter_maps_wait_dependency_error_to_503(monkeypatch: pytest.MonkeyPatch):
+    async def fake_submit_run_command(**_kwargs):
+        return {"run_id": "run-1", "thread_id": "thread-1", "status": "dispatched", "request_id": "eval-1"}
+
+    async def fake_await_agent_run_result(**_kwargs):
+        raise AgentRunWaitUnavailable("db_error")
+
+    monkeypatch.setattr(eval_router, "submit_run_command", fake_submit_run_command)
+    monkeypatch.setattr(eval_router, "await_agent_run_result", fake_await_agent_run_result)
+
+    with pytest.raises(HTTPException) as exc:
+        await eval_router.create_agent_eval_run(
+            eval_router.AgentEvalRunCreate(query="Hello", agent_slug="translator"),
+            current_user=SimpleNamespace(uid="user-1"),
+            db=object(),
+        )
+
+    assert exc.value.status_code == 503
+    assert exc.value.detail == {"message": "运行等待依赖暂时不可用，请稍后查询结果", "reason": "db_error"}
 
 
 def test_trajectory_summary_counts_tool_error_and_interrupt():

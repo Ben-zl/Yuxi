@@ -310,3 +310,25 @@ async def test_set_terminal_status_normalizes_cancel_request_under_lock(session)
     assert persisted.status == "cancelled"
     assert persisted.error_type is None
     assert persisted.error_message is None
+
+
+async def test_request_cancel_converts_interrupted_run_to_cancelled(session):
+    """人工审批挂起的 Run 仍可被取消，并且不能停留在 interrupted。"""
+    repo = AgentRunRepository(session)
+    run = await repo.create_run(
+        run_id="interrupted-cancel-run",
+        conversation_thread_id="thread-1",
+        agent_slug="main",
+        uid="user-1",
+        request_id="interrupted-cancel-request",
+        input_payload={},
+    )
+    run.status = "interrupted"
+    await session.flush()
+
+    persisted = await repo.request_cancel(run.id)
+
+    assert persisted is not None
+    assert persisted.status == "cancelled"
+    assert persisted.error_type == "cancelled"
+    assert persisted.error_message == "对话已取消"

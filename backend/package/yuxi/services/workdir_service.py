@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from fastapi import HTTPException
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.repositories.project_repository import ProjectRepository
-from yuxi.workspace.paths import ensure_bound_user_workdir
+from yuxi.workspace.paths import ensure_bound_user_workdir, strictly_overlapping_workdirs
 from yuxi.workspace.workdir import Workdir
 
 
@@ -21,6 +21,7 @@ class AuthorizedWorkdir:
     workdir: Workdir
     project_id: str
     directory_mode: str
+    project_workdir_paths: tuple[str, ...] = ()
 
     @property
     def workdir_path(self) -> str:
@@ -37,6 +38,7 @@ async def resolve_authorized_workdir(*, thread_id: str, uid: str, db) -> Authori
         uid=str(uid),
         db=db,
     )
+    project_paths = await ProjectRepository(db).list_active_workdir_paths_for_user(str(uid))
     return AuthorizedWorkdir(
         conversation_id=conversation.id,
         thread_id=conversation.thread_id,
@@ -44,6 +46,7 @@ async def resolve_authorized_workdir(*, thread_id: str, uid: str, db) -> Authori
         workdir=Workdir.open_existing(str(uid), workdir_path),
         project_id=project.id,
         directory_mode=project.directory_mode,
+        project_workdir_paths=tuple(project_paths),
     )
 
 
@@ -74,6 +77,9 @@ async def ensure_conversation_workdir_available(*, conversation, uid: str, db) -
 async def resolve_conversation_workdir_binding(*, conversation, uid: str, db):
     """解析 Conversation 唯一 Project 所拥有的持久 Workdir。"""
     project = await ProjectRepository(db).get_for_user(conversation.project_id, str(uid))
-    if project is None:
-        raise RuntimeError("Conversation 绑定的 Project 不存在")
+    if project is None or getattr(project, "status", "active") != "active":
+        raise HTTPException(status_code=404, detail="Conversation 绑定的 Project 不存在")
+    active_paths = await ProjectRepository(db).list_active_workdir_paths_for_user(str(uid))
+    if any(strictly_overlapping_workdirs(project.workdir_path, path) for path in active_paths):
+        raise HTTPException(status_code=409, detail="Project Workdir 与已有 Project 目录重叠")
     return project.workdir_path, project

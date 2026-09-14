@@ -93,13 +93,13 @@ async def destroy_thread_workspaces(
         ],
     ]
     missing_ids = [session_id for _, session_id, workspace_id in records if not workspace_id]
-    if missing_ids:
+    if missing_ids and backend != "docker":
         raise WorkspaceCleanupConflict(f"Session 缺少已持久化 workspace_id: {', '.join(missing_ids)}")
     for agent_id, session_id, _ in records:
         if await storage.get_session(uid, agent_id, session_id) is not None:
             raise WorkspaceCleanupConflict(f"AgentScope Session 仍存在: {session_id}")
 
-    workspace_ids = {str(workspace_id) for _, _, workspace_id in records}
+    workspace_ids = {str(workspace_id) for _, _, workspace_id in records if workspace_id}
     for workspace_id in workspace_ids:
         await workspace_manager.close(workspace_id)
 
@@ -109,17 +109,19 @@ async def destroy_thread_workspaces(
 
     base = Path(base_dir)
     for agent_id, _, workspace_id in records:
-        candidates = (
-            [(str(workspace_id),), (uid, agent_id)]
-            if backend == "docker"
-            else [(agent_id,)]
-        )
+        if backend == "docker":
+            candidates = [(uid, agent_id)]
+            if workspace_id:
+                candidates.insert(0, (str(workspace_id),))
+        else:
+            candidates = [(agent_id,)]
         for parts in candidates:
             target = _safe_existing_path(base, *parts)
             if target is None:
                 continue
             await asyncio.to_thread(shutil.rmtree, target)
-            removed_ids.add(str(workspace_id))
+            if workspace_id:
+                removed_ids.add(str(workspace_id))
 
     return {
         "destroyed_workspace_ids": sorted(removed_ids),

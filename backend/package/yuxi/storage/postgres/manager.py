@@ -23,7 +23,7 @@ from yuxi.utils.singleton import SingletonMeta
 # 合并两个 Base
 CombinedBase = declarative_base()
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
-BUSINESS_SCHEMA_VERSION = 5
+BUSINESS_SCHEMA_VERSION = 13
 KNOWLEDGE_SCHEMA_VERSION = 4
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
@@ -38,17 +38,28 @@ AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS ix_agent_runs_runtime_cleanup_pending ON agent_runs(runtime_cleanup_pending)",
 )
 AGENT_RUN_FACT_SCHEMA_STATEMENTS = (
+    "ALTER TABLE IF EXISTS tool_calls ADD COLUMN IF NOT EXISTS langgraph_tool_call_id VARCHAR(100)",
+    (
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = 'tool_calls' "
+        "AND column_name = 'tool_call_id') THEN "
+        "UPDATE tool_calls SET langgraph_tool_call_id = tool_call_id "
+        "WHERE langgraph_tool_call_id IS NULL AND tool_call_id IS NOT NULL; "
+        "END IF; END $$"
+    ),
+    "CREATE INDEX IF NOT EXISTS ix_tool_calls_langgraph_tool_call_id ON tool_calls(langgraph_tool_call_id)",
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS manifest JSONB",
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS manifest_fingerprint VARCHAR(64)",
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS manifest_recorded_at TIMESTAMP WITHOUT TIME ZONE",
     """
     CREATE TABLE IF NOT EXISTS agent_run_attempts (
-        id SERIAL PRIMARY KEY,
+        id VARCHAR(64) PRIMARY KEY,
         run_id VARCHAR(64) NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
         attempt_no INTEGER NOT NULL,
-        worker_id VARCHAR(128) NOT NULL,
+        owner_id VARCHAR(128) NOT NULL,
         started_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
-        heartbeat_at TIMESTAMP WITHOUT TIME ZONE,
+        last_heartbeat_at TIMESTAMP WITHOUT TIME ZONE,
         lease_expires_at TIMESTAMP WITHOUT TIME ZONE,
         finished_at TIMESTAMP WITHOUT TIME ZONE,
         outcome VARCHAR(32),
@@ -60,6 +71,190 @@ AGENT_RUN_FACT_SCHEMA_STATEMENTS = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS ix_agent_run_attempts_open ON agent_run_attempts(run_id, finished_at)",
+    """
+    DO $$
+    BEGIN
+        IF to_regclass('agent_run_attempts') IS NOT NULL THEN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'agent_run_attempts'
+                  AND column_name = 'worker_id'
+            ) AND NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'agent_run_attempts'
+                  AND column_name = 'owner_id'
+            ) THEN
+                ALTER TABLE agent_run_attempts RENAME COLUMN worker_id TO owner_id;
+            END IF;
+
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'agent_run_attempts'
+                  AND column_name = 'heartbeat_at'
+            ) AND NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'agent_run_attempts'
+                  AND column_name = 'last_heartbeat_at'
+            ) THEN
+                ALTER TABLE agent_run_attempts RENAME COLUMN heartbeat_at TO last_heartbeat_at;
+            END IF;
+
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'agent_run_attempts'
+                  AND column_name = 'id'
+                  AND data_type IN ('smallint', 'integer', 'bigint')
+            ) THEN
+                ALTER TABLE agent_run_attempts ALTER COLUMN id DROP DEFAULT;
+                ALTER TABLE agent_run_attempts
+                    ALTER COLUMN id TYPE VARCHAR(64)
+                    USING id::VARCHAR;
+            END IF;
+
+            ALTER TABLE agent_run_attempts
+                ADD COLUMN IF NOT EXISTS outcome VARCHAR(32),
+                ADD COLUMN IF NOT EXISTS error_type VARCHAR(64),
+                ADD COLUMN IF NOT EXISTS error_message TEXT,
+                ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+                ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW();
+            ALTER TABLE agent_run_attempts
+                ALTER COLUMN fencing_token SET DEFAULT 0,
+                ALTER COLUMN created_at SET DEFAULT NOW(),
+                ALTER COLUMN updated_at SET DEFAULT NOW();
+        END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    DECLARE
+        target_column TEXT;
+    BEGIN
+        IF to_regclass('agent_run_attempts') IS NOT NULL THEN
+            FOREACH target_column IN ARRAY ARRAY[
+                'started_at',
+                'last_heartbeat_at',
+                'lease_expires_at',
+                'finished_at'
+            ] LOOP
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'agent_run_attempts'
+                      AND information_schema.columns.column_name = target_column
+                      AND data_type = 'timestamp with time zone'
+                ) THEN
+                    EXECUTE format(
+                        'ALTER TABLE agent_run_attempts '
+                        'ALTER COLUMN %I TYPE TIMESTAMP WITHOUT TIME ZONE '
+                        'USING %I AT TIME ZONE ''UTC''',
+                        target_column,
+                        target_column
+                    );
+                END IF;
+            END LOOP;
+        END IF;
+    END $$;
+    """,
+)
+MESSAGE_FEEDBACK_SCHEMA_STATEMENTS = (
+    "ALTER TABLE IF EXISTS message_feedbacks DROP COLUMN IF EXISTS conversation_id",
+    """
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'message_feedbacks'
+              AND column_name = 'message_id'
+              AND data_type = 'character varying'
+        ) THEN
+            IF EXISTS (
+                SELECT 1
+                FROM message_feedbacks
+                WHERE message_id IS NULL OR btrim(message_id) !~ '^[0-9]+$'
+            ) THEN
+                RAISE EXCEPTION
+                    'message_feedbacks.message_id contains non-numeric values and cannot be migrated to integer';
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                FROM message_feedbacks
+                WHERE message_id::NUMERIC > 2147483647
+            ) THEN
+                RAISE EXCEPTION
+                    'message_feedbacks.message_id contains values outside the integer range';
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                FROM message_feedbacks AS feedback
+                LEFT JOIN messages AS message
+                  ON message.id = feedback.message_id::INTEGER
+                WHERE message.id IS NULL
+            ) THEN
+                RAISE EXCEPTION
+                    'message_feedbacks.message_id does not reference an existing message';
+            END IF;
+            ALTER TABLE message_feedbacks
+                ALTER COLUMN message_id TYPE INTEGER
+                USING message_id::INTEGER;
+        END IF;
+
+        IF EXISTS (
+            SELECT 1
+            FROM message_feedbacks AS feedback
+            LEFT JOIN messages AS message ON message.id = feedback.message_id
+            WHERE message.id IS NULL
+        ) THEN
+            RAISE EXCEPTION
+                'message_feedbacks.message_id does not reference an existing message';
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid = 'message_feedbacks'::regclass
+              AND contype = 'f'
+              AND pg_get_constraintdef(oid)
+                  = 'FOREIGN KEY (message_id) REFERENCES messages(id)'
+        ) THEN
+            ALTER TABLE message_feedbacks
+                ADD CONSTRAINT message_feedbacks_message_id_fkey
+                FOREIGN KEY (message_id) REFERENCES messages(id);
+        END IF;
+    END $$;
+    """,
+)
+LEGACY_AGENT_TOOL_SCHEMA_STATEMENTS = (
+    """
+    UPDATE agents
+    SET config_json = jsonb_set(
+        config_json::jsonb,
+        '{context,tools}',
+        COALESCE(
+            (
+                SELECT jsonb_agg(value)
+                FROM jsonb_array_elements_text(config_json::jsonb #> '{context,tools}') AS item(value)
+                WHERE value NOT IN ('read', 'write')
+            ),
+            '[]'::jsonb
+        ),
+        TRUE
+    )::json
+    WHERE jsonb_typeof(config_json::jsonb #> '{context,tools}') = 'array'
+      AND EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(config_json::jsonb #> '{context,tools}') AS item(value)
+          WHERE value IN ('read', 'write')
+      )
+    """,
 )
 WORKDIR_PATH_SCHEMA_STATEMENTS = (
     f"""
@@ -211,7 +406,8 @@ RUNTIME_SCOPE_SCHEMA_STATEMENTS = (
             JOIN conversations AS parent ON parent.id = relation.parent_conversation_id
             WHERE relation.id = run.subagent_thread_relation_id
         ),
-        run.conversation_thread_id
+        run.conversation_thread_id,
+        run.id
     )
     WHERE run.runtime_scope_id IS NULL
     """,
@@ -894,10 +1090,14 @@ class PostgresManager(metaclass=SingletonMeta):
             "ALTER TABLE IF EXISTS agents ALTER COLUMN share_config TYPE JSONB USING share_config::jsonb",
             (
                 "UPDATE agents SET share_config = jsonb_build_object("
-                "'version', 2, 'read_scope', CASE WHEN share_config = '{}'::jsonb THEN "
+                "'version', 2, 'read_scope', CASE "
+                "WHEN share_config IS NULL OR share_config = '{}'::jsonb THEN "
                 '\'{"access_level": "global", "department_ids": [], "user_uids": []}\'::jsonb '
-                "ELSE share_config END, 'manage_scope', NULL) "
-                "WHERE share_config IS NOT NULL AND share_config->>'version' IS DISTINCT FROM '2'"
+                "WHEN share_config ? 'read_scope' THEN share_config->'read_scope' "
+                "ELSE share_config END, "
+                "'manage_scope', CASE WHEN share_config ? 'read_scope' "
+                "THEN share_config->'manage_scope' ELSE NULL END) "
+                "WHERE share_config IS NULL OR share_config->>'version' IS DISTINCT FROM '2'"
             ),
             "ALTER TABLE IF EXISTS agents ALTER COLUMN share_config DROP DEFAULT",
             "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS is_subagent BOOLEAN NOT NULL DEFAULT FALSE",
@@ -1018,6 +1218,8 @@ class PostgresManager(metaclass=SingletonMeta):
             "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS external_id VARCHAR(128)",
             *AGENT_RUN_LEASE_SCHEMA_STATEMENTS,
             *AGENT_RUN_FACT_SCHEMA_STATEMENTS,
+            *MESSAGE_FEEDBACK_SCHEMA_STATEMENTS,
+            *LEGACY_AGENT_TOOL_SCHEMA_STATEMENTS,
             (
                 "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS "
                 "origin_metadata JSONB NOT NULL DEFAULT '{}'::jsonb"
@@ -1037,14 +1239,14 @@ class PostgresManager(metaclass=SingletonMeta):
             ),
             "ALTER TABLE IF EXISTS subagent_threads ADD COLUMN IF NOT EXISTS subagent_slug VARCHAR(64)",
             "ALTER TABLE IF EXISTS subagent_threads ADD COLUMN IF NOT EXISTS created_by_run_id VARCHAR(64)",
-            *RUNTIME_SCOPE_SCHEMA_STATEMENTS,
             """
             DO $$
             BEGIN
                 IF EXISTS (
                     SELECT 1
                     FROM information_schema.columns
-                    WHERE table_name = 'agent_runs'
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'agent_runs'
                       AND column_name = 'agent_id'
                 ) THEN
                     EXECUTE '
@@ -1058,7 +1260,8 @@ class PostgresManager(metaclass=SingletonMeta):
                 IF EXISTS (
                     SELECT 1
                     FROM information_schema.columns
-                    WHERE table_name = 'agent_runs'
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'agent_runs'
                       AND column_name = 'thread_id'
                 ) THEN
                     EXECUTE '
@@ -1072,23 +1275,27 @@ class PostgresManager(metaclass=SingletonMeta):
                 IF EXISTS (
                     SELECT 1
                     FROM information_schema.columns
-                    WHERE table_name = 'agent_runs'
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'agent_runs'
                       AND column_name = 'parent_agent_run_id'
                 ) OR EXISTS (
                     SELECT 1
                     FROM information_schema.columns
-                    WHERE table_name = 'agent_runs'
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'agent_runs'
                       AND column_name = 'parent_run_id'
                 ) THEN
                     IF EXISTS (
                         SELECT 1
                         FROM information_schema.columns
-                        WHERE table_name = 'agent_runs'
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'agent_runs'
                           AND column_name = 'parent_agent_run_id'
                     ) AND EXISTS (
                         SELECT 1
                         FROM information_schema.columns
-                        WHERE table_name = 'agent_runs'
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'agent_runs'
                           AND column_name = 'parent_run_id'
                     ) THEN
                         EXECUTE '
@@ -1100,7 +1307,8 @@ class PostgresManager(metaclass=SingletonMeta):
                     ELSIF EXISTS (
                         SELECT 1
                         FROM information_schema.columns
-                        WHERE table_name = 'agent_runs'
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'agent_runs'
                           AND column_name = 'parent_agent_run_id'
                     ) THEN
                         EXECUTE '
@@ -1120,6 +1328,8 @@ class PostgresManager(metaclass=SingletonMeta):
                 END IF;
             END $$;
             """,
+            ("UPDATE agent_runs SET conversation_thread_id = id WHERE conversation_thread_id IS NULL"),
+            *RUNTIME_SCOPE_SCHEMA_STATEMENTS,
             """
             UPDATE subagent_threads st
             SET subagent_slug = c.agent_id
@@ -1217,6 +1427,22 @@ class PostgresManager(metaclass=SingletonMeta):
             """
             CREATE INDEX IF NOT EXISTS idx_agent_runs_subagent_lookup
             ON agent_runs(uid, conversation_thread_id, run_type, created_at DESC)
+            """,
+            """
+            UPDATE agent_runs
+            SET status = 'interrupted',
+                error_type = COALESCE(error_type, 'legacy_expired_status'),
+                error_message = COALESCE(
+                    error_message,
+                    '旧版 expired 状态在 Schema 升级时归一为 interrupted。'
+                ),
+                finished_at = COALESCE(finished_at, updated_at, created_at, timezone('utc', now())),
+                worker_id = NULL,
+                heartbeat_at = NULL,
+                lease_expires_at = NULL,
+                runtime_cleanup_pending = FALSE,
+                updated_at = timezone('utc', now())
+            WHERE status = 'expired'
             """,
             f"""
             WITH duplicated_active_runs AS (

@@ -7,7 +7,9 @@ import threading
 import time
 import weakref
 from dataclasses import dataclass
+from pathlib import Path
 
+from yuxi.config import get_skill_projection_dir
 from yuxi.utils.logging_config import logger
 from yuxi.workspace.paths import normalize_workdir_path, workspace_uid_dirname
 
@@ -76,6 +78,24 @@ def load_user_agent_env(uid: str) -> dict[str, str]:
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"stored agent env for uid {uid} is not valid JSON") from exc
     return normalize_env(value)
+
+
+def _ensure_persistent_skill_projection_root(uid: str) -> Path:
+    """为持久 Sandbox 建立空的只读 Skill 挂载根，不读取当前授权。"""
+    projection_root = get_skill_projection_dir()
+    if projection_root.is_symlink():
+        raise ValueError("Skill projection root cannot be a symlink")
+    projection_root.mkdir(parents=True, exist_ok=True)
+    if not projection_root.is_dir() or projection_root.is_symlink():
+        raise ValueError("Skill projection root must be a directory without symlinks")
+
+    user_root = projection_root / workspace_uid_dirname(uid)
+    if user_root.is_symlink():
+        raise ValueError("Skill projection cannot be a symlink")
+    user_root.mkdir(mode=0o700, exist_ok=True)
+    if not user_root.is_dir() or user_root.is_symlink():
+        raise ValueError("Skill projection must be a directory without symlinks")
+    return user_root
 
 
 @dataclass(slots=True)
@@ -191,6 +211,8 @@ class ProvisionerSandboxProvider:
 
             sandbox_id = sandbox_id_for_thread(thread_id, uid=uid)
             logger.info(f"Ensuring sandbox {sandbox_id} for runtime thread {thread_id}")
+            if inherit_env:
+                _ensure_persistent_skill_projection_root(uid)
             record = self._client.create(
                 sandbox_id,
                 thread_id,
@@ -242,6 +264,8 @@ class ProvisionerSandboxProvider:
 
             sandbox_id = sandbox_id_for_thread(thread_id, uid=uid)
             if create_if_missing:
+                if inherit_env:
+                    _ensure_persistent_skill_projection_root(uid)
                 record = self._client.create(
                     sandbox_id,
                     thread_id,

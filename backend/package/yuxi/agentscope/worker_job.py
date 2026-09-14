@@ -7,7 +7,11 @@
 
 import asyncio
 import os
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from pathlib import PurePosixPath
 
 from yuxi.agentscope.client import AgentScopeServiceClient
 from yuxi.agentscope.event_stream import READ_TIMEOUT_SECONDS
@@ -42,11 +46,124 @@ from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.services.agent_request_queue_service import dispatch_next_request
 from yuxi.services.agent_run_manifest_service import compute_manifest_fingerprint
 from yuxi.services.run_resource_snapshot_service import load_run_resources
+from yuxi.config import get_user_data_dir
+from yuxi.agents.backends.sandbox import sandbox_uploads_dir
+from yuxi.workspace.paths import VIRTUAL_PATH_PREFIX, normalize_workdir_path, workspace_uid_dirname
+from yuxi.utils.paths import open_regular_file_fd
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Message
 from yuxi.utils import logger
 
 WORKER_ID = DEFAULT_WORKER_ID
+
+
+async def _ensure_user_skill_projection_root(uid: str) -> None:
+    """建立持久 Sandbox 的空 Skill 挂载根，不读取当前授权配置。"""
+    from yuxi.agents.backends.sandbox.provider import _ensure_persistent_skill_projection_root
+
+    await asyncio.to_thread(_ensure_persistent_skill_projection_root, uid)
+
+
+def _attachment_source_location(
+    uid: str,
+    source_path: str,
+    *,
+    workdir_path: str | None = None,
+    thread_id: str | None = None,
+) -> tuple[Path, tuple[str, ...]]:
+    """返回附件所属受信任根和逐层 no-follow 相对路径。"""
+    path = Path(source_path)
+
+    runtime_path = PurePosixPath(str(source_path))
+    runtime_root = PurePosixPath(VIRTUAL_PATH_PREFIX.rstrip("/"))
+    if runtime_path == runtime_root or not runtime_path.is_relative_to(runtime_root):
+        if not path.is_absolute() or thread_id is None or ".." in path.parts:
+            raise ValueError("附件路径不属于 Conversation 绑定的 Workdir")
+        legacy_root = sandbox_uploads_dir(thread_id)
+        try:
+            legacy_parts = path.relative_to(legacy_root).parts
+        except ValueError:
+            raise ValueError("附件路径不属于 Conversation 绑定的 Workdir") from None
+        return legacy_root, tuple(legacy_parts)
+
+    relative = runtime_path.relative_to(runtime_root)
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError("附件路径越界")
+    if workdir_path is None:
+        raise ValueError("附件 runtime 路径缺少 Conversation Workdir 绑定")
+    workdir = PurePosixPath(normalize_workdir_path(workdir_path))
+    if relative == workdir or not relative.is_relative_to(workdir):
+        raise ValueError("附件路径不属于 Conversation 绑定的 Workdir")
+
+    host_root = get_user_data_dir()
+    host_parts = (
+        "shared",
+        workspace_uid_dirname(uid),
+        "workspace",
+        *relative.parts,
+    )
+    return host_root, tuple(host_parts)
+
+
+def _resolve_attachment_source_path(
+    uid: str,
+    source_path: str,
+    *,
+    workdir_path: str | None = None,
+    thread_id: str | None = None,
+) -> Path:
+    """验证附件路径并返回其 worker 共享挂载位置。"""
+    root, parts = _attachment_source_location(
+        uid,
+        source_path,
+        workdir_path=workdir_path,
+        thread_id=thread_id,
+    )
+    with open_regular_file_fd(root, parts):
+        pass
+    return root.joinpath(*parts)
+
+
+@contextmanager
+def _trusted_attachment_upload_source(
+    uid: str,
+    source_path: str,
+    *,
+    workdir_path: str | None = None,
+    thread_id: str | None = None,
+) -> Iterator[Path]:
+    """从保持打开的 no-follow fd 有界复制出本次上传专用普通文件。"""
+    from yuxi.services.attachment_service import MAX_ATTACHMENT_SIZE_BYTES
+
+    root, parts = _attachment_source_location(
+        uid,
+        source_path,
+        workdir_path=workdir_path,
+        thread_id=thread_id,
+    )
+    temp_path: Path | None = None
+    try:
+        with open_regular_file_fd(root, parts) as (source_fd, _source_stat):
+            suffix = Path(parts[-1]).suffix if parts else ""
+            with tempfile.NamedTemporaryFile(
+                prefix="yuxi-run-attachment-",
+                suffix=suffix,
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                copied = 0
+                while chunk := os.read(source_fd, 1024 * 1024):
+                    copied += len(chunk)
+                    if copied > MAX_ATTACHMENT_SIZE_BYTES:
+                        raise ValueError("附件超过 5 MB 限制")
+                    temp_file.write(chunk)
+        yield temp_path
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 async def execute_agent_run_job(run_id: str) -> None:
@@ -146,12 +263,26 @@ async def execute_agent_run_job(run_id: str) -> None:
                         agent_slug=run.agent_slug,
                     ),
                 )
+                attachment_file_ids = (input_message.extra_metadata or {}).get("attachment_file_ids") or []
+                workdir_path = None
+                if attachment_file_ids:
+                    from yuxi.services.workdir_service import resolve_conversation_workdir_path
+
+                    conversation = await conv_repo.get_conversation_by_id(run.conversation_id)
+                    if conversation is None or conversation.uid != str(run.uid):
+                        raise ValueError("附件所属 Conversation 不存在或身份不匹配")
+                    workdir_path = await resolve_conversation_workdir_path(
+                        conversation=conversation,
+                        uid=str(run.uid),
+                        db=db,
+                    )
                 text = await _materialize_run_attachments(
                     conv_repo,
                     client,
                     run=run,
                     input_message=input_message,
                     mapping=mapping,
+                    workdir_path=workdir_path,
                 )
                 await _apply_permission_mode(client, run, mapping)
                 result = await execute_run(
@@ -165,7 +296,7 @@ async def execute_agent_run_job(run_id: str) -> None:
                     persist_result=False,
                 )
             if result.parked in {"permission", "external"} and result.pending_confirm:
-                await store_pending_confirm(run.conversation_thread_id, result.pending_confirm)
+                await store_pending_confirm(run.conversation_thread_id, result.pending_confirm, run_id=run.id)
 
             output_message = await persist_run_output(db, run, result)
             if output_message is not None:
@@ -214,9 +345,18 @@ async def execute_agent_run_job(run_id: str) -> None:
             if heartbeat_task is not None:
                 await stop_run_lease_heartbeat(run.id)
 
+        if result.run_status != "interrupted":
+            try:
+                await clear_pending_confirm(run_thread_id, expected_run_id=run_id)
+            except Exception as exc:
+                logger.warning("Run 终态审批缓存清理失败 run={} type={}", run_id, type(exc).__name__)
+
+        if result.run_status in {"cancelled", "failed"}:
+            await _emit_end_event(run.id, run.conversation_thread_id, {"status": result.run_status})
+
         # 挂起/中断终态补发 end 帧（前端收尾依赖）；completed 与 steer 中断
         # （非审批挂起）派发队头：引导消息需在被中断的 Run 结束后立即执行。
-        if result.run_status == "completed" or (
+        if result.run_status in {"completed", "cancelled", "failed"} or (
             result.run_status == "interrupted" and not await has_pending_confirm(run.conversation_thread_id)
         ):
             await dispatch_next_request(
@@ -243,6 +383,7 @@ async def _record_run_manifest(db, run_repo, run, *, worker_id: str | None) -> N
     if compute_manifest_fingerprint(run.manifest) != run.manifest_fingerprint:
         raise RuntimeError("Run 运行清单指纹不一致")
     await load_run_resources(db, uid=run.uid, manifest=run.manifest, agent_slug=run.agent_slug)
+    await _ensure_user_skill_projection_root(run.uid)
 
 
 async def _notify_agent_task(run_id: str, run_status: str) -> None:
@@ -295,11 +436,10 @@ async def _fail_run(
     cancelled = await has_cancel_signal(run_id)
     terminal_status = "cancelled" if cancelled else "failed"
     error_message = None if cancelled else message
-    end_payload = {"status": "cancelled"} if cancelled else {"status": "error", "error_message": message}
-
     terminal_kwargs = {
         "status": terminal_status,
         "error_message": error_message,
+        "cancel_requested_as_cancelled": True,
     }
     if worker_id:
         terminal_kwargs["worker_id"] = worker_id
@@ -307,14 +447,21 @@ async def _fail_run(
     if persisted is None or not changed:
         return False
     terminal_status = persisted.status
+    end_payload = (
+        {"status": "cancelled"} if terminal_status == "cancelled" else {"status": "error", "error_message": message}
+    )
     await _sync_input_delivery_status(
         db,
         input_message_id=input_message_id,
         run_status=terminal_status,
     )
     await db.commit()
+    try:
+        await clear_pending_confirm(thread_id, expected_run_id=run_id)
+    except Exception as exc:
+        logger.warning("失败 Run 审批缓存清理失败 run={} type={}", run_id, type(exc).__name__)
     await _emit_end_event(run_id, thread_id, end_payload)
-    if cancelled:
+    if terminal_status == "cancelled":
         await clear_cancel_signal(run_id)
     await dispatch_next_request(uid=uid, agent_slug=agent_slug, thread_id=thread_id)
     await _notify_agent_task(run_id, terminal_status)
@@ -458,6 +605,7 @@ async def _materialize_run_attachments(
     run,
     input_message: Message,
     mapping,
+    workdir_path: str | None = None,
 ) -> str:
     """绑定并上传本次请求附件，返回包含 workspace 路径的用户文本。"""
     file_ids = (input_message.extra_metadata or {}).get("attachment_file_ids") or []
@@ -483,15 +631,21 @@ async def _materialize_run_attachments(
             raise ValueError(f"附件 {item.get('file_id')} 缺少存储路径")
         suffix = ".md" if item.get("status") == "parsed" else Path(item.get("file_name") or "file").suffix
         destination = f"/workspace/uploads/{item['file_id']}{suffix}"
-        workspace_paths.append(
-            await client.upload_workspace_file(
-                run.uid,
-                mapping.agentscope_agent_id,
-                mapping.agentscope_session_id,
-                source_path=source_path,
-                destination=destination,
+        with _trusted_attachment_upload_source(
+            run.uid,
+            source_path,
+            workdir_path=workdir_path,
+            thread_id=getattr(run, "conversation_thread_id", None),
+        ) as trusted_source:
+            workspace_paths.append(
+                await client.upload_workspace_file(
+                    run.uid,
+                    mapping.agentscope_agent_id,
+                    mapping.agentscope_session_id,
+                    source_path=str(trusted_source),
+                    destination=destination,
+                )
             )
-        )
 
     bound = await conv_repo.bind_attachments_to_request(run.conversation_id, run.request_id, normalized_ids)
     if {str(item.get("file_id")) for item in bound} != requested:
@@ -530,7 +684,7 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
             raise ValueError("工具审批恢复缺少有效 decisions")
         approved = [str(d.get("type", "")).lower() in {"approve", "approved", "accept"} for d in decisions]
         result = await _resume_and_collect(client, run, mapping, confirm_event, approved)
-        await _replace_pending_confirm(run.conversation_thread_id, result)
+        await _replace_pending_confirm(run.conversation_thread_id, result, run_id=run.id)
         return result
 
     answer = resume_input.get("answer") if isinstance(resume_input, dict) else None
@@ -538,7 +692,7 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
         if answer is None:
             raise ValueError("外部问答恢复缺少 answer")
         result = await _resume_external_and_collect(client, run, mapping, confirm_event, answer)
-        await _replace_pending_confirm(run.conversation_thread_id, result)
+        await _replace_pending_confirm(run.conversation_thread_id, result, run_id=run.id)
         return result
 
     if confirm_event:
@@ -737,10 +891,10 @@ async def _resume_external_and_collect(client, run, mapping, pending_event: dict
         await cancel_tasks(pump, cancel_task)
 
 
-async def _replace_pending_confirm(thread_id: str, result: GatewayRoundResult) -> None:
+async def _replace_pending_confirm(thread_id: str, result: GatewayRoundResult, *, run_id: str) -> None:
     """成功恢复后清理旧挂起，或原子语义地以新挂起覆盖。"""
     if result.parked in {"permission", "external"} and result.pending_confirm:
-        await store_pending_confirm(thread_id, result.pending_confirm)
+        await store_pending_confirm(thread_id, result.pending_confirm, run_id=run_id)
     else:
         await clear_pending_confirm(thread_id)
 

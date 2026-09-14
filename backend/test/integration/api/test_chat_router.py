@@ -18,6 +18,14 @@ from test.live_api_cleanup import make_test_conversation_metadata, make_test_con
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
+async def _thread_workdir_path(test_client, headers, thread_id: str) -> str:
+    """从正式线程列表取得本次 Project Workdir。"""
+    response = await test_client.get("/api/chat/threads", headers=headers)
+    assert response.status_code == 200, response.text
+    thread = next(item for item in response.json() if (item.get("thread_id") or item.get("id")) == thread_id)
+    return f"/{thread['workdir_path']}"
+
+
 async def _upload_project_file(
     test_client,
     headers,
@@ -28,9 +36,10 @@ async def _upload_project_file(
     parent_path: str = "/",
     artifact_path: bool = False,
 ) -> str:
+    upload_parent = await _thread_workdir_path(test_client, headers, thread_id) if parent_path == "/" else parent_path
     response = await test_client.post(
-        "/api/viewer/filesystem/upload",
-        data={"thread_id": thread_id, "parent_path": parent_path},
+        "/api/workspace/upload",
+        data={"parent_path": upload_parent},
         files={"files": (name, content, "text/plain")},
         headers=headers,
     )
@@ -38,9 +47,7 @@ async def _upload_project_file(
     entry = response.json()["entries"][0]
     if not artifact_path:
         return entry["path"]
-    marker = f"/api/chat/thread/{thread_id}/artifacts/"
-    assert entry["artifact_url"].startswith(marker)
-    return f"/{entry['artifact_url'][len(marker) :]}"
+    return f"/home/gem/user-data{entry['path']}"
 
 
 async def test_chat_endpoints_require_authentication(test_client):
@@ -405,8 +412,11 @@ async def test_save_thread_artifact_to_workspace_auto_renames_conflicts(test_cli
     )
 
     directory = await test_client.post(
-        "/api/viewer/filesystem/directory",
-        json={"thread_id": thread_id, "parent_path": "/", "name": "second-source"},
+        "/api/workspace/directory",
+        json={
+            "parent_path": str(PurePosixPath(source_path).parent).removeprefix("/home/gem/user-data"),
+            "name": "second-source",
+        },
         headers=headers,
     )
     assert directory.status_code == 200, directory.text
@@ -448,11 +458,11 @@ async def test_save_thread_artifact_to_workspace_rejects_invalid_paths(test_clie
         json={"path": "/home/gem/user-data/not-allowed/demo.txt"},
         headers=headers,
     )
-    assert invalid_response.status_code == 404, invalid_response.text
+    assert invalid_response.status_code == 403, invalid_response.text
 
     directory = await test_client.post(
-        "/api/viewer/filesystem/directory",
-        json={"thread_id": thread_id, "parent_path": "/", "name": "nested-dir"},
+        "/api/workspace/directory",
+        json={"parent_path": await _thread_workdir_path(test_client, headers, thread_id), "name": "nested-dir"},
         headers=headers,
     )
     assert directory.status_code == 200, directory.text

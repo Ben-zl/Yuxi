@@ -11,9 +11,12 @@ EXPECTED_OUTPUT = "DETERMINISTIC_AGENT_E2E_OK"
 EXPECTED_AUTHORIZATION = "Bearer ci-replay-key"
 EXPECTED_MODEL = "deterministic-chat"
 EXPECTED_PRELOADED_SKILL_MARKER = "# 图片生成技能"
-EXPECTED_PRELOADED_TOOL = "present_artifacts"
+EXPECTED_PRELOADED_TOOL = "skill_dependency_gateway"
+EXPECTED_DEPENDENCY_TOOL = "present_artifacts"
 EXPECTED_TOOL_CALL_ID = "call-preloaded-tool"
 EXPECTED_TOOL_RESULT_MARKER = "已将交付物展示给用户"
+WRITE_TOOL_NAME = "Write"
+WRITE_FILE_PATH = "/workspace/outputs/deterministic.txt"
 
 
 def _validate_request(authorization: str | None, request: dict) -> str | None:
@@ -42,13 +45,49 @@ def _validate_request(authorization: str | None, request: dict) -> str | None:
     if EXPECTED_PRELOADED_TOOL not in tool_names:
         return "preloaded_tool_missing"
     tool_messages = [message for message in messages if isinstance(message, dict) and message.get("role") == "tool"]
-    if tool_messages and not any(
-        message.get("tool_call_id") == EXPECTED_TOOL_CALL_ID
-        and EXPECTED_TOOL_RESULT_MARKER in str(message.get("content", ""))
-        for message in tool_messages
+    dependency_called = any(
+        function.get("name") == EXPECTED_PRELOADED_TOOL
+        and _gateway_calls_expected_dependency(function.get("arguments"))
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict)
+        for function in [call.get("function") or {}]
+    )
+    called_tools = {
+        function.get("name")
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict)
+        for function in [call.get("function") or {}]
+    }
+    if tool_messages and not dependency_called and WRITE_TOOL_NAME not in called_tools:
+        return "tool_execution_result_missing"
+    present_result = next(
+        (message for message in tool_messages if message.get("tool_call_id") == EXPECTED_TOOL_CALL_ID),
+        None,
+    )
+    present_content = str(present_result.get("content", "")) if present_result is not None else ""
+    if present_result is not None and (
+        EXPECTED_TOOL_RESULT_MARKER not in present_content and "filepaths" not in present_content
     ):
         return "tool_execution_result_missing"
     return None
+
+
+def _gateway_calls_expected_dependency(raw_arguments: object) -> bool:
+    """确认 replay 中的 Gateway 调用仍指向预期 Skill 依赖。"""
+    try:
+        arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+    except json.JSONDecodeError:
+        return False
+    return (
+        isinstance(arguments, dict)
+        and arguments.get("skill") == "image-gen"
+        and arguments.get("tool_name") == EXPECTED_DEPENDENCY_TOOL
+        and arguments.get("arguments") == {"filepaths": [WRITE_FILE_PATH]}
+    )
 
 
 def _stream_payloads(model: str, messages: list[dict]) -> list[dict]:
@@ -58,7 +97,14 @@ def _stream_payloads(model: str, messages: list[dict]) -> list[dict]:
         "created": int(time.time()),
         "model": model,
     }
-    if any(message.get("role") == "tool" for message in messages if isinstance(message, dict)):
+    called_tools = {
+        call.get("function", {}).get("name")
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict)
+    }
+    if EXPECTED_PRELOADED_TOOL in called_tools:
         return [
             {
                 **common,
@@ -77,6 +123,44 @@ def _stream_payloads(model: str, messages: list[dict]) -> list[dict]:
             },
         ]
 
+    if WRITE_TOOL_NAME in called_tools:
+        return [
+            {
+                **common,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": EXPECTED_TOOL_CALL_ID,
+                                    "type": "function",
+                                    "function": {
+                                        "name": EXPECTED_PRELOADED_TOOL,
+                                        "arguments": json.dumps(
+                                            {
+                                                "skill": "image-gen",
+                                                "tool_name": EXPECTED_DEPENDENCY_TOOL,
+                                                "arguments": {"filepaths": [WRITE_FILE_PATH]},
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                **common,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10},
+            },
+        ]
+
     return [
         {
             **common,
@@ -88,11 +172,16 @@ def _stream_payloads(model: str, messages: list[dict]) -> list[dict]:
                         "tool_calls": [
                             {
                                 "index": 0,
-                                "id": EXPECTED_TOOL_CALL_ID,
+                                "id": "write-deterministic-file",
                                 "type": "function",
                                 "function": {
-                                    "name": EXPECTED_PRELOADED_TOOL,
-                                    "arguments": '{"filepaths": []}',
+                                    "name": WRITE_TOOL_NAME,
+                                    "arguments": json.dumps(
+                                        {
+                                            "file_path": WRITE_FILE_PATH,
+                                            "content": f"{EXPECTED_OUTPUT}\n",
+                                        }
+                                    ),
                                 },
                             }
                         ],

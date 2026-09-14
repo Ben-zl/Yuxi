@@ -7,11 +7,17 @@ Skill、MCP、子智能体模板、知识库），投影为 agentscope 运行时
 LITE 模式下裁剪知识库相关投影，纯聊天能力不受影响。
 """
 
+import asyncio
 from dataclasses import dataclass, field
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from yuxi.agents.skills.service import list_accessible_skills
+from yuxi.agents.skills.runtime import (
+    _read_preloaded_skill_contents,
+    build_runtime_skills,
+    expand_skill_closure,
+)
+from yuxi.agents.skills.service import list_accessible_skills, normalize_string_list
 from yuxi.agents.toolkits.service import get_tool_metadata
 from yuxi.agents.backends.paths import VIRTUAL_PATH_PREFIX
 from yuxi.agentscope.projection import (
@@ -41,6 +47,8 @@ class RuntimeProjection:
     chat_model_config: dict
     skill_slugs: list[str] = field(default_factory=list)
     skills: list[dict] = field(default_factory=list)
+    preloaded_skills: list[str] = field(default_factory=list)
+    preloaded_skill_contents: dict[str, str] = field(default_factory=dict)
     tool_slugs: list[str] | None = None
     skill_tool_dependencies: dict[str, list[str]] = field(default_factory=dict)
     skill_mcp_dependencies: dict[str, list[str]] = field(default_factory=dict)
@@ -221,6 +229,26 @@ async def project_runtime(
         }
         for item in (accessible_by_slug[slug] for slug in resolved_slugs)
     ]
+    runtime_skill_nodes = build_runtime_skills(accessible_skills)
+    configured_preloads = normalize_string_list(context.get("preload_skills"))
+    preload_roots = [slug for slug in configured_preloads if slug in selected_slugs]
+    projection.preloaded_skills = expand_skill_closure(preload_roots, runtime_skill_nodes)
+    projection.preloaded_skill_contents = (
+        await asyncio.to_thread(
+            _read_preloaded_skill_contents,
+            projection.preloaded_skills,
+            accessible_by_slug,
+        )
+        if projection.preloaded_skills
+        else {}
+    )
+    if projection.preloaded_skill_contents:
+        preload_prompt = "\n\n".join(
+            f"## Preloaded Skill: {slug}\n{projection.preloaded_skill_contents[slug]}"
+            for slug in projection.preloaded_skills
+            if slug in projection.preloaded_skill_contents
+        )
+        projection.agent_request["system_prompt"] = f"{projection.agent_request['system_prompt']}\n\n{preload_prompt}"
     projection.skill_tool_dependencies = {
         slug: list(accessible_by_slug[slug].tool_dependencies) for slug in resolved_slugs
     }

@@ -16,6 +16,7 @@ from yuxi.repositories.agent_run_request_repository import AgentRunRequestReposi
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.storage.minio import StorageError, get_minio_client
 from yuxi.utils.datetime_utils import utc_isoformat
+from yuxi.utils.async_cleanup import await_cleanup_completion
 from yuxi.utils.logging_config import logger
 from yuxi.utils.upload_utils import read_upload_with_limit
 
@@ -193,39 +194,66 @@ async def _store_attachment(
     file_name = _safe_file_name(file_name)
     storage_name = f"{file_id}_{file_name}"
     original_scope = f"/uploads/{storage_name}"
-    await _write_workdir_file(workdir, original_scope, file_content)
-    original_path = runtime_path_for_workdir_scope(workdir.relative_path, original_scope)
-    record = {
-        "file_id": file_id,
-        "file_name": file_name,
-        "file_type": file_type,
-        "file_size": len(file_content),
-        "status": "uploaded",
-        "uploaded_at": utc_isoformat(),
-        "path": original_path,
-        "original_path": original_path,
-    }
-    if parsed_markdown is None:
-        return record
-
-    markdown_scope = f"/uploads/attachments/{_make_attachment_path(storage_name)}"
-    markdown_path = runtime_path_for_workdir_scope(workdir.relative_path, markdown_scope)
-    try:
-        await _write_workdir_file(workdir, markdown_scope, parsed_markdown.encode("utf-8"))
-    except Exception:
-        await asyncio.to_thread(workdir.delete, original_scope)
-        raise
-    record.update(
-        {
-            "status": "parsed",
-            "path": markdown_path,
-        }
+    cleanup_scopes = [original_scope]
+    markdown_scope = (
+        f"/uploads/attachments/{_make_attachment_path(storage_name)}" if parsed_markdown is not None else None
     )
-    return record
+    if markdown_scope is not None:
+        cleanup_scopes.append(markdown_scope)
+    try:
+        await _write_workdir_file(workdir, original_scope, file_content)
+        original_path = runtime_path_for_workdir_scope(workdir.relative_path, original_scope)
+        record = {
+            "file_id": file_id,
+            "file_name": file_name,
+            "file_type": file_type,
+            "file_size": len(file_content),
+            "status": "uploaded",
+            "uploaded_at": utc_isoformat(),
+            "path": original_path,
+            "original_path": original_path,
+            "storage_path": original_path,
+            "original_storage_path": original_path,
+        }
+        if markdown_scope is None:
+            return record
+
+        markdown_path = runtime_path_for_workdir_scope(workdir.relative_path, markdown_scope)
+        await _write_workdir_file(workdir, markdown_scope, parsed_markdown.encode("utf-8"))
+        record.update(
+            {
+                "status": "parsed",
+                "path": markdown_path,
+                "storage_path": markdown_path,
+                "markdown_storage_path": markdown_path,
+            }
+        )
+        return record
+    except BaseException as exc:
+        try:
+            await await_cleanup_completion(_delete_workdir_scopes(workdir, cleanup_scopes))
+        except BaseException as cleanup_exc:
+            exc.add_note(f"Run attachment cleanup also failed: {type(cleanup_exc).__name__}")
+        raise
+
+
+async def _delete_workdir_scopes(workdir, scopes: list[str]) -> None:
+    """逐项删除预定文件并报告非缺失错误。"""
+    failures: list[Exception] = []
+    for scope in scopes:
+        try:
+            await asyncio.to_thread(workdir.delete, scope)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            failures.append(exc)
+    if failures:
+        raise ExceptionGroup("Run attachment cleanup failed", failures)
 
 
 async def _rollback_stored_attachments(workdir, records: list[dict]) -> None:
-    """尽力删除本批尚未提交的附件文件。"""
+    """逐项删除本批附件文件并报告非缺失错误。"""
+    failures: list[Exception] = []
     for record in records:
         for path in {record.get("path"), record.get("original_path")}:
             if not isinstance(path, str):
@@ -233,8 +261,12 @@ async def _rollback_stored_attachments(workdir, records: list[dict]) -> None:
             try:
                 scope = workdir_scope_from_runtime_path(workdir.relative_path, path)
                 await asyncio.to_thread(workdir.delete, scope)
-            except Exception:
-                pass
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                failures.append(exc)
+    if failures:
+        raise ExceptionGroup("Run attachment cleanup failed", failures)
 
 
 async def _cleanup_expired_tmp_attachments(minio_client, bucket_name: str, uid: str) -> None:
@@ -565,8 +597,11 @@ async def persist_run_submission_attachments(
             records.append(record)
         await ConversationRepository(db).add_attachments(conversation.id, records)
         return records
-    except Exception:
-        await _rollback_stored_attachments(workdir, records)
+    except BaseException as exc:
+        try:
+            await await_cleanup_completion(_rollback_stored_attachments(workdir, records))
+        except BaseException as cleanup_exc:
+            exc.add_note(f"Run attachment cleanup also failed: {type(cleanup_exc).__name__}")
         raise
 
 

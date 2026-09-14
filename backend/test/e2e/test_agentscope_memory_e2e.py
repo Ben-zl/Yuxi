@@ -9,6 +9,13 @@ import uuid
 
 import httpx
 import pytest
+from test.e2e.agentscope_e2e_fixtures import cleanup_test_users, run_e2e_cleanup_steps
+from test.live_api_cleanup import (
+    make_test_conversation_metadata,
+    make_test_conversation_title,
+    make_test_resource_id,
+)
+from yuxi.storage.postgres.manager import pg_manager
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.e2e, pytest.mark.slow]
 
@@ -21,8 +28,8 @@ requires_live_memory = pytest.mark.skipif(
 )
 
 
-async def _create_user(client: httpx.AsyncClient, admin_headers: dict[str, str]) -> dict:
-    """创建只服务于本用例的临时用户并返回登录态。"""
+async def _create_user(client: httpx.AsyncClient, admin_headers: dict[str, str]) -> tuple[dict, str]:
+    """创建临时用户，并在登录前返回可清理身份。"""
     profile = await client.get("/api/auth/me", headers=admin_headers)
     assert profile.status_code == 200, profile.text
     assert profile.json().get("role") in {"admin", "superadmin"}, "Memory E2E 需要管理员测试账号"
@@ -34,23 +41,24 @@ async def _create_user(client: httpx.AsyncClient, admin_headers: dict[str, str])
         "/api/auth/users",
         headers=admin_headers,
         json={
-            "username": f"e2e_memory_{uuid.uuid4().hex[:10]}",
+            "username": f"e2e_memory_{uuid.uuid4().hex[:8]}",
             "password": password,
             "role": "user",
             "department_id": departments.json()[0]["id"],
         },
     )
     assert created.status_code == 200, created.text
-    user = created.json()
+    return created.json(), password
+
+
+async def _login_user(client: httpx.AsyncClient, uid: str, password: str) -> dict[str, str]:
+    """登录已创建的 Memory E2E 用户。"""
     login = await client.post(
         "/api/auth/token",
-        data={"username": user["uid"], "password": password},
+        data={"username": uid, "password": password},
     )
     assert login.status_code == 200, login.text
-    return {
-        "user": user,
-        "headers": {"Authorization": f"Bearer {login.json()['access_token']}"},
-    }
+    return {"Authorization": f"Bearer {login.json()['access_token']}"}
 
 
 async def _create_thread(client: httpx.AsyncClient, headers: dict[str, str], agent_slug: str) -> str:
@@ -60,8 +68,8 @@ async def _create_thread(client: httpx.AsyncClient, headers: dict[str, str], age
         headers=headers,
         json={
             "agent_id": agent_slug,
-            "title": f"memory-recall-e2e-{uuid.uuid4().hex[:8]}",
-            "metadata": {"_yuxi_e2e": True, "test": "memory-recall-e2e"},
+            "title": make_test_conversation_title("memory-recall-e2e"),
+            "metadata": make_test_conversation_metadata("memory-recall-e2e", e2e=True),
         },
     )
     assert response.status_code == 200, response.text
@@ -87,7 +95,8 @@ async def _run(
             "query": query,
             "agent_slug": agent_slug,
             "thread_id": thread_id,
-            "meta": {"request_id": f"memory-recall-e2e-{uuid.uuid4()}"},
+            "tool_approval_mode": "always_trust",
+            "meta": {"request_id": make_test_resource_id("memory-recall-e2e")},
         },
     )
     assert response.status_code == 200, response.text
@@ -134,13 +143,17 @@ async def test_real_model_recalls_unique_fact_across_threads(
     e2e_headers: dict[str, str],
 ):
     """Thread A 写入的唯一事实必须能在同 Agent 的 Thread B 被真实模型召回。"""
-    target = await _create_user(e2e_client, e2e_headers)
-    headers = target["headers"]
     agent_slug = "default-chatbot"
     marker = f"REME_E2E_{uuid.uuid4().hex.upper()}"
+    user: dict | None = None
+    password: str | None = None
+    headers: dict[str, str] | None = None
     thread_ids: list[str] = []
+    primary_error: BaseException | None = None
 
     try:
+        user, password = await _create_user(e2e_client, e2e_headers)
+        headers = await _login_user(e2e_client, str(user["uid"]), password)
         enabled = await e2e_client.put(
             "/api/user/config",
             headers=headers,
@@ -171,12 +184,42 @@ async def test_real_model_recalls_unique_fact_across_threads(
         )
 
         assert marker in json.dumps(recalled.get("output"), ensure_ascii=False), recalled
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
+        cleanup_steps = []
         for thread_id in thread_ids:
-            response = await e2e_client.delete(f"/api/chat/thread/{thread_id}", headers=headers)
-            assert response.status_code in {200, 404}, response.text
-        response = await e2e_client.delete(
-            f"/api/auth/users/{target['user']['id']}",
-            headers=e2e_headers,
-        )
-        assert response.status_code in {200, 404}, response.text
+
+            async def delete_thread(target_thread_id: str = thread_id) -> None:
+                response = await e2e_client.delete(
+                    f"/api/chat/thread/{target_thread_id}",
+                    headers=headers,
+                )
+                assert response.status_code in {200, 404}, response.text
+
+            cleanup_steps.append((f"delete thread {thread_id}", delete_thread))
+
+        if user is not None:
+            target_user_id = user["id"]
+
+            async def delete_user() -> None:
+                response = await e2e_client.delete(
+                    f"/api/auth/users/{target_user_id}",
+                    headers=e2e_headers,
+                )
+                assert response.status_code in {200, 404}, response.text
+
+            cleanup_steps.append(("soft-delete memory user", delete_user))
+
+            target_uid = str(user["uid"])
+
+            async def cleanup_user_rows() -> None:
+                pg_manager.initialize()
+                await pg_manager.ensure_business_schema()
+                async with pg_manager.get_async_session_context() as session:
+                    await cleanup_test_users(session, target_uid)
+
+            cleanup_steps.append(("physically delete memory user resources", cleanup_user_rows))
+
+        await run_e2e_cleanup_steps(cleanup_steps, primary_error=primary_error)

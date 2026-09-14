@@ -12,16 +12,15 @@ import uuid
 import pytest
 from sqlalchemy import delete
 
+from e2e_helpers import consume_events, wait_for_run
 from test.e2e.agentscope_e2e_fixtures import (
-    PROVIDER_ID,
+    PROVIDER_RESOURCE_ID,
     cleanup_fixture_agents,
     cleanup_test_users,
+    open_fixture_http_client,
     seed_test_users,
     upsert_mock_provider,
 )
-from yuxi.agentscope.client import AgentScopeServiceClient
-from yuxi.agentscope.gateway import stream_round_to_run_events
-from yuxi.agentscope.runner import ensure_thread_session
 from yuxi.agents.skills.service import refresh_user_skill_projection_async
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.config import get_skill_data_dir
@@ -46,7 +45,14 @@ async def db_session():
         skill_dir = get_skill_data_dir() / "shared" / SKILL_NAME
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(
-            "---\nslug: e2e-skill-demo\nname: e2e-skill-demo\ndescription: 用于渐进披露验证的技能\n---\n\n用于渐进披露验证的技能。\n",
+            (
+                "---\n"
+                "slug: e2e-skill-demo\n"
+                "name: e2e-skill-demo\n"
+                "description: 用于渐进披露验证的技能\n"
+                "---\n\n"
+                "用于渐进披露验证的技能。\n"
+            ),
             encoding="utf-8",
         )
         session.add(
@@ -72,8 +78,10 @@ async def db_session():
                 backend_id="ChatbotAgent",
                 config_json={
                     "context": {
-                        "model": f"{PROVIDER_ID}:mock-chat-model",
+                        "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
                         "mcps": [],
+                        "tools": [],
+                        "subagents": [],
                         "skills": [SKILL_NAME],
                         "system_prompt": "你是技能测试助手。",
                     }
@@ -98,113 +106,120 @@ async def db_session():
 
 async def test_skill_progressive_disclosure(db_session):
     uid = USER_ID
-    run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
     request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
-
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
-    result = await stream_round_to_run_events(
-        client,
-        uid=uid,
-        agent_id=mapping.agentscope_agent_id,
-        session_id=mapping.agentscope_session_id,
-        text="请查看技能",
-        run_id=run_id,
-        request_id=request_id,
-        thread_id=thread_id,
-        read_timeout=300.0,
-    )
-    assert result.run_status == "completed"
-
-    redis_client = await get_async_redis_client()
-    stream_key = f"run:events:{run_id}"
+    client, headers = await open_fixture_http_client(uid)
     try:
-        frames = await redis_client.xrange(stream_key)
-        all_chunks = []
-        for _, entry in frames:
-            if entry["event_type"] == "messages":
-                all_chunks.extend(json.loads(entry["payload"])["payload"]["items"])
+        thread_response = await client.post(
+            "/api/chat/thread",
+            json={"agent_id": CHATBOT_SLUG, "title": f"skills-{uuid.uuid4().hex[:8]}"},
+            headers=headers,
+        )
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json().get("id"))
+        run_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请查看技能",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "meta": {"request_id": request_id},
+            },
+            headers=headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json()["run_id"])
+        event_counts = await consume_events(client, headers, run_id)
+        assert event_counts.get("end", 0) == 1, event_counts
+        run = await wait_for_run(client, headers, run_id)
+        assert run["status"] == "completed", run
 
-        # SkillViewer 工具被调用，且披露内容进入对话
-        called_names = [
-            frag["name"]
-            for c in all_chunks
-            if c["status"] == "loading" and c["msg"].get("tool_call_chunks")
-            for frag in c["msg"]["tool_call_chunks"]
-        ]
-        assert "Skill" in called_names, called_names
+        redis_client = await get_async_redis_client()
+        stream_key = f"run:events:{run_id}"
+        try:
+            frames = await redis_client.xrange(stream_key)
+            all_chunks = []
+            for _, entry in frames:
+                if entry["event_type"] == "messages":
+                    all_chunks.extend(json.loads(entry["payload"])["payload"]["items"])
 
-        finished = [c for c in all_chunks if c["status"] == "stream_event"]
-        skill_content = "".join(c["event"]["data"]["output"]["content"] for c in finished)
-        assert "用于渐进披露验证的技能" in skill_content
+            called_names = [
+                frag["name"]
+                for c in all_chunks
+                if c["status"] == "loading" and c["msg"].get("tool_call_chunks")
+                for frag in c["msg"]["tool_call_chunks"]
+            ]
+            assert "Skill" in called_names, called_names
+
+            finished = [c for c in all_chunks if c["status"] == "stream_event"]
+            skill_content = "".join(c["event"]["data"]["output"]["content"] for c in finished)
+            assert "用于渐进披露验证的技能" in skill_content
+        finally:
+            await redis_client.delete(stream_key)
+            await close_async_redis_client()
     finally:
-        await redis_client.delete(stream_key)
-        await close_async_redis_client()
+        await client.aclose()
 
 
 async def test_skill_dependency_runs_through_gateway(db_session):
     """原版 AgentScope 通过 Yuxi Gateway 执行激活后的 Skill 依赖。"""
-    run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
     request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = await ensure_thread_session(
-        db_session,
-        client,
-        uid=USER_ID,
-        thread_id=thread_id,
-        agent_slug=CHATBOT_SLUG,
-    )
-    await client.set_permission_mode(
-        USER_ID,
-        mapping.agentscope_agent_id,
-        mapping.agentscope_session_id,
-        "bypass",
-    )
-
-    result = await stream_round_to_run_events(
-        client,
-        uid=USER_ID,
-        agent_id=mapping.agentscope_agent_id,
-        session_id=mapping.agentscope_session_id,
-        text="请调用技能依赖完成查询",
-        run_id=run_id,
-        request_id=request_id,
-        thread_id=thread_id,
-        read_timeout=300.0,
-    )
-    assert result.run_status == "completed"
-
-    redis_client = await get_async_redis_client()
+    client, headers = await open_fixture_http_client(USER_ID)
     try:
-        frames = await redis_client.xrange(f"run:events:{run_id}")
-        chunks = [
-            chunk
-            for _, entry in frames
-            if entry["event_type"] == "messages"
-            for chunk in json.loads(entry["payload"])["payload"]["items"]
-        ]
-        called_names = [
-            fragment["name"]
-            for chunk in chunks
-            if chunk["status"] == "loading" and chunk["msg"].get("tool_call_chunks")
-            for fragment in chunk["msg"]["tool_call_chunks"]
-        ]
-        assert "Skill" in called_names
-        assert "skill_dependency_gateway" in called_names
-        call_names_by_id = {
-            fragment["id"]: fragment["name"]
-            for chunk in chunks
-            if chunk["status"] == "loading" and chunk["msg"].get("tool_call_chunks")
-            for fragment in chunk["msg"]["tool_call_chunks"]
-        }
-        finished = [chunk for chunk in chunks if chunk["status"] == "stream_event"]
-        assert any(
-            call_names_by_id.get(chunk["event"]["data"]["tool_call_id"])
-            == "skill_dependency_gateway"
-            for chunk in finished
+        thread_response = await client.post(
+            "/api/chat/thread",
+            json={"agent_id": CHATBOT_SLUG, "title": f"skill-dependency-{uuid.uuid4().hex[:8]}"},
+            headers=headers,
         )
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json().get("id"))
+        run_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请调用技能依赖完成查询",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "tool_approval_mode": "always_trust",
+                "meta": {"request_id": request_id},
+            },
+            headers=headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json()["run_id"])
+        event_counts = await consume_events(client, headers, run_id)
+        assert event_counts.get("end", 0) == 1, event_counts
+        run = await wait_for_run(client, headers, run_id)
+        assert run["status"] == "completed", run
+
+        redis_client = await get_async_redis_client()
+        try:
+            frames = await redis_client.xrange(f"run:events:{run_id}")
+            chunks = [
+                chunk
+                for _, entry in frames
+                if entry["event_type"] == "messages"
+                for chunk in json.loads(entry["payload"])["payload"]["items"]
+            ]
+            called_names = [
+                fragment["name"]
+                for chunk in chunks
+                if chunk["status"] == "loading" and chunk["msg"].get("tool_call_chunks")
+                for fragment in chunk["msg"]["tool_call_chunks"]
+            ]
+            assert "Skill" in called_names
+            assert "skill_dependency_gateway" in called_names
+            call_names_by_id = {
+                fragment["id"]: fragment["name"]
+                for chunk in chunks
+                if chunk["status"] == "loading" and chunk["msg"].get("tool_call_chunks")
+                for fragment in chunk["msg"]["tool_call_chunks"]
+            }
+            finished = [chunk for chunk in chunks if chunk["status"] == "stream_event"]
+            assert any(
+                call_names_by_id.get(chunk["event"]["data"]["tool_call_id"]) == "skill_dependency_gateway"
+                for chunk in finished
+            )
+        finally:
+            await redis_client.delete(f"run:events:{run_id}")
+            await close_async_redis_client()
     finally:
-        await redis_client.delete(f"run:events:{run_id}")
-        await close_async_redis_client()
+        await client.aclose()

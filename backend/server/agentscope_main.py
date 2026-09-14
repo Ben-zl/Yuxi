@@ -211,6 +211,8 @@ async def _build_extra_agent_tools(user_id: str, agent_id: str, session_id: str)
     )
 
     async with pg_manager.get_async_session_context() as db:
+        from yuxi.repositories.user_repository import UserRepository
+
         projection = await resolve_runtime_projection(
             db,
             app.state.storage,
@@ -218,6 +220,9 @@ async def _build_extra_agent_tools(user_id: str, agent_id: str, session_id: str)
             agent_id=agent_id,
             session_id=session_id,
         )
+        user = await UserRepository().get_by_uid_with_db(db, user_id)
+        if user is None:
+            raise ValueError(f"用户 {user_id} 不存在，无法装配运行时工具")
 
     session = await app.state.storage.get_session(user_id, agent_id, session_id)
     if session is None:
@@ -231,7 +236,7 @@ async def _build_extra_agent_tools(user_id: str, agent_id: str, session_id: str)
     await sync_runtime_skills(workspace, projection, agent_id=agent_id)
 
     tools = await build_kb_tools(uid=user_id, knowledge_slugs=projection.knowledge_slugs)
-    tools.extend(await build_mcp_tools(mcp_servers=projection.mcp_servers))
+    tools.extend(await build_mcp_tools(mcp_servers=projection.mcp_servers, user=user))
     tools.extend(
         await build_extra_tools(
             uid=user_id,
@@ -261,6 +266,7 @@ async def _build_extra_agent_tools(user_id: str, agent_id: str, session_id: str)
             uid=user_id,
             agent_id=agent_id,
             session_id=session_id,
+            user=user,
         )
     )
     return filter_runtime_tools_for_role(

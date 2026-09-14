@@ -397,6 +397,42 @@ async def test_stream_agent_run_events_emits_error_on_db_error(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+async def test_stream_agent_run_events_raises_db_error_for_internal_waiter(monkeypatch: pytest.MonkeyPatch):
+    """同步等待使用内部模式时，数据库错误不能伪装成连接超时。"""
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    class BrokenRepo:
+        def __init__(self, db):
+            self.db = db
+
+        async def get_run_for_user(self, run_id: str, uid: str):
+            del run_id, uid
+            raise RuntimeError("db down")
+
+    monkeypatch.setattr(agent_run_service.pg_manager, "get_async_session_context", fake_session_ctx)
+    monkeypatch.setattr(agent_run_service, "AgentRunRepository", BrokenRepo)
+
+    caught = None
+    try:
+        async for _ in agent_run_service.stream_agent_run_events(
+            run_id="run-1",
+            after_seq="0",
+            current_uid="user-1",
+            raise_on_error=True,
+        ):
+            pass
+    except Exception as exc:  # noqa: BLE001
+        caught = exc
+
+    assert caught is not None
+    assert type(caught).__name__ == "AgentRunWaitUnavailable"
+    assert getattr(caught, "reason", None) == "db_error"
+
+
+@pytest.mark.asyncio
 async def test_stream_agent_run_events_reads_redis_and_ends_on_end_event(monkeypatch: pytest.MonkeyPatch):
     @asynccontextmanager
     async def fake_session_ctx():
@@ -463,6 +499,77 @@ async def test_stream_agent_run_events_reads_redis_and_ends_on_end_event(monkeyp
     assert "id: 1700000000000-0" in chunks[0]
     assert chunks[-1].startswith("event: end")
     assert "id: 1700000000001-0" in chunks[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("statuses", "early_status", "expected_status"),
+    [
+        (("cancel_requested", "cancelled"), "interrupted", "cancelled"),
+        (("cancelled",), "interrupted", "cancelled"),
+        (("failed",), "completed", "failed"),
+    ],
+)
+async def test_stream_waits_for_persisted_terminal_before_emitting_end(
+    monkeypatch: pytest.MonkeyPatch, statuses, early_status, expected_status
+):
+    """Gateway 的旧 end 不得先于 PostgreSQL 最终状态结束 SSE。"""
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    reads = iter(statuses)
+
+    class Repo:
+        def __init__(self, _db):
+            pass
+
+        async def get_run_for_user(self, _run_id, _uid):
+            return SimpleNamespace(
+                status=next(reads, statuses[-1]),
+                conversation_thread_id="thread-1",
+                request_id="request-1",
+                runtime_cleanup_pending=False,
+            )
+
+    calls = 0
+
+    async def fake_list_events(_run_id, *, after_seq, limit):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return []
+        return [
+            {
+                "seq": "1700000000001-0",
+                "event_type": "end",
+                "payload": {
+                    "schema_version": 1,
+                    "run_id": "run-1",
+                    "thread_id": "thread-1",
+                    "event": "end",
+                    "payload": {"status": early_status},
+                    "created_at": "2026-09-14T00:00:00+00:00",
+                },
+            }
+        ]
+
+    monkeypatch.setattr(agent_run_service.pg_manager, "get_async_session_context", fake_session_ctx)
+    monkeypatch.setattr(agent_run_service, "AgentRunRepository", Repo)
+    monkeypatch.setattr(agent_run_service, "list_run_stream_events", fake_list_events)
+    monkeypatch.setattr(agent_run_service, "get_last_run_stream_seq", AsyncMock(return_value="1700000000001-0"))
+    monkeypatch.setattr(agent_run_service, "SSE_POLL_INTERVAL_SECONDS", 0)
+
+    chunks = [
+        chunk
+        async for chunk in agent_run_service.stream_agent_run_events(
+            run_id="run-1", after_seq="0-0", current_uid="user-1"
+        )
+    ]
+    ends = [_sse_data(chunk) for chunk in chunks if chunk.startswith("event: end")]
+    assert len(ends) == 1
+    assert ends[0]["payload"]["status"] == expected_status
 
 
 @pytest.mark.asyncio
@@ -745,17 +852,10 @@ async def test_stream_agent_run_events_does_not_fallback_end_before_runtime_clea
         del run_id, after_seq, limit
         return []
 
-    sleep_calls = 0
-
-    async def stop_after_one_poll(_seconds: float):
-        nonlocal sleep_calls
-        sleep_calls += 1
-        raise agent_run_service.asyncio.CancelledError
-
     monkeypatch.setattr(agent_run_service.pg_manager, "get_async_session_context", fake_session_ctx)
     monkeypatch.setattr(agent_run_service, "AgentRunRepository", Repo)
     monkeypatch.setattr(agent_run_service, "list_run_stream_events", fake_list_events)
-    monkeypatch.setattr(agent_run_service.asyncio, "sleep", stop_after_one_poll)
+    monkeypatch.setattr(agent_run_service, "SSE_MAX_CONNECTION_MINUTES", 0)
 
     chunks = []
     async for chunk in agent_run_service.stream_agent_run_events(
@@ -766,7 +866,6 @@ async def test_stream_agent_run_events_does_not_fallback_end_before_runtime_clea
     ):
         chunks.append(chunk)
 
-    assert sleep_calls == 1
     assert not any(chunk.startswith("event: end") for chunk in chunks)
 
 
@@ -1492,11 +1591,19 @@ async def test_get_agent_run_langfuse_link_hides_missing_run(monkeypatch: pytest
 async def test_await_agent_run_result_drains_stream_then_loads_result(monkeypatch: pytest.MonkeyPatch):
     drained: list[str] = []
 
-    async def fake_stream(*, run_id: str, after_seq: str, current_uid: str, verbose: bool):
+    async def fake_stream(
+        *,
+        run_id: str,
+        after_seq: str,
+        current_uid: str,
+        verbose: bool,
+        raise_on_error: bool,
+    ):
         assert run_id == "run-1"
         assert after_seq == "0-0"
         assert current_uid == "user-1"
         assert verbose is False
+        assert raise_on_error is True
         for chunk in ("event: messages\n\n", "event: end\n\n"):
             drained.append(chunk)
             yield chunk
@@ -1517,11 +1624,19 @@ async def test_await_agent_run_result_drains_stream_then_loads_result(monkeypatc
 
 @pytest.mark.asyncio
 async def test_await_agent_run_result_raises_when_stream_ends_before_terminal(monkeypatch: pytest.MonkeyPatch):
-    async def fake_stream(*, run_id: str, after_seq: str, current_uid: str, verbose: bool):
+    async def fake_stream(
+        *,
+        run_id: str,
+        after_seq: str,
+        current_uid: str,
+        verbose: bool,
+        raise_on_error: bool,
+    ):
         assert run_id == "run-1"
         assert after_seq == "0-0"
         assert current_uid == "user-1"
         assert verbose is False
+        assert raise_on_error is True
         yield ": heartbeat\n\n"
 
     async def fake_load(*, run_id: str, current_uid: str):
@@ -1539,8 +1654,52 @@ async def test_await_agent_run_result_raises_when_stream_ends_before_terminal(mo
 
 
 @pytest.mark.asyncio
+async def test_stream_agent_run_events_propagates_cancellation(monkeypatch: pytest.MonkeyPatch):
+    """服务关闭或客户端断开时不得把取消转换为非终态等待超时。"""
+
+    @asynccontextmanager
+    async def fake_session_context():
+        yield object()
+
+    class RunRepository:
+        def __init__(self, _db):
+            pass
+
+        async def get_run_for_user(self, run_id: str, uid: str):
+            assert run_id == "run-1"
+            assert uid == "user-1"
+            return SimpleNamespace(status="running")
+
+    async def no_events(*_args, **_kwargs):
+        return []
+
+    async def cancelled_sleep(_seconds: float):
+        raise agent_run_service.asyncio.CancelledError
+
+    monkeypatch.setattr(agent_run_service.pg_manager, "get_async_session_context", fake_session_context)
+    monkeypatch.setattr(agent_run_service, "AgentRunRepository", RunRepository)
+    monkeypatch.setattr(agent_run_service, "list_run_stream_events", no_events)
+    monkeypatch.setattr(agent_run_service.asyncio, "sleep", cancelled_sleep)
+
+    with pytest.raises(agent_run_service.asyncio.CancelledError):
+        async for _ in agent_run_service.stream_agent_run_events(
+            run_id="run-1",
+            after_seq="0-0",
+            current_uid="user-1",
+            verbose=False,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_cancel_agent_run_view_cascades_children(monkeypatch: pytest.MonkeyPatch):
-    parent_run = SimpleNamespace(id="parent-run", uid="user-1", to_dict=lambda: {"id": "parent-run"})
+    parent_run = SimpleNamespace(
+        id="parent-run",
+        uid="user-1",
+        status="cancel_requested",
+        conversation_thread_id="thread-1",
+        to_dict=lambda: {"id": "parent-run"},
+    )
     child_runs = [SimpleNamespace(id="child-1"), SimpleNamespace(id="child-2")]
     requested: list[str] = []
     signals: list[tuple[str, bool]] = []
@@ -1560,7 +1719,7 @@ async def test_cancel_agent_run_view_cascades_children(monkeypatch: pytest.Monke
             assert uid == "user-1"
             assert cascade_descendants is True
             requested.extend(["parent-run", *(child.id for child in child_runs)])
-            return parent_run, list(requested)
+            return parent_run, list(requested), False
 
     async def fake_publish_cancel_signal(run_id: str):
         signals.append((run_id, db.committed))
@@ -1578,6 +1737,108 @@ async def test_cancel_agent_run_view_cascades_children(monkeypatch: pytest.Monke
     assert result["run"]["id"] == "parent-run"
     assert requested == ["parent-run", "child-1", "child-2"]
     assert signals == [("parent-run", True), ("child-1", True), ("child-2", True)]
+
+
+@pytest.mark.asyncio
+async def test_recancelling_old_run_preserves_new_run_pending_confirm(monkeypatch: pytest.MonkeyPatch):
+    """旧 Run 重复取消不得清除同线程新 Run 的审批事件。"""
+    from yuxi.agentscope import thread_guard
+
+    pending = {"owner_run_id": "new-run", "reply_id": "new-approval"}
+
+    class Db:
+        async def commit(self):
+            return None
+
+    class RunRepo:
+        def __init__(self, _db):
+            pass
+
+        async def request_cancel_execution_tree(self, **_kwargs):
+            return (
+                SimpleNamespace(
+                    id="old-run",
+                    status="cancelled",
+                    error_type="cancelled",
+                    error_message="对话已取消",
+                    conversation_thread_id="thread-1",
+                ),
+                ["old-run"],
+                False,
+            )
+
+    async def clear(_thread_id, *, expected_run_id, include_legacy=False):
+        if pending.get("owner_run_id") == expected_run_id:
+            pending.clear()
+
+    async def interrupt(**_kwargs):
+        return None
+
+    async def publish(_run_id):
+        return None
+
+    monkeypatch.setattr(agent_run_service, "AgentRunRepository", RunRepo)
+    monkeypatch.setattr(thread_guard, "clear_pending_confirm", clear)
+    monkeypatch.setattr("yuxi.agentscope.team_lifecycle.interrupt_team_worker_runs", interrupt)
+    monkeypatch.setattr(agent_run_service, "publish_cancel_signal", publish)
+    await agent_run_service.request_cancel_agent_run(run_id="old-run", current_uid="user-1", db=Db())
+    assert pending == {"owner_run_id": "new-run", "reply_id": "new-approval"}
+
+
+@pytest.mark.asyncio
+async def test_pending_clear_failure_still_publishes_cancel_and_can_retry(monkeypatch: pytest.MonkeyPatch):
+    """取消已提交后 Redis 清理失败必须通知调用方，并保留可重试清理入口。"""
+    from yuxi.agentscope import thread_guard
+
+    signals: list[str] = []
+    clear_calls: list[str] = []
+
+    class Db:
+        async def commit(self):
+            return None
+
+    class RunRepo:
+        def __init__(self, _db):
+            pass
+
+        async def request_cancel_execution_tree(self, **_kwargs):
+            return (
+                SimpleNamespace(
+                    id="old-run",
+                    uid="user-1",
+                    agent_slug="main",
+                    status="cancelled",
+                    conversation_thread_id="thread-1",
+                ),
+                ["old-run"],
+                True,
+            )
+
+    async def clear(_thread_id, *, expected_run_id, include_legacy=False):
+        clear_calls.append(expected_run_id)
+        if len(clear_calls) == 1:
+            raise ConnectionError("Redis unavailable")
+
+    async def publish(run_id):
+        signals.append(run_id)
+
+    monkeypatch.setattr(agent_run_service, "AgentRunRepository", RunRepo)
+    monkeypatch.setattr(thread_guard, "clear_pending_confirm", clear)
+    monkeypatch.setattr("yuxi.agentscope.team_lifecycle.interrupt_team_worker_runs", AsyncMock())
+    monkeypatch.setattr(agent_run_service, "publish_cancel_signal", publish)
+    dispatch = AsyncMock()
+    monkeypatch.setattr("yuxi.services.agent_request_queue_service.dispatch_next_request", dispatch)
+
+    with pytest.raises(agent_run_service.HTTPException) as exc:
+        await agent_run_service.request_cancel_agent_run(run_id="old-run", current_uid="user-1", db=Db())
+    assert exc.value.status_code == 503
+    assert signals == ["old-run"]
+    dispatch.assert_not_awaited()
+
+    await agent_run_service.request_cancel_agent_run(run_id="old-run", current_uid="user-1", db=Db())
+    assert clear_calls == ["old-run", "old-run"]
+    assert signals == ["old-run", "old-run"]
+    dispatch.assert_awaited_once_with(uid="user-1", agent_slug="main", thread_id="thread-1")
 
 
 @pytest.mark.asyncio
@@ -1710,6 +1971,55 @@ async def test_resolve_agent_run_model_spec_validates_configured_model(monkeypat
         await agent_run_service.resolve_agent_run_model_spec(None, "missing:model")
 
     assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_run_model_spec_loads_authorized_resource_on_cache_miss(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(agent_run_service.model_cache, "get_model_info", lambda _spec: None)
+    monkeypatch.setattr(agent_run_service.model_cache, "canonicalize_spec", lambda _spec: None)
+    monkeypatch.setenv("E2E_MODEL_API_KEY", "runtime-only-key")
+
+    provider = SimpleNamespace(
+        resource_id="resource-1",
+        provider_id="provider-1",
+        is_enabled=True,
+        enabled_models=[
+            {
+                "id": "chat-model",
+                "type": "chat",
+                "display_name": "Chat Model",
+                "request_body_overrides": {"thinking": True},
+                "input_modalities": ["text"],
+            }
+        ],
+        api_key="",
+        api_key_env="E2E_MODEL_API_KEY",
+        base_url="https://example.test/v1",
+        provider_type="anthropic",
+        headers_json={"x-tenant": "test"},
+        extra_json={"region": "test"},
+    )
+
+    async def fake_get_model_provider_for_user(_db, resource_id, current_user):
+        assert resource_id == "resource-1"
+        assert current_user == "user-1"
+        return provider
+
+    monkeypatch.setattr(
+        "yuxi.models.providers.repository.get_model_provider_for_user",
+        fake_get_model_provider_for_user,
+    )
+
+    resolved = await agent_run_service.resolve_agent_run_model_spec(
+        "resource-1:chat-model",
+        "default:model",
+        db="db",
+        user="user-1",
+    )
+
+    assert resolved == "resource-1:chat-model"
 
 
 def _patch_agent_run_creation(

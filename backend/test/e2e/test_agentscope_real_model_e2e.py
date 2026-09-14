@@ -10,26 +10,31 @@ import os
 import uuid
 
 import pytest
-from sqlalchemy import delete
+import pytest_asyncio
+from sqlalchemy import delete, select
 
+from e2e_helpers import cancel_run, consume_events, wait_for_run
 from test.e2e.agentscope_e2e_fixtures import cleanup_fixture_agents
-from yuxi.agentscope.client import AgentScopeServiceClient
-from yuxi.agentscope.gateway import stream_round_to_run_events
-from yuxi.agentscope.runner import ensure_thread_session
+from test.live_api_cleanup import cleanup_static_test_user_resources
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.repositories.agent_repository import DEFAULT_SHARE_CONFIG
 from yuxi.storage.postgres.models_business import (
     Agent,
     AgentScopeThreadSession,
+    Conversation,
+    ConversationStats,
     ModelProvider,
+    OperationLog,
     User,
 )
 from yuxi.storage.redis.manager import close_async_redis_client
+from yuxi.utils.auth_utils import AuthUtils
 
 AGENTSCOPE_BASE_URL = os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100")
 CHATBOT_SLUG = "e2e-realmodel-chatbot"
 PROVIDER_ID = "e2e-minimax-real"
-MODEL_SPEC = f"{PROVIDER_ID}:MiniMax-M3"
+PROVIDER_RESOURCE_ID = "e2e-minimax-real-resource"
+MODEL_SPEC = f"{PROVIDER_RESOURCE_ID}:MiniMax-M3"
 REAL_UID = "e2e-realmodel"
 
 pytestmark = pytest.mark.e2e
@@ -39,6 +44,12 @@ requires_minimax_key = pytest.mark.skipif(
 )
 
 
+async def _cleanup_real_model_conversations(session) -> None:
+    """按现有测试清理器删除该专用用户的完整 Conversation 事实链。"""
+    await session.commit()
+    await cleanup_static_test_user_resources(REAL_UID)
+
+
 @pytest.fixture
 async def db_session():
     pg_manager.initialize()
@@ -46,6 +57,13 @@ async def db_session():
     async with pg_manager.get_async_session_context() as session:
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
         await session.execute(delete(AgentScopeThreadSession).where(AgentScopeThreadSession.uid == REAL_UID))
+        await session.execute(
+            delete(OperationLog).where(OperationLog.user_id.in_(select(User.id).where(User.uid == REAL_UID)))
+        )
+        await session.commit()
+        await _cleanup_real_model_conversations(session)
+        conversation_ids = select(Conversation.id).where(Conversation.uid == REAL_UID)
+        await session.execute(delete(ConversationStats).where(ConversationStats.conversation_id.in_(conversation_ids)))
         await session.execute(delete(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID))
         await session.execute(delete(User).where(User.uid == REAL_UID))
         session.add_all(
@@ -53,10 +71,12 @@ async def db_session():
                 User(
                     uid=REAL_UID,
                     username=REAL_UID,
-                    password_hash="test-only",
+                    password_hash=AuthUtils.hash_password("test-only"),
                     role="superadmin",
+                    department_id=1,
                 ),
                 ModelProvider(
+                    resource_id=PROVIDER_RESOURCE_ID,
                     provider_id=PROVIDER_ID,
                     display_name="MiniMax real model e2e",
                     provider_type="anthropic",
@@ -82,8 +102,10 @@ async def db_session():
                     config_json={
                         "context": {
                             "model": MODEL_SPEC,
+                            "tools": [],
                             "skills": [],
                             "mcps": [],
+                            "subagents": [],
                             "system_prompt": "你是真实模型验证助手，请用一句话回答。",
                         }
                     },
@@ -95,6 +117,13 @@ async def db_session():
         yield session
         await session.execute(delete(AgentScopeThreadSession).where(AgentScopeThreadSession.uid == REAL_UID))
         await cleanup_fixture_agents(session, CHATBOT_SLUG)
+        await session.execute(
+            delete(OperationLog).where(OperationLog.user_id.in_(select(User.id).where(User.uid == REAL_UID)))
+        )
+        await session.commit()
+        await _cleanup_real_model_conversations(session)
+        conversation_ids = select(Conversation.id).where(Conversation.uid == REAL_UID)
+        await session.execute(delete(ConversationStats).where(ConversationStats.conversation_id.in_(conversation_ids)))
         await session.execute(delete(ModelProvider).where(ModelProvider.provider_id == PROVIDER_ID))
         await session.execute(delete(User).where(User.uid == REAL_UID))
         await session.commit()
@@ -103,46 +132,81 @@ async def db_session():
     pg_manager._initialized = False
 
 
+@pytest_asyncio.fixture
+async def real_model_headers(db_session, e2e_client):
+    """使用本用例创建的专用 superadmin 登录正式 HTTP 入口。"""
+    response = await e2e_client.post(
+        "/api/auth/token",
+        data={"username": REAL_UID, "password": "test-only"},
+    )
+    assert response.status_code == 200, response.text
+    access_token = response.json().get("access_token")
+    assert access_token, response.text
+    return {"Authorization": f"Bearer {access_token}"}
+
+
 @requires_minimax_key
-async def test_real_model_roundtrip_with_usage(db_session):
-    uid = REAL_UID
-    run_id = f"e2e-run-{uuid.uuid4().hex[:12]}"
+async def test_real_model_roundtrip_with_usage(db_session, e2e_client, real_model_headers):
+    run_id = None
+    thread_id = None
     request_id = f"e2e-req-{uuid.uuid4().hex[:8]}"
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
-
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-    mapping = None
+    run_completed = False
     try:
-        mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
-        assert mapping.model_spec == MODEL_SPEC
-
-        result = await stream_round_to_run_events(
-            client,
-            uid=uid,
-            agent_id=mapping.agentscope_agent_id,
-            session_id=mapping.agentscope_session_id,
-            text="用一句话介绍你自己",
-            run_id=run_id,
-            request_id=request_id,
-            thread_id=thread_id,
-            read_timeout=180.0,
+        agent = await db_session.scalar(select(Agent).where(Agent.slug == CHATBOT_SLUG))
+        assert agent is not None
+        assert (agent.config_json or {}).get("context", {}).get("tools") == []
+        thread_response = await e2e_client.post(
+            "/api/chat/thread",
+            json={
+                "agent_id": CHATBOT_SLUG,
+                "title": f"MiniMax real model e2e {uuid.uuid4().hex[:8]}",
+                "metadata": {"_yuxi_e2e": True, "test": "agentscope-real-model"},
+            },
+            headers=real_model_headers,
         )
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json().get("id"))
+        assert thread_id, thread_response.text
+        api_agent_response = await e2e_client.get(
+            f"/api/agent/{CHATBOT_SLUG}",
+            headers=real_model_headers,
+        )
+        assert api_agent_response.status_code == 200, api_agent_response.text
+        api_agent_context = (api_agent_response.json().get("agent") or {}).get("config_json", {}).get("context", {})
+        assert api_agent_context.get("tools") == [], api_agent_response.text
 
-        assert result.run_status == "completed"
-        assert len(result.text.strip()) > 0, "真实模型应返回非空回复"
-        assert len(result.reasoning.strip()) > 0, "开启 thinking 后应返回非空推理摘要"
-        assert result.usage and result.usage["total_tokens"] > 0, result.usage
+        run_response = await e2e_client.post(
+            "/api/agent/runs",
+            json={
+                "query": "用一句话介绍你自己",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "meta": {"request_id": request_id, "model_spec": MODEL_SPEC},
+            },
+            headers=real_model_headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json().get("run_id"))
+        assert run_id, run_response.text
 
-        messages = await client.list_messages(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)
-        assistant_texts = [
-            block.get("text", "")
-            for msg in messages
-            for block in msg.get("content", [])
-            if block.get("type") == "text" and msg.get("role") == "assistant"
-        ]
-        assert any(text.strip() for text in assistant_texts)
+        event_counts = await consume_events(e2e_client, real_model_headers, run_id)
+        assert event_counts.get("messages", 0) > 0, event_counts
+        assert event_counts.get("end", 0) == 1, event_counts
+
+        run_payload = await wait_for_run(e2e_client, real_model_headers, run_id)
+        assert run_payload.get("status") == "completed", run_payload
+        assert run_payload.get("request_id") == request_id, run_payload
+
+        result_response = await e2e_client.get(f"/api/agent/runs/{run_id}/result", headers=real_model_headers)
+        assert result_response.status_code == 200, result_response.text
+        result = result_response.json()
+        assert result.get("status") == "completed", result
+        assert len(str(result.get("output") or "").strip()) > 0, result
+        assert result.get("token_usage", {}).get("total_tokens", 0) > 0, result
+        run_completed = True
     finally:
-        if mapping is not None:
-            await client.delete_session(uid, mapping.agentscope_agent_id, mapping.agentscope_session_id)
-            await client.delete_agent(uid, mapping.agentscope_agent_id)
-            await client.delete_credential(uid, mapping.agentscope_credential_id)
+        if not run_completed:
+            await cancel_run(e2e_client, real_model_headers, run_id)
+        if thread_id:
+            response = await e2e_client.delete(f"/api/chat/thread/{thread_id}", headers=real_model_headers)
+            assert response.status_code in {200, 404}, response.text

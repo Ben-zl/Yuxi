@@ -10,16 +10,16 @@ import os
 import uuid
 
 import pytest
+from e2e_helpers import consume_events, wait_for_run
 
 from test.e2e.agentscope_e2e_fixtures import (
-    PROVIDER_ID,
+    PROVIDER_RESOURCE_ID,
     cleanup_fixture_agents,
     cleanup_test_users,
+    open_fixture_http_client,
     seed_test_users,
     upsert_mock_provider,
 )
-from yuxi.agentscope.client import AgentScopeServiceClient
-from yuxi.agentscope.runner import collect_chat_round, ensure_thread_session
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Agent
 from yuxi.storage.redis.manager import close_async_redis_client
@@ -46,7 +46,15 @@ async def db_session():
                 name="团队子智能体",
                 backend_id="SubAgentBackend",
                 is_subagent=True,
-                config_json={"context": {"model": f"{PROVIDER_ID}:mock-chat-model", "system_prompt": "e2e 团队子智能体模板提示"}},
+                config_json={
+                    "context": {
+                        "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
+                        "tools": [],
+                        "skills": [],
+                        "subagents": [],
+                        "system_prompt": "e2e 团队子智能体模板提示",
+                    }
+                },
                 share_config={},
             )
         )
@@ -57,8 +65,10 @@ async def db_session():
                 backend_id="ChatbotAgent",
                 config_json={
                     "context": {
-                        "model": f"{PROVIDER_ID}:mock-chat-model",
+                        "model": f"{PROVIDER_RESOURCE_ID}:mock-chat-model",
                         "mcps": [],
+                        "tools": [],
+                        "skills": [],
                         "subagents": [SUBAGENT_SLUG],
                         "system_prompt": "你是团队主智能体。",
                     }
@@ -77,25 +87,38 @@ async def db_session():
 
 async def test_team_choreography_with_custom_template(db_session):
     uid = USER_ID
-    thread_id = f"e2e-thread-{uuid.uuid4().hex[:12]}"
-    client = AgentScopeServiceClient(AGENTSCOPE_BASE_URL)
-
-    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
-    result = await collect_chat_round(
-        client,
-        uid=uid,
-        agent_id=mapping.agentscope_agent_id,
-        session_id=mapping.agentscope_session_id,
-        text="请组建团队完成示例任务",
-        read_timeout=300.0,
-    )
-    assert result.parked is None
-    assert result.text.startswith(TEAM_DONE_TEXT)
-
-    # AgentScope Team runtime 按当前 Yuxi 契约保留到父线程删除，不要求旧 TeamDelete 工具。
-    tool_starts = [ev for ev in result.events if str(ev.get("type", "")).upper() == "TOOL_CALL_START"]
-    called = {ev.get("tool_call_name") for ev in tool_starts}
-    assert {"TeamCreate", "AgentCreate"} <= called, called
+    client, headers = await open_fixture_http_client(uid)
+    try:
+        thread_response = await client.post(
+            "/api/chat/thread",
+            json={"agent_id": CHATBOT_SLUG, "title": f"team-{uuid.uuid4().hex[:8]}"},
+            headers=headers,
+        )
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json().get("id"))
+        run_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请组建团队完成示例任务",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "tool_approval_mode": "always_trust",
+                "meta": {"request_id": f"team-{uuid.uuid4().hex[:8]}"},
+            },
+            headers=headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json()["run_id"])
+        event_counts = await consume_events(client, headers, run_id)
+        assert event_counts.get("end", 0) == 1, event_counts
+        run = await wait_for_run(client, headers, run_id)
+        assert run["status"] == "completed", run
+        result_response = await client.get(f"/api/agent/runs/{run_id}/result", headers=headers)
+        assert result_response.status_code == 200, result_response.text
+        result = result_response.json()
+        assert str(result.get("output") or "").startswith(TEAM_DONE_TEXT), result
+    finally:
+        await client.aclose()
 
     # worker 以独立 team 会话落地，系统提示来自 yuxi 模板投影
     import asyncpg

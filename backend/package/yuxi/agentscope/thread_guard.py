@@ -23,12 +23,15 @@ PENDING_CONFIRM_KEY = "agentscope:pending_confirm:{thread_id}"
 PENDING_CONFIRM_TTL_SECONDS = 86400
 
 
-async def store_pending_confirm(thread_id: str, confirm_event: dict) -> None:
+async def store_pending_confirm(thread_id: str, confirm_event: dict, *, run_id: str | None = None) -> None:
     """缓存审批挂起事件，供 resume 请求构造 UserConfirmResultEvent。"""
     redis = await get_async_redis_client()
+    payload = dict(confirm_event)
+    if run_id is not None:
+        payload["_owner_run_id"] = run_id
     await redis.set(
         PENDING_CONFIRM_KEY.format(thread_id=thread_id),
-        json.dumps(confirm_event, ensure_ascii=False),
+        json.dumps(payload, ensure_ascii=False),
         ex=PENDING_CONFIRM_TTL_SECONDS,
     )
 
@@ -43,10 +46,35 @@ async def load_pending_confirm(thread_id: str) -> dict | None:
     return json.loads(raw)
 
 
-async def clear_pending_confirm(thread_id: str) -> None:
-    """恢复成功后清除线程挂起事件。"""
+async def clear_pending_confirm(
+    thread_id: str,
+    *,
+    expected_run_id: str | None = None,
+    include_legacy: bool = False,
+) -> None:
+    """恢复成功时清理；取消时仅原子删除属于目标 Run 的事件。"""
     redis = await get_async_redis_client()
-    await redis.delete(PENDING_CONFIRM_KEY.format(thread_id=thread_id))
+    key = PENDING_CONFIRM_KEY.format(thread_id=thread_id)
+    if expected_run_id is None:
+        await redis.delete(key)
+        return
+    await redis.eval(
+        """
+        local raw = redis.call('GET', KEYS[1])
+        if not raw then return 0 end
+        local ok, event = pcall(cjson.decode, raw)
+        if ok and type(event) == 'table' and
+            (event['_owner_run_id'] == ARGV[1] or
+             (ARGV[2] == '1' and event['_owner_run_id'] == nil)) then
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        """,
+        1,
+        key,
+        expected_run_id,
+        "1" if include_legacy else "0",
+    )
 
 
 async def has_pending_confirm(thread_id: str) -> bool:

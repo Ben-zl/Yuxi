@@ -5,9 +5,12 @@ import threading
 from pathlib import Path
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from httpx import ASGITransport, AsyncClient
 
 import yuxi.services.artifact_service as svc
+from server.routers.chat_router import chat
+from server.utils.auth_middleware import get_db, get_required_user
 from yuxi.agents.backends.paths import workspace_scope_from_runtime_path
 from yuxi.workspace.errors import FileTransferLimitError
 from yuxi.services.workdir_service import AuthorizedWorkdir
@@ -82,6 +85,7 @@ def live_files(monkeypatch, tmp_path):
         return binding
 
     monkeypatch.setattr(svc, "resolve_authorized_workdir", resolve)
+    monkeypatch.setattr(svc, "lock_project_workdir_changes", lambda **_kwargs: _async_value(None))
     monkeypatch.setattr(svc, "resolve_thread_workspace", lambda *_args, **_kwargs: _async_value(None))
     monkeypatch.setattr(
         svc,
@@ -102,6 +106,126 @@ def live_files(monkeypatch, tmp_path):
 
 async def _async_value(value):
     return value
+
+
+@pytest.fixture
+def artifact_http_client(live_files):
+    app = FastAPI()
+    app.include_router(chat, prefix="/api")
+    app.dependency_overrides[get_db] = lambda: object()
+    app.dependency_overrides[get_required_user] = lambda: type("User", (), {"uid": "user-1"})()
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_http_uses_current_workdir_and_selected_destination(live_files, artifact_http_client):
+    """正式 HTTP 保存入口使用当前 Workdir，并保留用户选择的目录。"""
+    async with artifact_http_client as client:
+        response = await client.post(
+            "/api/chat/thread/thread-1/artifacts/save",
+            json={
+                "path": "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111/report.md",
+                "destination_path": "/exports/reports",
+            },
+        )
+        assert response.status_code == 200, response.text
+        saved_path = response.json()["saved_path"]
+        assert saved_path == "/home/gem/user-data/exports/reports/report.md"
+        assert response.json()["saved_artifact_url"] == "/api/workspace/download?path=/exports/reports/report.md"
+        assert live_files.expected_bytes(saved_path) == b"one\ntwo\n"
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_http_rejects_other_project_of_same_user(live_files, artifact_http_client):
+    """同一 UID 的其他 Project 文件不能经正式 HTTP 保存入口复制。"""
+    other_path = "/home/gem/user-data/projects/22222222-2222-4222-8222-222222222222/secret.txt"
+    live_files.add_runtime_file(other_path, b"other project secret")
+    async with artifact_http_client as client:
+        response = await client.post(
+            "/api/chat/thread/thread-1/artifacts/save",
+            json={"path": other_path},
+        )
+    assert response.status_code == 403
+    assert "/saved_artifacts/secret.txt" not in live_files.files
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_http_rejects_other_project_destination(live_files, artifact_http_client, monkeypatch):
+    """当前 Conversation 不能把交付物写入同 UID 的其他 Project。"""
+    other_dir = "/projects/22222222-2222-4222-8222-222222222222"
+    live_files.directories.add(other_dir)
+    binding = AuthorizedWorkdir(
+        conversation_id=1,
+        thread_id="thread-1",
+        uid="user-1",
+        workdir=Workdir("projects/11111111-1111-4111-8111-111111111111", live_files),
+        project_id="11111111-1111-4111-8111-111111111111",
+        directory_mode="managed",
+        project_workdir_paths=(
+            "projects/11111111-1111-4111-8111-111111111111",
+            "projects/22222222-2222-4222-8222-222222222222",
+        ),
+    )
+    monkeypatch.setattr(svc, "resolve_authorized_workdir", lambda **_kwargs: _async_value(binding))
+    async with artifact_http_client as client:
+        response = await client.post(
+            "/api/chat/thread/thread-1/artifacts/save",
+            json={
+                "path": "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111/report.md",
+                "destination_path": other_dir,
+            },
+        )
+    assert response.status_code == 403
+    assert f"{other_dir}/report.md" not in live_files.files
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["get", "post"])
+async def test_artifact_http_rejects_session_root_owned_by_other_project(
+    live_files, artifact_http_client, monkeypatch, method
+):
+    """Session 根路径与其他 linked Project 冲突时优先拒绝。"""
+    from yuxi.services import thread_files_service
+
+    original_resolve = svc.resolve_authorized_workdir
+
+    async def resolve(**kwargs):
+        access = await original_resolve(**kwargs)
+        return AuthorizedWorkdir(
+            conversation_id=access.conversation_id,
+            thread_id=access.thread_id,
+            uid=access.uid,
+            workdir=access.workdir,
+            project_id=access.project_id,
+            directory_mode=access.directory_mode,
+            project_workdir_paths=("projects/11111111-1111-4111-8111-111111111111", "uploads"),
+        )
+
+    async def session_artifact(**_kwargs):
+        return thread_files_service.InMemoryArtifact(name="report.md", content=b"session bytes")
+
+    monkeypatch.setattr(svc, "resolve_authorized_workdir", resolve)
+    monkeypatch.setattr(svc, "resolve_thread_workspace", lambda *_args, **_kwargs: _async_value((object(), object())))
+    monkeypatch.setattr(thread_files_service, "resolve_thread_artifact_by_owner", session_artifact)
+    url = "/api/chat/thread/thread-1/artifacts/"
+    path = "/home/gem/user-data/uploads/report.md"
+    async with artifact_http_client as client:
+        if method == "get":
+            response = await client.get(f"{url}{path.lstrip('/')}")
+        else:
+            response = await client.post(f"{url}save", json={"path": path})
+    assert response.status_code == 403
+    assert "/saved_artifacts/report.md" not in live_files.files
+
+
+@pytest.mark.asyncio
+async def test_artifact_http_does_not_read_unbound_personal_directory(live_files, artifact_http_client):
+    """未绑定的个人目录不属于当前线程的 Artifact 来源。"""
+    path = "/home/gem/user-data/private/ledger.csv"
+    live_files.add_runtime_file(path, b"private")
+    async with artifact_http_client as client:
+        response = await client.get(f"/api/chat/thread/thread-1/artifacts/{path.lstrip('/')}")
+    assert response.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -152,7 +276,7 @@ async def test_artifact_preview_uses_shared_file_renderer(live_files, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_agentscope_artifact_preview_reads_the_mapped_session_file(monkeypatch):
+async def test_agentscope_artifact_preview_reads_the_mapped_session_file(live_files, monkeypatch):
     from yuxi.services import thread_files_service
 
     monkeypatch.setattr(svc, "resolve_thread_workspace", lambda *_args, **_kwargs: _async_value((object(), object())))
@@ -183,6 +307,82 @@ async def test_agentscope_artifact_preview_reads_the_mapped_session_file(monkeyp
         "raw_content": b"<h1>ok</h1>",
         "office_cache_key": "artifact:user-1:/home/gem/user-data/outputs/report.html",
     }
+
+
+@pytest.mark.asyncio
+async def test_save_agentscope_session_output_uses_current_session_owner(live_files, monkeypatch):
+    """Session 产物可保存到用户目录，不经错误的本地 Workdir 来源。"""
+    from yuxi.services import thread_files_service
+
+    monkeypatch.setattr(svc, "resolve_thread_workspace", lambda *_args, **_kwargs: _async_value((object(), object())))
+
+    async def resolve_from_agentscope(**_kwargs):
+        return thread_files_service.InMemoryArtifact(name="report.md", content=b"session output")
+
+    monkeypatch.setattr(thread_files_service, "resolve_thread_artifact_by_owner", resolve_from_agentscope)
+    result = await svc.save_thread_artifact_to_workspace_view(
+        thread_id="thread-1",
+        current_uid="user-1",
+        db=object(),
+        path="/home/gem/user-data/outputs/report.md",
+    )
+    assert result["saved_path"] == "/home/gem/user-data/saved_artifacts/report.md"
+    assert live_files.expected_bytes(result["saved_path"]) == b"session output"
+
+
+@pytest.mark.asyncio
+async def test_project_artifact_stays_owned_by_workdir_after_session_mapping_exists(live_files, monkeypatch):
+    """Session 建立后，Project Workdir 附件仍必须从原 Owner 下载。"""
+    from yuxi.services import thread_files_service
+
+    path = "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111/report.md"
+    monkeypatch.setattr(svc, "resolve_thread_workspace", lambda *_args, **_kwargs: _async_value((object(), object())))
+
+    async def reject_session_owner(**_kwargs):
+        raise AssertionError("Project Workdir artifact must not be routed to AgentScope Session")
+
+    monkeypatch.setattr(thread_files_service, "resolve_thread_artifact_by_owner", reject_session_owner)
+
+    response = await svc.resolve_thread_artifact_view(
+        thread_id="thread-1",
+        current_uid="user-1",
+        db=object(),
+        path=path,
+    )
+
+    assert Path(response.path).read_bytes() == live_files.expected_bytes(path)
+    await response.background()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root", ["uploads", "outputs"])
+async def test_root_named_linked_workdir_artifact_stays_owned_after_session_mapping(live_files, monkeypatch, root):
+    """合法的根级 linked Workdir 优先于同名的 Session 目录。"""
+    from yuxi.services import thread_files_service
+
+    path = f"/home/gem/user-data/{root}/report.md"
+    live_files.add_runtime_file(path, b"linked workdir")
+    binding = AuthorizedWorkdir(
+        conversation_id=1,
+        thread_id="thread-1",
+        uid="user-1",
+        workdir=Workdir(root, live_files),
+        project_id="linked-project",
+        directory_mode="linked",
+    )
+    monkeypatch.setattr(svc, "resolve_authorized_workdir", lambda **_kwargs: _async_value(binding))
+    monkeypatch.setattr(svc, "resolve_thread_workspace", lambda *_args, **_kwargs: _async_value((object(), object())))
+
+    async def reject_session_owner(**_kwargs):
+        raise AssertionError("linked Workdir artifact must not be routed to AgentScope Session")
+
+    monkeypatch.setattr(thread_files_service, "resolve_thread_artifact_by_owner", reject_session_owner)
+
+    response = await svc.resolve_thread_artifact_view(
+        thread_id="thread-1", current_uid="user-1", db=object(), path=path
+    )
+    assert Path(response.path).read_bytes() == b"linked workdir"
+    await response.background()
 
 
 @pytest.mark.asyncio
@@ -233,14 +433,84 @@ async def test_artifact_download_encodes_untrusted_posix_filename(live_files, fi
 
 @pytest.mark.asyncio
 async def test_artifact_rejects_other_project(live_files):
+    path = "/home/gem/user-data/projects/other/secret.txt"
+    live_files.add_runtime_file(path, b"other project secret")
     with pytest.raises(HTTPException) as exc:
         await svc.resolve_thread_artifact_view(
             thread_id="thread-1",
             current_uid="user-1",
             db=object(),
-            path="/home/gem/user-data/projects/other/secret.txt",
+            path=path,
         )
-    assert exc.value.status_code == 404
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_rejects_existing_other_project(live_files):
+    path = "/home/gem/user-data/projects/other/secret.txt"
+    live_files.add_runtime_file(path, b"other project secret")
+    with pytest.raises(HTTPException) as exc:
+        await svc.save_thread_artifact_to_workspace_view(
+            thread_id="thread-1",
+            current_uid="user-1",
+            db=object(),
+            path=path,
+        )
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_saved_artifact_compatibility_rejects_other_linked_project(live_files, monkeypatch):
+    """兼容目录不是跨 Project 的通用读取权限。"""
+    path = "/home/gem/user-data/saved_artifacts/client/secret.txt"
+    live_files.add_runtime_file(path, b"other linked project")
+    original_resolve = svc.resolve_authorized_workdir
+
+    async def resolve(**kwargs):
+        access = await original_resolve(**kwargs)
+        return AuthorizedWorkdir(
+            conversation_id=access.conversation_id,
+            thread_id=access.thread_id,
+            uid=access.uid,
+            workdir=access.workdir,
+            project_id=access.project_id,
+            directory_mode=access.directory_mode,
+            project_workdir_paths=("saved_artifacts/client",),
+        )
+
+    monkeypatch.setattr(svc, "resolve_authorized_workdir", resolve)
+    with pytest.raises(HTTPException) as exc:
+        await svc.resolve_thread_artifact_view(thread_id="thread-1", current_uid="user-1", db=object(), path=path)
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root", ["uploads", "outputs"])
+async def test_save_root_named_linked_workdir_ignores_session_owner(live_files, monkeypatch, root):
+    """同名 linked Workdir 的保存来源仍是当前 Project。"""
+    from yuxi.services import thread_files_service
+
+    path = f"/home/gem/user-data/{root}/report.md"
+    live_files.add_runtime_file(path, b"linked workdir")
+    binding = AuthorizedWorkdir(
+        conversation_id=1,
+        thread_id="thread-1",
+        uid="user-1",
+        workdir=Workdir(root, live_files),
+        project_id="linked-project",
+        directory_mode="linked",
+    )
+    monkeypatch.setattr(svc, "resolve_authorized_workdir", lambda **_kwargs: _async_value(binding))
+    monkeypatch.setattr(svc, "resolve_thread_workspace", lambda *_args, **_kwargs: _async_value((object(), object())))
+
+    async def reject_session_owner(**_kwargs):
+        raise AssertionError("linked Workdir save must not read AgentScope Session")
+
+    monkeypatch.setattr(thread_files_service, "resolve_thread_artifact_by_owner", reject_session_owner)
+    result = await svc.save_thread_artifact_to_workspace_view(
+        thread_id="thread-1", current_uid="user-1", db=object(), path=path
+    )
+    assert live_files.expected_bytes(result["saved_path"]) == b"linked workdir"
 
 
 @pytest.mark.asyncio

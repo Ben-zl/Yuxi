@@ -314,7 +314,17 @@ class ConversationRepository:
         commit: bool = True,
     ) -> ToolCall:
         if langgraph_tool_call_id:
-            existing = await self.get_tool_call_by_langgraph_id(langgraph_tool_call_id)
+            # tool_call_id 只在一条模型消息内唯一；不能跨 Run/消息更新旧记录。
+            result = await self.db.execute(
+                select(ToolCall)
+                .where(
+                    ToolCall.langgraph_tool_call_id == langgraph_tool_call_id,
+                    ToolCall.message_id == message_id,
+                )
+                .order_by(ToolCall.created_at.desc(), ToolCall.id.desc())
+                .limit(1)
+            )
+            existing = result.scalar_one_or_none()
             if existing:
                 existing.tool_name = tool_name
                 if tool_input is not None:

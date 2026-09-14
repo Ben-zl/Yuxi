@@ -11,12 +11,11 @@ from typing import Any
 
 from yuxi.utils.logging_config import logger
 from yuxi.agents.backends.paths import (
-    OUTPUTS_DIR_NAME,
-    UPLOADS_DIR_NAME,
     VIRTUAL_PATH_PREFIX,
     VIRTUAL_SKILLS_PATH,
-    WORKSPACE_DIR_NAME,
+    runtime_workdir_path,
 )
+from yuxi.workspace.paths import normalize_workdir_path
 
 from .provider import get_sandbox_provider, sandbox_id_for_thread, sandbox_provisioner_token
 
@@ -107,12 +106,8 @@ def _get_file_type(path: str) -> str:
 
 
 _USER_DATA_ROOT = "/" + VIRTUAL_PATH_PREFIX.strip("/")
-_WORKSPACE_ROOT = f"{_USER_DATA_ROOT}/{WORKSPACE_DIR_NAME}"
-_UPLOADS_ROOT = f"{_USER_DATA_ROOT}/{UPLOADS_DIR_NAME}"
-_OUTPUTS_ROOT = f"{_USER_DATA_ROOT}/{OUTPUTS_DIR_NAME}"
 _SKILLS_ROOT = "/" + VIRTUAL_SKILLS_PATH.strip("/")
 _READABLE_ROOTS = (_USER_DATA_ROOT, _SKILLS_ROOT)
-_WRITABLE_ROOTS = (_WORKSPACE_ROOT, _OUTPUTS_ROOT)
 _BINARY_PREVIEW_TOO_LARGE_ERROR = f"Binary file exceeds maximum preview size of {MAX_BINARY_BYTES} bytes"
 _IMAGE_EXTENSIONS = frozenset({".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".webp"})
 _DOCUMENT_EXTENSIONS = frozenset({".doc", ".docx", ".pdf", ".ppt", ".pptx", ".xls", ".xlsx"})
@@ -147,10 +142,6 @@ def _can_read_path(path: str) -> bool:
 
 def _can_list_path(path: str) -> bool:
     return any(_path_overlaps_root(path, root) for root in _READABLE_ROOTS)
-
-
-def _can_write_path(path: str) -> bool:
-    return any(_is_same_or_child(path, root) for root in _WRITABLE_ROOTS)
 
 
 def _readable_search_paths(path: str) -> list[str]:
@@ -272,7 +263,8 @@ class ProvisionerSandboxBackend:
         self._readable_skills = list(readable_skills or [])
         self._skill_sources = dict(skill_sources or {})
         self._inherit_env = inherit_env
-        self._workdir_path = workdir_path
+        self._workdir_path = normalize_workdir_path(workdir_path) if workdir_path else None
+        self._writable_roots = (runtime_workdir_path(self._workdir_path),) if self._workdir_path else ()
         self._provider = get_sandbox_provider()
         self._id = sandbox_id_for_thread(self._thread_id, uid=self._uid)
         self._client: Any | None = None
@@ -283,6 +275,10 @@ class ProvisionerSandboxBackend:
     @property
     def id(self) -> str:
         return self._id
+
+    def _can_write_path(self, path: str) -> bool:
+        """只允许当前 Sandbox 实际可写挂载的 Workdir 执行写操作。"""
+        return any(_is_same_or_child(path, root) for root in self._writable_roots)
 
     def _build_client(self, sandbox_url: str):
         try:
@@ -525,7 +521,7 @@ class ProvisionerSandboxBackend:
             normalized_path = _normalize_path(file_path)
         except Exception as exc:  # noqa: BLE001
             return WriteResult(error=f"Error: Invalid path '{file_path}': {exc}")
-        if not _can_write_path(normalized_path):
+        if not self._can_write_path(normalized_path):
             return WriteResult(error=f"Error: {_permission_error('write', normalized_path)}")
         if not isinstance(content, str):
             return WriteResult(error="Error: write() only supports text content; use upload_files() for binary data")
@@ -561,7 +557,7 @@ class ProvisionerSandboxBackend:
             normalized_path = _normalize_path(file_path)
         except Exception as exc:  # noqa: BLE001
             return EditResult(error=f"Error: Invalid path '{file_path}': {exc}")
-        if not _can_write_path(normalized_path):
+        if not self._can_write_path(normalized_path):
             return EditResult(error=f"Error: {_permission_error('write', normalized_path)}")
 
         # Check if old_string exists
@@ -654,7 +650,7 @@ class ProvisionerSandboxBackend:
         for path, content in files:
             try:
                 normalized_path = _normalize_path(path)
-                if not _can_write_path(normalized_path):
+                if not self._can_write_path(normalized_path):
                     responses.append(FileUploadResponse(path=normalized_path, error="permission_denied"))
                     continue
                 result = self._get_client().file.write_file(
