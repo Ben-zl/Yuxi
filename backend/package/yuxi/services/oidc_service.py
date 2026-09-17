@@ -20,7 +20,11 @@ from sqlalchemy.exc import IntegrityError
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.services.operation_log_service import log_operation
 from yuxi.storage.postgres.models_business import Department, User
-from yuxi.utils.auth_utils import AuthUtils
+from yuxi.services.department_context_service import (
+    create_session_for_login,
+    resolve_department_context,
+)
+from yuxi.utils.auth_utils import JWT_EXPIRATION, AuthUtils
 from yuxi.utils.datetime_utils import utc_now_naive
 from yuxi.utils.logging_config import logger
 
@@ -839,15 +843,20 @@ async def oidc_callback_handler(code: str, state: str, db, request: Request | No
     if user.is_deleted:
         return _redirect_to_login_with_error("该账户已注销")
 
-    token_data = {"sub": str(user.id)}
+    # OIDC 登录与密码登录同样创建服务端会话
+    auth_session = await create_session_for_login(db, user_id=user.id, ttl_seconds=JWT_EXPIRATION)
+    context = await resolve_department_context(
+        db,
+        user_id=user.id,
+        department_id=auth_session.active_department_id,
+        session_id=auth_session.id,
+        revision=auth_session.revision,
+    )
+    token_data = {"sub": str(user.id), "sid": auth_session.id}
     jwt_token = AuthUtils.create_access_token(token_data)
 
     await log_operation(db, user.id, "OIDC 登录", request=request)
-
-    department_name = None
-    if user.department_id:
-        result = await db.execute(select(Department.name).filter(Department.id == user.department_id))
-        department_name = result.scalar_one_or_none()
+    await db.commit()
 
     response_data = {
         "access_token": jwt_token,
@@ -857,9 +866,12 @@ async def oidc_callback_handler(code: str, state: str, db, request: Request | No
         "uid": user.uid,
         "phone_number": user.phone_number,
         "avatar": user.avatar,
-        "role": user.role,
-        "department_id": user.department_id,
-        "department_name": department_name,
+        "role": context.role,
+        "account_role": context.account_role,
+        "department_id": context.department_id,
+        "department_name": context.department_name,
+        "context_revision": context.revision,
+        "session_id": context.session_id,
     }
 
     exchange_code = OIDCUtils.generate_login_code(response_data)

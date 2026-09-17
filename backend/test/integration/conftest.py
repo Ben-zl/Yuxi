@@ -7,10 +7,11 @@ from __future__ import annotations
 import os
 import sys
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 
 import anyio
+import asyncpg
 import httpx
 import pytest
 import pytest_asyncio
@@ -111,6 +112,24 @@ def admin_headers(admin_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {admin_token}"}
 
 
+@pytest_asyncio.fixture(scope="function")
+async def department_headers(test_client) -> Callable[[dict[str, str]], dict[str, str]]:
+    """为部门写请求附加当前会话的 X-Department-Revision。
+
+    以传入 headers 的 Bearer 调用 /api/auth/me 取 context_revision 并复制副本返回；
+    不修改共享 admin_headers。陈旧 revision 负向测试应自行保存旧副本。
+    """
+
+    async def _build(headers: dict[str, str]) -> dict[str, str]:
+        me = await test_client.get("/api/auth/me", headers=headers)
+        assert me.status_code == 200, me.text
+        merged = dict(headers)
+        merged["X-Department-Revision"] = str(me.json()["context_revision"])
+        return merged
+
+    return _build
+
+
 @pytest.fixture(scope="session", autouse=True)
 def cleanup_test_knowledge_resources():
     async def run_cleanup() -> None:
@@ -192,6 +211,22 @@ async def standard_user(test_client: httpx.AsyncClient, admin_headers: dict[str,
         pytest.fail(f"Failed to create standard user (status={response.status_code}): {response.text}")
 
     user_payload = response.json()
+
+    # 部门权限来自成员关系：旧创建接口只写 User.department_id，这里直连 PG 补成员事实
+    dsn = os.getenv("POSTGRES_URL", "postgresql+asyncpg://postgres:postgres@postgres:5432/yuxi").replace(
+        "postgresql+asyncpg://", "postgresql://"
+    )
+    pg_conn = await asyncpg.connect(dsn)
+    try:
+        await pg_conn.execute(
+            "INSERT INTO department_memberships (user_id, department_id, role, created_at) "
+            "VALUES ($1, $2, 'user', NOW())",
+            user_payload["id"],
+            department_id,
+        )
+    finally:
+        await pg_conn.close()
+
     login_response = await test_client.post(
         "/api/auth/token",
         data={"username": user_payload["uid"], "password": password},
@@ -217,6 +252,12 @@ async def standard_user(test_client: httpx.AsyncClient, admin_headers: dict[str,
             {"Authorization": f"Bearer {access_token}"},
             owner_uid=str(user_payload["uid"]),
         )
+        # 成员事实先于账号软删除清除，避免残留关系阻碍部门清理
+        cleanup_conn = await asyncpg.connect(dsn)
+        try:
+            await cleanup_conn.execute("DELETE FROM department_memberships WHERE user_id = $1", user_payload["id"])
+        finally:
+            await cleanup_conn.close()
         cleanup_error = None
         for _ in range(3):
             response = await test_client.delete(f"/api/auth/users/{user_payload['id']}", headers=admin_headers)

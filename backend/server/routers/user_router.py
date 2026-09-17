@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from server.utils.auth_middleware import get_current_user, get_db, get_required_user
+from server.utils.auth_middleware import get_authenticated_user, get_db, get_required_user
 from yuxi.config import UserConfig, UserConfigSchema
 from yuxi.repositories.agent_env_repository import AgentEnvRepository
 from yuxi.repositories.api_key_repository import (
@@ -71,7 +71,7 @@ class AgentEnvResponse(BaseModel):
     updated_at: str | None = None
 
 
-async def get_logged_in_user(user: User | None = Depends(get_current_user)) -> User:
+async def get_logged_in_user(user: User | None = Depends(get_authenticated_user)) -> User:
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -101,7 +101,7 @@ async def update_user_config(
 
 
 @user_router.post("/upload-image", response_model=dict)
-async def upload_user_image(file: UploadFile = File(...), current_user: User = Depends(get_required_user)):
+async def upload_user_image(file: UploadFile = File(...), current_user: User = Depends(get_authenticated_user)):
     try:
         image_url = await upload_image_to_minio(
             file,
@@ -158,7 +158,7 @@ async def get_accessible_api_key(repository: APIKeyRepository, api_key_id: int, 
 async def list_api_keys(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
-    current_user: User = Depends(get_required_user),
+    current_user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     api_keys, total = await APIKeyRepository(db).list_visible(
@@ -226,7 +226,7 @@ async def create_api_key(
 @user_router.get("/apikey/{api_key_id}", response_model=dict)
 async def get_api_key(
     api_key_id: int,
-    current_user: User = Depends(get_required_user),
+    current_user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     api_key = await get_accessible_api_key(APIKeyRepository(db), api_key_id, current_user)
@@ -237,7 +237,7 @@ async def get_api_key(
 async def update_api_key(
     api_key_id: int,
     data: APIKeyUpdate,
-    current_user: User = Depends(get_required_user),
+    current_user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     repository = APIKeyRepository(db)
@@ -259,7 +259,7 @@ async def update_api_key(
 @user_router.delete("/apikey/{api_key_id}", response_model=dict)
 async def delete_api_key(
     api_key_id: int,
-    current_user: User = Depends(get_required_user),
+    current_user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     repository = APIKeyRepository(db)
@@ -271,7 +271,7 @@ async def delete_api_key(
 
 @user_router.get("/agent-env", response_model=AgentEnvResponse)
 async def get_agent_env(
-    current_user: User = Depends(get_required_user),
+    current_user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     agent_env = await AgentEnvRepository(db).get_by_uid(current_user.uid)

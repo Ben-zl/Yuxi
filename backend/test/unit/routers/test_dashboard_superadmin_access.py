@@ -14,6 +14,7 @@ from server.routers.dashboard_router import (
     get_user_activity_stats,
 )
 from server.utils.auth_middleware import get_superadmin_user
+from yuxi.services.department_context_service import DepartmentContext
 from yuxi.storage.postgres.models_business import Agent, Base, Conversation, Department, Message, ToolCall, User
 from yuxi.utils.datetime_utils import utc_now_naive
 
@@ -140,8 +141,20 @@ async def test_dashboard_routes_require_superadmin_dependency():
 
 
 async def test_dashboard_dependency_rejects_department_admin(dashboard_session):
+    admin_a = dashboard_session["admin_a"]
+    context = DepartmentContext(
+        id=admin_a.id,
+        uid=admin_a.uid,
+        username=admin_a.username,
+        account_role="user",
+        department_id=admin_a.department_id,
+        department_name=None,
+        role="admin",
+        session_id=None,
+        revision=0,
+    )
     with pytest.raises(HTTPException) as exc:
-        await get_superadmin_user(dashboard_session["admin_a"])
+        await get_superadmin_user(context)
 
     assert exc.value.status_code == 403
 

@@ -8,11 +8,10 @@ from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from server.utils.auth_middleware import get_current_user, get_db, verify_api_key
+from server.utils.auth_middleware import get_db, get_required_user, verify_api_key
 from yuxi.services.agent_task_crud_service import (
     AgentTaskCRUDService,
     can_manage_task,
-    can_view_task,
 )
 from yuxi.services.agent_task_dispatcher import AgentTaskDispatcher
 from yuxi.services.agent_task_execution_view_service import AgentTaskExecutionViewService
@@ -23,7 +22,6 @@ from yuxi.services.agent_task_trigger_service import (
 )
 from yuxi.repositories.agent_task_repository import TaskExecutionRepository
 from yuxi.storage.postgres.models_business import User
-from yuxi.storage.postgres.models_business import TaskExecution
 from yuxi.utils.datetime_utils import utc_now_naive
 
 agent_task_router = APIRouter(prefix="/agent-tasks", tags=["agent-task-center"])
@@ -34,7 +32,7 @@ agent_task_router = APIRouter(prefix="/agent-tasks", tags=["agent-task-center"])
 
 @agent_task_router.get("")
 async def list_tasks(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     service = AgentTaskCRUDService(db)
@@ -51,7 +49,7 @@ async def list_tasks(
 @agent_task_router.post("")
 async def create_task(
     payload: dict[str, Any] = Body(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     if current_user is None:
@@ -64,7 +62,7 @@ async def create_task(
 @agent_task_router.post("/schedule-preview")
 async def schedule_preview(
     payload: dict[str, Any] = Body(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
 ):
     """预览未来五次本地执行时间（创建/编辑校验用）。"""
     if current_user is None:
@@ -77,7 +75,7 @@ async def schedule_preview(
 @agent_task_router.get("/{task_id}")
 async def get_task(
     task_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     service = AgentTaskCRUDService(db)
@@ -89,7 +87,7 @@ async def get_task(
 async def update_task(
     task_id: str,
     payload: dict[str, Any] = Body(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     service = AgentTaskCRUDService(db)
@@ -103,7 +101,7 @@ async def update_task(
 @agent_task_router.post("/{task_id}/executions")
 async def trigger_manual(
     task_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Web 手动触发：使用触发者身份，立即返回 execution_id。"""
@@ -151,7 +149,7 @@ async def trigger_api(
 @agent_task_router.get("/{task_id}/executions")
 async def list_executions(
     task_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     service = AgentTaskCRUDService(db)
@@ -170,7 +168,7 @@ executions_router = APIRouter(prefix="/agent-task-executions", tags=["agent-task
 @executions_router.get("/{execution_id}")
 async def get_execution(
     execution_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     """查询单次执行状态、消息和结果定位信息（父规格 #958 接口面）。"""
@@ -189,7 +187,7 @@ async def stream_execution_events(
     after_seq: str = "0-0",
     verbose: bool = Query(default=True),
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
 ):
     """按任务可见范围转发该执行的 Run SSE 事件流（工单 03/05）。"""
     if current_user is None:
@@ -214,7 +212,7 @@ async def get_execution_artifact(
     execution_id: str,
     path: str,
     download: bool = Query(False),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     """按任务可见范围读取执行线程产物（工单 05）。"""
@@ -244,7 +242,7 @@ async def get_execution_artifact(
 async def submit_approval(
     execution_id: str,
     payload: dict[str, Any] = Body(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     """仅执行身份可审批/拒绝（工单 05）；复用标准 resume 提交链路。"""
@@ -261,7 +259,7 @@ async def submit_approval(
 @executions_router.post("/{execution_id}/cancel")
 async def cancel_execution(
     execution_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     """取消执行：任务创建者任意取消；部门成员只能取消自己触发的。"""

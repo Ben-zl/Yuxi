@@ -3,17 +3,28 @@ import re
 
 from typing import Literal
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.utils.auth_middleware import (
-    get_admin_user,
+    get_authenticated_user,
     get_db,
     get_required_user,
     get_superadmin_user,
+)
+from yuxi.services.department_context_service import (
+    DepartmentAccessDeniedError,
+    DepartmentContextError,
+    DepartmentNotFoundError,
+    DepartmentRevisionConflictError,
+    create_session_for_login,
+    list_available_departments,
+    resolve_department_context,
+    revoke_auth_session,
+    switch_department,
 )
 from yuxi.services.auth_service import (
     CLI_AUTH_POLL_INTERVAL_SECONDS,
@@ -44,7 +55,7 @@ from yuxi.storage.postgres.models_business import User
 from yuxi.repositories.department_repository import DepartmentRepository
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.utils import logger
-from yuxi.utils.auth_utils import AuthUtils
+from yuxi.utils.auth_utils import JWT_EXPIRATION, AuthUtils
 from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError
 from yuxi.utils.datetime_utils import utc_now_naive
 
@@ -70,8 +81,11 @@ class Token(BaseModel):
     phone_number: str | None = None
     avatar: str | None = None
     role: str
+    account_role: str | None = None
     department_id: int | None = None
     department_name: str | None = None
+    context_revision: int | None = None
+    session_id: str | None = None
 
 
 class UserCreate(BaseModel):
@@ -104,10 +118,25 @@ class UserResponse(BaseModel):
     phone_number: str | None = None
     avatar: str | None = None
     role: str
+    account_role: str | None = None  # 全局账号身份：superadmin/user
     department_id: int | None = None
     department_name: str | None = None  # 部门名称
+    context_revision: int | None = None  # 登录会话的部门上下文版本
+    session_id: str | None = None  # 非秘密会话标识
     created_at: str
     last_login: str | None = None
+
+
+def _context_identity_fields(context) -> dict:
+    """身份响应统一装配：角色、部门与会话字段以不可变上下文为准。"""
+    return {
+        "role": context.role,
+        "account_role": context.account_role,
+        "department_id": context.department_id,
+        "department_name": context.department_name,
+        "context_revision": context.revision,
+        "session_id": context.session_id,
+    }
 
 
 class UserPageResponse(BaseModel):
@@ -150,7 +179,7 @@ class OIDCConfigResponse(BaseModel):
 
 
 class OIDCLoginResponse(BaseModel):
-    """OIDC 登录响应"""
+    """OIDC 登录响应：身份装配规则与密码登录 Token 一致"""
 
     access_token: str
     token_type: str
@@ -160,8 +189,11 @@ class OIDCLoginResponse(BaseModel):
     phone_number: str | None = None
     avatar: str | None = None
     role: str
+    account_role: str | None = None
     department_id: int | None = None
     department_name: str | None = None
+    context_revision: int | None = None
+    session_id: str | None = None
 
 
 class CLIAuthSessionCreate(BaseModel):
@@ -304,18 +336,23 @@ async def login_for_access_token(
     await user_repository.save(user)
     await clear_login_failures(client_ip, login_identifier)
 
-    # 生成访问令牌
-    token_data = {"sub": str(user.id)}
+    # 创建登录会话并签发带 sid 的令牌；活动部门取可用部门中 ID 最小项
+    auth_session = await create_session_for_login(db, user_id=user.id, ttl_seconds=JWT_EXPIRATION)
+    context = await resolve_department_context(
+        db,
+        user_id=user.id,
+        department_id=auth_session.active_department_id,
+        session_id=auth_session.id,
+        revision=auth_session.revision,
+    )
+    token_data = {"sub": str(user.id), "sid": auth_session.id}
     access_token = AuthUtils.create_access_token(token_data)
 
     # 记录登录操作
     await log_operation(db, user.id, "登录")
-
-    # 获取部门名称
-    department_name = None
-    if user.department_id:
-        department_name = await DepartmentRepository(db).get_name_by_id(user.department_id)
     await db.commit()
+
+    department_name = context.department_name
 
     return {
         "access_token": access_token,
@@ -325,9 +362,12 @@ async def login_for_access_token(
         "uid": user.uid,
         "phone_number": user.phone_number,
         "avatar": normalize_public_minio_url(user.avatar),
-        "role": user.role,
-        "department_id": user.department_id,
+        "role": context.role,
+        "account_role": context.account_role,
+        "department_id": context.department_id,
         "department_name": department_name,
+        "context_revision": context.revision,
+        "session_id": context.session_id,
     }
 
 
@@ -351,7 +391,7 @@ async def create_cli_session(data: CLIAuthSessionCreate, db: AsyncSession = Depe
 @auth.get("/cli/sessions/{user_code}", response_model=CLIAuthSessionResponse)
 async def get_cli_session(
     user_code: str,
-    _current_user: User = Depends(get_required_user),
+    _current_user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -423,9 +463,18 @@ async def initialize_admin(admin_data: InitializeAdmin, db: AsyncSession = Depen
 
     new_admin = created.admin
 
-    # 生成访问令牌
-    token_data = {"sub": str(new_admin.id)}
+    # 初始化成功即自动登录：为目标账号创建独立会话
+    auth_session = await create_session_for_login(db, user_id=new_admin.id, ttl_seconds=JWT_EXPIRATION)
+    context = await resolve_department_context(
+        db,
+        user_id=new_admin.id,
+        department_id=auth_session.active_department_id,
+        session_id=auth_session.id,
+        revision=auth_session.revision,
+    )
+    token_data = {"sub": str(new_admin.id), "sid": auth_session.id}
     access_token = AuthUtils.create_access_token(token_data)
+    await db.commit()
 
     return {
         "access_token": access_token,
@@ -435,8 +484,112 @@ async def initialize_admin(admin_data: InitializeAdmin, db: AsyncSession = Depen
         "uid": new_admin.uid,
         "phone_number": new_admin.phone_number,
         "avatar": new_admin.avatar,
-        "role": new_admin.role,
+        "role": context.role,
+        "account_role": context.account_role,
+        "department_id": context.department_id,
+        "department_name": context.department_name,
+        "context_revision": context.revision,
+        "session_id": context.session_id,
     }
+
+
+# =============================================================================
+# === 部门上下文分组 ===
+# =============================================================================
+
+
+@auth.get("/my-departments")
+async def read_my_departments(
+    current_user: User = Depends(get_authenticated_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """当前账号可切换的部门及实时角色。"""
+    return {"items": await list_available_departments(db, user_id=current_user.id)}
+
+
+class DepartmentContextSwitch(BaseModel):
+    department_id: int
+    expected_revision: int
+
+
+@auth.post("/department-context", response_model=UserResponse)
+async def switch_department_context(
+    payload: DepartmentContextSwitch,
+    current_user: User = Depends(get_authenticated_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """切换当前登录会话的活动部门；失败不改原会话。"""
+    if current_user.session_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API Key 不能调用交互切换路由",
+        )
+    try:
+        context = await switch_department(
+            db,
+            session_id=current_user.session_id,
+            department_id=payload.department_id,
+            expected_revision=payload.expected_revision,
+        )
+    except DepartmentRevisionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "department_context_stale", "message": str(exc)},
+        ) from exc
+    except DepartmentNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except DepartmentAccessDeniedError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except DepartmentContextError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    user = await UserRepository(db).get_active_by_id(context.id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="账号不存在或已删除")
+    user_dict = user.to_dict()
+    user_dict.update(_context_identity_fields(context))
+    return user_dict
+
+
+@auth.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout_current_session(
+    authorization: str | None = Header(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """撤销当前 JWT 的登录会话；幂等，不影响同账号其他登录。"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="需要 Bearer 凭证",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = authorization.split("Bearer ", 1)[1]
+    if token.startswith("yxkey_"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="API Key 无登录会话可退出")
+    try:
+        payload = AuthUtils.verify_access_token(token)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    user_id = payload.get("sub")
+    session_id = payload.get("sid")
+    if not user_id or not isinstance(session_id, str) or not session_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="凭证缺少会话标识，请重新登录",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        await revoke_auth_session(db, session_id=session_id, user_id=int(user_id))
+    except DepartmentContextError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
 
 
 # 路由：获取当前用户信息
@@ -446,13 +599,13 @@ async def initialize_admin(admin_data: InitializeAdmin, db: AsyncSession = Depen
 
 
 @auth.get("/me", response_model=UserResponse)
-async def read_users_me(current_user: User = Depends(get_required_user), db: AsyncSession = Depends(get_db)):
-    """获取当前登录用户的个人信息"""
-    user_dict = current_user.to_dict()
-
-    if current_user.department_id:
-        user_dict["department_name"] = await DepartmentRepository(db).get_name_by_id(current_user.department_id)
-
+async def read_users_me(current_user: User = Depends(get_authenticated_user), db: AsyncSession = Depends(get_db)):
+    """获取当前登录用户的个人信息：个人资料来自账号行，角色/部门/会话字段来自不可变上下文。"""
+    user = await UserRepository(db).get_active_by_id(current_user.id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="账号不存在或已删除")
+    user_dict = user.to_dict()
+    user_dict.update(_context_identity_fields(current_user))
     return user_dict
 
 
@@ -461,12 +614,16 @@ async def read_users_me(current_user: User = Depends(get_required_user), db: Asy
 async def update_profile(
     profile_data: UserProfileUpdate,
     request: Request,
-    current_user: User = Depends(get_required_user),
+    current_user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     """更新当前用户的个人资料"""
     update_details = []
     user_repository = UserRepository(db)
+    # 个人资料写账号行本身：按 id 重新加载 ORM，不修改权限上下文
+    user = await user_repository.get_active_by_id(current_user.id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="账号不存在或已删除")
 
     # 更新用户名（仅允许修改显示名，不修改 user_id）
     if profile_data.username is not None:
@@ -479,14 +636,14 @@ async def update_profile(
             )
 
         # 检查用户名是否已被其他用户使用
-        existing_user = await user_repository.get_by_username(profile_data.username, exclude_user_id=current_user.id)
+        existing_user = await user_repository.get_by_username(profile_data.username, exclude_user_id=user.id)
         if existing_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="用户名已存在",
             )
 
-        current_user.username = profile_data.username
+        user.username = profile_data.username
         update_details.append(f"用户名: {profile_data.username}")
 
     # 更新手机号
@@ -497,21 +654,23 @@ async def update_profile(
 
         # 检查手机号是否已被其他用户使用
         if profile_data.phone_number:
-            existing_phone = await user_repository.get_by_phone_excluding(profile_data.phone_number, current_user.id)
+            existing_phone = await user_repository.get_by_phone_excluding(profile_data.phone_number, user.id)
             if existing_phone:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="手机号已被其他用户使用")
 
-        current_user.phone_number = profile_data.phone_number
+        user.phone_number = profile_data.phone_number
         update_details.append(f"手机号: {profile_data.phone_number or '已清空'}")
 
-    await user_repository.save(current_user)
+    await user_repository.save(user)
 
     # 记录操作
     if update_details:
-        await log_operation(db, current_user.id, "更新个人资料", f"更新个人资料: {', '.join(update_details)}", request)
+        await log_operation(db, user.id, "更新个人资料", f"更新个人资料: {', '.join(update_details)}", request)
     await db.commit()
 
-    return current_user.to_dict()
+    user_dict = user.to_dict()
+    user_dict.update(_context_identity_fields(current_user))
+    return user_dict
 
 
 # 路由：创建新用户（管理员权限）
@@ -524,7 +683,7 @@ async def update_profile(
 async def create_user(
     user_data: UserCreate,
     request: Request,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     """创建新用户（管理员权限）"""
@@ -628,7 +787,7 @@ async def read_users_page(
     search: str | None = Query(None, max_length=100),
     department_id: int | None = Query(None, ge=1),
     role: Literal["superadmin", "admin", "user"] | None = None,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     """分页查询当前管理员可管理的有效用户。"""
@@ -649,7 +808,7 @@ async def read_users_page(
 async def read_users(
     skip: int = 0,
     limit: int = 100,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     user_repo = UserRepository(db)
@@ -686,7 +845,7 @@ def _ensure_user_in_current_department(current_user: User, target_user: User) ->
 async def read_user_access_options(
     skip: int = 0,
     limit: int = 1000,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     user_repo = UserRepository(db)
@@ -712,7 +871,7 @@ async def read_user_access_options(
 @auth.get("/users/{user_id}", response_model=UserResponse)
 async def read_user(
     user_id: int,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     user = await UserRepository(db).get_active_by_id(user_id)
@@ -731,7 +890,7 @@ async def update_user(
     user_id: int,
     user_data: UserUpdate,
     request: Request,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     user_repository = UserRepository(db)
@@ -820,7 +979,7 @@ async def update_user(
 async def delete_user(
     user_id: int,
     request: Request,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     user_repository = UserRepository(db)
@@ -893,7 +1052,7 @@ async def delete_user(
 @auth.post("/validate-username", response_model=UidGeneration)
 async def validate_username_and_generate_uid(
     validation_data: UsernameValidation,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     """验证用户名格式并生成可用的user_id"""
@@ -925,7 +1084,7 @@ async def validate_username_and_generate_uid(
 @auth.get("/check-uid/{uid}")
 async def check_uid_availability(
     uid: str,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     """检查 uid 是否可用"""
@@ -936,21 +1095,26 @@ async def check_uid_availability(
 @auth.post("/upload-avatar")
 async def upload_user_avatar(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_required_user),
+    current_user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     """上传用户头像"""
+    user_repository = UserRepository(db)
+    # 头像写账号行本身：按 id 重新加载 ORM，不修改权限上下文
+    user = await user_repository.get_active_by_id(current_user.id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="账号不存在或已删除")
     try:
         avatar_url = await upload_image_to_minio(
             file,
-            object_prefix=f"avatar/{current_user.id}",
+            object_prefix=f"avatar/{user.id}",
             max_size_bytes=5 * 1024 * 1024,
             too_large_message="文件大小不能超过5MB",
         )
 
-        current_user.avatar = avatar_url
-        await UserRepository(db).save(current_user)
-        await log_operation(db, current_user.id, "上传头像", f"更新头像: {avatar_url}")
+        user.avatar = avatar_url
+        await user_repository.save(user)
+        await log_operation(db, user.id, "上传头像", f"更新头像: {avatar_url}")
         await db.commit()
 
         return {"success": True, "avatar_url": avatar_url, "message": "头像上传成功"}
@@ -985,18 +1149,22 @@ async def impersonate_user(
             detail="不能模拟超级管理员账户",
         )
 
-    # 生成访问令牌
-    token_data = {"sub": str(target_user.id)}
+    # 为目标账号创建新会话；不复用也不撤销操作者原会话
+    auth_session = await create_session_for_login(db, user_id=target_user.id, ttl_seconds=JWT_EXPIRATION)
+    context = await resolve_department_context(
+        db,
+        user_id=target_user.id,
+        department_id=auth_session.active_department_id,
+        session_id=auth_session.id,
+        revision=auth_session.revision,
+    )
+    token_data = {"sub": str(target_user.id), "sid": auth_session.id}
     access_token = AuthUtils.create_access_token(token_data)
-
-    # 获取部门名称
-    department_name = None
-    if target_user.department_id:
-        department_name = await DepartmentRepository(db).get_name_by_id(target_user.department_id)
 
     # 记录操作（危险操作标记）
     await log_operation(db, current_user.id, "⚠️ 危险操作-模拟用户", f"模拟用户: {target_user.username}", request)
     await db.commit()
+    department_name = context.department_name
 
     # 控制台警告日志
     logger.warning(f"⚠️ [危险操作] 超级管理员 {current_user.username} 模拟登录用户: {target_user.username}")
@@ -1009,9 +1177,12 @@ async def impersonate_user(
         "uid": target_user.uid,
         "phone_number": target_user.phone_number,
         "avatar": normalize_public_minio_url(target_user.avatar),
-        "role": target_user.role,
-        "department_id": target_user.department_id,
+        "role": context.role,
+        "account_role": context.account_role,
+        "department_id": context.department_id,
         "department_name": department_name,
+        "context_revision": context.revision,
+        "session_id": context.session_id,
     }
 
 

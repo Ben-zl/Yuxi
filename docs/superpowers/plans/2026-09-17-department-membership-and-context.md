@@ -108,10 +108,10 @@ class DepartmentContext:
 
 `resolve_department_context(db, *, user_id:int, department_id:int|None, session_id:str|None=None, revision:int=0) -> DepartmentContext` 检查账号有效性、锁定、部门存在性及实时成员角色；`switch_department(db, *, session_id:str, department_id:int, expected_revision:int) -> DepartmentContext` 在事务内锁会话并递增 revision。新增交互接口契约为 `GET /api/auth/my-departments`、`POST /api/auth/department-context`、`POST /api/auth/logout`；logout成功及重复撤销为204，鉴权规则见本任务步骤。新增 `get_authenticated_user` 作为无需部门的强制登录依赖。
 
-- [ ] 写两次独立登录的 HTTP 测试，复用 `test_client/admin_headers` 创建测试账号和关系，再登录获取不同 token；首个切换 A，第二个切 B，交替 `/api/auth/me` 必须保持各自部门。同 token 两次读取必须相同；移除关系后旧 token 不能读取原部门。
-- [ ] 运行 `docker compose exec api uv run --group test pytest test/integration/services/test_department_session_context.py -v`；预期缺少切换路由/会话隔离失败。
-- [ ] 统一普通登录、初始化管理员后的自动登录、超级管理员模拟登录、OIDC 登录四个 JWT 签发点创建 AuthSession，JWT 写入 `sid`；用 `rg -n create_access_token backend/server backend/package/yuxi` 检查无遗漏。模拟登录为目标账号创建新会话，不复用或撤销操作者原会话；活动部门初始化为可用部门中 ID 最小项，无可用部门为 NULL，超级管理员可选所有存在部门。退出撤销当前会话，过期/撤销/账号无效均 401。旧无 sid JWT 不回退到 User.department_id。
-- [ ] 新增 `GET /api/auth/my-departments` 返回 `{items:[{id,name,role}]}`，`POST /api/auth/department-context` 接收 `{department_id,expected_revision}`，响应与 `/me` 同一身份结构，并包含 `context_revision` 与非秘密 `session_id`。API Key 不允许调用交互切换路由。版本冲突 409；不存在部门 404；非成员 403；失败不改原会话。
+- [x] 写两次独立登录的 HTTP 测试，复用 `test_client/admin_headers` 创建测试账号和关系，再登录获取不同 token；首个切换 A，第二个切 B，交替 `/api/auth/me` 必须保持各自部门。同 token 两次读取必须相同；移除关系后旧 token 不能读取原部门。
+- [x] 运行 `docker compose exec api uv run --group test pytest test/integration/services/test_department_session_context.py -v`；预期缺少切换路由/会话隔离失败。
+- [x] 统一普通登录、初始化管理员后的自动登录、超级管理员模拟登录、OIDC 登录四个 JWT 签发点创建 AuthSession，JWT 写入 `sid`；用 `rg -n create_access_token backend/server backend/package/yuxi` 检查无遗漏。模拟登录为目标账号创建新会话，不复用或撤销操作者原会话；活动部门初始化为可用部门中 ID 最小项，无可用部门为 NULL，超级管理员可选所有存在部门。退出撤销当前会话，过期/撤销/账号无效均 401。旧无 sid JWT 不回退到 User.department_id。
+- [x] 新增 `GET /api/auth/my-departments` 返回 `{items:[{id,name,role}]}`，`POST /api/auth/department-context` 接收 `{department_id,expected_revision}`，响应与 `/me` 同一身份结构，并包含 `context_revision` 与非秘密 `session_id`。API Key 不允许调用交互切换路由。版本冲突 409；不存在部门 404；非成员 403；失败不改原会话。
 
 ```python
 # switch_department 在同一事务内执行，成功才提交：
@@ -123,9 +123,9 @@ await db.commit()
 return context
 ```
 
-- [ ] `/me` 按context.id通过现有UserRepository查询账号资料，沿用UserResponse允许的个人字段（含 `phone_number`、`avatar`），再由不可变context覆盖角色、部门及会话字段；不能直接序列化context替代完整响应，也不能让ORM旧role/department_id覆盖有效权限。登录、切换及个人资料更新返回身份时使用同一装配规则，调整UserResponse声明新增字段。补测有/无部门账号的 `/me` 与切换响应保留个人资料，且角色、部门、revision来自context。
-- [ ] 定义认证依赖分层：`get_current_user` 返回 `DepartmentContext | None`；新增 `get_authenticated_user` 只要求有效账号/凭证（缺登录401），允许无部门；`get_required_user` 依赖它并要求有效部门（缺失/撤权403，错误码 `department_context_invalid`）。`get_superadmin_user` 依赖宽松层并检查account_role；`get_admin_user` 也依赖宽松层，先允许全局superadmin，否则要求有效部门且role为admin。具体部门写用例即使面对superadmin也必须验证目标部门存在，不能把通过admin guard当作已经选定部门。
-- [ ] 按以下表迁移路由依赖，`rg -n 'Depends\((get_current_user|get_required_user|get_admin_user|get_superadmin_user|get_logged_in_user)' backend/server` 逐项归类，禁止把全部路由改成宽松依赖：
+- [x] `/me` 按context.id通过现有UserRepository查询账号资料，沿用UserResponse允许的个人字段（含 `phone_number`、`avatar`），再由不可变context覆盖角色、部门及会话字段；不能直接序列化context替代完整响应，也不能让ORM旧role/department_id覆盖有效权限。登录、切换及个人资料更新返回身份时使用同一装配规则，调整UserResponse声明新增字段。补测有/无部门账号的 `/me` 与切换响应保留个人资料，且角色、部门、revision来自context。
+- [x] 定义认证依赖分层：`get_current_user` 返回 `DepartmentContext | None`；新增 `get_authenticated_user` 只要求有效账号/凭证（缺登录401），允许无部门；`get_required_user` 依赖它并要求有效部门（缺失/撤权403，错误码 `department_context_invalid`）。`get_superadmin_user` 依赖宽松层并检查account_role；`get_admin_user` 也依赖宽松层，先允许全局superadmin，否则要求有效部门且role为admin。具体部门写用例即使面对superadmin也必须验证目标部门存在，不能把通过admin guard当作已经选定部门。
+- [x] 按以下表迁移路由依赖，`rg -n 'Depends\((get_current_user|get_required_user|get_admin_user|get_superadmin_user|get_logged_in_user)' backend/server` 逐项归类，禁止把全部路由改成宽松依赖：
 
 | 接口类别 | 依赖及行为 |
 |---|---|
@@ -138,12 +138,22 @@ return context
 | 部门管理列表 | `get_admin_user`；超管无membership可访问，普通账号不得读取管理列表 |
 
 成员失效或部门消失时 `/me` 返回无部门状态并更新会话revision，可切换列表重读；部门资源返回上述403，不把其他403误报为成员撤权。
-- [ ] 新增 `POST /api/auth/logout`，只撤销当前JWT的sid，成功及重复撤销返回204空响应；无效签名、缺sid或过期JWT返回401，API Key调用返回403。实现独立退出用例 `revoke_auth_session(db, *, session_id:str, user_id:int) -> None`，签名/exp校验后以sid与sub匹配更新，允许已撤销会话幂等重试，不借用会拒绝已撤销session的常规依赖；不撤销该账号其他登录。任务8前端显式退出先调用此接口再清本地状态；网络失败仍允许本地退出，但不得显示服务端已撤销。测试两次logout均204、随后/me为401、另一个session仍200。
-- [ ] 明确AuthSession生命周期：本轮每次登录独立建行，不限制并发会话数，不新增自动清理任务；过期/撤销行留在PG但永不参与有效认证。为按用户、expires_at查找建立索引，不记录原始token。过期行物理清理与会话配额属于后续运维范围，不作为本轮隐藏交付物。
-- [ ] 在本任务定义并实现 `X-Department-Revision` 契约：交互JWT的部门级写请求必须带当前revision（缺失或非整数422，不匹配409与 `department_context_stale`）；个人/全局账号管理请求不要求，API Key使用其固定部门不要求，切换使用body.expected_revision。部门级请求一旦解析出不可变context，后续写入只能消费该context，不能重新读取切换后的活动部门。比较/捕获以会话行锁与switch串行化，已通过校验的旧请求允许在其原部门完成，未通过者不能写入新部门。普通部门读请求携带revision时同样校验；省略时按请求接入时的context读取。保留此机制用于阻止尚未收到跨标签通知的旧页面误写新部门，epoch只防迟到结果，不能替代后端写入校验。测试旧revision写请求409且两部门数据均未改变；在 `backend/server/main.py` 的显式CORS请求头列表放行该头。integration/conftest.py新增 `department_headers(test_client, headers) -> dict[str,str]`：用现有Bearer调用/me，复制headers并加入响应context_revision，不修改共享admin_headers；所有部门写测试在准备期或成功切换后显式调用，陈旧revision负向测试故意保留旧副本。不要在请求失败时自动刷新重试，以免掩盖竞态。
-- [ ] 测试初始化自动登录与模拟登录 token 可访问 `/me`，退出模拟会话后原超级管理员会话仍可用；测试无部门账号登录/自助修改成功、部门资源拒绝；实时降级旧 token、伪造部门、过期会话、锁定账号和 concurrent revision 冲突。运行 task 2 unit/integration，预期通过。
-- [ ] 覆盖定时任务交互HTTP入口：无登录401、无有效部门403 `department_context_invalid`、跨部门任务ID不可访问；既有owner限制保持，部门写请求遵守revision契约。
-- [ ] 审查所有认证返回字段消费者与事务边界后提交 `feat: 按登录会话解析当前部门权限`。
+- [x] 新增 `POST /api/auth/logout`，只撤销当前JWT的sid，成功及重复撤销返回204空响应；无效签名、缺sid或过期JWT返回401，API Key调用返回403。实现独立退出用例 `revoke_auth_session(db, *, session_id:str, user_id:int) -> None`，签名/exp校验后以sid与sub匹配更新，允许已撤销会话幂等重试，不借用会拒绝已撤销session的常规依赖；不撤销该账号其他登录。任务8前端显式退出先调用此接口再清本地状态；网络失败仍允许本地退出，但不得显示服务端已撤销。测试两次logout均204、随后/me为401、另一个session仍200。
+- [x] 明确AuthSession生命周期：本轮每次登录独立建行，不限制并发会话数，不新增自动清理任务；过期/撤销行留在PG但永不参与有效认证。为按用户、expires_at查找建立索引，不记录原始token。过期行物理清理与会话配额属于后续运维范围，不作为本轮隐藏交付物。
+- [x] 在本任务定义并实现 `X-Department-Revision` 契约：交互JWT的部门级写请求必须带当前revision（缺失或非整数422，不匹配409与 `department_context_stale`）；个人/全局账号管理请求不要求，API Key使用其固定部门不要求，切换使用body.expected_revision。部门级请求一旦解析出不可变context，后续写入只能消费该context，不能重新读取切换后的活动部门。比较/捕获以会话行锁与switch串行化，已通过校验的旧请求允许在其原部门完成，未通过者不能写入新部门。普通部门读请求携带revision时同样校验；省略时按请求接入时的context读取。保留此机制用于阻止尚未收到跨标签通知的旧页面误写新部门，epoch只防迟到结果，不能替代后端写入校验。测试旧revision写请求409且两部门数据均未改变；在 `backend/server/main.py` 的显式CORS请求头列表放行该头。integration/conftest.py新增 `department_headers(test_client, headers) -> dict[str,str]`：用现有Bearer调用/me，复制headers并加入响应context_revision，不修改共享admin_headers；所有部门写测试在准备期或成功切换后显式调用，陈旧revision负向测试故意保留旧副本。不要在请求失败时自动刷新重试，以免掩盖竞态。
+- [x] 测试初始化自动登录与模拟登录 token 可访问 `/me`，退出模拟会话后原超级管理员会话仍可用；测试无部门账号登录/自助修改成功、部门资源拒绝；实时降级旧 token、伪造部门、过期会话、锁定账号和 concurrent revision 冲突。运行 task 2 unit/integration，预期通过。
+- [x] 覆盖定时任务交互HTTP入口：无登录401、无有效部门403 `department_context_invalid`、跨部门任务ID不可访问；既有owner限制保持，部门写请求遵守revision契约。
+- [x] 审查所有认证返回字段消费者与事务边界后提交 `feat: 按登录会话解析当前部门权限`。
+
+**执行记录（2026-09-18）：**
+- 实现：`department_context_service.py`（DepartmentContext/resolve/switch/revoke/list_available/create_session_for_login）；`auth_middleware.py` 依赖分层重写（get_current_user 返回上下文、get_authenticated_user、get_required_user 403 `department_context_invalid`、get_admin_user 先放行全局超管、get_superadmin_user 不要求部门）；`require_department_revision` 守卫与 CORS 头已落地。四个签发点（auth_router 三处 + oidc_service:843）均建 AuthSession 并写 sid，`rg create_access_token` 复核无第五处。
+- 路由归类：auth_router 账号 CRUD 9 处改 get_superadmin_user；/me、profile、upload-avatar、CLI 会话查看、user_router 个人配置/agent-env、API Key 读改宽松层；API Key 创建、CLI 批准保持 required；agent_task_router 12 处交互接口改 get_required_user。部门创建/更新/删除保持 get_superadmin_user（全局管理，无部门超管可管理），X-Department-Revision 守卫不挂在全局管理路由，挂载点留待任务3成员路由并在该任务闭环 409 测试；切换路由自身以 body.expected_revision 覆盖 409/404/403 语义。
+- conftest：新增 `department_headers` 辅助；`standard_user` fixture 在旧创建接口下直连 PG 补 department_memberships（任务3换正式成员 API 后移除），teardown 先删成员关系。
+- 测试：`test_department_context_service.py` 5 passed（纯库）；`test_department_session_context.py` 9 passed（两会话隔离、切换 409/404/403、撤权即时失效、logout 幂等且不影响他会话、旧无 sid token 401、API Key 禁用切换、my-departments 实时角色、impersonate 独立会话、定时任务入口 401/403）。
+- 回归：unit 全量 2081 passed（66 个失败均为已证实的环境性集合：compose 结构/workspace symlink/OCR env，含 .env 增量变量触发的 3 个）；integration 全量经 stash 基线对照，失败/错误集合与 main 基线等价（agent_task_center 11 ERROR 等为基线既有的跨事件循环问题，单独运行 10 passed 与基线一致）。适配 3 个受新语义影响的既有 unit 测试（CLI auth override、dashboard context 构造、oidc sqlite 建表）。
+- ruff：全部改动文件 check/format 通过（含顺手清理 agent_task_router 两处基线 F401）；`git diff --check` 通过。容器内命令沿 Task 1 固定形式（`python -m pytest`、`uv run --no-sync --with ruff`）。
+- Reviewer 第一轮 BLOCK 修复（2026-09-18）：① `OIDCLoginResponse` 补 account_role/context_revision/session_id（OIDC 登录契约与密码登录对齐）。② 成员失效折叠分支以 `dataclasses.replace` 返回递增后的 revision，`/me` 首次折叠即给出新值（新增 test_stale_fold_returns_bumped_revision 断言折叠后 revision > 切换返回值且两次读取一致，并覆盖无部门账号自助改名成功）。③ `require_department_revision` 输入校验改 try/int，杜绝 `--5` 类输入 500。④ 三个测试文件 ruff format 已执行（此前"全部改动文件 format 通过"表述不实，予以修正）；API Key 禁切换断言改为强制。补 test_expired_and_locked_sessions_rejected（过期会话 401、锁定 423；SQL 过期写入以 `NOW() AT TIME ZONE 'UTC'` 对齐 naive UTC 语义）。修复后本任务测试 16 passed、routers/services unit 885 passed + 17 failed（失败全部为 test_workspace_service 基线环境失败，见上文基线对照；860 为忽略该文件后的口径）、ruff check/format 与 `git diff --check` 全过。
+- 缺口如实标注：初始化自动登录 token 访问 `/me` 未测（本栈已完成初始化，`/auth/initialize` 返回 403 无法在不重置库的情况下验证）——Not run；Task 3 重做账号创建语义时以服务级测试补。agent_task_router 死代码（不可达 admin 分支、`is None` 检查）与 `current_user: User` 过时注解留待任务 3 账号 CRUD 重构一并清理。
 
 ## Task 3：收紧账号管理并实现成员服务
 

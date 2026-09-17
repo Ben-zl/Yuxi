@@ -7,7 +7,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from server.routers.auth_router import auth
-from server.utils.auth_middleware import get_db, get_required_user
+from server.utils.auth_middleware import get_authenticated_user, get_db, get_required_user
 from yuxi.storage.postgres.models_business import Base, Department, User
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
@@ -48,6 +48,7 @@ async def app_client():
 
         app.dependency_overrides[get_db] = override_db
         app.dependency_overrides[get_required_user] = override_user
+        app.dependency_overrides[get_authenticated_user] = override_user
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             yield client
