@@ -11,6 +11,11 @@ from server.utils.auth_middleware import get_required_user
 external_kb = APIRouter(prefix="/knowledge", tags=["knowledge"])
 
 
+def _ctx_user(current_user) -> dict:
+    """把权限上下文字段传给知识库可见性查询。"""
+    return {"uid": current_user.uid, "role": current_user.role, "department_id": current_user.department_id}
+
+
 class ExternalRetrieveRequest(BaseModel):
     query: str
     file_name: str | None = None
@@ -28,7 +33,9 @@ class ExternalFindRequest(BaseModel):
 @external_kb.get("/databases/external")
 async def list_external_databases(current_user: User = Depends(get_required_user)):
     """列出当前登录用户可见的知识库，供 CLI 选择与展示。"""
-    databases = await knowledge_base.get_databases_by_uid(current_user.uid)
+    databases = await knowledge_base.get_databases_by_user(
+        {"uid": current_user.uid, "role": current_user.role, "department_id": current_user.department_id}
+    )
     items = []
     for db in databases:
         kb_type = db.kb_type.lower()
@@ -54,7 +61,7 @@ async def list_external_files(
     current_user: User = Depends(get_required_user),
 ):
     """列出或搜索知识库文件，供 CLI 浏览与定位。"""
-    database = await knowledge_base.get_accessible_database_info_by_uid(current_user.uid, kb_id)
+    database = await knowledge_base.get_accessible_database_info(_ctx_user(current_user), kb_id)
     if not database:
         raise HTTPException(status_code=404, detail=f"知识库 {kb_id} 不存在或无权访问")
     if not knowledge_base.database_type_supports_documents(database.kb_type):
@@ -82,7 +89,7 @@ async def retrieve_external(
     """对知识库执行检索查询，返回结构化结果。"""
     if not payload.query:
         raise HTTPException(status_code=400, detail="query is required")
-    await _require_accessible_kb(kb_id, current_user.uid)
+    await _require_accessible_kb(kb_id, _ctx_user(current_user))
     options = dict(payload.options or {})
     if payload.file_name:
         options["file_name"] = payload.file_name
@@ -104,7 +111,7 @@ async def open_external_file(
     current_user: User = Depends(get_required_user),
 ):
     """按行窗口打开文件解析后的 Markdown 内容。"""
-    await _require_accessible_kb(kb_id, current_user.uid, require_documents=True, operation="文档查看")
+    await _require_accessible_kb(kb_id, _ctx_user(current_user), require_documents=True, operation="文档查看")
     try:
         return await knowledge_base.open_document(kb_id, file_id, offset=offset, limit=limit)
     except ValueError as e:
@@ -122,7 +129,7 @@ async def find_external_file(
     current_user: User = Depends(get_required_user),
 ):
     """在指定文件内做关键词或正则定位，返回匹配窗口。"""
-    await _require_accessible_kb(kb_id, current_user.uid, require_documents=True, operation="文档查找")
+    await _require_accessible_kb(kb_id, _ctx_user(current_user), require_documents=True, operation="文档查找")
     if not payload.patterns:
         raise HTTPException(status_code=400, detail="patterns 不能为空")
     try:
@@ -144,13 +151,13 @@ async def find_external_file(
 
 async def _require_accessible_kb(
     kb_id: str,
-    uid: str,
+    user: dict,
     *,
     require_documents: bool = False,
     operation: str = "文档查看",
 ) -> KnowledgeBaseSummary:
-    """校验知识库对 uid 可见，必要时同时校验文档能力。"""
-    database = await knowledge_base.get_accessible_database_info_by_uid(uid, str(kb_id or "").strip())
+    """校验知识库对权限上下文可见，必要时同时校验文档能力。"""
+    database = await knowledge_base.get_accessible_database_info(user, str(kb_id or "").strip())
     if not database:
         raise HTTPException(status_code=404, detail=f"知识库 {kb_id} 不存在或无权访问")
     if require_documents and not knowledge_base.database_type_supports_documents(database.kb_type):

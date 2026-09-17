@@ -517,11 +517,11 @@ async def generate_database_mindmap(
     }
 
 
-async def get_mindmap_databases_overview(uid: str) -> dict[str, Any]:
+async def get_mindmap_databases_overview(user: dict) -> dict[str, Any]:
     from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
 
     file_repo = KnowledgeFileRepository()
-    databases = await knowledge_base.get_databases_by_uid(uid)
+    databases = await knowledge_base.get_databases_by_user(user)
     db_list = []
     for db_info in databases:
         kb_id = db_info.kb_id

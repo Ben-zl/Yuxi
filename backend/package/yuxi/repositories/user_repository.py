@@ -10,7 +10,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import APIKey, User
+from yuxi.storage.postgres.models_business import DepartmentMembership, APIKey, User
 
 
 def _utc_now() -> dt:
@@ -77,6 +77,18 @@ class UserRepository:
         """使用指定的 db 获取用户"""
         result = await db.execute(select(User).where(User.uid == uid))
         return result.scalar_one_or_none()
+
+    async def list_member_user_ids(self, user_ids: list[int], department_ids: list[int]) -> set[int]:
+        """返回在任一指定部门拥有成员关系的用户 ID 集合。"""
+        if not user_ids or not department_ids:
+            return set()
+        rows = await self.db_session.execute(
+            select(DepartmentMembership.user_id).where(
+                DepartmentMembership.user_id.in_(user_ids),
+                DepartmentMembership.department_id.in_(department_ids),
+            )
+        )
+        return set(rows.scalars().all())
 
     async def list_by_uids(self, uids: list[str]) -> list[User]:
         """批量获取指定 uid 的用户。"""

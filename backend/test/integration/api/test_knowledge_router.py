@@ -82,12 +82,6 @@ async def _delete_user_by_id(test_client, admin_headers, user_id):
     assert response.status_code in (200, 404), response.text
 
 
-async def _remove_membership(test_client, admin_headers, department_id, user_id):
-    me = await test_client.get("/api/auth/me", headers=admin_headers)
-    revision_headers = {**admin_headers, "X-Department-Revision": str(me.json()["context_revision"])}
-    await test_client.delete(f"/api/departments/{department_id}/members/{user_id}", headers=revision_headers)
-
-
 async def _find_user_id_by_uid(test_client, admin_headers, uid):
     response = await test_client.get("/api/auth/users", headers=admin_headers)
     assert response.status_code == 200, response.text
@@ -98,15 +92,20 @@ async def _find_user_id_by_uid(test_client, admin_headers, uid):
 
 
 async def _delete_department_with_admin(test_client, admin_headers, department):
-    # 先清空全部成员关系（含会话活动部门引用经直连），再软删账号，最后删部门
-    members_response = await test_client.get(
-        f"/api/departments/{department['id']}/members",
-        params={"limit": 100},
-        headers=admin_headers,
+    # 直连清空全部成员关系（软删账号的成员行 API 列表不可见），再软删账号，最后删部门
+    import asyncpg
+    import os as _os
+
+    dsn = _os.getenv("POSTGRES_URL", "postgresql+asyncpg://postgres:postgres@postgres:5432/yuxi").replace(
+        "postgresql+asyncpg://", "postgresql://"
     )
-    if members_response.status_code == 200:
-        for member in members_response.json()["items"]:
-            await _remove_membership(test_client, admin_headers, department["id"], member["user_id"])
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute("DELETE FROM department_memberships WHERE department_id = $1", department["id"])
+        await conn.execute("DELETE FROM auth_sessions WHERE active_department_id = $1", department["id"])
+        await conn.execute("UPDATE users SET department_id = NULL WHERE department_id = $1", department["id"])
+    finally:
+        await conn.close()
     admin_user_id = await _find_user_id_by_uid(test_client, admin_headers, department["admin_uid"])
     if admin_user_id:
         import asyncpg

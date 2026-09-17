@@ -309,7 +309,12 @@ def _resolve_owning_department(current_user: User, requested_department_id: int 
 async def get_databases(current_user: User = Depends(require_knowledge_viewer)):
     """获取所有知识库（根据用户权限过滤）"""
     try:
-        return serialize_knowledge_base_list(await knowledge_base.get_databases_by_uid(current_user.uid))
+        user_info = {
+            "uid": current_user.uid,
+            "role": current_user.role,
+            "department_id": current_user.department_id,
+        }
+        return serialize_knowledge_base_list(await knowledge_base.get_databases_by_user(user_info))
     except Exception as e:
         logger.error(f"获取数据库列表失败 {e}, {traceback.format_exc()}")
         return {"message": f"获取数据库列表失败 {e}", "databases": []}
@@ -381,7 +386,13 @@ async def create_database(
 async def get_accessible_databases(current_user: User = Depends(get_required_user)):
     """获取当前用户有权访问的知识库列表（用于智能体配置）"""
     try:
-        databases = await knowledge_base.get_databases_by_uid(current_user.uid)
+        databases = await knowledge_base.get_databases_by_user(
+            {
+                "uid": current_user.uid,
+                "role": current_user.role,
+                "department_id": current_user.department_id,
+            }
+        )
 
         accessible = [
             {
@@ -405,7 +416,9 @@ async def get_accessible_databases(current_user: User = Depends(get_required_use
 async def get_mindmap_databases(current_user: User = Depends(get_admin_user)):
     """获取所有知识库的概览信息，用于思维导图界面选择。"""
     try:
-        return await get_mindmap_databases_overview(current_user.uid)
+        return await get_mindmap_databases_overview(
+            {"uid": current_user.uid, "role": current_user.role, "department_id": current_user.department_id}
+        )
     except HTTPException:
         raise
     except Exception as e:

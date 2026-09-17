@@ -424,6 +424,17 @@ class KnowledgeBaseManager:
 
         return self._database_info_accessible(user, kb)
 
+    async def get_accessible_database_info(self, user: dict, kb_id: str) -> KnowledgeBaseSummary | None:
+        """按权限上下文 dict（uid/role/department_id）获取一个可访问知识库。"""
+        normalized_kb_id = str(kb_id or "").strip()
+        if not normalized_kb_id:
+            return None
+        databases = await self.get_databases_by_user(user)
+        for database in databases:
+            if database.kb_id == normalized_kb_id:
+                return database
+        return None
+
     async def get_accessible_database_info_by_uid(self, uid: str, kb_id: str) -> KnowledgeBaseSummary | None:
         """按 uid 获取一个可访问知识库的信息，找不到或无权访问时返回 None。"""
         normalized_kb_id = str(kb_id or "").strip()

@@ -197,7 +197,13 @@ async def _scope_contains(
     if {str(user.uid) for user in users if not bool(user.is_deleted)} != target_uids:
         return False
     allowed_departments = set(container.get("department_ids") or [])
-    return all(user.department_id in allowed_departments for user in users)
+    if not allowed_departments:
+        return False
+    # 共享目标合法性按成员关系判定：目标用户是任一允许部门的成员即被部门范围覆盖
+    member_user_ids = await UserRepository(db).list_member_user_ids(
+        [user.id for user in users], list(allowed_departments)
+    )
+    return all(user.id in member_user_ids for user in users)
 
 
 async def resource_read_scope_covers_share_config(

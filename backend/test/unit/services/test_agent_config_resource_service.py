@@ -52,9 +52,9 @@ def resources(monkeypatch):
         ),
     )
     users = {
-        "owner": SimpleNamespace(uid="owner", department_id=1, is_deleted=False),
-        "outside": SimpleNamespace(uid="outside", department_id=2, is_deleted=False),
-        "deleted": SimpleNamespace(uid="deleted", department_id=1, is_deleted=True),
+        "owner": SimpleNamespace(id=101, uid="owner", department_id=1, is_deleted=False),
+        "outside": SimpleNamespace(id=102, uid="outside", department_id=2, is_deleted=False),
+        "deleted": SimpleNamespace(id=103, uid="deleted", department_id=1, is_deleted=True),
     }
 
     async def list_users(_self, uids):
@@ -62,6 +62,12 @@ def resources(monkeypatch):
         return [users[uid] for uid in uids if uid in users]
 
     monkeypatch.setattr(resource_permission.UserRepository, "list_by_uids", list_users)
+
+    async def member_user_ids(self, user_ids, department_ids):
+        fake_departments = {101: {1}, 102: {2}, 103: {1}}
+        return {uid for uid in user_ids if fake_departments.get(uid, set()) & set(department_ids)}
+
+    monkeypatch.setattr(resource_permission.UserRepository, "list_member_user_ids", member_user_ids)
     return provider, lookup
 
 
@@ -83,7 +89,7 @@ async def test_service_rejects_uncovered_readers_managers_and_owner(resources, r
         await service.authorize_agent_config_resources(
             original,
             db=Mock(),
-            user=SimpleNamespace(uid="operator"),
+            user=SimpleNamespace(id=1, uid="operator"),
             agent_share_config=sharing(read, manage),
             owner_uid=owner,
         )
@@ -92,7 +98,7 @@ async def test_service_rejects_uncovered_readers_managers_and_owner(resources, r
 
 async def test_service_canonicalizes_without_mutating_input_and_uses_operator(resources):
     _, lookup = resources
-    operator = SimpleNamespace(uid="operator")
+    operator = SimpleNamespace(id=1, uid="operator")
     original = {"context": {"model": "legacy:chat", "system_prompt": "keep"}}
     result = await service.authorize_agent_config_resources(
         original,
@@ -129,7 +135,7 @@ async def test_service_resolves_old_cache_payload_through_database(monkeypatch):
     result = await service.authorize_agent_config_resources(
         {"context": {"model": "legacy:/jade/chat"}},
         db=Mock(),
-        user=SimpleNamespace(uid="operator"),
+        user=SimpleNamespace(id=1, uid="operator"),
         agent_share_config=sharing(scope("user", ["owner"])),
         owner_uid="owner",
     )
@@ -142,7 +148,7 @@ async def test_service_materializes_missing_context_and_rejects_invalid_context(
     result = await service.authorize_agent_config_resources(
         {},
         db=Mock(),
-        user=SimpleNamespace(uid="operator"),
+        user=SimpleNamespace(id=1, uid="operator"),
         agent_share_config=sharing(scope("user", ["owner"])),
         owner_uid="owner",
     )
@@ -152,7 +158,7 @@ async def test_service_materializes_missing_context_and_rejects_invalid_context(
         await service.authorize_agent_config_resources(
             {"context": []},
             db=Mock(),
-            user=SimpleNamespace(uid="operator"),
+            user=SimpleNamespace(id=1, uid="operator"),
             agent_share_config=sharing(scope("user", ["owner"])),
             owner_uid="owner",
         )
@@ -168,7 +174,7 @@ async def test_service_rejects_invisible_or_disabled_model(resources, disabled):
         await service.authorize_agent_config_resources(
             {"context": {"model": "legacy:chat"}},
             db=Mock(),
-            user=SimpleNamespace(uid="operator"),
+            user=SimpleNamespace(id=1, uid="operator"),
             agent_share_config=sharing(scope("user", ["owner"])),
             owner_uid="owner",
         )
@@ -189,7 +195,7 @@ async def test_service_rejects_mcp_scope_expansion(monkeypatch):
         await service.authorize_agent_config_resources(
             {"context": {"mcps": ["mcp"]}},
             db=Mock(),
-            user=SimpleNamespace(uid="operator"),
+            user=SimpleNamespace(id=1, uid="operator"),
             agent_share_config=sharing(scope("global")),
             owner_uid="owner",
         )
@@ -216,7 +222,7 @@ async def test_service_freezes_and_validates_implicit_skill_and_mcp_resources(mo
     result = await service.authorize_agent_config_resources(
         {"context": {}},
         db=Mock(),
-        user=SimpleNamespace(uid="operator"),
+        user=SimpleNamespace(id=1, uid="operator"),
         agent_share_config=sharing(scope("department", [1])),
         owner_uid="owner",
     )
@@ -228,7 +234,7 @@ async def test_service_freezes_and_validates_implicit_skill_and_mcp_resources(mo
         await service.authorize_agent_config_resources(
             {"context": {}},
             db=Mock(),
-            user=SimpleNamespace(uid="operator"),
+            user=SimpleNamespace(id=1, uid="operator"),
             agent_share_config=sharing(scope("department", [1])),
             owner_uid="owner",
         )
@@ -270,7 +276,7 @@ async def test_service_validates_skill_closure_and_skill_mcp_scope(monkeypatch):
         await service.authorize_agent_config_resources(
             {"context": {"skills": ["parent"], "preload_skills": ["parent"]}},
             db=Mock(),
-            user=SimpleNamespace(uid="operator"),
+            user=SimpleNamespace(id=1, uid="operator"),
             agent_share_config=sharing(scope("global")),
             owner_uid="owner",
         )
@@ -293,7 +299,7 @@ async def test_service_rejects_missing_transitive_skill_and_invalid_preload(monk
         await service.authorize_agent_config_resources(
             {"context": {"skills": ["parent"]}},
             db=Mock(),
-            user=SimpleNamespace(uid="operator"),
+            user=SimpleNamespace(id=1, uid="operator"),
             agent_share_config=sharing(scope("user", ["owner"])),
             owner_uid="owner",
         )
@@ -303,7 +309,7 @@ async def test_service_rejects_missing_transitive_skill_and_invalid_preload(monk
         await service.authorize_agent_config_resources(
             {"context": {"skills": ["parent"], "preload_skills": ["other"]}},
             db=Mock(),
-            user=SimpleNamespace(uid="operator"),
+            user=SimpleNamespace(id=1, uid="operator"),
             agent_share_config=sharing(scope("user", ["owner"])),
             owner_uid="owner",
         )
@@ -311,7 +317,7 @@ async def test_service_rejects_missing_transitive_skill_and_invalid_preload(monk
     result = await service.authorize_agent_config_resources(
         {"context": {"preload_skills": ["parent"]}},
         db=Mock(),
-        user=SimpleNamespace(uid="operator"),
+        user=SimpleNamespace(id=1, uid="operator"),
         agent_share_config=sharing(scope("user", ["owner"])),
         owner_uid="owner",
     )
@@ -338,7 +344,7 @@ async def test_repository_rejects_missing_operator_before_mutation(operation):
 async def test_repository_rejects_uncovered_reference_without_http(resources, operation):
     db = SimpleNamespace(add=Mock(), commit=AsyncMock())
     repo = AgentRepository(db)
-    operator = SimpleNamespace(uid="owner", role="superadmin")
+    operator = SimpleNamespace(id=1, uid="owner", role="superadmin")
     agent = SimpleNamespace(
         slug="custom",
         name="unchanged",

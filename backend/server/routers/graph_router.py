@@ -28,7 +28,9 @@ async def _get_graph_service(kb_id: str) -> MilvusGraphService:
 async def get_graphs(current_user: User = Depends(get_admin_user)):
     """获取支持图谱能力的 Milvus 知识库列表"""
     try:
-        databases = await knowledge_base.get_databases_by_uid(current_user.uid)
+        databases = await knowledge_base.get_databases_by_user(
+            {"uid": current_user.uid, "role": current_user.role, "department_id": current_user.department_id}
+        )
         graphs = []
         for db in databases:
             kb_type = db.kb_type.lower()

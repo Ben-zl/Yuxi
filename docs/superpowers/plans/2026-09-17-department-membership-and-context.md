@@ -208,7 +208,7 @@ if actor.account_role != "superadmin":
 
 **Interfaces:** `scope_matches(user,scope)` 保持调用形式，user 在请求/运行路径必须是 DepartmentContext。部门匹配只读取其 department_id；检查共享目标合法性的查询改为 membership，而非 User.department_id。全局和 user_uids 共享语义保持原样。
 
-- [ ] 写 unit 测试，直接构造上下文验证单一活动部门：
+- [x] 写 unit 测试，直接构造上下文验证单一活动部门：
 
 ```python
 from yuxi.permissions.resource_permission import scope_matches
@@ -222,16 +222,23 @@ def test_department_scope_is_not_union():
 
 现有 scope access_level 的合法值为 `global/department/user`；沿用该协议，不增加另一套共享范围。
 
-- [ ] 运行 `docker compose exec api uv run --group test pytest test/unit/permissions/test_department_context_visibility.py -v`；该纯函数已有正确语义时可直接通过，真正回归 red test 放在 HTTP 用同账号切 A/B 后查询资源，而非强行制造 unit 失败。
-- [ ] 审计所有直接/间接读取点并把结果记入执行证据，特别检查后台按 uid 重载：
+- [x] 运行 `docker compose exec api uv run --group test pytest test/unit/permissions/test_department_context_visibility.py -v`；该纯函数已有正确语义时可直接通过，真正回归 red test 放在 HTTP 用同账号切 A/B 后查询资源，而非强行制造 unit 失败。
+- [x] 审计所有直接/间接读取点并把结果记入执行证据，特别检查后台按 uid 重载：
 
 ```bash
 rg -n 'User\.department_id|User\.role|user\.department_id|user\.role|getattr\(.*(role|department)|get_by_uid|project_runtime\(' backend/package backend/server
 ```
 
-- [ ] 将认证/运行上下文传到模型供应商、MCP、知识库、智能体、Skill、工作区权限查询；需要修改账号的 service 明确重新加载 ORM。role_ceiling 使用有效角色；不得通过全部 membership IDs 扩大 read/write scope。保持 LITE 惰性导入，不为认证导入知识库重运行时。
-- [ ] 用真实 HTTP 建 A-only、B-only、global、personal 四类现有资源，A 为 admin、B 为 user：切 B 不可读写 A-only，global/personal 原规则不变，模型与 MCP 响应不泄漏 A 的凭据。检查知识库列表和直接 ID 访问两条路径。
-- [ ] 运行本任务两个测试文件与既有 resource_permission 最小集；通过后审查并提交 `fix: 按有效部门统一资源权限查询`。
+- [x] 将认证/运行上下文传到模型供应商、MCP、知识库、智能体、Skill、工作区权限查询；需要修改账号的 service 明确重新加载 ORM。role_ceiling 使用有效角色；不得通过全部 membership IDs 扩大 read/write scope。保持 LITE 惰性导入，不为认证导入知识库重运行时。
+- [x] 用真实 HTTP 建 A-only、B-only、global、personal 四类现有资源，A 为 admin、B 为 user：切 B 不可读写 A-only，global/personal 原规则不变，模型与 MCP 响应不泄漏 A 的凭据。检查知识库列表和直接 ID 访问两条路径。
+- [x] 运行本任务两个测试文件与既有 resource_permission 最小集；通过后审查并提交 `fix: 按有效部门统一资源权限查询`。
+
+**执行记录（2026-09-18）：**
+- 请求路径迁移：知识库列表四处调用（knowledge_router 两处、graph_router、external_kb_router）由 `get_databases_by_uid`（按 uid 重查 ORM 旧字段）改为直接传 `DepartmentContext` 字段 dict（uid/role/department_id）给 `get_databases_by_user`；`resource_share_config_covers_target` 的部门覆盖判定改经 `UserRepository.list_member_user_ids`（membership 实时事实，目标用户为任一允许部门成员即覆盖）。
+- 审计结论：`scope_matches` 纯函数消费鸭子字段（context 直传即正确）；`agents/context.py::_role_can_access`、`agent_repository/skills service` 的 `ADMIN_ROLES` 集合与三值有效角色（superadmin/admin/user）天然兼容；`workspace_router:54`、knowledge_router 归属部门段已消费 context；`role_ceiling` 字典键与有效角色一致。运行时路径（agentscope/tools.py、mindmap_utils、manager.get_databases_by_uid 内部）按计划在任务5 以固定部门参数改造，不在本任务扩散。
+- 测试：`test_department_context_visibility.py` 4 passed（单一活动部门非并集、global/user 原语义、无部门不匹配部门级、超管角色兼容）；`test_department_resource_visibility.py` 2 passed（同账号切 B 后 A-only 不可见/global 可见、切回 A 恢复；撤 A 成员→折叠→切 B 后 A-only 不可见）。注：内置模式知识库列表有管理员门禁（require_knowledge_viewer），测试两部门均设 admin 以聚焦部门范围差异。既有 `test_share_config_filters_accessible_databases` 2 个红测试随本迁移修复通过（任务3记录的归属兑现）；其 helper 清理改直连清空成员行。
+- 回归：unit 全量（除环境性集合）1996 passed（含适配 `test_agent_config_resource_service` 假用户 id 与 membership mock）；knowledge_router + 可见性 + permissions 98 passed。ruff check/format 通过；`git diff --check` 通过。
+- Reviewer BLOCK 修复（2026-09-18）：复审判定"运行时路径归任务5"的归类不实——external_kb_router 四个直接 ID 端点（files/retrieve/open/find，经 `_require_accessible_kb`→`get_accessible_database_info_by_uid`）与 knowledge_router `/mindmap/databases`（经 `get_mindmap_databases_overview`）均为 HTTP 请求路径且任务5 Files 不含这两个 router。已在本任务闭合：manager 新增 `get_accessible_database_info(user_dict, kb_id)`，external 五端点统一经 `_ctx_user(context)` 传 dict，mindmap overview 签名改收 user dict 并由 router 传 context；删除死 helper `_remove_membership`；新增 `test_direct_id_access_scopes_to_active_department`（B 上下文直访 A-only 库 404、切回 A 后 200）。修复后可见性 3 passed、knowledge_router 40 passed、unit 1996 passed、ruff/format 与 `git diff --check` 全过。
 
 ## Task 5：固定提交、排队和恢复运行的部门
 
