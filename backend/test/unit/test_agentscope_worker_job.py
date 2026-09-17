@@ -124,6 +124,7 @@ async def test_fail_run_loser_has_no_terminal_side_effects(monkeypatch):
 async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
     """业务事务失败后必须先 rollback，再用同一 session 写 Run 终态。"""
     run = SimpleNamespace(
+        department_id=11,
         id="run-1",
         uid="u",
         status="pending",
@@ -148,6 +149,19 @@ async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=SimpleNamespace(uid="u")),
+        # execute 供部门守卫查询 owner 与部门/成员关系，恒返回同一有效账号对象
+        execute=AsyncMock(
+            return_value=SimpleNamespace(
+                scalar_one_or_none=lambda: SimpleNamespace(
+                    id=1,
+                    uid="u",
+                    role="user",
+                    username="u",
+                    name="dept-11",
+                    is_login_locked=lambda: False,
+                )
+            )
+        ),
         commit=AsyncMock(),
         rollback=AsyncMock(),
     )
@@ -219,6 +233,7 @@ async def test_worker_error_rolls_back_before_finishing_run(monkeypatch):
 async def test_manifest_failure_prevents_agentscope_execution(monkeypatch, manifest, fingerprint, error):
     """manifest 未成为持久事实时不得启动 AgentScope Session 或模型执行。"""
     run = SimpleNamespace(
+        department_id=11,
         id="run-manifest",
         uid="u",
         status="pending",

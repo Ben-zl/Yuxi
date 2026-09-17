@@ -33,7 +33,7 @@ async def test_agent_call_adapter_submits_shared_run_command(monkeypatch: pytest
         "await_agent_run_result",
         lambda **_: pytest.fail("async Agent Call must not wait"),
     )
-    user = SimpleNamespace(uid="user-1")
+    user = SimpleNamespace(department_id=11, uid="user-1")
     result = await call_router.create_agent_call_run(
         call_router.AgentCallRunCreate(
             agent_slug=" translator ",
@@ -89,7 +89,7 @@ async def test_agent_call_adapter_waits_and_wraps_result(monkeypatch: pytest.Mon
             messages=[{"role": "user", "content": "Hello"}],
             request_id="req-1",
         ),
-        current_user=SimpleNamespace(uid="user-1"),
+        current_user=SimpleNamespace(department_id=11, uid="user-1"),
         db=object(),
     )
 
@@ -132,7 +132,7 @@ async def test_agent_call_adapter_rejects_invalid_sync_policy():
                 messages=[{"role": "user", "content": "Hello"}],
                 queue_policy="enqueue",
             ),
-            current_user=SimpleNamespace(uid="user-1"),
+            current_user=SimpleNamespace(department_id=11, uid="user-1"),
             db=object(),
         )
     assert exc.value.status_code == 422
@@ -156,7 +156,7 @@ async def test_agent_call_adapter_maps_wait_dependency_error_to_503(monkeypatch:
                 messages=[{"role": "user", "content": "Hello"}],
                 request_id="req-1",
             ),
-            current_user=SimpleNamespace(uid="user-1"),
+            current_user=SimpleNamespace(department_id=11, uid="user-1"),
             db=object(),
         )
 
@@ -185,7 +185,7 @@ async def test_eval_adapter_submits_evaluation_origin_and_waits(monkeypatch: pyt
             evaluation={"dataset_name": "dataset", "ignored": "nope"},
             meta={"request_id": "eval-1"},
         ),
-        current_user=SimpleNamespace(uid="user-1"),
+        current_user=SimpleNamespace(department_id=11, uid="user-1"),
         db=object(),
     )
 
@@ -211,7 +211,7 @@ async def test_eval_adapter_maps_wait_dependency_error_to_503(monkeypatch: pytes
     with pytest.raises(HTTPException) as exc:
         await eval_router.create_agent_eval_run(
             eval_router.AgentEvalRunCreate(query="Hello", agent_slug="translator"),
-            current_user=SimpleNamespace(uid="user-1"),
+            current_user=SimpleNamespace(department_id=11, uid="user-1"),
             db=object(),
         )
 

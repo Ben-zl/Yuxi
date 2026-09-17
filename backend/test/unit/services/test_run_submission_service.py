@@ -47,6 +47,7 @@ class _EmptyRunRepo:
 )
 async def test_submit_run_command_rejects_overlong_origin_before_repository_access(source, channel, detail):
     command = svc.RunSubmissionCommand(
+        department_id=11,
         agent_slug="translator",
         thread_id="thread-1",
         request_id="req-1",
@@ -57,7 +58,7 @@ async def test_submit_run_command_rejects_overlong_origin_before_repository_acce
     with pytest.raises(HTTPException) as exc_info:
         await svc.submit_run_command(
             command=command,
-            current_user=SimpleNamespace(uid="user-1"),
+            current_user=SimpleNamespace(uid="user-1", department_id=11),
             db=object(),
         )
 
@@ -68,7 +69,7 @@ async def test_submit_run_command_rejects_overlong_origin_before_repository_acce
 @pytest.mark.asyncio
 async def test_submit_run_command_shares_conversation_intake_and_finalize(monkeypatch: pytest.MonkeyPatch):
     calls: dict[str, object] = {}
-    current_user = SimpleNamespace(uid="user-1", role="user")
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=11)
 
     class Db:
         commit = AsyncMock()
@@ -148,6 +149,7 @@ async def test_submit_run_command_shares_conversation_intake_and_finalize(monkey
     monkeypatch.setattr(svc, "finalize_intake", fake_finalize_intake)
 
     command = svc.RunSubmissionCommand(
+        department_id=11,
         agent_slug="translator",
         thread_id="thread-1",
         request_id="req-1",
@@ -207,7 +209,7 @@ async def test_submit_run_command_shares_conversation_intake_and_finalize(monkey
 async def test_submit_run_command_requires_existing_conversation_for_web_chat(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    current_user = SimpleNamespace(uid="user-1", role="user")
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=11)
 
     class AgentRepo:
         def __init__(self, db):
@@ -235,6 +237,7 @@ async def test_submit_run_command_requires_existing_conversation_for_web_chat(
     monkeypatch.setattr(svc.agent_manager, "get_agent", lambda backend_id: object())
 
     command = svc.RunSubmissionCommand(
+        department_id=11,
         agent_slug="translator",
         thread_id="missing-thread",
         request_id="req-1",
@@ -253,7 +256,7 @@ async def test_submit_run_command_maps_runtime_resource_validation_to_422(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """提交时发现 Skill 等运行资源已不可访问时必须返回客户端校验错误。"""
-    current_user = SimpleNamespace(uid="user-1", role="user")
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=11)
     conversation = SimpleNamespace(id=1, thread_id="thread-1", project_id="project-1")
 
     class AgentRepo:
@@ -289,6 +292,7 @@ async def test_submit_run_command_maps_runtime_resource_validation_to_422(
     )
 
     command = svc.RunSubmissionCommand(
+        department_id=11,
         agent_slug="translator",
         thread_id="thread-1",
         request_id="req-resource-validation",
@@ -308,7 +312,7 @@ async def test_submit_run_command_maps_runtime_resource_validation_to_422(
 @pytest.mark.asyncio
 async def test_final_agent_lock_failure_rolls_back_persisted_attachments(monkeypatch: pytest.MonkeyPatch):
     """附件落盘后 Agent 被删除时必须补偿附件副作用。"""
-    current_user = SimpleNamespace(uid="user-1", role="user")
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=11)
     conversation = SimpleNamespace(id=1, thread_id="thread-1", project_id="project-1")
     rollback = []
 
@@ -355,6 +359,7 @@ async def test_final_agent_lock_failure_rolls_back_persisted_attachments(monkeyp
     db = Db()
 
     command = svc.RunSubmissionCommand(
+        department_id=11,
         agent_slug="translator",
         thread_id="thread-1",
         request_id="req-attachment",
@@ -377,8 +382,9 @@ async def test_existing_request_with_attachments_returns_without_new_file(
     monkeypatch: pytest.MonkeyPatch, agent_visible
 ):
     """相同 request_id 重试不能给已提交输入附加孤立文件。"""
-    current_user = SimpleNamespace(uid="user-1", role="user")
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=11)
     existing = SimpleNamespace(
+        department_id=11,
         uid="user-1",
         agent_slug="translator",
         conversation_thread_id="thread-1",
@@ -450,6 +456,7 @@ async def test_existing_request_with_attachments_returns_without_new_file(
     monkeypatch.setattr(attachment_service, "persist_run_submission_attachments", persist)
     result = await svc.submit_run_command(
         command=svc.RunSubmissionCommand(
+            department_id=11,
             agent_slug="translator",
             thread_id="thread-1",
             request_id="req-existing",
@@ -469,7 +476,7 @@ async def test_existing_request_with_attachments_returns_without_new_file(
 @pytest.mark.asyncio
 async def test_cancelled_submission_rolls_back_attachments_and_created_workdir(monkeypatch: pytest.MonkeyPatch):
     """提交任务取消时仍需补偿已落盘附件和本次创建的 managed Workdir。"""
-    current_user = SimpleNamespace(uid="user-1", role="user")
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=11)
     project = SimpleNamespace(
         id="11111111-1111-4111-8111-111111111111",
         workdir_path="projects/11111111-1111-4111-8111-111111111111",
@@ -529,6 +536,7 @@ async def test_cancelled_submission_rolls_back_attachments_and_created_workdir(m
     monkeypatch.setattr(svc, "_rollback_submission_side_effects", rollback)
 
     command = svc.RunSubmissionCommand(
+        department_id=11,
         agent_slug="translator",
         thread_id="thread-1",
         request_id="req-cancelled",
@@ -556,7 +564,7 @@ async def test_submission_cancellation_preserves_cancel_when_compensation_fails(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """补偿异常只能附加诊断，不能替换提交任务的原始取消。"""
-    current_user = SimpleNamespace(uid="user-1", role="user")
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=11)
     project = SimpleNamespace(
         id="11111111-1111-4111-8111-111111111111",
         workdir_path="projects/11111111-1111-4111-8111-111111111111",
@@ -610,6 +618,7 @@ async def test_submission_cancellation_preserves_cancel_when_compensation_fails(
     monkeypatch.setattr(svc, "_rollback_submission_side_effects", fail_compensation)
 
     command = svc.RunSubmissionCommand(
+        department_id=11,
         agent_slug="translator",
         thread_id="thread-1",
         request_id="req-cancelled-compensation",
@@ -760,7 +769,7 @@ async def test_submission_compensation_waits_through_repeated_cancellation(monke
 @pytest.mark.asyncio
 async def test_submission_commit_ack_failure_preserves_persisted_run_and_files(monkeypatch: pytest.MonkeyPatch):
     """服务器已提交但确认丢失时不得清理其附件和 managed Workdir。"""
-    current_user = SimpleNamespace(uid="user-1", role="user")
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=11)
     project = SimpleNamespace(
         id="11111111-1111-4111-8111-111111111111",
         workdir_path="projects/11111111-1111-4111-8111-111111111111",
@@ -818,6 +827,7 @@ async def test_submission_commit_ack_failure_preserves_persisted_run_and_files(m
     monkeypatch.setattr(svc, "_committed_submission_visible", committed, raising=False)
     monkeypatch.setattr(svc, "_rollback_submission_side_effects", rollback)
     command = svc.RunSubmissionCommand(
+        department_id=11,
         agent_slug="translator",
         thread_id="thread-1",
         request_id="req-ack-lost",
@@ -842,7 +852,7 @@ async def test_submission_commit_failure_compensates_filesystem_side_effects(
     commit_error: BaseException,
 ):
     """数据库 commit 未成功时必须补偿附件与本次 managed Workdir。"""
-    current_user = SimpleNamespace(uid="user-1", role="user")
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=11)
     project = SimpleNamespace(
         id="11111111-1111-4111-8111-111111111111",
         workdir_path="projects/11111111-1111-4111-8111-111111111111",
@@ -908,6 +918,7 @@ async def test_submission_commit_failure_compensates_filesystem_side_effects(
     monkeypatch.setattr(svc, "_committed_submission_visible", AsyncMock(return_value=False), raising=False)
 
     command = svc.RunSubmissionCommand(
+        department_id=11,
         agent_slug="translator",
         thread_id="thread-1",
         request_id="req-commit",
@@ -929,7 +940,7 @@ async def test_submission_commit_failure_compensates_filesystem_side_effects(
 @pytest.mark.asyncio
 async def test_submission_post_commit_failure_keeps_committed_facts_for_recovery(monkeypatch: pytest.MonkeyPatch):
     """commit 成功后的物化或投递失败必须保留事实供 pending recovery 接管。"""
-    current_user = SimpleNamespace(uid="user-1", role="user")
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=11)
     conversation = SimpleNamespace(id=1, thread_id="thread-1", project_id="project-1")
     project = SimpleNamespace(directory_mode="managed")
 
@@ -980,6 +991,7 @@ async def test_submission_post_commit_failure_keeps_committed_facts_for_recovery
     monkeypatch.setattr(svc, "_rollback_submission_side_effects", rollback)
 
     command = svc.RunSubmissionCommand(
+        department_id=11,
         agent_slug="translator",
         thread_id="thread-1",
         request_id="req-finalize",
@@ -992,3 +1004,21 @@ async def test_submission_post_commit_failure_keeps_committed_facts_for_recovery
 
     Db.commit.assert_awaited_once()
     rollback.assert_not_awaited()
+
+
+async def test_submit_rejects_department_mismatch(monkeypatch):
+    """提交部门与当前有效部门不一致时拒绝，且不创建 request/run。"""
+    from fastapi import HTTPException
+
+    current_user = SimpleNamespace(uid="user-1", role="user", department_id=12)
+    command = svc.RunSubmissionCommand(
+        department_id=11,
+        agent_slug="chatbot",
+        thread_id="thread-1",
+        request_id="req-dept-mismatch",
+        input_message=build_chat_input_message("hello"),
+        origin=svc.RunOrigin(source="chat", channel="web"),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await svc.submit_run_command(command=command, current_user=current_user, db=object())
+    assert exc.value.status_code == 403

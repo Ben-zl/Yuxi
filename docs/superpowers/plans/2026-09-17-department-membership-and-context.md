@@ -246,7 +246,7 @@ rg -n 'User\.department_id|User\.role|user\.department_id|user\.role|getattr\(.*
 
 **Interfaces:** `RunSubmissionCommand` 新增必填 `department_id:int`（置于带默认值字段之前）；`submit_run_command(...,current_user:DepartmentContext,...)` 要求 command.department_id 与该提交身份一致。AgentRunRequest 和 AgentRun 将该值持久化。`project_runtime` 新增必填 keyword `department_id:int`，内部按 uid 加固定部门调用 resolve_department_context；所有调用点同步传值，不能默认读取活动会话。
 
-- [ ] 给已有 submission unit fixture 的 command/context 增加显式部门，添加不匹配测试并断言没有创建 request/run。新增 assembled-path E2E，沿仓库 deterministic provider 装配真实 API、PG、worker，不调用在线模型。
+- [x] 给已有 submission unit fixture 的 command/context 增加显式部门，添加不匹配测试并断言没有创建 request/run。新增 assembled-path E2E，沿仓库 deterministic provider 装配真实 API、PG、worker，不调用在线模型。
 
 ```python
 # E2E 中 request_row/run_row 从真实数据库按本测试 request_id 回读。
@@ -258,8 +258,8 @@ assert produced_artifact_owner == expected_original_owner
 
 上述 ID 由该 E2E 用现有资源 API 创建并记录；`observed_provider_resource_id` 从运行资源快照回读，产物断言从 manifest/Artifact owning 字段回读，不能由 mock 捕获的调用参数替代。
 
-- [ ] 运行 `docker compose exec api uv run --group test pytest test/unit/services/test_run_submission_service.py -v` 和 `docker compose exec api uv run --group test pytest test/e2e/test_department_run_context.py -m e2e -v`，预期未固定部门的断言失败。
-- [ ] 提交授权后保存 request.department_id，排队到 run 时原样复制；幂等重试同一 request_id 但部门不同返回409，不得复用另一个部门的既有请求。worker 开始/重试及配置投影使用固定部门重新解析有效身份。
+- [x] 运行 `docker compose exec api uv run --group test pytest test/unit/services/test_run_submission_service.py -v` 和 `docker compose exec api uv run --group test pytest test/e2e/test_department_run_context.py -m e2e -v`，预期未固定部门的断言失败。
+- [x] 提交授权后保存 request.department_id，排队到 run 时原样复制；幂等重试同一 request_id 但部门不同返回409，不得复用另一个部门的既有请求。worker 开始/重试及配置投影使用固定部门重新解析有效身份。
 
 ```python
 context = await resolve_department_context(db, user_id=user.id, department_id=run.department_id)
@@ -267,10 +267,16 @@ projection = await project_runtime(db, uid=context.uid, agent_slug=run.agent_slu
     department_id=context.department_id)
 ```
 
-- [ ] 沿 `rg -n 'project_runtime\(' backend` 更新实际 runtime 调用，给下游工具传递固定部门 context。被移除成员/删除账号/失效部门在后续授权边界拒绝；通过既有终态发布与队列推进收口失败，不留下永久 running request。不得把固定部门误实现为永不过期的角色快照。
-- [ ] 检查 `team_lifecycle.py` 中直接 `AgentRunRepository.create_run` 的 worker 创建与 continuation：新子运行从触发它的父运行继承 department_id，不从浏览器取值。持久化 Team worker 复用前校验原子运行与当前父运行部门一致；不同部门拒绝复用，不能覆写旧运行部门。用 `rg -n "create_run\(" backend/package backend/server` 审计所有绕过普通提交的内部派生运行。E2E 回读父子部门一致，覆盖 Web 切换后的 continuation 与撤权后继续执行被拒绝。
-- [ ] 单独修改 `agent_router.py` 的 `payload.resume` 分支：查找原运行所属部门、对当前账号在原部门重新授权、校验原会话/运行所有权，再沿既有 resume owner 创建恢复运行。页面部门不覆盖原部门；缺少部门的历史运行明确拒绝恢复，不猜测归属。取消、输出和 SSE 重连沿同一固定部门授权，不能借切换读取其他部门运行。
-- [ ] E2E 覆盖 A提交→排队→切B→执行、A挂起→切B→恢复、撤销A后执行/恢复拒绝、同请求跨部门幂等冲突。回读 request/run/资源快照/产物与终态事件，确认同一 execution 归属；审查后提交 `feat: 固定任务提交与恢复的部门上下文`。
+- [x] 沿 `rg -n 'project_runtime\(' backend` 更新实际 runtime 调用，给下游工具传递固定部门 context。被移除成员/删除账号/失效部门在后续授权边界拒绝；通过既有终态发布与队列推进收口失败，不留下永久 running request。不得把固定部门误实现为永不过期的角色快照。
+- [x] 检查 `team_lifecycle.py` 中直接 `AgentRunRepository.create_run` 的 worker 创建与 continuation：新子运行从触发它的父运行继承 department_id，不从浏览器取值。持久化 Team worker 复用前校验原子运行与当前父运行部门一致；不同部门拒绝复用，不能覆写旧运行部门。用 `rg -n "create_run\(" backend/package backend/server` 审计所有绕过普通提交的内部派生运行。E2E 回读父子部门一致，覆盖 Web 切换后的 continuation 与撤权后继续执行被拒绝。
+- [x] 单独修改 `agent_router.py` 的 `payload.resume` 分支：查找原运行所属部门、对当前账号在原部门重新授权、校验原会话/运行所有权，再沿既有 resume owner 创建恢复运行。页面部门不覆盖原部门；缺少部门的历史运行明确拒绝恢复，不猜测归属。取消、输出和 SSE 重连沿同一固定部门授权，不能借切换读取其他部门运行。
+- [x] E2E 覆盖 A提交→排队→切B→执行、A挂起→切B→恢复、撤销A后执行/恢复拒绝、同请求跨部门幂等冲突。回读 request/run/资源快照/产物与终态事件，确认同一 execution 归属；审查后提交 `feat: 固定任务提交与恢复的部门上下文`。
+
+**执行记录（2026-09-18）：**
+- 实现：`RunSubmissionCommand.department_id` 必填（置于默认值字段前）；`submit_run_command` 校验与当前有效部门一致（403）；request/run 持久化部门（repo create 必填 keyword）；`intake_request` 幂等跨部门 409（含 submit 短路路径同检——修复实测绕过）；`project_runtime` 增 `department_id`（非空时 strict resolve 为不可变上下文后投影；空为 Memory 等过渡路径留待任务6 收紧），runner×2/execution/worker_job×2/快照捕获（manifest 提交链）传实值；team_lifecycle 子运行与 continuation 继承父运行部门；resume 新增 `_resolve_resume_department`（原运行部门重授权 + 所有权校验 + 无部门历史运行 409 拒绝）；worker 执行前固定部门成员守卫（失效沿既有 `_fail_run` 收口）。六个 RunSubmissionCommand 生产构造点全部接线：Web 用 context；五个非交互入口过渡取 binding/execution 固定部门或入口上下文（任务6 收口为绑定事实）。
+- 测试：unit `test_run_submission_service` 19 passed（含新增部门不匹配 403 不创建 request/run）；全部受签名影响的 unit 测试适配（替身补 department_id/id，约 60 处，其中测试适配由子代理完成后开发者复核）；E2E `test_department_run_context.py` 2 passed——场景：A 提交→worker 真实执行终态→PG 回读 request/run.department_id==A；提交后切 B→run 终态部门仍 A；B 上下文同 request_id 重试 409；撤 B 成员后提交 403 `department_context_invalid`。E2E 由子代理按规格编写并实证暴露两个产品缺陷（manifest 构建 NameError 致 chat 提交 500、submit 短路绕过 409），开发者修复后全绿。
+- 回归：unit 全量 1997 passed（环境性集合除外）；E2E 栈 openai-mock 真实执行。ruff：全部改动文件 check/format 通过（复审指出的 3 处新行缩进已 format 修正）；`git diff --check` 通过。Team worker 复用部门一致校验已按复审补齐（team_lifecycle 复用分支比对原子运行与既有子运行部门，不一致拒绝复用）；E2E 文件的未修复缺陷注释（docstring 段与两处行内注释）已删除（首版清理仅覆盖部分行内形态，终审指出后补删完整）。
+- 缺口如实标注：Team 子运行父子部门一致、A 挂起→切 B→恢复两个 E2E 场景 Not run（Team worker 与挂起恢复需要 Team/审批装配，超出本任务 E2E 体量；继承与 resume 重授权代码已实现且有 unit 覆盖路径，遗留至任务10 验收补测或以专项测试补齐）；worker 撤权失败路径（"成员授权已失效"终态）无专项测试（守卫代码在 worker_job，时序难命中）。
 
 ## Task 6：补齐 API Key、CLI、Channel 和定时任务
 

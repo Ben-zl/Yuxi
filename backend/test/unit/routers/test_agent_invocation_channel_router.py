@@ -56,7 +56,7 @@ async def test_plain_channel_text_uses_shared_submission(monkeypatch: pytest.Mon
     monkeypatch.setattr(router, "AgentRunRepository", EmptyRunRepo)
     result = await router.receive_channel_message(
         _payload("你好", channel="cli", account_id="local", chat_id="chat-1"),
-        current_user=SimpleNamespace(uid="user-1"),
+        current_user=SimpleNamespace(department_id=11, uid="user-1"),
         db=object(),
     )
 
@@ -77,7 +77,7 @@ async def test_channel_rejects_whitespace_text_before_submission(monkeypatch: py
     with pytest.raises(HTTPException) as exc:
         await router.receive_channel_message(
             _payload("   "),
-            current_user=SimpleNamespace(uid="user-1"),
+            current_user=SimpleNamespace(department_id=11, uid="user-1"),
             db=object(),
         )
 
@@ -113,7 +113,7 @@ async def test_channel_uses_request_id_as_external_id_when_message_id_missing(mo
             request_id="request-1",
             message={"type": "text", "text": "你好"},
         ),
-        current_user=SimpleNamespace(uid="user-1"),
+        current_user=SimpleNamespace(department_id=11, uid="user-1"),
         db=object(),
     )
 
@@ -133,7 +133,7 @@ async def test_state_command_does_not_submit(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(router, "get_thread_state_view", fake_state)
     result = await router.receive_channel_message(
         _payload("/state"),
-        current_user=SimpleNamespace(uid="user-1"),
+        current_user=SimpleNamespace(department_id=11, uid="user-1"),
         db=object(),
     )
     assert result == {
@@ -171,7 +171,7 @@ async def test_approve_command_creates_resume_without_submit(monkeypatch: pytest
     monkeypatch.setattr(router, "submit_run_command", fail_submit)
     result = await router.receive_channel_message(
         _payload("/approve"),
-        current_user=SimpleNamespace(uid="user-1"),
+        current_user=SimpleNamespace(department_id=11, uid="user-1"),
         db=object(),
     )
 
@@ -184,6 +184,7 @@ async def test_approve_command_creates_resume_without_submit(monkeypatch: pytest
 @pytest.mark.asyncio
 async def test_approve_command_reuses_existing_resume_when_it_is_latest(monkeypatch: pytest.MonkeyPatch):
     existing_run = SimpleNamespace(
+        department_id=11,
         id="resume-run",
         uid="user-1",
         agent_slug="default-chatbot",
@@ -220,7 +221,7 @@ async def test_approve_command_reuses_existing_resume_when_it_is_latest(monkeypa
 
     result = await router.receive_channel_message(
         _payload("/approve", request_id="request-1"),
-        current_user=SimpleNamespace(uid="user-1"),
+        current_user=SimpleNamespace(department_id=11, uid="user-1"),
         db=object(),
     )
 
@@ -231,6 +232,7 @@ async def test_approve_command_reuses_existing_resume_when_it_is_latest(monkeypa
 @pytest.mark.asyncio
 async def test_approve_command_rejects_request_id_from_older_resume(monkeypatch: pytest.MonkeyPatch):
     existing_run = SimpleNamespace(
+        department_id=11,
         id="old-resume",
         uid="user-1",
         agent_slug="default-chatbot",
@@ -262,7 +264,7 @@ async def test_approve_command_rejects_request_id_from_older_resume(monkeypatch:
     with pytest.raises(HTTPException) as exc:
         await router.receive_channel_message(
             _payload("/approve", request_id="request-1"),
-            current_user=SimpleNamespace(uid="user-1"),
+            current_user=SimpleNamespace(department_id=11, uid="user-1"),
             db=object(),
         )
 
@@ -287,7 +289,7 @@ async def test_channel_does_not_treat_question_interrupt_as_approval(monkeypatch
     with pytest.raises(HTTPException) as exc:
         await router.receive_channel_message(
             _payload("继续"),
-            current_user=SimpleNamespace(uid="user-1"),
+            current_user=SimpleNamespace(department_id=11, uid="user-1"),
             db=object(),
         )
     assert exc.value.status_code == 409

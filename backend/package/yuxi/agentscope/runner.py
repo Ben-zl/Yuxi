@@ -71,6 +71,7 @@ async def ensure_thread_session(
     agent_slug: str,
     model_spec: str | None = None,
     projection: RuntimeProjection | None = None,
+    department_id: int | None = None,
 ) -> AgentScopeThreadSession:
     """保障线程映射的 session 存在；命中映射直接返回，缺失则投影并创建。
 
@@ -95,6 +96,7 @@ async def ensure_thread_session(
             agent_slug=agent_slug,
             model_spec=model_spec,
             thread_id=thread_id,
+            department_id=department_id,
         )
         credential_id = await client.create_credential(uid, projection.credential_data)
         await client.update_agent(uid, existing.agentscope_agent_id, projection.agent_request)
@@ -159,6 +161,7 @@ async def ensure_thread_session(
         agent_slug=agent_slug,
         model_spec=model_spec,
         thread_id=thread_id,
+        department_id=department_id,
     )
     credential_id = await client.create_credential(uid, projection.credential_data)
     agent_id = await client.create_agent(uid, projection.agent_request)

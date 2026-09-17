@@ -434,6 +434,7 @@ async def create_agent_run(
 
     return await submit_run_command(
         command=RunSubmissionCommand(
+            department_id=current_user.department_id,
             agent_slug=payload.agent_slug,
             thread_id=payload.thread_id,
             request_id=request_id,

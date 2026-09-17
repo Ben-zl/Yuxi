@@ -68,8 +68,10 @@ async def create_agent_eval_run(
     request_id = _normalize_request_id(meta)
     evaluation = _normalize_evaluation(payload.evaluation.model_dump(exclude_none=True))
     origin_metadata = {"agent_invocation_meta": {"evaluation": evaluation}} if evaluation else {}
+    actor_department_id = current_user.department_id
     run_response = await submit_run_command(
         command=RunSubmissionCommand(
+            department_id=actor_department_id,
             agent_slug=agent_slug,
             thread_id=(payload.thread_id or "").strip()
             or hash_id("invocation_", f"{current_user.uid}:{agent_slug}:{request_id}", length=64),

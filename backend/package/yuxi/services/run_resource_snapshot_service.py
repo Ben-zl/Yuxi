@@ -132,7 +132,9 @@ def _restore_preloaded_skill_copies(projection: dict) -> None:
     agent_request["system_prompt"] = f"{system_prompt}\n\n{_preloaded_skill_prompt(preloaded_skills, contents)}"
 
 
-async def capture_run_resources(db, *, uid: str, agent_slug: str, model_spec: str, thread_id: str | None) -> dict:
+async def capture_run_resources(
+    db, *, uid: str, agent_slug: str, model_spec: str, thread_id: str | None, department_id: int | None = None
+) -> dict:
     """解析根 Agent 及可调用子 Agent 的授权资源并在同一事务封存。"""
     projections = {}
     skill_trees: dict[str, dict] = {}
@@ -150,6 +152,7 @@ async def capture_run_resources(db, *, uid: str, agent_slug: str, model_spec: st
             model_spec=model_spec,
             thread_id=thread_id,
             is_team_worker=slug != agent_slug,
+            department_id=department_id,
         )
         projection_value = asdict(projection)
         referenced_skills = []

@@ -19,13 +19,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agents.buildin import agent_manager
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_repository import AgentRunRepository
+from yuxi.services.department_context_service import DepartmentContext
 from yuxi.repositories.agent_run_request_repository import AgentRunRequestRepository
 from yuxi.repositories.conversation_repository import ConversationRepository
 from yuxi.services.agent_request_queue_service import build_existing_intake_result, finalize_intake, intake_request
 from yuxi.services.input_message_service import AgentRunInputMessage
 from yuxi.services.project_service import create_implicit_project, lock_project_workdir_changes
 from yuxi.services.workdir_service import resolve_conversation_workdir_binding
-from yuxi.storage.postgres.models_business import Project, User
+from yuxi.storage.postgres.models_business import Project
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.utils.async_cleanup import await_cleanup_completion
 from yuxi.workspace.filesystem import Workspace
@@ -141,6 +142,7 @@ class RunSubmissionCommand:
     request_id: str
     input_message: AgentRunInputMessage
     origin: RunOrigin
+    department_id: int
     request_metadata: dict[str, Any] = field(default_factory=dict)
     model_spec: str | None = None
     tool_approval_mode: str | None = None
@@ -236,7 +238,7 @@ async def _compensate_submission_failure(
 async def submit_run_command(
     *,
     command: RunSubmissionCommand,
-    current_user: User,
+    current_user: DepartmentContext,
     db: AsyncSession,
 ) -> dict[str, Any]:
     """校验作用域、写入 Request 并在提交后投递消息型 AgentRun。
@@ -246,6 +248,11 @@ async def submit_run_command(
     """
 
     current_uid = str(current_user.uid)
+    if current_user.department_id is None or command.department_id != current_user.department_id:
+        raise HTTPException(
+            status_code=403,
+            detail="运行提交部门必须与当前有效部门上下文一致",
+        )
     origin = command.origin
     if not origin.source.strip() or not origin.channel.strip():
         raise HTTPException(status_code=422, detail="Run origin source/channel 不能为空")
@@ -265,6 +272,11 @@ async def submit_run_command(
     request_repo = AgentRunRequestRepository(db)
     existing_request = await request_repo.get_by_request_id(command.request_id)
     if existing_request is not None:
+        if existing_request.department_id != command.department_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"request_id 已绑定其他部门（{existing_request.department_id}），不能复用",
+            )
         intake = await build_existing_intake_result(
             repo=request_repo,
             request=existing_request,
@@ -378,6 +390,7 @@ async def submit_run_command(
 
         try:
             intake = await intake_request(
+                department_id=command.department_id,
                 db=db,
                 request_id=command.request_id,
                 uid=current_uid,

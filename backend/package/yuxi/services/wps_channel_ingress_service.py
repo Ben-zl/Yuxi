@@ -76,9 +76,12 @@ async def submit_wps_channel_event(binding_id: str, event: WPSChannelEvent) -> d
         await db.commit()
         existing_request = await AgentRunRequestRepository(db).get_by_request_id(request_id)
 
+        # 过渡：Channel 绑定部门优先；未迁移的旧绑定暂以 owner 旧部门字段兜底（任务6 收口拒绝）
+        actor_department_id = binding.department_id or current_user.department_id
         try:
             return await submit_run_command(
                 command=RunSubmissionCommand(
+                    department_id=actor_department_id,
                     agent_slug=binding.agent_slug,
                     thread_id=thread_id,
                     request_id=request_id,

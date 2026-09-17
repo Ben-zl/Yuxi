@@ -198,6 +198,7 @@ async def build_submission_manifest_result(
     tool_approval_mode: str | None,
     run_type: str = "chat",
     thread_id: str | None = None,
+    department_id: int | None = None,
 ) -> RunManifestBuildResult:
     """在提交事务内按当前授权构建可安全持久化的运行快照。"""
     normalized_context: dict = {}
@@ -246,6 +247,7 @@ async def build_submission_manifest_result(
         agent_slug=agent_item.slug,
         model_spec=model_spec,
         thread_id=thread_id,
+        department_id=department_id,
     )
     return RunManifestBuildResult(
         manifest=manifest,

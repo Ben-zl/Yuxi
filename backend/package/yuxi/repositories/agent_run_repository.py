@@ -298,6 +298,7 @@ class AgentRunRepository:
         subagent_thread_relation_id: int | None = None,
         run_type: str = "chat",
         input_message_id: int | None = None,
+        department_id: int | None = None,
     ) -> AgentRun:
         """登记一条 run 记录；输入正文和图片应通过 input_message_id 指向 Message。"""
         runtime_scope = str(conversation_thread_id) if runtime_scope_id is None else str(runtime_scope_id).strip()
@@ -307,6 +308,7 @@ class AgentRunRepository:
             runtime_scope_id=runtime_scope,
             agent_slug=agent_slug,
             uid=str(uid),
+            department_id=department_id,
             request_id=request_id,
             source=source,
             channel=channel,

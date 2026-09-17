@@ -87,6 +87,7 @@ async def test_intake_rejects_steer_for_unsupported_source(session):
     with pytest.raises(HTTPException) as exc_info:
         await intake_request(
             db=session,
+            department_id=11,
             request_id="request-agent-call-steer",
             uid="user-1",
             agent_slug="main",
@@ -114,6 +115,7 @@ async def test_channel_steer_is_accepted_for_active_message_run(
 
     result = await intake_request(
         db=session,
+        department_id=11,
         request_id="request-channel-steer",
         uid="user-1",
         agent_slug="main",
@@ -160,6 +162,7 @@ async def test_intake_rejects_image_for_declared_text_model_before_persisting(
     with pytest.raises(HTTPException) as exc_info:
         await intake_request(
             db=session,
+            department_id=11,
             request_id="request-image-text-model",
             uid="user-1",
             agent_slug="main",
@@ -250,6 +253,7 @@ async def _seed_active_run(session, *, source="chat", status="running", run_type
         agent_slug="main",
         conversation_thread_id="t1",
         source=source,
+        department_id=11,
         input_message_id=101,
         status="dispatched",
     )
@@ -280,6 +284,7 @@ async def _create_request(session, *, request_id, uid="user-1", msg_id=100, queu
         uid=uid,
         agent_slug="main",
         conversation_thread_id="t1",
+        department_id=11,
         input_message_id=msg_id,
         queue_policy=queue_policy,
     )
@@ -376,6 +381,7 @@ async def test_steer_rejects_unsupported_active_run_before_persisting(session, s
     with pytest.raises(HTTPException) as exc_info:
         await intake_request(
             db=session,
+            department_id=11,
             request_id="request-steer",
             uid="user-1",
             agent_slug="main",
@@ -493,6 +499,7 @@ async def test_intake_idempotent_returns_existing(session):
 
     result = await intake_request(
         db=session,
+        department_id=11,
         request_id="req-idem",
         uid="user-1",
         agent_slug="main",
@@ -523,6 +530,7 @@ async def test_intake_idempotent_rejects_cross_user(session):
     with pytest.raises(HTTPException) as exc_info:
         await intake_request(
             db=session,
+            department_id=11,
             request_id="req-cross",
             uid="user-2",
             agent_slug="main",
@@ -557,6 +565,7 @@ async def test_intake_idempotent_rejects_scope_mismatch(session):
     with pytest.raises(HTTPException) as exc_info:
         await intake_request(
             db=session,
+            department_id=11,
             request_id="req-scope",
             uid="user-1",
             agent_slug="other",
@@ -610,6 +619,7 @@ async def test_dispatch_sets_delivery_status_dispatched(session):
         uid="user-1",
         agent_slug="main",
         conversation_thread_id="t1",
+        department_id=11,
         input_message_id=200,
     )
     await session.commit()
@@ -648,6 +658,7 @@ async def test_dispatches_multiple_queued_requests_one_at_a_time(session):
             uid="user-1",
             agent_slug="main",
             conversation_thread_id="t1",
+            department_id=11,
             input_message_id=message_id,
         )
     await session.commit()
@@ -833,6 +844,7 @@ async def test_reject_with_active_run_persists_request(session):
 
     result = await intake_request(
         db=session,
+        department_id=11,
         request_id="req-reject-fix3",
         uid="user-1",
         agent_slug="main",
@@ -878,6 +890,7 @@ async def test_reject_idempotent(session):
 
     first = await intake_request(
         db=session,
+        department_id=11,
         request_id="req-reject-idem",
         uid="user-1",
         agent_slug="main",
@@ -891,6 +904,7 @@ async def test_reject_idempotent(session):
 
     second = await intake_request(
         db=session,
+        department_id=11,
         request_id="req-reject-idem",
         uid="user-1",
         agent_slug="main",
@@ -917,6 +931,7 @@ async def _seed_queued_request(session, *, request_id: str, message_id: int, cre
         uid="user-1",
         agent_slug="main",
         conversation_thread_id="t1",
+        department_id=11,
         input_message_id=message_id,
     )
     request.created_at = created_at
@@ -1090,6 +1105,7 @@ async def test_reject_does_not_resume_paused_queue(session):
 
     result = await intake_request(
         db=session,
+        department_id=11,
         request_id="request-c",
         uid="user-1",
         agent_slug="main",
@@ -1126,6 +1142,7 @@ async def test_reject_marks_request_rejected_when_immediate_dispatch_loses_race(
 
     result = await intake_request(
         db=session,
+        department_id=11,
         request_id="request-reject",
         uid="user-1",
         agent_slug="main",
@@ -1177,6 +1194,7 @@ async def test_intake_rejects_message_while_run_is_interrupted(
     with pytest.raises(HTTPException) as exc_info:
         await intake_request(
             db=session,
+            department_id=11,
             request_id="request-c",
             uid="user-1",
             agent_slug="main",
@@ -1211,6 +1229,7 @@ async def test_intake_persists_accepted_model_on_conversation(session, monkeypat
 
     result = await intake_request(
         db=session,
+        department_id=11,
         request_id="request-model",
         uid="user-1",
         agent_slug="main",
@@ -1245,6 +1264,7 @@ async def test_enqueue_after_empty_failed_queue_dispatches_new_request(session, 
 
     result = await intake_request(
         db=session,
+        department_id=11,
         request_id="request-b",
         uid="user-1",
         agent_slug="main",

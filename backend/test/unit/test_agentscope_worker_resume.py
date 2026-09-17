@@ -23,6 +23,7 @@ pytestmark = pytest.mark.unit
 async def test_worker_preserves_mixed_approval_decisions(monkeypatch):
     """worker 公共恢复路径必须按原顺序保留 approve/reject。"""
     run = SimpleNamespace(
+        department_id=11,
         uid="u",
         id="run",
         conversation_thread_id="thread",
@@ -72,6 +73,7 @@ async def test_worker_preserves_mixed_approval_decisions(monkeypatch):
 async def test_resume_failure_keeps_pending_confirmation(monkeypatch):
     """会话读取/恢复失败时不得清除 Redis 挂起事实。"""
     run = SimpleNamespace(
+        department_id=11,
         uid="u",
         id="run",
         conversation_thread_id="thread",
@@ -111,6 +113,7 @@ async def test_resume_failure_keeps_pending_confirmation(monkeypatch):
 async def test_resume_streams_reasoning_tools_and_terminal_event(monkeypatch):
     """审批恢复后应继续输出完整事件，并返回可持久化的工具结果。"""
     run = SimpleNamespace(
+        department_id=11,
         uid="u",
         id="run",
         request_id="request",
@@ -206,6 +209,7 @@ async def test_resume_streams_reasoning_tools_and_terminal_event(monkeypatch):
 async def test_external_resume_waits_for_team_worker_wakeup(monkeypatch):
     """用户回答后创建子智能体时，父 Run 必须收齐 worker 回报再结束。"""
     run = SimpleNamespace(
+        department_id=11,
         uid="u",
         id="run",
         request_id="request",
@@ -271,6 +275,7 @@ async def test_external_resume_waits_for_team_worker_wakeup(monkeypatch):
 async def test_permission_resume_requires_decisions(monkeypatch):
     """审批挂起不能因缺少 decisions 静默退化为普通用户消息。"""
     run = SimpleNamespace(
+        department_id=11,
         uid="u",
         id="run",
         conversation_thread_id="thread",
@@ -333,6 +338,7 @@ class _AttachmentRepository:
 
 def _attachment_run():
     return SimpleNamespace(
+        department_id=11,
         uid="u",
         conversation_id=1,
         conversation_thread_id="thread",
@@ -439,6 +445,7 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
     from yuxi.services import run_queue_service
 
     run = SimpleNamespace(
+        department_id=11,
         id="run",
         uid="u",
         status="dispatched",
@@ -461,7 +468,19 @@ async def test_projection_value_error_marks_run_failed(monkeypatch):
     )
     db = SimpleNamespace(
         execute=AsyncMock(
-            return_value=SimpleNamespace(scalar_one_or_none=lambda: SimpleNamespace(content="hello", extra_metadata={}))
+            return_value=SimpleNamespace(
+                # 同一对象复用为部门守卫的 owner/部门/成员查询结果
+                scalar_one_or_none=lambda: SimpleNamespace(
+                    id=1,
+                    uid="u",
+                    role="user",
+                    username="u",
+                    name="dept-11",
+                    content="hello",
+                    extra_metadata={},
+                    is_login_locked=lambda: False,
+                )
+            )
         ),
         commit=AsyncMock(),
         rollback=AsyncMock(),
@@ -514,6 +533,7 @@ async def test_worker_persists_reasoning_and_tool_calls(monkeypatch):
     from yuxi.agentscope import execution
 
     run = SimpleNamespace(
+        department_id=11,
         id="run",
         uid="u",
         status="dispatched",
@@ -542,7 +562,22 @@ async def test_worker_persists_reasoning_and_tool_calls(monkeypatch):
         add_tool_call=AsyncMock(),
         set_message_delivery_status=AsyncMock(),
     )
-    db = SimpleNamespace(commit=AsyncMock())
+    db = SimpleNamespace(
+        # execute 供部门守卫查询 owner 与部门/成员关系，恒返回同一有效账号对象
+        execute=AsyncMock(
+            return_value=SimpleNamespace(
+                scalar_one_or_none=lambda: SimpleNamespace(
+                    id=1,
+                    uid="u",
+                    role="user",
+                    username="u",
+                    name="dept-11",
+                    is_login_locked=lambda: False,
+                )
+            )
+        ),
+        commit=AsyncMock(),
+    )
 
     class _SessionContext:
         async def __aenter__(self):

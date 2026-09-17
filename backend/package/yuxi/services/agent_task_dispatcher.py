@@ -24,7 +24,6 @@ from yuxi.services.run_submission_service import (
     submit_run_command,
 )
 from yuxi.storage.postgres.models_business import TaskExecution, User
-from yuxi.utils.datetime_utils import utc_now_naive
 from yuxi.utils.logging_config import logger
 
 # AgentRun 终态 → TaskExecution 终态；interrupted 保持占槽（等待审批）
@@ -90,7 +89,10 @@ class AgentTaskDispatcher:
         from yuxi.services.agent_task_trigger_service import TRIGGER_CHANNELS
 
         principal = await self._principal(execution.execution_principal_uid)
+        # 过渡：执行记录固定部门优先；未迁移的旧任务暂以 principal 旧部门字段兜底（任务6 收口拒绝）
+        actor_department_id = execution.department_id or principal.department_id
         command = RunSubmissionCommand(
+            department_id=actor_department_id,
             agent_slug=execution.agent_slug,
             thread_id=execution_thread_id(execution.id),
             request_id=execution.id,

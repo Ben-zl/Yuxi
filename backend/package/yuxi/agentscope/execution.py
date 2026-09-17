@@ -46,6 +46,7 @@ async def execute_run(
             thread_id=run.conversation_thread_id,
             agent_slug=run.agent_slug,
             model_spec=model_spec,
+            department_id=run.department_id,
         )
     await recover_untracked_pending_session(
         client,

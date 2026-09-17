@@ -77,8 +77,10 @@ async def create_agent_call_run(
     if not payload.async_mode and queue_policy != "reject":
         raise HTTPException(status_code=422, detail="同步 agent-call 仅支持 queue_policy=reject")
 
+    actor_department_id = current_user.department_id
     run_response = await submit_run_command(
         command=RunSubmissionCommand(
+            department_id=actor_department_id,
             agent_slug=agent_slug,
             thread_id=str(payload.thread_id or "").strip()
             or _invocation_thread_id(current_user.uid, agent_slug, request_id),

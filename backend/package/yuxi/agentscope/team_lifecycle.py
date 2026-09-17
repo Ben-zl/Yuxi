@@ -243,6 +243,7 @@ class TeamLifecycleModule:
                 runtime_scope_id=getattr(parent_run, "runtime_scope_id", None) or leader.thread_id,
                 agent_slug=subagent_slug,
                 uid=self.uid,
+                department_id=getattr(parent_run, "department_id", None),
                 request_id=request_id,
                 input_payload={
                     "model_spec": (parent_run.input_payload or {}).get("model_spec"),
@@ -592,6 +593,10 @@ class TeamLifecycleModule:
             request_id = hash_id("team-reply:", f"{worker_session_id}:{reply_id}", length=64)
             existing = await runs.get_run_by_request_id(request_id)
             if existing is not None:
+                # 持久化 worker 复用前校验原子运行与当前父运行部门一致；不同部门拒绝复用
+                creator_run = await runs.get_run_for_user(binding.created_by_run_id, self.uid)
+                if existing.department_id != getattr(creator_run, "department_id", None):
+                    raise ValueError("Team 子运行与当前父运行部门不一致，拒绝复用")
                 if existing.status not in TERMINAL_RUN_STATUSES:
                     claimed, acquired = await runs.mark_running(existing.id, lease_seconds=RUN_LEASE_SECONDS)
                     if claimed is None or not acquired or not claimed.worker_id:
@@ -636,6 +641,7 @@ class TeamLifecycleModule:
                 runtime_scope_id=getattr(parent, "runtime_scope_id", None) or binding.parent_thread_id,
                 agent_slug=binding.subagent_slug,
                 uid=self.uid,
+                department_id=getattr(parent, "department_id", None),
                 request_id=request_id,
                 input_payload={
                     "model_spec": (parent.input_payload or {}).get("model_spec") if parent else None,

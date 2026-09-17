@@ -130,8 +130,10 @@ async def receive_channel_message(
             },
         )
 
+    actor_department_id = current_user.department_id
     result = await submit_run_command(
         command=RunSubmissionCommand(
+            department_id=actor_department_id,
             agent_slug=agent_slug,
             thread_id=thread_id,
             request_id=request_id,

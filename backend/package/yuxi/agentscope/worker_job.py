@@ -242,6 +242,39 @@ async def execute_agent_run_job(run_id: str) -> None:
             return
         await db.commit()
 
+        # 固定部门实时授权：成员失效/账号删除时按既有失败路径收口，不留下永久 running
+        if run.department_id is not None:
+            from yuxi.repositories.user_repository import UserRepository
+            from yuxi.services.department_context_service import (
+                DepartmentContextError,
+                resolve_department_context,
+            )
+
+            department_owner = await UserRepository().get_by_uid_with_db(db, run.uid)
+            department_valid = False
+            if department_owner is not None:
+                try:
+                    department_context = await resolve_department_context(
+                        db, user_id=department_owner.id, department_id=run.department_id, strict=True
+                    )
+                    department_valid = department_context.department_id is not None
+                except DepartmentContextError:
+                    department_valid = False
+            if not department_valid:
+                await db.rollback()
+                await _fail_run(
+                    db,
+                    run_repo,
+                    run_id=run_id,
+                    uid=run_uid,
+                    agent_slug=run_agent_slug,
+                    thread_id=run_thread_id,
+                    input_message_id=run_input_message_id,
+                    worker_id=worker_id,
+                    message="运行所属部门的成员授权已失效",
+                )
+                return
+
         client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
         heartbeat_task = start_run_lease_heartbeat(run.id, worker_id=worker_id) if lease_owned and worker_id else None
         try:
@@ -256,6 +289,7 @@ async def execute_agent_run_job(run_id: str) -> None:
                     thread_id=run.conversation_thread_id,
                     agent_slug=run.agent_slug,
                     model_spec=model_spec,
+                    department_id=run.department_id,
                     projection=await load_run_resources(
                         db,
                         uid=run.uid,
@@ -667,6 +701,7 @@ async def _execute_resume(db, client, run, input_message) -> GatewayRoundResult:
         thread_id=run.conversation_thread_id,
         agent_slug=run.agent_slug,
         model_spec=(run.input_payload or {}).get("model_spec"),
+        department_id=run.department_id,
         projection=await load_run_resources(db, uid=run.uid, manifest=run.manifest, agent_slug=run.agent_slug),
     )
     await _apply_permission_mode(client, run, mapping)

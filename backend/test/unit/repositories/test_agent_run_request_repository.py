@@ -68,6 +68,7 @@ def _make_request(
 async def test_create_persists_request_with_queued_status(session):
     repo = AgentRunRequestRepository(session)
     created = await repo.create(
+        department_id=11,
         request_id="req-new",
         uid="user-1",
         agent_slug="main",
@@ -81,6 +82,7 @@ async def test_create_persists_request_with_queued_status(session):
 
 async def test_create_persists_origin_metadata(session):
     created = await AgentRunRequestRepository(session).create(
+        department_id=11,
         request_id="origin-request",
         uid="user-1",
         agent_slug="main",

@@ -104,9 +104,7 @@ def test_wps_event_converts_files_to_run_submission_attachments():
         channel_message_id="message-1",
         chat_id="chat-1",
         text="分析附件",
-        attachments=(
-            WPSAttachment(name="report.pdf", media_type="application/pdf", content=b"pdf", sha256="digest"),
-        ),
+        attachments=(WPSAttachment(name="report.pdf", media_type="application/pdf", content=b"pdf", sha256="digest"),),
     )
 
     text, attachments = _convert_event_content(event)
@@ -129,7 +127,7 @@ async def test_ingress_only_deletes_new_orphaned_delivery(
     db = FakeDB()
     binding = _binding(encrypt_app_secret("wps-secret"))
     binding.sync_status = "synced"
-    owner = SimpleNamespace(uid="owner-1", is_deleted=False)
+    owner = SimpleNamespace(uid="owner-1", is_deleted=False, department_id=11)
     delivery = SimpleNamespace(id=7)
     deliveries = SimpleNamespace(
         create_if_missing=AsyncMock(return_value=(delivery, delivery_created)),
@@ -137,9 +135,7 @@ async def test_ingress_only_deletes_new_orphaned_delivery(
         delete=AsyncMock(),
     )
     request_repo = SimpleNamespace(
-        get_by_request_id=AsyncMock(
-            side_effect=[None, SimpleNamespace() if accepted_after_failure else None]
-        )
+        get_by_request_id=AsyncMock(side_effect=[None, SimpleNamespace() if accepted_after_failure else None])
     )
 
     @asynccontextmanager
@@ -259,8 +255,7 @@ def test_transport_attachment_limit_matches_run_intake_limit():
 async def test_run_submission_rejects_more_than_ten_external_attachments():
     """统一 Run intake 在写 Workdir 前拒绝超过十个附件。"""
     attachments = tuple(
-        RunSubmissionAttachment(file_name=f"{index}.txt", media_type="text/plain", content=b"x")
-        for index in range(11)
+        RunSubmissionAttachment(file_name=f"{index}.txt", media_type="text/plain", content=b"x") for index in range(11)
     )
 
     with pytest.raises(ValueError, match="最多提交 10 个附件"):

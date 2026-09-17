@@ -127,6 +127,7 @@ async def intake_request(
     external_id: str | None = None,
     origin_metadata: dict | None = None,
     queue_policy: str = "enqueue",
+    department_id: int,
     input_message: AgentRunInputMessage,
     agent_item: Any,
     agent_backend: Any,
@@ -152,6 +153,11 @@ async def intake_request(
         existing = await repo.get_by_request_id(request_id)
         if not existing:
             return None
+        if existing.department_id != department_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"request_id 已绑定其他部门（{existing.department_id}），不能复用",
+            )
         return await build_existing_intake_result(
             repo=repo,
             request=existing,
@@ -236,6 +242,7 @@ async def intake_request(
         if user is None:
             raise HTTPException(status_code=500, detail="Run 提交缺少当前用户授权上下文")
         submission_manifest = await build_submission_manifest_result(
+            department_id=department_id,
             agent_item=agent_item,
             agent_backend=agent_backend,
             user=user,
@@ -269,6 +276,7 @@ async def intake_request(
                 external_id=external_id,
                 origin_metadata=origin_metadata,
                 queue_policy=policy,
+                department_id=department_id,
                 input_message_id=persisted_message.id,
                 input_payload=input_payload,
                 status=request_status,
@@ -969,6 +977,7 @@ async def _dispatch_locked_head(
                 conversation_id=conversation_id,
                 run_type="chat",
                 input_message_id=head.input_message_id,
+                department_id=head.department_id,
             )
             run = await run_repo.get_run(run_id)
             manifest = (head.input_payload or {}).get(RUN_MANIFEST_INPUT_KEY)

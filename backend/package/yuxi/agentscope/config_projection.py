@@ -32,6 +32,10 @@ from yuxi.agentscope.projection import (
 from yuxi.config.options import system_options
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.user_repository import UserRepository
+from yuxi.services.department_context_service import (
+    DepartmentContextError,
+    resolve_department_context,
+)
 from yuxi.models.providers.repository import get_model_provider_for_user
 from yuxi.storage.postgres.models_business import Agent, ModelProvider
 
@@ -111,9 +115,22 @@ async def project_runtime(
     thread_id: str | None = None,
     is_team_worker: bool = False,
     include_memory_models: bool = False,
+    department_id: int | None = None,
 ) -> RuntimeProjection:
-    """统一投影入口：读取 yuxi 配置并产出该线程运行的全部运行时对象。"""
+    """统一投影入口：读取 yuxi 配置并产出该线程运行的全部运行时对象。
+
+    department_id 为运行提交时固定的部门：非空时按实时成员关系解析为不可变
+    权限上下文后再投影；为空仅限尚未绑定部门的过渡路径（Memory 维护等）。
+    """
     user = await _load_user(db, uid)
+    if department_id is not None:
+        try:
+            context = await resolve_department_context(db, user_id=user.id, department_id=department_id, strict=True)
+        except DepartmentContextError as exc:
+            raise ValueError(f"运行部门上下文无效: {exc}") from exc
+        if context.department_id is None:
+            raise ValueError("运行部门上下文无效")
+        user = context
     agent = await _load_agent(db, agent_slug, user)
     context = agent_context(agent)
     settings = await system_options.get(db)

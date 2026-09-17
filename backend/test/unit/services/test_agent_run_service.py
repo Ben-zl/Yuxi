@@ -242,7 +242,16 @@ class _FakeBackend:
 
 class _UserResult:
     def scalar_one_or_none(self):
-        return SimpleNamespace(uid="user-1", role="user")
+        # 同一对象复用为原运行、owner 与部门/成员查询结果，覆盖 resume 部门解析链路
+        return SimpleNamespace(
+            id=1,
+            uid="user-1",
+            role="user",
+            username="user-1",
+            department_id=11,
+            name="dept-11",
+            is_login_locked=lambda: False,
+        )
 
 
 class _CreateRunDb:
@@ -353,6 +362,7 @@ class _CreateRunRepo:
         if self.db.raise_create_integrity_error:
             raise agent_run_service.IntegrityError("insert agent_run", kwargs, Exception("duplicate request_id"))
         self.db.created_run = SimpleNamespace(
+            department_id=11,
             id=kwargs["run_id"],
             conversation_thread_id=kwargs["conversation_thread_id"],
             agent_slug=kwargs["agent_slug"],
@@ -527,6 +537,7 @@ async def test_stream_waits_for_persisted_terminal_before_emitting_end(
 
         async def get_run_for_user(self, _run_id, _uid):
             return SimpleNamespace(
+                department_id=11,
                 status=next(reads, statuses[-1]),
                 conversation_thread_id="thread-1",
                 request_id="request-1",
@@ -789,6 +800,7 @@ async def test_stream_agent_run_events_compact_fallback_end_keeps_request_id(mon
         async def get_run_for_user(self, run_id: str, uid: str):
             del run_id, uid
             return SimpleNamespace(
+                department_id=11,
                 status="completed",
                 conversation_thread_id="thread-1",
                 request_id="req-1",
@@ -842,6 +854,7 @@ async def test_stream_agent_run_events_does_not_fallback_end_before_runtime_clea
         async def get_run_for_user(self, run_id: str, uid: str):
             del run_id, uid
             return SimpleNamespace(
+                department_id=11,
                 status="completed",
                 conversation_thread_id="thread-1",
                 request_id="req-1",
@@ -908,6 +921,7 @@ async def test_create_agent_run_persists_input_before_enqueue(monkeypatch: pytes
 @pytest.mark.asyncio
 async def test_create_agent_run_reuses_existing_only_with_same_request_scope(monkeypatch: pytest.MonkeyPatch):
     existing_run = SimpleNamespace(
+        department_id=11,
         id="existing-run",
         conversation_thread_id="thread-1",
         agent_slug="default",
@@ -937,6 +951,7 @@ async def test_create_agent_run_reuses_existing_only_with_same_request_scope(mon
 @pytest.mark.asyncio
 async def test_create_agent_run_rejects_request_id_scope_mismatch(monkeypatch: pytest.MonkeyPatch):
     existing_run = SimpleNamespace(
+        department_id=11,
         id="existing-run",
         conversation_thread_id="other-thread",
         agent_slug="default",
@@ -967,6 +982,7 @@ async def test_create_agent_run_rejects_request_id_scope_mismatch(monkeypatch: p
 @pytest.mark.asyncio
 async def test_create_agent_run_integrity_error_reuses_same_request_scope(monkeypatch: pytest.MonkeyPatch):
     existing_run = SimpleNamespace(
+        department_id=11,
         id="existing-run",
         conversation_thread_id="thread-1",
         agent_slug="default",
@@ -1003,6 +1019,7 @@ async def test_create_agent_run_integrity_error_reuses_same_request_scope(monkey
 @pytest.mark.asyncio
 async def test_create_agent_run_integrity_error_rejects_scope_mismatch(monkeypatch: pytest.MonkeyPatch):
     existing_run = SimpleNamespace(
+        department_id=11,
         id="existing-run",
         conversation_thread_id="other-thread",
         agent_slug="default",
@@ -1168,6 +1185,7 @@ async def test_create_resume_run_without_request_id_reuses_stable_key(monkeypatc
 
     request_id = first_db.created_run_kwargs["request_id"]
     existing_run = SimpleNamespace(
+        department_id=11,
         id="existing-resume-run",
         conversation_thread_id="thread-1",
         agent_slug="default",
@@ -1250,7 +1268,7 @@ async def test_create_resume_run_requires_parent_run_id(monkeypatch: pytest.Monk
         )
 
     assert exc.value.status_code == 422
-    assert exc.value.detail == "created_by_run_id 不能为空"
+    assert exc.value.detail == "恢复请求缺少原运行标识"
     assert db.created_run_kwargs is None
 
 
@@ -1370,6 +1388,7 @@ async def test_create_agent_run_rejects_active_checkpoint_run(monkeypatch: pytes
 @pytest.mark.asyncio
 async def test_get_agent_run_result_uses_output_message_id(monkeypatch: pytest.MonkeyPatch):
     run = SimpleNamespace(
+        department_id=11,
         id="run-1",
         status="completed",
         agent_slug="default-chatbot",
@@ -1427,6 +1446,7 @@ async def test_get_agent_run_result_does_not_fallback_when_explicit_binding_is_i
     monkeypatch: pytest.MonkeyPatch,
 ):
     run = SimpleNamespace(
+        department_id=11,
         id="run-1",
         status="completed",
         agent_slug="default-chatbot",

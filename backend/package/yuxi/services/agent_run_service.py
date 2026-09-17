@@ -514,6 +514,38 @@ async def get_agent_run_progress(run_id: str, *, message_limit: int = RUN_PROGRE
     return {"last_seq": last_seq, "messages": list(reversed(messages))}
 
 
+async def _resolve_resume_department(db: AsyncSession, *, current_uid: str, created_by_run_id: str | None) -> int:
+    """查原运行所属部门并对当前账号在该部门重新授权；历史无部门运行拒绝恢复。"""
+    from yuxi.repositories.agent_run_repository import AgentRunRepository
+    from yuxi.repositories.user_repository import UserRepository
+    from yuxi.services.department_context_service import (
+        DepartmentContextError,
+        resolve_department_context,
+    )
+
+    if not created_by_run_id:
+        raise HTTPException(status_code=422, detail="恢复请求缺少原运行标识")
+    origin_run = await AgentRunRepository(db).get_run(created_by_run_id)
+    if origin_run is None:
+        raise HTTPException(status_code=404, detail="原运行不存在")
+    if origin_run.uid != current_uid:
+        raise HTTPException(status_code=403, detail="只能恢复自己的运行")
+    if origin_run.department_id is None:
+        raise HTTPException(status_code=409, detail="原运行缺少部门归属，无法恢复")
+    owner = await UserRepository().get_by_uid_with_db(db, current_uid)
+    if owner is None:
+        raise HTTPException(status_code=401, detail="账号不存在或已删除")
+    try:
+        context = await resolve_department_context(
+            db, user_id=owner.id, department_id=origin_run.department_id, strict=True
+        )
+    except DepartmentContextError as exc:
+        raise HTTPException(status_code=403, detail=f"原部门上下文无效: {exc}") from exc
+    if context.department_id is None:
+        raise HTTPException(status_code=403, detail="原部门上下文无效")
+    return origin_run.department_id
+
+
 async def create_agent_run_view(
     *,
     input_message: AgentRunInputMessage | None,
@@ -526,6 +558,7 @@ async def create_agent_run_view(
     tool_approval_mode: str | None = None,
     resume: object | None = None,
     created_by_run_id: str | None = None,
+    department_id: int | None = None,
     source: str | None = None,
     channel: str | None = None,
     external_id: str | None = None,
@@ -539,6 +572,13 @@ async def create_agent_run_view(
         _validate_resume_input(resume)
 
     run_type = "resume" if resume is not None else "chat"
+    # 恢复使用原运行所属部门并重新校验当前账号在该部门的有效成员身份；
+    # 页面当前部门不覆盖原部门；缺少部门归属的历史运行拒绝恢复
+    if run_type == "resume":
+        resume_department_id = await _resolve_resume_department(
+            db, current_uid=current_uid, created_by_run_id=created_by_run_id
+        )
+        department_id = resume_department_id
     run_created_by_id = created_by_run_id if run_type == "resume" else None
     request_id = _resolve_agent_run_request_id(
         meta=meta,
@@ -653,6 +693,7 @@ async def create_agent_run_view(
         channel=channel,
         external_id=external_id,
         origin_metadata=origin_metadata,
+        department_id=department_id,
     )
     if created:
         await _commit_and_enqueue(db, run.id)
@@ -785,6 +826,7 @@ async def persist_agent_run_record(
     channel: str = "web",
     external_id: str | None = None,
     origin_metadata: dict[str, Any] | None = None,
+    department_id: int | None = None,
 ) -> tuple[Any, bool]:
     """登记一条 AgentRun 并绑定已创建的输入消息，返回是否为本次新建。"""
     run_id = str(uuid.uuid4())
@@ -803,6 +845,7 @@ async def persist_agent_run_record(
                 external_id=external_id,
                 origin_metadata=origin_metadata,
                 conversation_id=conversation_id,
+                department_id=department_id,
                 created_by_run_id=created_by_run_id,
                 subagent_thread_relation_id=subagent_thread_relation_id,
                 run_type=run_type,
