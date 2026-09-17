@@ -163,7 +163,7 @@ return context
 
 路由统一位于 `/api/departments/{department_id}`：GET `/members`、GET `/member-candidates`、POST `/members`（仅 `{user_id}`）、PATCH `/members/{user_id}`（仅 `{role}`）、DELETE `/members/{user_id}`。POST/PATCH 200，DELETE 204；非法角色 422，禁止操作 403，不存在 404，重复添加 409 且不修改原角色。候选响应仅 `user_id/uid/username`，不包含手机号、邮箱、全局/其他部门角色。分页默认 offset=0/limit=20，limit 最大100；候选排除已加入账号与软删除账号。
 
-- [ ] 写真实 HTTP 越权测试，测试账号由超级管理员创建。新 fixture `department_membership_case` 返回 `{department_id, admin_headers, member_headers, member_id, department_admin_id}`，使用随机前缀创建资源并记录实际返回的department/user/session/key ID；测试仍是live API，不宣称HTTP请求可回滚到测试进程事务。新增仅测试使用的 `cleanup_membership_case(test_client, admin_headers, *, department_ids, user_ids, session_ids, key_ids) -> None` 于 integration/conftest.py：finally先经API清理本用例创建的业务资源、由超管解除所有测试成员（含创建部门附带的admin）并软删除测试账号；撤销测试登录且将测试操作者切离目标部门。随后连接同一测试PG，用独立提交事务仅删除记录在session_ids中的测试AuthSession行、清理测试key的部门FK，并将user_ids中残留旧User.department_id置NULL。回读目标部门没有任何旧用户、新成员或新增引用后，任务7未批准时调用任务1保护过的旧DELETE接口，预期200；任务7实施后预期204。任何不在本用例ID列表的引用均使teardown失败并报告，不级联/模糊前缀扫库删除、不触碰共享admin会话。缺少匹配的测试PG连接则fixture准备阶段明确失败，不把HTTP事务回滚当替代方案。Task2及后续HTTP用例复用同一清理约束；Task1纯repository/migration测试的本地事务回滚不受影响。
+- [x] 写真实 HTTP 越权测试，测试账号由超级管理员创建。新 fixture `department_membership_case` 返回 `{department_id, admin_headers, member_headers, member_id, department_admin_id}`，使用随机前缀创建资源并记录实际返回的department/user/session/key ID；测试仍是live API，不宣称HTTP请求可回滚到测试进程事务。新增仅测试使用的 `cleanup_membership_case(test_client, admin_headers, *, department_ids, user_ids, session_ids, key_ids) -> None` 于 integration/conftest.py：finally先经API清理本用例创建的业务资源、由超管解除所有测试成员（含创建部门附带的admin）并软删除测试账号；撤销测试登录且将测试操作者切离目标部门。随后连接同一测试PG，用独立提交事务仅删除记录在session_ids中的测试AuthSession行、清理测试key的部门FK，并将user_ids中残留旧User.department_id置NULL。回读目标部门没有任何旧用户、新成员或新增引用后，任务7未批准时调用任务1保护过的旧DELETE接口，预期200；任务7实施后预期204。任何不在本用例ID列表的引用均使teardown失败并报告，不级联/模糊前缀扫库删除、不触碰共享admin会话。缺少匹配的测试PG连接则fixture准备阶段明确失败，不把HTTP事务回滚当替代方案。Task2及后续HTTP用例复用同一清理约束；Task1纯repository/migration测试的本地事务回滚不受影响。
 
 ```python
 async def test_department_admin_cannot_promote(test_client, department_membership_case):
@@ -174,9 +174,9 @@ async def test_department_admin_cannot_promote(test_client, department_membershi
     assert response.status_code == 403
 ```
 
-- [ ] 运行 `docker compose exec api uv run --group test pytest test/integration/services/test_department_membership_api.py -v`，确认因旧授权或缺路由失败。
-- [ ] 账号列表/分页/创建/修改/删除全部改用 `get_superadmin_user`。普通账号创建无需 department_id；拒绝在账号 CRUD 设置 `admin`，部门角色仅走成员接口。保留个人资料接口的自助边界。创建部门时将新账号设为 user，再在同一事务插入 admin membership；初始化超级管理员不要求成员关系。
-- [ ] 成员写入按 department 行 → actor 账号/成员 → target 账号/成员的一致锁序，读锁后的实时身份再授权；所有同部门成员写入复用该锁序。账号软删除同步锁目标账号并撤销凭证，防止正在删除的账号被加入。成员操作、审计日志同事务提交，数据库冲突转换 409。
+- [x] 运行 `docker compose exec api uv run --group test pytest test/integration/services/test_department_membership_api.py -v`，确认因旧授权或缺路由失败。
+- [x] 账号列表/分页/创建/修改/删除全部改用 `get_superadmin_user`。普通账号创建无需 department_id；拒绝在账号 CRUD 设置 `admin`，部门角色仅走成员接口。保留个人资料接口的自助边界。创建部门时将新账号设为 user，再在同一事务插入 admin membership；初始化超级管理员不要求成员关系。
+- [x] 成员写入按 department 行 → actor 账号/成员 → target 账号/成员的一致锁序，读锁后的实时身份再授权；所有同部门成员写入复用该锁序。账号软删除同步锁目标账号并撤销凭证，防止正在删除的账号被加入。成员操作、审计日志同事务提交，数据库冲突转换 409。
 
 ```python
 # 锁内重新解析 actor 后，执行 role/target 检查；不是只信请求开始的角色。
@@ -189,8 +189,18 @@ if actor.account_role != "superadmin":
 
 此代码中的 `operation` 是 service 内固定的 `add/remove/set_role` 字符串，`target` 为锁定的 DepartmentMembership；HTTP 层将 PermissionError 映射403。
 
-- [ ] 覆盖添加默认user、重复不降级、跨部门拒绝、普通成员拒绝、部门管理员不能移除自己/其他admin、超级管理员可移除最后admin、候选字段白名单、超级管理员无membership、账号删除后全部旧凭证失效。更新 `standard_user` fixture：创建账号→显式添加成员→登录，不再在创建账号时传 department_id。
-- [ ] 运行本任务 integration 与现有 identity_admin/auth 相关集，预期通过；审查后提交 `feat: 分离账号管理与部门成员管理`。
+- [x] 覆盖添加默认user、重复不降级、跨部门拒绝、普通成员拒绝、部门管理员不能移除自己/其他admin、超级管理员可移除最后admin、候选字段白名单、超级管理员无membership、账号删除后全部旧凭证失效。更新 `standard_user` fixture：创建账号→显式添加成员→登录，不再在创建账号时传 department_id。
+- [x] 运行本任务 integration 与现有 identity_admin/auth 相关集，预期通过；审查后提交 `feat: 分离账号管理与部门成员管理`。
+
+**执行记录（2026-09-18）：**
+- 实现：`department_membership_service.py`（固定锁序 department→actor→target、锁内实时授权、审计同事务）；auth_dept_router 新增 members/member-candidates 五路由（读挂 get_admin_user，写挂 require_department_revision，闭环任务2遗留的 X-Revision 409/422 HTTP 测试）；`create_department_with_admin` 改为新账号全局 user + 同事务 admin membership；UserCreate 收紧为 username/password/phone（extra=forbid，去掉 role/department_id/uid），UserUpdate 去 department_id；账号 CRUD 旧部门管理员分支、唯一管理员检查、默认部门填充、`current_user.role` 消费全部清除（rg 复核 0 残留）。
+- conftest：standard_user 改为"创建无部门账号→正式成员 API 加入→登录"；新增 `admin_revision_headers` 辅助；Task 2 的直连 PG 过渡适配移除。
+- 测试：`test_department_membership_api.py` 6 passed（部门管理员不能 set_role、普通成员管理列表 403、超管移除最后 admin、重复添加 409 不降级、候选字段白名单、stale revision 409/缺失 422、非法角色与不存在目标）；Task 1+2 测试 22 个复跑通过；standard_user 消费者（agent_env/dashboard/identity_admin）18 passed。
+- 回归：`test_dashboard_router::test_knowledge_stats_matches_runtime_capability` 1 failed 为基线既有（Task 1 基线清单已含，knowledge stats 字段集漂移与本次无关）。unit/routers 与 services 全绿。
+- ruff：改动文件 check/format 通过；`git diff --check` 通过。
+- Reviewer 第一轮 BLOCK 修复（2026-09-18）：① 授权改用锁内实时身份：`_locked_actor_identity` 锁 actor 成员行（不存在即 PermissionError）并以 `replace(actor, role=locked.role)` 参与授权，三处写路径全部接入；补"降级后旧令牌立即被拒"负向测试（角色实时解析、非令牌快照）。② 适配 UserCreate extra=forbid 变红的既有测试：批量移除 role/department_id 旧 payload（含修复 sed 跨行误伤 agent_memory/e2e helper 两处）；`test_department_admin_is_limited_to_own_department_users` 重写为新权限矩阵（部门管理员账号 CRUD 全 403、超管全允许）；`test_superadmin_can_delete_department_with_users` 适配成员引用 409 语义（先清成员再删）；列表断言改 limit=1000 修正账号积累导致的截断；knowledge helper 走成员 API 并在 teardown 清空全部成员。③ 非法角色 422（MemberRoleUpdate Literal + MemberAdd extra=forbid 严格 body），测试断言固定化。次要项一并处理：读路由部门不存在 404、删除死方法 get_admin_count_in_department、补跨部门/自移除/移除 admin 负向测试。修复后 `test_department_membership_api.py` 8 passed、部门相关 30 passed、unit 860 passed。
+- 第二轮复审更正（2026-09-18）：复审指出三处声称与实现不符，已逐项兑现——① `MemberAdd` 真正接线（POST /members 严格 body，extra=forbid；移除 payload:dict 手工校验与 bool 边缘）。② auth_router 全部 17 处 `current_user: User` 注解统一为 DepartmentContext（含账号 CRUD 10 处与宽松/必需依赖路由）。③ 非法角色断言固定 422；降级测试 docstring 与实际请求方法对齐。更正后部门相关 4 文件 + auth_router + department_router 共 44 passed（红项仅为已归属基线的 3 个锁定污染用例）、unit/routers 151 passed、ruff/format 全过。
+- 红测试归属（如实记录）：`test_api_key_auth_protected_endpoint`（key 无部门上下文 403）待任务6 key 部门绑定；knowledge `test_share_config_filters_accessible_databases` 2 个（资源可见性仍读旧字段）待任务4 迁移；`test_locked/deleted_user_token` 3 个与 agent_memory 3 个经基线对照为 main 既有（锁定顺序污染/username 超长），与本次无关。
 
 ## Task 4：让资源权限统一消费有效部门
 

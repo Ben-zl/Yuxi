@@ -186,7 +186,7 @@ async def test_user_delete_oidc_restore_cannot_republish_or_enable_old_api_key(t
     suffix = uuid.uuid4().hex[:12]
     user_response = await test_client.post(
         "/api/auth/users",
-        json={"username": f"revive_{suffix}", "password": "routerTest123!", "role": "user"},
+        json={"username": f"revive_{suffix}", "password": "routerTest123!"},
         headers=admin_headers,
     )
     assert user_response.status_code == 200, user_response.text

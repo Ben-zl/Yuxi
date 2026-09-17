@@ -4,14 +4,26 @@
 """
 
 import re
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from server.utils.auth_middleware import get_admin_user, get_db, get_superadmin_user
+from server.utils.auth_middleware import (
+    get_admin_user,
+    get_db,
+    get_superadmin_user,
+    require_department_revision,
+)
 from yuxi.repositories.department_repository import DepartmentDeletionConflict, DepartmentRepository
 from yuxi.repositories.user_repository import UserRepository
+from yuxi.services.department_context_service import DepartmentContext
+from yuxi.services.department_membership_service import (
+    DepartmentMembershipService,
+    MemberConflictError,
+    MemberNotFoundError,
+)
 from yuxi.services.identity_admin_service import IdentityConflictError, create_department_with_admin
 from yuxi.services.operation_log_service import log_operation
 from yuxi.services.user_identity_service import is_valid_phone_number
@@ -217,3 +229,118 @@ async def delete_department(
     await db.commit()
 
     return {"success": True, "message": "部门已删除"}
+
+
+# =============================================================================
+# === 部门成员管理 ===
+# =============================================================================
+
+
+class MemberAdd(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: int
+
+
+class MemberRoleUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["admin", "user"]
+
+
+def _map_membership_error(exc: Exception) -> HTTPException:
+    """成员用例错误到 HTTP 结论的映射。"""
+    if isinstance(exc, PermissionError):
+        return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    if isinstance(exc, MemberNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, MemberConflictError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@department.get("/{department_id}/members")
+async def list_department_members(
+    department_id: int,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: DepartmentContext = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """分页列出部门成员；部门管理员限本部门，超级管理员任意部门。"""
+    try:
+        return await DepartmentMembershipService(db).list_members(
+            current_user, department_id, offset=offset, limit=limit
+        )
+    except (PermissionError, MemberNotFoundError) as exc:
+        raise _map_membership_error(exc) from exc
+
+
+@department.get("/{department_id}/member-candidates")
+async def search_member_candidates(
+    department_id: int,
+    search: str | None = Query(None),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: DepartmentContext = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """检索可加入的已有账号；仅返回 user_id/uid/username。"""
+    try:
+        return await DepartmentMembershipService(db).search_candidates(
+            current_user, department_id, search, offset=offset, limit=limit
+        )
+    except (PermissionError, MemberNotFoundError) as exc:
+        raise _map_membership_error(exc) from exc
+
+
+@department.post("/{department_id}/members")
+async def add_department_member(
+    department_id: int,
+    payload: MemberAdd,
+    request: Request,
+    current_user: DepartmentContext = Depends(require_department_revision),
+    db: AsyncSession = Depends(get_db),
+):
+    """添加已有账号为部门成员，默认普通角色。"""
+    try:
+        member = await DepartmentMembershipService(db).add_member(
+            current_user, department_id, payload.user_id, request=request
+        )
+    except (PermissionError, MemberNotFoundError, MemberConflictError) as exc:
+        raise _map_membership_error(exc) from exc
+    return member
+
+
+@department.patch("/{department_id}/members/{user_id}")
+async def update_department_member_role(
+    department_id: int,
+    user_id: int,
+    payload: MemberRoleUpdate,
+    request: Request,
+    current_user: DepartmentContext = Depends(require_department_revision),
+    db: AsyncSession = Depends(get_db),
+):
+    """修改部门成员角色；任命/降级管理员仅超级管理员。"""
+    try:
+        member = await DepartmentMembershipService(db).set_role(
+            current_user, department_id, user_id, payload.role, request=request
+        )
+    except (PermissionError, MemberNotFoundError, MemberConflictError) as exc:
+        raise _map_membership_error(exc) from exc
+    return member
+
+
+@department.delete("/{department_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_department_member(
+    department_id: int,
+    user_id: int,
+    request: Request,
+    current_user: DepartmentContext = Depends(require_department_revision),
+    db: AsyncSession = Depends(get_db),
+):
+    """移除部门成员；部门管理员只能移除普通成员。"""
+    try:
+        await DepartmentMembershipService(db).remove_member(current_user, department_id, user_id, request=request)
+    except (PermissionError, MemberNotFoundError, MemberConflictError) as exc:
+        raise _map_membership_error(exc) from exc

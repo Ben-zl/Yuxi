@@ -11,7 +11,6 @@ from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 
 import anyio
-import asyncpg
 import httpx
 import pytest
 import pytest_asyncio
@@ -112,6 +111,15 @@ def admin_headers(admin_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {admin_token}"}
 
 
+async def admin_revision_headers(test_client, admin_headers: dict[str, str]) -> dict[str, str]:
+    """为超管的部门写请求附加当前会话 revision（每次现查 /me）。"""
+    me = await test_client.get("/api/auth/me", headers=admin_headers)
+    assert me.status_code == 200, me.text
+    merged = dict(admin_headers)
+    merged["X-Department-Revision"] = str(me.json()["context_revision"])
+    return merged
+
+
 @pytest_asyncio.fixture(scope="function")
 async def department_headers(test_client) -> Callable[[dict[str, str]], dict[str, str]]:
     """为部门写请求附加当前会话的 X-Department-Revision。
@@ -196,7 +204,7 @@ async def standard_user(test_client: httpx.AsyncClient, admin_headers: dict[str,
     username = f"pytest_user_{uuid.uuid4().hex[:8]}"
     password = f"Pw!{uuid.uuid4().hex[:8]}"
 
-    # 用户隔离重构后所有登录用户必须绑定部门，创建时显式指定一个已存在部门
+    # 创建无部门账号后通过正式成员接口加入第一个部门
     dept_response = await test_client.get("/api/departments", headers=admin_headers)
     if dept_response.status_code != 200 or not dept_response.json():
         pytest.fail(f"No department available to bind standard user: {dept_response.text}")
@@ -204,7 +212,7 @@ async def standard_user(test_client: httpx.AsyncClient, admin_headers: dict[str,
 
     response = await test_client.post(
         "/api/auth/users",
-        json={"username": username, "password": password, "role": "user", "department_id": department_id},
+        json={"username": username, "password": password},
         headers=admin_headers,
     )
     if response.status_code != 200:
@@ -212,20 +220,13 @@ async def standard_user(test_client: httpx.AsyncClient, admin_headers: dict[str,
 
     user_payload = response.json()
 
-    # 部门权限来自成员关系：旧创建接口只写 User.department_id，这里直连 PG 补成员事实
-    dsn = os.getenv("POSTGRES_URL", "postgresql+asyncpg://postgres:postgres@postgres:5432/yuxi").replace(
-        "postgresql+asyncpg://", "postgresql://"
+    # 部门权限来自成员关系：通过正式成员接口加入部门
+    add_member = await test_client.post(
+        f"/api/departments/{department_id}/members",
+        headers=await admin_revision_headers(test_client, admin_headers),
+        json={"user_id": user_payload["id"]},
     )
-    pg_conn = await asyncpg.connect(dsn)
-    try:
-        await pg_conn.execute(
-            "INSERT INTO department_memberships (user_id, department_id, role, created_at) "
-            "VALUES ($1, $2, 'user', NOW())",
-            user_payload["id"],
-            department_id,
-        )
-    finally:
-        await pg_conn.close()
+    assert add_member.status_code == 200, add_member.text
 
     login_response = await test_client.post(
         "/api/auth/token",
@@ -253,11 +254,10 @@ async def standard_user(test_client: httpx.AsyncClient, admin_headers: dict[str,
             owner_uid=str(user_payload["uid"]),
         )
         # 成员事实先于账号软删除清除，避免残留关系阻碍部门清理
-        cleanup_conn = await asyncpg.connect(dsn)
-        try:
-            await cleanup_conn.execute("DELETE FROM department_memberships WHERE user_id = $1", user_payload["id"])
-        finally:
-            await cleanup_conn.close()
+        await test_client.delete(
+            f"/api/departments/{department_id}/members/{user_payload['id']}",
+            headers=await admin_revision_headers(test_client, admin_headers),
+        )
         cleanup_error = None
         for _ in range(3):
             response = await test_client.delete(f"/api/auth/users/{user_payload['id']}", headers=admin_headers)

@@ -43,8 +43,6 @@ async def _create_user(client: httpx.AsyncClient, admin_headers: dict[str, str])
         json={
             "username": f"e2e_memory_{uuid.uuid4().hex[:8]}",
             "password": password,
-            "role": "user",
-            "department_id": departments.json()[0]["id"],
         },
     )
     assert created.status_code == 200, created.text

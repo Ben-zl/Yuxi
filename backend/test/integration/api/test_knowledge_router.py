@@ -52,13 +52,22 @@ async def _create_test_user(test_client, admin_headers, department_id):
         json={
             "username": f"pytest_user_{suffix}",
             "password": password,
-            "role": "user",
-            "department_id": department_id,
         },
         headers=admin_headers,
     )
     assert response.status_code == 200, response.text
     user = response.json()
+
+    # 部门上下文来自成员关系：通过正式成员接口加入
+    me = await test_client.get("/api/auth/me", headers=admin_headers)
+    assert me.status_code == 200, me.text
+    revision_headers = {**admin_headers, "X-Department-Revision": str(me.json()["context_revision"])}
+    added = await test_client.post(
+        f"/api/departments/{department_id}/members",
+        headers=revision_headers,
+        json={"user_id": user["id"]},
+    )
+    assert added.status_code == 200, added.text
 
     login_response = await test_client.post(
         "/api/auth/token",
@@ -73,6 +82,12 @@ async def _delete_user_by_id(test_client, admin_headers, user_id):
     assert response.status_code in (200, 404), response.text
 
 
+async def _remove_membership(test_client, admin_headers, department_id, user_id):
+    me = await test_client.get("/api/auth/me", headers=admin_headers)
+    revision_headers = {**admin_headers, "X-Department-Revision": str(me.json()["context_revision"])}
+    await test_client.delete(f"/api/departments/{department_id}/members/{user_id}", headers=revision_headers)
+
+
 async def _find_user_id_by_uid(test_client, admin_headers, uid):
     response = await test_client.get("/api/auth/users", headers=admin_headers)
     assert response.status_code == 200, response.text
@@ -83,8 +98,29 @@ async def _find_user_id_by_uid(test_client, admin_headers, uid):
 
 
 async def _delete_department_with_admin(test_client, admin_headers, department):
+    # 先清空全部成员关系（含会话活动部门引用经直连），再软删账号，最后删部门
+    members_response = await test_client.get(
+        f"/api/departments/{department['id']}/members",
+        params={"limit": 100},
+        headers=admin_headers,
+    )
+    if members_response.status_code == 200:
+        for member in members_response.json()["items"]:
+            await _remove_membership(test_client, admin_headers, department["id"], member["user_id"])
     admin_user_id = await _find_user_id_by_uid(test_client, admin_headers, department["admin_uid"])
     if admin_user_id:
+        import asyncpg
+        import os as _os
+
+        dsn = _os.getenv("POSTGRES_URL", "postgresql+asyncpg://postgres:postgres@postgres:5432/yuxi").replace(
+            "postgresql+asyncpg://", "postgresql://"
+        )
+        conn = await asyncpg.connect(dsn)
+        try:
+            await conn.execute("DELETE FROM auth_sessions WHERE active_department_id = $1", department["id"])
+            await conn.execute("UPDATE users SET department_id = NULL WHERE department_id = $1", department["id"])
+        finally:
+            await conn.close()
         await _delete_user_by_id(test_client, admin_headers, admin_user_id)
     response = await test_client.delete(f"/api/departments/{department['id']}", headers=admin_headers)
     assert response.status_code in (200, 404), response.text
@@ -301,14 +337,18 @@ async def test_knowledge_virtual_folder_migration_runs_without_sse_and_is_resuma
         assert final_detection.json()["has_virtual_folders"] is False
         async with engine.connect() as connection:
             folder_creators = (
-                await connection.execute(
-                    text(
-                        "SELECT created_by FROM knowledge_files WHERE kb_id = :kb "
-                        "AND is_folder IS TRUE AND filename IN (:root, 'shared', 'other')"
-                    ),
-                    {"kb": kb_id, "root": f"history-{prefix}"},
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT created_by FROM knowledge_files WHERE kb_id = :kb "
+                            "AND is_folder IS TRUE AND filename IN (:root, 'shared', 'other')"
+                        ),
+                        {"kb": kb_id, "root": f"history-{prefix}"},
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         assert len(folder_creators) == 3
         assert all(folder_creators)
     finally:
@@ -362,26 +402,28 @@ async def test_virtual_folder_migration_keeps_conflicts_and_commits_other_paths(
 
         async with engine.connect() as connection:
             rows = (
-                await connection.execute(
-                    text(
-                        "SELECT filename, parent_id FROM knowledge_files WHERE file_id IN "
-                        "(:blocked_file, :movable_file) ORDER BY file_id"
-                    ),
-                    {
-                        "blocked_file": f"file_{suffix}_blocked",
-                        "movable_file": f"file_{suffix}_movable",
-                    },
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT filename, parent_id FROM knowledge_files WHERE file_id IN "
+                            "(:blocked_file, :movable_file) ORDER BY file_id"
+                        ),
+                        {
+                            "blocked_file": f"file_{suffix}_blocked",
+                            "movable_file": f"file_{suffix}_movable",
+                        },
+                    )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
         assert {row["filename"] for row in rows} == {f"{blocked}/a.txt", "b.txt"}
         assert sum(row["parent_id"] is not None for row in rows) == 1
     finally:
         await engine.dispose()
 
 
-async def test_folder_mutations_reject_invalid_name_and_directory_cycle(
-    test_client, admin_headers, knowledge_database
-):
+async def test_folder_mutations_reject_invalid_name_and_directory_cycle(test_client, admin_headers, knowledge_database):
     kb_id = knowledge_database["kb_id"]
 
     parent_response = await test_client.post(
@@ -604,9 +646,7 @@ async def test_knowledge_routes_enforce_permissions(test_client, standard_user, 
     _assert_forbidden_response(forbidden_exists)
 
 
-async def test_kb_image_proxy_requires_auth_and_streams_private_image(
-    test_client, admin_headers, knowledge_database
-):
+async def test_kb_image_proxy_requires_auth_and_streams_private_image(test_client, admin_headers, knowledge_database):
     """知识库图片代理：未登录不可访问，鉴权后可读取私有 bucket 图片"""
     from yuxi.storage.minio.client import MinIOClient, get_minio_client
 

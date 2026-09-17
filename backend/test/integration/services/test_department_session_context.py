@@ -47,7 +47,7 @@ async def session_case(test_client, admin_headers):
         created = await test_client.post(
             "/api/auth/users",
             headers=admin_headers,
-            json={"uid": case.uid, "password": case.password, "username": case.username},
+            json={"password": case.password, "username": case.username},
         )
         assert created.status_code == 200, created.text
         case.user_id = created.json()["id"]

@@ -237,14 +237,13 @@ async def test_admin_can_create_and_delete_user(test_client, admin_headers):
     payload = {
         "username": f"rtu_{suffix}",
         "password": "routerTest123!",
-        "role": "user",
     }
     create_response = await test_client.post("/api/auth/users", json=payload, headers=admin_headers)
     assert create_response.status_code == 200, create_response.text
 
     created_user = create_response.json()
     assert created_user["username"] == payload["username"]
-    assert created_user["role"] == payload["role"]
+    assert created_user["role"] == "user"
 
     delete_response = await test_client.delete(f"/api/auth/users/{created_user['id']}", headers=admin_headers)
     assert delete_response.status_code == 200, delete_response.text
@@ -267,7 +266,6 @@ async def test_admin_user_page_filters_before_pagination_and_excludes_deleted(te
                 json={
                     "username": f"paged_{suffix}_{index}",
                     "password": "routerTest123!",
-                    "role": "user",
                 },
                 headers=admin_headers,
             )
@@ -279,7 +277,7 @@ async def test_admin_user_page_filters_before_pagination_and_excludes_deleted(te
 
         page_response = await test_client.get(
             "/api/auth/users/page",
-            params={"search": f"paged_{suffix}", "offset": 1, "limit": 1, "role": "user"},
+            params={"search": f"paged_{suffix}", "offset": 1, "limit": 1},
             headers=admin_headers,
         )
         assert page_response.status_code == 200, page_response.text
@@ -299,7 +297,7 @@ async def test_admin_password_mutations_reject_passwords_shorter_than_eight_char
 ):
     create_response = await test_client.post(
         "/api/auth/users",
-        json={"username": f"weak_{uuid.uuid4().hex[:8]}", "password": "short", "role": "user"},
+        json={"username": f"weak_{uuid.uuid4().hex[:8]}", "password": "short"},
         headers=admin_headers,
     )
     assert create_response.status_code == 422, create_response.text
@@ -314,106 +312,83 @@ async def test_admin_password_mutations_reject_passwords_shorter_than_eight_char
     assert update_response.json()["detail"][0]["loc"] == ["body", "password"]
 
 
-async def test_department_admin_is_limited_to_own_department_users(test_client, admin_headers):
+async def test_department_admin_is_rejected_from_account_management(test_client, admin_headers):
+    """账号管理为超管专属：部门管理员对账号 CRUD 全部 403。"""
     await _require_superadmin(test_client, admin_headers)
 
     user_ids: list[int] = []
     admin_ids: list[int] = []
-    department_ids: list[int] = []
 
     try:
         dept_a = await _create_department_with_admin(test_client, admin_headers, "a")
-        dept_b = await _create_department_with_admin(test_client, admin_headers, "b")
         department_a = dept_a["department"]
-        department_b = dept_b["department"]
-        department_ids.extend([department_a["id"], department_b["id"]])
-        admin_ids.extend([dept_a["admin_id"], dept_b["admin_id"]])
+        admin_ids.append(dept_a["admin_id"])
+        admin_headers_a = dept_a["admin_headers"]
 
-        user_a = await _create_user(test_client, dept_a["admin_headers"], "a")
-        user_b = await _create_user(test_client, dept_b["admin_headers"], "b")
-        superadmin_created_user = await _create_user(test_client, admin_headers, "s", department_id=department_b["id"])
-        user_ids.extend([user_a["id"], user_b["id"], superadmin_created_user["id"]])
-
-        assert user_a["department_id"] == department_a["id"]
-        assert superadmin_created_user["department_id"] == department_b["id"]
+        created = await test_client.post(
+            "/api/auth/users",
+            headers=admin_headers,
+            json={"username": f"acct_{uuid.uuid4().hex[:8]}", "password": "routerTest123!"},
+        )
+        assert created.status_code == 200, created.text
+        user_id = created.json()["id"]
+        user_ids.append(user_id)
 
         forbidden_create = await test_client.post(
             "/api/auth/users",
-            json={
-                "username": f"ux_{uuid.uuid4().hex[:8]}",
-                "password": "routerTest123!",
-                "role": "user",
-                "department_id": department_b["id"],
-            },
-            headers=dept_a["admin_headers"],
+            json={"username": f"ux_{uuid.uuid4().hex[:8]}", "password": "routerTest123!"},
+            headers=admin_headers_a,
         )
         assert forbidden_create.status_code == 403, forbidden_create.text
 
-        list_response = await test_client.get("/api/auth/users", headers=dept_a["admin_headers"])
-        assert list_response.status_code == 200, list_response.text
-        listed_users = list_response.json()
-        listed_user_ids = {user["id"] for user in listed_users}
-        assert user_a["id"] in listed_user_ids
-        assert user_b["id"] not in listed_user_ids
-        assert all(user["department_id"] == department_a["id"] for user in listed_users)
+        for method, url in (
+            ("get", "/api/auth/users"),
+            ("get", "/api/auth/users/page"),
+            ("get", f"/api/auth/users/{user_id}"),
+        ):
+            response = await getattr(test_client, method)(url, headers=admin_headers_a)
+            assert response.status_code == 403, response.text
 
-        page_response = await test_client.get(
-            "/api/auth/users/page",
-            params={"department_id": department_b["id"], "limit": 100},
-            headers=dept_a["admin_headers"],
-        )
-        assert page_response.status_code == 200, page_response.text
-        paged_users = page_response.json()["items"]
-        paged_user_ids = {user["id"] for user in paged_users}
-        assert user_a["id"] in paged_user_ids
-        assert user_b["id"] not in paged_user_ids
-        assert all(user["department_id"] == department_a["id"] for user in paged_users)
-
-        options_response = await test_client.get("/api/auth/users/access-options", headers=dept_a["admin_headers"])
-        assert options_response.status_code == 200, options_response.text
-        access_options = options_response.json()
-        option_uids = {user["uid"] for user in access_options}
-        assert user_a["uid"] in option_uids
-        assert user_b["uid"] not in option_uids
-        assert all(user["department_id"] == department_a["id"] for user in access_options)
-
-        superadmin_list_response = await test_client.get("/api/auth/users?limit=1000", headers=admin_headers)
-        assert superadmin_list_response.status_code == 200, superadmin_list_response.text
-        superadmin_user_ids = {user["id"] for user in superadmin_list_response.json()}
-        assert user_a["id"] in superadmin_user_ids
-        assert user_b["id"] in superadmin_user_ids
-
-        own_read = await test_client.get(f"/api/auth/users/{user_a['id']}", headers=dept_a["admin_headers"])
-        assert own_read.status_code == 200, own_read.text
-
-        cross_read = await test_client.get(f"/api/auth/users/{user_b['id']}", headers=dept_a["admin_headers"])
-        assert cross_read.status_code == 403, cross_read.text
-
-        cross_update = await test_client.put(
-            f"/api/auth/users/{user_b['id']}",
+        forbidden_update = await test_client.put(
+            f"/api/auth/users/{user_id}",
             json={"username": f"ub_{uuid.uuid4().hex[:8]}"},
-            headers=dept_a["admin_headers"],
+            headers=admin_headers_a,
         )
-        assert cross_update.status_code == 403, cross_update.text
+        assert forbidden_update.status_code == 403, forbidden_update.text
 
-        role_escalation = await test_client.put(
-            f"/api/auth/users/{user_a['id']}", json={"role": "admin"}, headers=dept_a["admin_headers"]
-        )
-        assert role_escalation.status_code == 422, role_escalation.text
+        forbidden_delete = await test_client.delete(f"/api/auth/users/{user_id}", headers=admin_headers_a)
+        assert forbidden_delete.status_code == 403, forbidden_delete.text
 
-        cross_delete = await test_client.delete(f"/api/auth/users/{user_b['id']}", headers=dept_a["admin_headers"])
-        assert cross_delete.status_code == 403, cross_delete.text
-
-        own_delete = await test_client.delete(f"/api/auth/users/{user_a['id']}", headers=dept_a["admin_headers"])
-        assert own_delete.status_code == 200, own_delete.text
-        user_ids.remove(user_a["id"])
+        # 超管仍可完整管理
+        superadmin_list = await test_client.get("/api/auth/users?limit=1000", headers=admin_headers)
+        assert superadmin_list.status_code == 200
+        assert user_id in {user["id"] for user in superadmin_list.json()}
     finally:
-        for user_id in user_ids:
-            await _cleanup_user(test_client, admin_headers, user_id)
-        for admin_id in admin_ids:
-            await _cleanup_user(test_client, admin_headers, admin_id)
-        for department_id in department_ids:
-            await _cleanup_department(test_client, admin_headers, department_id)
+        for uid in user_ids + admin_ids:
+            await _cleanup_user(test_client, admin_headers, uid)
+        # 清除成员关系、会话活动部门引用后删除部门
+        if dept_a["department"]["id"]:
+            import asyncpg
+
+            department_id = dept_a["department"]["id"]
+            me = await test_client.get("/api/auth/me", headers=admin_headers)
+            rev = {"X-Department-Revision": str(me.json()["context_revision"])}
+            if dept_a["admin_id"]:
+                await test_client.delete(
+                    f"/api/departments/{department_id}/members/{dept_a['admin_id']}",
+                    headers={**admin_headers, **rev},
+                )
+                dsn = os.getenv("POSTGRES_URL", "postgresql+asyncpg://postgres:postgres@postgres:5432/yuxi").replace(
+                    "postgresql+asyncpg://", "postgresql://"
+                )
+                conn = await asyncpg.connect(dsn)
+                try:
+                    await conn.execute("DELETE FROM auth_sessions WHERE active_department_id = $1", department_id)
+                    await conn.execute("UPDATE users SET department_id = NULL WHERE department_id = $1", department_id)
+                finally:
+                    await conn.close()
+            deletion = await test_client.delete(f"/api/departments/{department_id}", headers=admin_headers)
+            assert deletion.status_code == 200, deletion.text
 
 
 async def test_invalid_token_is_rejected(test_client):

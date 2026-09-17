@@ -37,8 +37,6 @@ async def _create_user(
         json={
             "username": f"pytest_memory_{label}_{uuid.uuid4().hex[:8]}",
             "password": password,
-            "role": "user",
-            "department_id": departments.json()[0]["id"],
         },
     )
     assert response.status_code == 200, response.text

@@ -17,6 +17,7 @@ from server.utils.auth_middleware import (
 )
 from yuxi.services.department_context_service import (
     DepartmentAccessDeniedError,
+    DepartmentContext,
     DepartmentContextError,
     DepartmentNotFoundError,
     DepartmentRevisionConflictError,
@@ -51,8 +52,6 @@ from yuxi.services.operation_log_service import log_operation
 from yuxi.services.user_identity_service import generate_unique_uid, is_valid_phone_number, validate_username
 from yuxi.storage.minio import upload_image_to_minio
 from yuxi.storage.minio.client import normalize_public_minio_url
-from yuxi.storage.postgres.models_business import User
-from yuxi.repositories.department_repository import DepartmentRepository
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.utils import logger
 from yuxi.utils.auth_utils import JWT_EXPIRATION, AuthUtils
@@ -89,11 +88,11 @@ class Token(BaseModel):
 
 
 class UserCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     username: str
     password: str = Field(min_length=8)
-    role: str = "user"
     phone_number: str | None = None
-    department_id: int | None = None
 
 
 class UserUpdate(BaseModel):
@@ -103,7 +102,6 @@ class UserUpdate(BaseModel):
     password: str | None = Field(default=None, min_length=8)
     phone_number: str | None = None
     avatar: str | None = None
-    department_id: int | None = None
 
 
 class UserProfileUpdate(BaseModel):
@@ -391,7 +389,7 @@ async def create_cli_session(data: CLIAuthSessionCreate, db: AsyncSession = Depe
 @auth.get("/cli/sessions/{user_code}", response_model=CLIAuthSessionResponse)
 async def get_cli_session(
     user_code: str,
-    _current_user: User = Depends(get_authenticated_user),
+    _current_user: DepartmentContext = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -404,7 +402,7 @@ async def get_cli_session(
 @auth.post("/cli/sessions/{user_code}/approve", response_model=CLIAuthApproveResponse)
 async def approve_cli_session(
     user_code: str,
-    current_user: User = Depends(get_required_user),
+    current_user: DepartmentContext = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -500,7 +498,7 @@ async def initialize_admin(admin_data: InitializeAdmin, db: AsyncSession = Depen
 
 @auth.get("/my-departments")
 async def read_my_departments(
-    current_user: User = Depends(get_authenticated_user),
+    current_user: DepartmentContext = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     """当前账号可切换的部门及实时角色。"""
@@ -515,7 +513,7 @@ class DepartmentContextSwitch(BaseModel):
 @auth.post("/department-context", response_model=UserResponse)
 async def switch_department_context(
     payload: DepartmentContextSwitch,
-    current_user: User = Depends(get_authenticated_user),
+    current_user: DepartmentContext = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     """切换当前登录会话的活动部门；失败不改原会话。"""
@@ -599,7 +597,9 @@ async def logout_current_session(
 
 
 @auth.get("/me", response_model=UserResponse)
-async def read_users_me(current_user: User = Depends(get_authenticated_user), db: AsyncSession = Depends(get_db)):
+async def read_users_me(
+    current_user: DepartmentContext = Depends(get_authenticated_user), db: AsyncSession = Depends(get_db)
+):
     """获取当前登录用户的个人信息：个人资料来自账号行，角色/部门/会话字段来自不可变上下文。"""
     user = await UserRepository(db).get_active_by_id(current_user.id)
     if user is None:
@@ -614,7 +614,7 @@ async def read_users_me(current_user: User = Depends(get_authenticated_user), db
 async def update_profile(
     profile_data: UserProfileUpdate,
     request: Request,
-    current_user: User = Depends(get_authenticated_user),
+    current_user: DepartmentContext = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     """更新当前用户的个人资料"""
@@ -683,7 +683,7 @@ async def update_profile(
 async def create_user(
     user_data: UserCreate,
     request: Request,
-    current_user: User = Depends(get_superadmin_user),
+    current_user: DepartmentContext = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     """创建新用户（管理员权限）"""
@@ -720,61 +720,20 @@ async def create_user(
     # 创建新用户
     hashed_password = AuthUtils.hash_password(user_data.password)
 
-    # 检查角色权限
-    # 禁止创建超级管理员账户（系统只能有一个超级管理员）
-    if user_data.role == "superadmin":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="不能创建超级管理员账户",
-        )
-
-    # 管理员只能创建普通用户
-    if current_user.role == "admin" and user_data.role != "user":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="管理员只能创建普通用户账户",
-        )
-
-    # 部门分配逻辑
-    if current_user.role == "superadmin":
-        # 超级管理员创建用户时，使用指定的部门或默认部门
-        department_id = user_data.department_id
-        if department_id is None:
-            # 获取默认部门
-            dept_repo = DepartmentRepository(db)
-            departments = await dept_repo.list_departments()
-            default_dept = next((d for d in departments if d.name == "默认部门"), None)
-            department_id = default_dept.id if default_dept else None
-    else:
-        # 普通管理员创建用户时，自动继承该管理员的部门
-        department_id = current_user.department_id
-        if department_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="管理员必须属于部门才能创建用户",
-            )
-        # 非超级管理员不能指定部门
-        if user_data.department_id is not None:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="普通管理员不能指定部门",
-            )
-
+    # 账号身份固定全局 user；部门角色与归属仅走成员接口
     new_user = await user_repo.create(
         {
             "username": user_data.username,
             "uid": uid,
             "phone_number": user_data.phone_number,
             "password_hash": hashed_password,
-            "role": user_data.role,
-            "department_id": department_id,
+            "role": "user",
+            "department_id": None,
         }
     )
 
     # 记录操作
-    await log_operation(
-        db, current_user.id, "创建用户", f"创建用户: {user_data.username}, 角色: {user_data.role}", request
-    )
+    await log_operation(db, current_user.id, "创建用户", f"创建用户: {user_data.username}", request)
     await db.commit()
 
     return new_user.to_dict()
@@ -787,7 +746,7 @@ async def read_users_page(
     search: str | None = Query(None, max_length=100),
     department_id: int | None = Query(None, ge=1),
     role: Literal["superadmin", "admin", "user"] | None = None,
-    current_user: User = Depends(get_superadmin_user),
+    current_user: DepartmentContext = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     """分页查询当前管理员可管理的有效用户。"""
@@ -795,8 +754,8 @@ async def read_users_page(
         db,
         offset=offset,
         limit=limit,
-        is_superadmin=current_user.role == "superadmin",
-        visible_department_id=current_user.department_id,
+        is_superadmin=True,
+        visible_department_id=None,
         department_id=department_id,
         role=role,
         search=search.strip() if search else None,
@@ -808,20 +767,11 @@ async def read_users_page(
 async def read_users(
     skip: int = 0,
     limit: int = 100,
-    current_user: User = Depends(get_superadmin_user),
+    current_user: DepartmentContext = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     user_repo = UserRepository(db)
-
-    # 部门隔离逻辑
-    if current_user.role == "superadmin":
-        # 超级管理员可以看到所有用户
-        users_with_dept = await user_repo.list_with_department(skip=skip, limit=limit)
-    else:
-        # 普通管理员只能看到本部门用户
-        users_with_dept = await user_repo.list_with_department(
-            skip=skip, limit=limit, department_id=current_user.department_id
-        )
+    users_with_dept = await user_repo.list_with_department(skip=skip, limit=limit)
 
     users = []
     for user, dept_name in users_with_dept:
@@ -831,30 +781,15 @@ async def read_users(
     return users
 
 
-def _ensure_user_in_current_department(current_user: User, target_user: User) -> None:
-    if current_user.role == "superadmin":
-        return
-    if target_user.department_id != current_user.department_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只能管理本部门用户",
-        )
-
-
 @auth.get("/users/access-options", response_model=list[UserAccessOption])
 async def read_user_access_options(
     skip: int = 0,
     limit: int = 1000,
-    current_user: User = Depends(get_superadmin_user),
+    current_user: DepartmentContext = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     user_repo = UserRepository(db)
-    if current_user.role == "superadmin":
-        users_with_dept = await user_repo.list_with_department(skip=skip, limit=limit)
-    else:
-        users_with_dept = await user_repo.list_with_department(
-            skip=skip, limit=limit, department_id=current_user.department_id
-        )
+    users_with_dept = await user_repo.list_with_department(skip=skip, limit=limit)
     return [
         {
             "uid": user.uid,
@@ -871,7 +806,7 @@ async def read_user_access_options(
 @auth.get("/users/{user_id}", response_model=UserResponse)
 async def read_user(
     user_id: int,
-    current_user: User = Depends(get_superadmin_user),
+    current_user: DepartmentContext = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     user = await UserRepository(db).get_active_by_id(user_id)
@@ -880,7 +815,6 @@ async def read_user(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="用户不存在",
         )
-    _ensure_user_in_current_department(current_user, user)
     return user.to_dict()
 
 
@@ -890,7 +824,7 @@ async def update_user(
     user_id: int,
     user_data: UserUpdate,
     request: Request,
-    current_user: User = Depends(get_superadmin_user),
+    current_user: DepartmentContext = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     user_repository = UserRepository(db)
@@ -901,21 +835,12 @@ async def update_user(
             detail="用户不存在",
         )
 
-    _ensure_user_in_current_department(current_user, user)
-
-    # 检查权限
-    if user.role == "superadmin" and current_user.role != "superadmin":
+    # 超级管理员不能被其他身份路径修改（本接口仅超管可用）
+    if user.role == "superadmin" and current_user.account_role != "superadmin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有超级管理员才能修改超级管理员账户",
         )
-
-    if current_user.role == "admin":
-        if user.role != "user":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="管理员只能修改普通用户账户",
-            )
 
     # 更新信息
     update_details = []
@@ -943,28 +868,6 @@ async def update_user(
         user.avatar = user_data.avatar
         update_details.append(f"头像: {user_data.avatar or '已清空'}")
 
-    # 部门修改权限控制（只有超级管理员可以修改用户部门）
-    if user_data.department_id is not None and user_data.department_id != user.department_id:
-        if current_user.role != "superadmin":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="只有超级管理员才能修改用户部门",
-            )
-
-        # 检查该用户是否是当前部门的唯一管理员
-        if user.role == "admin" and user.department_id is not None:
-            admin_count = await user_repository.get_admin_count_in_department(
-                user.department_id, exclude_user_id=user_id
-            )
-            if admin_count <= 1:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="不能修改该用户的部门，因为该用户是当前部门的唯一管理员",
-                )
-
-        user.department_id = user_data.department_id
-        update_details.append(f"部门ID: {user_data.department_id}")
-
     await user_repository.save(user)
 
     # 记录操作
@@ -979,7 +882,7 @@ async def update_user(
 async def delete_user(
     user_id: int,
     request: Request,
-    current_user: User = Depends(get_superadmin_user),
+    current_user: DepartmentContext = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     user_repository = UserRepository(db)
@@ -990,29 +893,12 @@ async def delete_user(
             detail="用户不存在",
         )
 
-    _ensure_user_in_current_department(current_user, user)
-
     # 不能删除超级管理员账户
     if user.role == "superadmin":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="不能删除超级管理员账户",
         )
-
-    if current_user.role == "admin" and user.role != "user":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="管理员只能删除普通用户账户",
-        )
-
-    # 检查是否是部门的唯一管理员
-    if user.role == "admin" and current_user.role != "superadmin":
-        admin_count = await user_repository.get_admin_count_in_department(user.department_id)
-        if admin_count <= 1:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="不能删除部门唯一的管理员",
-            )
 
     # 不能删除自己的账户
     if user.id == current_user.id:
@@ -1052,7 +938,7 @@ async def delete_user(
 @auth.post("/validate-username", response_model=UidGeneration)
 async def validate_username_and_generate_uid(
     validation_data: UsernameValidation,
-    current_user: User = Depends(get_superadmin_user),
+    current_user: DepartmentContext = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     """验证用户名格式并生成可用的user_id"""
@@ -1084,7 +970,7 @@ async def validate_username_and_generate_uid(
 @auth.get("/check-uid/{uid}")
 async def check_uid_availability(
     uid: str,
-    current_user: User = Depends(get_superadmin_user),
+    current_user: DepartmentContext = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     """检查 uid 是否可用"""
@@ -1095,7 +981,7 @@ async def check_uid_availability(
 @auth.post("/upload-avatar")
 async def upload_user_avatar(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_authenticated_user),
+    current_user: DepartmentContext = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     """上传用户头像"""
@@ -1130,7 +1016,7 @@ async def upload_user_avatar(
 async def impersonate_user(
     user_id: int,
     request: Request,
-    current_user: User = Depends(get_superadmin_user),
+    current_user: DepartmentContext = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
     """超级管理员模拟其他用户登录"""

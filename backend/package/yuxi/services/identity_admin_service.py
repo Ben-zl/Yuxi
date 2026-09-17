@@ -6,6 +6,7 @@ from fastapi import Request
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from yuxi.repositories.department_membership_repository import DepartmentMembershipRepository
 from yuxi.repositories.department_repository import DepartmentRepository
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.services.operation_log_service import log_operation
@@ -73,7 +74,7 @@ async def create_department_with_admin(
     actor_user_id: int,
     request: Request | None = None,
 ) -> DepartmentAdminCreation:
-    """原子创建部门、首位管理员和强制审计事实。"""
+    """原子创建部门、首位管理员和强制审计事实；管理员身份落在成员关系上。"""
 
     password_hash = AuthUtils.hash_password(admin_password)
     try:
@@ -90,10 +91,11 @@ async def create_department_with_admin(
                     "uid": admin_uid,
                     "phone_number": admin_phone,
                     "password_hash": password_hash,
-                    "role": "admin",
+                    "role": "user",
                     "department_id": department.id,
                 }
             )
+            await DepartmentMembershipRepository(db).add(admin.id, department.id, role="admin")
         except IntegrityError as exc:
             raise IdentityConflictError("部门名称、管理员用户ID、用户名或手机号已存在") from exc
 

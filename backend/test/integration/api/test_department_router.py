@@ -22,7 +22,6 @@ async def test_superadmin_can_delete_department_with_users(test_client, admin_he
     user_payload = {
         "username": f"dept_user_{suffix}",
         "password": "RouterUser123!",
-        "role": "user",
     }
 
     department_id = None
@@ -40,13 +39,13 @@ async def test_superadmin_can_delete_department_with_users(test_client, admin_he
 
         create_user_response = await test_client.post(
             "/api/auth/users",
-            json={**user_payload, "department_id": department_id},
+            json={**user_payload},
             headers=admin_headers,
         )
         assert create_user_response.status_code == 200, create_user_response.text
         created_user_id = create_user_response.json()["id"]
 
-        list_users_response = await test_client.get("/api/auth/users", headers=admin_headers)
+        list_users_response = await test_client.get("/api/auth/users?limit=1000", headers=admin_headers)
         assert list_users_response.status_code == 200, list_users_response.text
         users_before_delete = list_users_response.json()
         department_admin = next(
@@ -55,6 +54,14 @@ async def test_superadmin_can_delete_department_with_users(test_client, admin_he
         assert department_admin is not None
         department_admin_id = department_admin["id"]
 
+        # 新语义：部门含成员关系时删除被拒（409），清成员后可删
+        conflict_delete = await test_client.delete(f"/api/departments/{department_id}", headers=admin_headers)
+        assert conflict_delete.status_code == 409, conflict_delete.text
+        me = await test_client.get("/api/auth/me", headers=admin_headers)
+        revision_headers = {**admin_headers, "X-Department-Revision": str(me.json()["context_revision"])}
+        await test_client.delete(
+            f"/api/departments/{department_id}/members/{department_admin_id}", headers=revision_headers
+        )
         delete_department_response = await test_client.delete(
             f"/api/departments/{department_id}", headers=admin_headers
         )
@@ -68,7 +75,7 @@ async def test_superadmin_can_delete_department_with_users(test_client, admin_he
         )
         assert deleted_department_response.status_code == 404, deleted_department_response.text
 
-        list_users_after_delete_response = await test_client.get("/api/auth/users", headers=admin_headers)
+        list_users_after_delete_response = await test_client.get("/api/auth/users?limit=1000", headers=admin_headers)
         assert list_users_after_delete_response.status_code == 200, list_users_after_delete_response.text
         users_after_delete = list_users_after_delete_response.json()
 
@@ -77,9 +84,10 @@ async def test_superadmin_can_delete_department_with_users(test_client, admin_he
         assert migrated_admin is not None
         assert migrated_admin["department_id"] == 1
 
+        # 普通用户与部门的关联走成员关系（删除时已清理），旧单部门字段保持无归属
         migrated_user = next((user for user in users_after_delete if user["id"] == created_user_id), None)
         assert migrated_user is not None
-        assert migrated_user["department_id"] == 1
+        assert migrated_user["department_id"] is None
     finally:
         if department_admin_id is not None:
             await test_client.delete(f"/api/auth/users/{department_admin_id}", headers=admin_headers)

@@ -280,14 +280,3 @@ class UserRepository:
         async with self._session() as session:
             result = await session.execute(select(User.uid))
             return [uid for (uid,) in result.all()]
-
-    async def get_admin_count_in_department(self, department_id: int, exclude_user_id: int | None = None) -> int:
-        """统计部门中管理员数量"""
-        async with self._session() as session:
-            query = select(func.count(User.id)).where(
-                User.department_id == department_id, User.role == "admin", User.is_deleted == 0
-            )
-            if exclude_user_id is not None:
-                query = query.where(User.id != exclude_user_id)
-            result = await session.execute(query)
-            return result.scalar() or 0
