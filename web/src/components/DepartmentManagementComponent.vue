@@ -125,10 +125,10 @@
 
         <template v-if="!departmentManagement.editMode">
           <p class="admin-section-hint">
-            创建部门时必须同时创建管理员，该管理员将负责管理本部门用户
+            创建部门时必须同时创建部门管理员；其管理员身份仅在本部门的成员关系内生效，不是全局账号身份
           </p>
 
-          <a-form-item label="管理员UID" required class="form-item">
+          <a-form-item label="部门管理员UID" required class="form-item">
             <a-input
               v-model:value="departmentManagement.form.adminUid"
               placeholder="请输入管理员UID（3-20位字母/数字/下划线）"
@@ -144,7 +144,7 @@
             <div v-else class="help-text">此 UID 将用于登录</div>
           </a-form-item>
 
-          <a-form-item label="密码" required class="form-item">
+          <a-form-item label="部门管理员密码" required class="form-item">
             <a-input-password
               v-model:value="departmentManagement.form.adminPassword"
               :placeholder="`请输入管理员密码（至少 ${MIN_PASSWORD_LENGTH} 位）`"
@@ -442,7 +442,7 @@ const handleDepartmentFormSubmit = async () => {
         admin_phone: departmentManagement.form.adminPhone || undefined
       })
 
-      message.success(`部门创建成功，管理员 "${adminUid}" 已创建`)
+      message.success(`部门创建成功，"${adminUid}" 已加入本部门并担任部门管理员`)
     }
 
     // 重新获取部门列表

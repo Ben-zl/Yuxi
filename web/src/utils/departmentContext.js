@@ -39,3 +39,19 @@ export function memberActions(accountRole, currentRole, targetRole) {
     canEditRole: superadmin
   }
 }
+
+/**
+ * 判断设置面板“成员管理”标签对当前身份是否可见。
+ *
+ * 成员管理只作用于当前部门，超管与当前部门管理员可见；
+ * 无当前部门时没有可管理对象，超管也不例外。
+ *
+ * @param {string} accountRole 全局账号身份：superadmin/user
+ * @param {string} currentRole 当前部门有效角色
+ * @param {boolean} hasDepartment 是否有当前活动部门
+ * @returns {boolean}
+ */
+export function canManageCurrentDepartmentMembers(accountRole, currentRole, hasDepartment) {
+  if (!hasDepartment) return false
+  return accountRole === 'superadmin' || currentRole === 'admin'
+}

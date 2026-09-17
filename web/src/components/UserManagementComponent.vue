@@ -5,7 +5,7 @@
       <div class="header-content">
         <div class="section-title">用户管理</div>
         <p class="section-description">
-          管理系统用户，请谨慎操作。删除用户后该用户将无法登录系统。
+          管理系统账号，请谨慎操作。删除账号后该账号将无法登录；部门内角色请在“成员管理”中调整。
         </p>
       </div>
       <div class="header-actions">
@@ -36,20 +36,9 @@
         <template #prefix><Search :size="16" /></template>
       </a-input>
       <div class="filter-actions">
-        <a-select v-model:value="userManagement.departmentFilter" class="filter-select">
-          <a-select-option value="">全部部门</a-select-option>
-          <a-select-option
-            v-for="dept in departmentFilterOptions"
-            :key="dept.value"
-            :value="dept.value"
-          >
-            {{ dept.label }}
-          </a-select-option>
-        </a-select>
         <a-select v-model:value="userManagement.roleFilter" class="filter-select">
-          <a-select-option value="">全部权限</a-select-option>
+          <a-select-option value="">全部身份</a-select-option>
           <a-select-option value="superadmin">超级管理员</a-select-option>
-          <a-select-option value="admin">管理员</a-select-option>
           <a-select-option value="user">普通用户</a-select-option>
         </a-select>
       </div>
@@ -98,9 +87,6 @@
                     <User v-else :size="12" />
                     <span>{{ getRoleDisplayName(record.role) }}</span>
                   </span>
-                </template>
-                <template v-if="column.key === 'department'">
-                  <span class="dept-text">{{ record.department_name || '-' }}</span>
                 </template>
                 <template v-if="column.key === 'phone'">
                   <span class="phone-text">{{ record.phone_number || '-' }}</span>
@@ -227,26 +213,6 @@
             />
           </a-form-item>
         </template>
-
-        <a-form-item v-if="!userManagement.editMode" label="角色" class="form-item">
-          <a-select v-model:value="userManagement.form.role">
-            <a-select-option value="user">普通用户</a-select-option>
-            <a-select-option value="admin" v-if="userStore.isSuperAdmin">管理员</a-select-option>
-          </a-select>
-        </a-form-item>
-
-        <!-- 部门选择器（仅超级管理员可见） -->
-        <a-form-item v-if="userStore.isSuperAdmin" label="部门" class="form-item">
-          <a-select v-model:value="userManagement.form.departmentId" placeholder="请选择部门">
-            <a-select-option
-              v-for="dept in departmentManagement.departments"
-              :key="dept.id"
-              :value="dept.id"
-            >
-              {{ dept.name }}
-            </a-select-option>
-          </a-select>
-        </a-form-item>
       </a-form>
     </a-modal>
   </div>
@@ -256,7 +222,7 @@
 import { reactive, onMounted, onUnmounted, watch, computed } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { useUserStore } from '@/stores/user'
-import { authApi, departmentApi } from '@/apis'
+import { authApi } from '@/apis'
 import { Plus, SquarePen, Trash2, User, UserLock, UserStar, RefreshCw, Search } from '@lucide/vue'
 import { formatDateTime } from '@/utils/time'
 import { isPasswordLongEnough, MIN_PASSWORD_LENGTH } from '@/utils/passwordValidation'
@@ -266,11 +232,10 @@ import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
 const userStore = useUserStore()
 
 const columns = [
-  { title: '用户', key: 'user', width: '26%' },
-  { title: '角色', dataIndex: 'role', key: 'role', width: '16%' },
-  { title: '所属部门', dataIndex: 'department_name', key: 'department', width: '18%' },
-  { title: '手机号', dataIndex: 'phone_number', key: 'phone', width: '16%' },
-  { title: '最后登录', dataIndex: 'last_login', key: 'lastLogin', width: '14%' },
+  { title: '用户', key: 'user', width: '34%' },
+  { title: '账号身份', dataIndex: 'role', key: 'role', width: '20%' },
+  { title: '手机号', dataIndex: 'phone_number', key: 'phone', width: '20%' },
+  { title: '最后登录', dataIndex: 'last_login', key: 'lastLogin', width: '16%' },
   { title: '操作', key: 'action', width: '10%', align: 'center' }
 ]
 
@@ -290,7 +255,6 @@ const userManagement = reactive({
   users: [],
   total: 0,
   searchKeyword: '',
-  departmentFilter: '',
   roleFilter: '',
   currentPage: 1,
   pageSize: 20,
@@ -305,65 +269,15 @@ const userManagement = reactive({
     phoneNumber: '', // 手机号
     password: '',
     confirmPassword: '',
-    role: 'user', // 默认角色
-    departmentId: null, // 部门ID
     usernameError: '', // 用户名错误信息
     phoneError: '' // 手机号错误信息
   },
   displayPasswordFields: true // 编辑时是否显示密码字段
 })
 
-// 部门列表（仅超级管理员使用）
-const departmentManagement = reactive({
-  departments: []
-})
-
 const hasActiveFilters = computed(
-  () =>
-    Boolean(userManagement.searchKeyword.trim()) ||
-    Boolean(userManagement.departmentFilter) ||
-    Boolean(userManagement.roleFilter)
+  () => Boolean(userManagement.searchKeyword.trim()) || Boolean(userManagement.roleFilter)
 )
-
-const departmentFilterOptions = computed(() => {
-  const options = new Map()
-
-  departmentManagement.departments.forEach((dept) => {
-    options.set(String(dept.id), {
-      value: String(dept.id),
-      label: dept.name
-    })
-  })
-
-  userManagement.users.forEach((user) => {
-    const departmentId = user.department_id
-    const departmentName = user.department_name
-
-    if (departmentId == null && !departmentName) return
-
-    const value = String(departmentId ?? departmentName)
-
-    if (!options.has(value)) {
-      options.set(value, {
-        value,
-        label: departmentName || `部门 ${departmentId}`
-      })
-    }
-  })
-
-  return [...options.values()]
-})
-
-// 获取部门列表
-const fetchDepartments = async () => {
-  if (!userStore.isSuperAdmin) return // 普通管理员不需要获取所有部门列表
-  try {
-    const departments = await departmentApi.getDepartments()
-    departmentManagement.departments = departments
-  } catch (error) {
-    console.error('获取部门列表失败:', error)
-  }
-}
 
 // 添加验证用户名并生成uid的函数
 const validateAndGenerateUid = async () => {
@@ -427,7 +341,7 @@ watch(
 
 let filterRequestTimer = null
 watch(
-  () => [userManagement.searchKeyword, userManagement.departmentFilter, userManagement.roleFilter],
+  () => [userManagement.searchKeyword, userManagement.roleFilter],
   () => {
     userManagement.currentPage = 1
     if (filterRequestTimer) clearTimeout(filterRequestTimer)
@@ -454,7 +368,6 @@ const fetchUsers = async () => {
       offset: (userManagement.currentPage - 1) * pageSize,
       limit: pageSize,
       search: userManagement.searchKeyword.trim(),
-      departmentId: userManagement.departmentFilter,
       role: userManagement.roleFilter
     })
     if (requestId !== latestUserRequest) return
@@ -485,12 +398,12 @@ const handlePageChange = (page, pageSize) => {
   fetchUsers()
 }
 
-// 刷新用户和部门信息
+// 刷新用户列表
 const handleRefresh = async () => {
   if (userManagement.refreshing) return
   userManagement.refreshing = true
   try {
-    await Promise.all([fetchUsers(), fetchDepartments()])
+    await fetchUsers()
     message.success('刷新成功')
   } catch (error) {
     console.error('刷新失败:', error)
@@ -511,8 +424,6 @@ const showAddUserModal = () => {
     phoneNumber: '',
     password: '',
     confirmPassword: '',
-    role: 'user', // 默认角色为普通用户
-    departmentId: null,
     usernameError: '',
     phoneError: ''
   }
@@ -531,7 +442,6 @@ const showEditUserModal = (user) => {
     phoneNumber: user.phone_number || '',
     password: '',
     confirmPassword: '',
-    departmentId: user.department_id || null,
     usernameError: '',
     phoneError: ''
   }
@@ -582,9 +492,8 @@ const handleUserFormSubmit = async () => {
 
     userManagement.loading = true
 
-    // 根据模式决定创建还是更新用户
+    // 与收紧后的 UserCreate/UserUpdate 对齐：仅 username/password/phone_number
     if (userManagement.editMode) {
-      // 创建更新数据对象
       const updateData = {
         username: userManagement.form.username.trim()
       }
@@ -592,11 +501,6 @@ const handleUserFormSubmit = async () => {
       // 添加手机号字段
       if (userManagement.form.phoneNumber) {
         updateData.phone_number = userManagement.form.phoneNumber
-      }
-
-      // 超级管理员可以修改部门
-      if (userStore.isSuperAdmin && userManagement.form.departmentId) {
-        updateData.department_id = userManagement.form.departmentId
       }
 
       // 如果显示了密码字段并且填写了密码，才更新密码
@@ -607,16 +511,10 @@ const handleUserFormSubmit = async () => {
       await userStore.updateUser(userManagement.editUserId, updateData)
       message.success('用户更新成功')
     } else {
-      // 创建新用户
+      // 创建普通账号，不要求部门；部门角色由成员管理维护
       const createData = {
         username: userManagement.form.username.trim(),
-        password: userManagement.form.password,
-        role: userManagement.form.role
-      }
-
-      // 超级管理员可以指定部门
-      if (userStore.isSuperAdmin && userManagement.form.departmentId) {
-        createData.department_id = userManagement.form.departmentId
+        password: userManagement.form.password
       }
 
       // 添加手机号字段（如果填写了）
@@ -625,7 +523,7 @@ const handleUserFormSubmit = async () => {
       }
 
       await userStore.createUser(createData)
-      message.success('用户创建成功')
+      message.success('用户创建成功，可在“成员管理”中将其加入部门')
     }
 
     // 重新获取用户列表
@@ -674,7 +572,6 @@ const confirmDeleteUser = (user) => {
 // 在组件挂载时获取用户列表
 onMounted(async () => {
   await fetchUsers()
-  await fetchDepartments()
 })
 
 onUnmounted(() => {
@@ -902,7 +799,6 @@ onUnmounted(() => {
         }
       }
 
-      .dept-text,
       .time-text {
         color: var(--gray-600);
         font-size: 12px;

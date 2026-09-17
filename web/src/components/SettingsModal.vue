@@ -57,9 +57,18 @@
           </div>
           <div
             class="sider-item"
+            :class="{ activesec: activeTab === 'members' }"
+            @click="activeTab = 'members'"
+            v-if="canManageMembers"
+          >
+            <UserPlus class="icon" :size="18" />
+            <span>成员管理</span>
+          </div>
+          <div
+            class="sider-item"
             :class="{ activesec: activeTab === 'user' }"
             @click="activeTab = 'user'"
-            v-if="userStore.isAdmin"
+            v-if="userStore.isSuperAdmin"
           >
             <User class="icon" :size="18" />
             <span>用户管理</span>
@@ -162,9 +171,17 @@
         </div>
         <div
           class="nav-item"
+          :class="{ active: activeTab === 'members' }"
+          @click="activeTab = 'members'"
+          v-if="canManageMembers"
+        >
+          成员管理
+        </div>
+        <div
+          class="nav-item"
           :class="{ active: activeTab === 'user' }"
           @click="activeTab = 'user'"
-          v-if="userStore.isAdmin"
+          v-if="userStore.isSuperAdmin"
         >
           用户管理
         </div>
@@ -201,7 +218,11 @@
             <OCRSettingsSection />
           </div>
 
-          <div v-show="activeTab === 'user'" v-if="userStore.isAdmin">
+          <div v-show="activeTab === 'members'" v-if="canManageMembers">
+            <DepartmentMembersComponent />
+          </div>
+
+          <div v-show="activeTab === 'user'" v-if="userStore.isSuperAdmin">
             <UserManagementComponent />
           </div>
 
@@ -226,6 +247,7 @@ import {
   Star,
   SquareTerminal,
   User,
+  UserPlus,
   Users,
   X
 } from '@lucide/vue'
@@ -234,8 +256,10 @@ import AgentEnvSettingsCard from '@/components/AgentEnvSettingsCard.vue'
 import BasicSettingsSection from '@/components/BasicSettingsSection.vue'
 import OCRSettingsSection from '@/components/OCRSettingsSection.vue'
 import ApiKeyManagementComponent from '@/components/ApiKeyManagementComponent.vue'
+import DepartmentMembersComponent from '@/components/DepartmentMembersComponent.vue'
 import UserManagementComponent from '@/components/UserManagementComponent.vue'
 import DepartmentManagementComponent from '@/components/DepartmentManagementComponent.vue'
+import { canManageCurrentDepartmentMembers } from '@/utils/departmentContext'
 
 const props = defineProps({
   visible: {
@@ -262,11 +286,21 @@ const visible = computed({
   set: (value) => emit('update:visible', value)
 })
 
+// 成员管理仅对有当前部门的管理者可见；用户管理为超级管理员专属
+const canManageMembers = computed(() =>
+  canManageCurrentDepartmentMembers(
+    userStore.accountRole,
+    userStore.userRole,
+    userStore.departmentId !== null
+  )
+)
+
 const availableTabs = computed(() => {
   const tabs = []
   if (userStore.isLoggedIn) tabs.push('account', 'apiKeys', 'agentEnv')
-  if (userStore.isAdmin) tabs.push('base', 'ocr', 'user')
-  if (userStore.isSuperAdmin) tabs.push('department')
+  if (userStore.isAdmin) tabs.push('base', 'ocr')
+  if (canManageMembers.value) tabs.push('members')
+  if (userStore.isSuperAdmin) tabs.push('user', 'department')
   return tabs
 })
 
@@ -277,6 +311,13 @@ const setActiveTab = (preferredTab) => {
   }
   activeTab.value = userStore.isAdmin ? 'base' : availableTabs.value[0]
 }
+
+// 角色下降或部门失效导致当前标签不可见时，退回个人设置
+watch([() => userStore.isSuperAdmin, canManageMembers], () => {
+  if (!availableTabs.value.includes(activeTab.value)) {
+    activeTab.value = 'account'
+  }
+})
 
 const handleClose = () => {
   emit('close')

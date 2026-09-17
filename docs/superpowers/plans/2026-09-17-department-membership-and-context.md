@@ -390,7 +390,7 @@ export function createDepartmentEpoch() {
 
 **Interfaces:** department API 导出 `listMembers(departmentId,params)`、`searchMemberCandidates(departmentId,params)`、`addMember(departmentId,userId)`、`updateMemberRole(departmentId,userId,role)`、`removeMember(departmentId,userId)`，对应任务3协议。工具新增 `memberActions(accountRole,currentRole,targetRole)` 返回 `{canAdd,canRemove,canEditRole}`；服务器仍为授权事实 Owner。
 
-- [ ] 写纯函数测试：
+- [x] 写纯函数测试：
 
 ```javascript
 import assert from 'node:assert/strict'
@@ -404,7 +404,7 @@ test('部门管理员不能操作管理员角色', () => {
 })
 ```
 
-- [ ] 运行 `cd web && node --test test/unit/department_member_permissions.test.js`，预期缺少导出失败；实现真实按钮使用的函数：
+- [x] 运行 `cd web && node --test test/unit/department_member_permissions.test.js`，预期缺少导出失败；实现真实按钮使用的函数：
 
 ```javascript
 export function memberActions(accountRole, currentRole, targetRole) {
@@ -419,10 +419,15 @@ export function memberActions(accountRole, currentRole, targetRole) {
 }
 ```
 
-- [ ] SettingsModal 桌面入口、移动入口、availableTabs、直接指定标签与内容挂载统一 `isSuperAdmin` 限制用户管理；新增 member 标签仅当前admin/superadmin可见，角色下降时若当前标签失效则退回个人设置。router 的账号管理入口使用同一限制。
-- [ ] 成员组件只使用 user store 当前部门，不再新增部门选择器。列表显示名称/登录ID/部门角色，分别实现加载、空结果、加载失败重试；添加弹窗查询候选账号默认普通角色。只有超级管理员显示 admin/user 选择；部门管理员不显示无实际变化的编辑按钮。移除前确认目标姓名；写入失败保留原列表并显示错误，成功重读后端分页。
-- [ ] 用户管理去掉单部门与部门admin角色编辑，创建普通账号不要求部门；保留超级管理员身份既有保护。部门创建界面仍可创建管理员账号，但响应展示成员角色，避免暗示全局admin身份。
-- [ ] 运行 `cd web && pnpm run test:unit && pnpm run lint:check && pnpm run build`。真实浏览器覆盖三身份、移动设置、直接打开非法标签、最后管理员移除、候选空/失败、写入失败；保存最终截图后审查提交 `feat: 增加设置成员管理并收紧用户管理入口`。
+- [x] SettingsModal 桌面入口、移动入口、availableTabs、直接指定标签与内容挂载统一 `isSuperAdmin` 限制用户管理；新增 member 标签仅当前admin/superadmin可见，角色下降时若当前标签失效则退回个人设置。router 的账号管理入口使用同一限制。
+- [x] 成员组件只使用 user store 当前部门，不再新增部门选择器。列表显示名称/登录ID/部门角色，分别实现加载、空结果、加载失败重试；添加弹窗查询候选账号默认普通角色。只有超级管理员显示 admin/user 选择；部门管理员不显示无实际变化的编辑按钮。移除前确认目标姓名；写入失败保留原列表并显示错误，成功重读后端分页。
+- [x] 用户管理去掉单部门与部门admin角色编辑，创建普通账号不要求部门；保留超级管理员身份既有保护。部门创建界面仍可创建管理员账号，但响应展示成员角色，避免暗示全局admin身份。
+- [x] 运行 `cd web && pnpm run test:unit && pnpm run lint:check && pnpm run build`。真实浏览器覆盖三身份、移动设置、直接打开非法标签、最后管理员移除、候选空/失败、写入失败；保存最终截图后审查提交 `feat: 增加设置成员管理并收紧用户管理入口`。
+
+**执行记录（2026-09-18，子代理实施+开发者复核）：**
+- 实现：department_api 五函数（对应任务3协议；PATCH 沿 base.js 既有 checkAdminPermission 模式）；DepartmentMembersComponent（只用 store 当前部门、列表/分页/添加弹窗/超管角色选择/移除确认姓名/失败保留原列表、切换部门重置、stale 静默）；SettingsModal 用户管理桌面+移动+availableTabs+挂载统一 isSuperAdmin，新增 members 标签（canManageCurrentDepartmentMembers：超管或当前部门 admin 且有活动部门），角色下降 watch 退回个人设置；UserManagement 移除部门选择器/部门列/admin 角色编辑，请求体对齐收紧后 UserCreate/UserUpdate；DepartmentManagement 创建管理员文案改 membership 语义；router 审计确认无账号管理路由（SettingsModal 为唯一入口）无需改。
+- 测试：`department_member_permissions.test.js` red→green 3 pass（memberActions 三断言 verbatim + 超管矩阵 + 标签可见性）；全量 256/256 pass；lint:check（--max-warnings=0）与 build exit 0；新组件 dev server transform 200。
+- Not run：真实浏览器覆盖（三身份/移动/非法标签/最后管理员移除/候选与写入失败/截图）——计划归属任务10 验收。getUsersPage 的 departmentId 形参保留（后端仍支持，不在本任务 Files）。
 
 ## Task 10：开发账号清理、旧字段收口与整体验收
 
