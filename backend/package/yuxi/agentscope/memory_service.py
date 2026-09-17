@@ -63,8 +63,20 @@ class AgentMemoryService:
         }
         return result
 
-    async def delete_item(self, uid: str, agent_slug: str, memory_id: str) -> None:
-        """独占 scope 删除一张卡片，并在提交删除前重建索引。"""
+    async def delete_item(
+        self,
+        uid: str,
+        agent_slug: str,
+        memory_id: str,
+        *,
+        department_id: int | None = None,
+    ) -> None:
+        """独占 scope 删除一张卡片，并在提交删除前重建索引。
+
+        department_id 为用户显式请求的有效部门：携带时本次重建按该部门
+        投影并在成功事务中重绑 scope 维护部门；后台调用不传值，只消费
+        scope 既有绑定，不绑定明确失败。
+        """
         async with self.registry.acquire_exclusive(uid, agent_slug):
             workspace = validate_memory_workspace(self.base_dir, uid, agent_slug)
             await delete_memory_card(
@@ -75,6 +87,7 @@ class AgentMemoryService:
                     agent_slug,
                     workspace,
                     daily_date=daily_date,
+                    department_id=department_id,
                 ),
             )
 
@@ -95,15 +108,22 @@ class AgentMemoryService:
             records = await AgentMemoryScopeRepository(db).list_for_user(uid)
         return await self._clear_records(records)
 
-    async def _load_projection(self, uid: str, agent_slug: str):
-        """为维护任务解析模型，即使用户当前已关闭 Memory。"""
+    async def _load_projection(self, uid: str, agent_slug: str, *, department_id: int):
+        """按固定维护部门解析模型，即使用户当前已关闭 Memory。"""
         async with pg_manager.get_async_session_context() as db:
             return await project_runtime(
                 db,
                 uid=uid,
                 agent_slug=agent_slug,
                 include_memory_models=True,
+                department_id=department_id,
             )
+
+    async def _maintenance_department_id(self, uid: str, agent_slug: str) -> int | None:
+        """读取 scope 创建时记录的维护部门；无绑定返回 None。"""
+        async with pg_manager.get_async_session_context() as db:
+            record = await AgentMemoryScopeRepository(db).get(uid, agent_slug)
+            return record.maintenance_department_id if record else None
 
     async def reindex_scope(
         self,
@@ -112,9 +132,19 @@ class AgentMemoryService:
         workspace: Path,
         *,
         daily_date: str | None = None,
+        department_id: int | None = None,
     ) -> None:
-        """使用短生命周期 ReMe 应用完整重建一个 scope 的混合索引。"""
-        projection = await self._load_projection(uid, agent_slug)
+        """使用短生命周期 ReMe 应用完整重建一个 scope 的混合索引。
+
+        department_id 非空为用户显式重建：按请求有效部门投影，成功后在
+        同一成功事务内重绑 scope 维护部门。为空是后台调度路径：只消费
+        scope 既有绑定，无绑定明确失败且不调用模型。
+        """
+        if department_id is None:
+            department_id = await self._maintenance_department_id(uid, agent_slug)
+            if department_id is None:
+                raise RuntimeError("Memory scope 未绑定维护部门，需先通过显式重建索引绑定部门")
+        projection = await self._load_projection(uid, agent_slug, department_id=department_id)
         chat_model, embedding_model, _fingerprint = build_memory_models(projection)
         async with reme_maintenance_app(
             workspace_dir=workspace,
@@ -128,6 +158,14 @@ class AgentMemoryService:
             response = await maintenance.run_job("reindex")
             if getattr(response, "success", True) is False:
                 raise RuntimeError(f"ReMe reindex failed: {getattr(response, 'answer', '')}")
+        # 显式重建成功才重绑；后台调度调用不传 department_id，不会走到这里
+        async with pg_manager.get_async_session_context() as db:
+            await AgentMemoryScopeRepository(db).rebind_maintenance_department(
+                uid,
+                agent_slug,
+                department_id,
+            )
+            await db.commit()
 
     async def _delete_scope_data(self, uid: str, agent_slug: str) -> bool:
         """调用方持有独占 lease 时删除 scope 目录和 catalog。"""

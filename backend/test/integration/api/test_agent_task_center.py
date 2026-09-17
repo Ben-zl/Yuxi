@@ -152,8 +152,12 @@ async def _cleanup_all(db):
     await db.commit()
 
 
-async def _user(db, uid: str = "task-it-user", *, superadmin: bool = False) -> User:
+async def _user(db, uid: str = "task-it-user", *, superadmin: bool = False):
+    """确保测试账号并返回绑定固定部门的执行上下文（非交互入口同构）。"""
     from sqlalchemy import select as _select
+
+    from yuxi.services.department_context_service import resolve_department_context
+    from yuxi.storage.postgres.models_business import Department, DepartmentMembership
 
     user = await db.scalar(_select(User).where(User.uid == uid))
     if user is None:
@@ -169,7 +173,25 @@ async def _user(db, uid: str = "task-it-user", *, superadmin: bool = False) -> U
         )
         await db.commit()
         user = await db.scalar(_select(User).where(User.uid == uid))
-    return user
+    # 任务创建/触发均要求固定部门：确保部门与成员事实后解析上下文
+    dept_id = await db.scalar(
+        _select(Department.id).order_by(Department.id).limit(1),
+    )
+    if dept_id is None:
+        dept = Department(name=f"it-task-dept-{uuid.uuid4().hex[:6]}")
+        db.add(dept)
+        await db.flush()
+        dept_id = dept.id
+    membership = await db.scalar(
+        _select(DepartmentMembership).where(
+            DepartmentMembership.user_id == user.id,
+            DepartmentMembership.department_id == dept_id,
+        )
+    )
+    if membership is None and not superadmin:
+        db.add(DepartmentMembership(user_id=user.id, department_id=dept_id, role="admin"))
+        await db.commit()
+    return await resolve_department_context(db, user_id=user.id, department_id=dept_id)
 
 
 def _payload(name: str, **over) -> dict:
@@ -329,8 +351,22 @@ async def test_api_trigger_idempotent(db_session):
     trigger = AgentTaskTriggerService(db_session)
     key = "it-api-key-1"
     api_task_id = task.id
-    e1, c1 = await trigger.trigger(task_id=api_task_id, user=user, trigger_type="api", idempotency_key=key)
-    e2, c2 = await trigger.trigger(task_id=api_task_id, user=user, trigger_type="api", idempotency_key=key)
+    # API 触发要求 key 绑定部门与任务部门一致；测试直接传等值部门模拟合法 key
+    assert task.department_id is not None
+    e1, c1 = await trigger.trigger(
+        task_id=api_task_id,
+        user=user,
+        trigger_type="api",
+        idempotency_key=key,
+        key_department_id=task.department_id,
+    )
+    e2, c2 = await trigger.trigger(
+        task_id=api_task_id,
+        user=user,
+        trigger_type="api",
+        idempotency_key=key,
+        key_department_id=task.department_id,
+    )
     assert c1 is True and c2 is False
     assert e1.id == e2.id
 

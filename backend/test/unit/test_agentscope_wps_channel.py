@@ -47,6 +47,7 @@ def _binding(ciphertext: str) -> AgentScopeChannelBinding:
     return AgentScopeChannelBinding(
         id="binding-1",
         owner_uid="owner-1",
+        department_id=11,
         agent_slug="assistant",
         name="WPS 测试",
         channel_type="wps_xiezuo",
@@ -87,7 +88,9 @@ async def test_reconcile_only_validates_yuxi_projection(monkeypatch, credential_
     assert result.agentscope_channel_id is None
     assert result.agentscope_agent_id is None
     assert result.agentscope_credential_id is None
-    project_runtime.assert_awaited_once_with(db, uid="owner-1", agent_slug="assistant", model_spec=None)
+    project_runtime.assert_awaited_once_with(
+        db, uid="owner-1", agent_slug="assistant", model_spec=None, department_id=11
+    )
 
 
 def test_channel_management_schema_has_no_model_override():
@@ -127,7 +130,7 @@ async def test_ingress_only_deletes_new_orphaned_delivery(
     db = FakeDB()
     binding = _binding(encrypt_app_secret("wps-secret"))
     binding.sync_status = "synced"
-    owner = SimpleNamespace(uid="owner-1", is_deleted=False, department_id=11)
+    owner = SimpleNamespace(id=7, uid="owner-1", is_deleted=False, department_id=11)
     delivery = SimpleNamespace(id=7)
     deliveries = SimpleNamespace(
         create_if_missing=AsyncMock(return_value=(delivery, delivery_created)),
@@ -137,6 +140,8 @@ async def test_ingress_only_deletes_new_orphaned_delivery(
     request_repo = SimpleNamespace(
         get_by_request_id=AsyncMock(side_effect=[None, SimpleNamespace() if accepted_after_failure else None])
     )
+
+    actor = SimpleNamespace(uid="owner-1", department_id=11)
 
     @asynccontextmanager
     async def session_context():
@@ -152,6 +157,11 @@ async def test_ingress_only_deletes_new_orphaned_delivery(
         wps_ingress,
         "UserRepository",
         lambda _db: SimpleNamespace(get_by_uid=AsyncMock(return_value=owner)),
+    )
+    monkeypatch.setattr(
+        wps_ingress,
+        "resolve_department_context",
+        AsyncMock(return_value=actor),
     )
     monkeypatch.setattr(wps_ingress, "ChannelDeliveryRepository", lambda _db: deliveries)
     monkeypatch.setattr(wps_ingress, "AgentRunRequestRepository", lambda _db: request_repo)

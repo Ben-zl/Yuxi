@@ -16,6 +16,7 @@ from yuxi.repositories.api_key_repository import (
     APIKeyRepository,
     APIKeySubjectUnavailable,
 )
+from yuxi.services.department_context_service import DepartmentContext
 from yuxi.storage.minio import upload_image_to_minio
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.auth_utils import AuthUtils
@@ -34,7 +35,6 @@ class APIKeyCreate(BaseModel):
     request_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$")
     name: str
     user_id: int | None = None
-    department_id: int | None = None
     expires_at: str | None = None
 
 
@@ -177,10 +177,11 @@ async def list_api_keys(
 @user_router.post("/apikey/", response_model=APIKeyCreateResponse)
 async def create_api_key(
     data: APIKeyCreate,
-    current_user: User = Depends(get_required_user),
+    current_user: DepartmentContext = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if data.user_id and data.user_id != current_user.id and current_user.role != "superadmin":
+    """创建 API Key：部门绑定取创建者当前有效部门，不接受客户端指定。"""
+    if data.user_id and data.user_id != current_user.id and current_user.account_role != "superadmin":
         raise HTTPException(status_code=403, detail="无权为其他用户创建 API Key")
 
     target_user_id = data.user_id or current_user.id
@@ -202,9 +203,10 @@ async def create_api_key(
             request_id=data.request_id,
             name=data.name,
             user_id=target_user_id,
-            department_id=data.department_id,
+            department_id=current_user.department_id,
             expires_at=expires_at,
             created_by=str(current_user.id),
+            creator_is_superadmin=current_user.account_role == "superadmin",
         )
         await db.commit()
     except APIKeyIdempotencyConflict as exc:

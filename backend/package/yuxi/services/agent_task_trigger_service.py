@@ -1,7 +1,7 @@
 """AgentTask 触发收口：手动、API 与定时统一创建幂等 TaskExecution。
 
 触发事务只固化执行事实（智能体身份、提示词、审批模式、执行身份、
-幂等键），派发交由 AgentTaskDispatcher（父规格 #958）。
+幂等键、任务固定部门），派发交由 AgentTaskDispatcher（父规格 #958）。
 """
 
 from __future__ import annotations
@@ -16,7 +16,8 @@ from yuxi.repositories.agent_task_repository import (
     TaskExecutionRepository,
 )
 from yuxi.services.agent_task_crud_service import can_view_task
-from yuxi.storage.postgres.models_business import TaskExecution, User
+from yuxi.services.department_context_service import DepartmentContext
+from yuxi.storage.postgres.models_business import TaskExecution
 from yuxi.utils.ids import new_uuid
 
 TRIGGER_CHANNELS = {"manual": "web", "api": "api", "schedule": "internal"}
@@ -34,12 +35,17 @@ class AgentTaskTriggerService:
         self,
         *,
         task_id: str,
-        user: User,
+        user: DepartmentContext,
         trigger_type: str,
         idempotency_key: str,
         scheduled_at=None,
+        key_department_id: int | None = None,
     ) -> tuple[TaskExecution, bool]:
-        """创建（或幂等返回）一次执行；返回 (execution, created)。"""
+        """创建（或幂等返回）一次执行；返回 (execution, created)。
+
+        API 触发额外校验 key 绑定部门与任务固定部门一致，不允许
+        以 Web 活动部门覆盖任一绑定事实。
+        """
         if trigger_type not in TRIGGER_CHANNELS:
             raise HTTPException(status_code=422, detail="无效的触发方式")
 
@@ -50,10 +56,15 @@ class AgentTaskTriggerService:
             raise HTTPException(status_code=409, detail="任务未启用")
         if trigger_type == "api" and not task.api_enabled:
             raise HTTPException(status_code=409, detail="任务未启用 API 触发")
+        if task.department_id is None:
+            raise HTTPException(status_code=409, detail="任务未绑定部门，不能触发执行")
+        if trigger_type == "api" and key_department_id != task.department_id:
+            raise HTTPException(status_code=403, detail="API Key 绑定部门与任务部门不一致")
 
+        principal_uid = str(user.uid)
         existing = await self.executions.find_idempotent(
             task_id=task.id,
-            principal_uid=str(user.uid),
+            principal_uid=principal_uid,
             idempotency_key=idempotency_key,
         )
         if existing is not None:
@@ -65,8 +76,9 @@ class AgentTaskTriggerService:
                 id=new_uuid(),
                 task_id=task.id,
                 trigger_type=trigger_type,
-                triggered_by_uid=str(user.uid),
-                execution_principal_uid=str(user.uid),
+                triggered_by_uid=principal_uid,
+                execution_principal_uid=principal_uid,
+                department_id=task.department_id,
                 agent_id=task.agent_id,
                 agent_slug=task.agent_slug_snapshot or "",
                 prompt=task.prompt,
@@ -82,8 +94,9 @@ class AgentTaskTriggerService:
             id=new_uuid(),
             task_id=task.id,
             trigger_type=trigger_type,
-            triggered_by_uid=str(user.uid),
-            execution_principal_uid=str(user.uid),
+            triggered_by_uid=principal_uid,
+            execution_principal_uid=principal_uid,
+            department_id=task.department_id,
             agent_id=task.agent_id,
             agent_slug=task.agent_slug_snapshot or "",
             prompt=task.prompt,

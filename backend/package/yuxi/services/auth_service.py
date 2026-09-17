@@ -14,6 +14,11 @@ from yuxi.repositories.api_key_repository import (
     APIKeyRepository,
     APIKeySubjectUnavailable,
 )
+from yuxi.services.department_context_service import (
+    DepartmentContext,
+    DepartmentContextError,
+    resolve_department_context,
+)
 from yuxi.storage.postgres.models_business import APIKey, CLIAuthSession, Department, User
 from yuxi.utils.auth_utils import AuthUtils
 from yuxi.utils.datetime_utils import utc_now_naive
@@ -99,7 +104,8 @@ async def get_cli_auth_session_for_user(
     return session
 
 
-async def approve_cli_auth_session(db: AsyncSession, user_code: str, user: User) -> CLIAuthSession:
+async def approve_cli_auth_session(db: AsyncSession, user_code: str, approver: DepartmentContext) -> CLIAuthSession:
+    """批准 CLI 授权：固定批准者当前有效部门为长期授权事实。"""
     session = await get_cli_auth_session_for_user(db, user_code, for_update=True)
     if session.status == CLI_AUTH_STATUS_CONSUMED:
         raise CLIAuthError("already_consumed", "授权会话已完成", status_code=409)
@@ -109,7 +115,8 @@ async def approve_cli_auth_session(db: AsyncSession, user_code: str, user: User)
         raise CLIAuthError("invalid_state", "授权会话状态无效", status_code=409)
 
     session.status = CLI_AUTH_STATUS_APPROVED
-    session.approved_user_id = user.id
+    session.approved_user_id = approver.id
+    session.approved_department_id = approver.department_id
     session.approved_at = utc_now_naive()
     await db.commit()
     await db.refresh(session)
@@ -123,8 +130,9 @@ async def _build_cli_exchange_result(db: AsyncSession, session: CLIAuthSession) 
         raise CLIAuthError("invalid_state", "授权会话缺少已提交的密钥事实", status_code=409)
     result = await db.execute(
         select(User, Department.name, APIKey)
-        .outerjoin(Department, User.department_id == Department.id)
+        .select_from(User)
         .join(APIKey, APIKey.id == session.api_key_id)
+        .outerjoin(Department, APIKey.department_id == Department.id)
         .filter(User.id == session.approved_user_id, User.is_deleted == 0)
     )
     row = result.one_or_none()
@@ -167,6 +175,25 @@ async def exchange_cli_auth_token(db: AsyncSession, device_code: str) -> dict:
         return await _build_cli_exchange_result(db, session)
     if session.status != CLI_AUTH_STATUS_APPROVED or not session.approved_user_id:
         raise CLIAuthError("invalid_state", "授权会话状态无效", status_code=409)
+    # 旧批准记录没有固定部门事实：明确拒绝，不读取当前会话活动部门补齐
+    if session.approved_department_id is None:
+        raise CLIAuthError(
+            "department_binding_missing",
+            "授权批准缺少部门绑定，请重新发起 CLI 授权",
+            status_code=409,
+        )
+    # 兑换前实时校验批准用户在批准部门的有效成员关系（超管验证部门存在）
+    try:
+        context = await resolve_department_context(
+            db,
+            user_id=session.approved_user_id,
+            department_id=session.approved_department_id,
+            strict=True,
+        )
+    except DepartmentContextError as exc:
+        raise CLIAuthError("invalid_user", f"授权部门上下文无效: {exc}", status_code=409) from exc
+    if context.department_id is None:
+        raise CLIAuthError("invalid_user", "授权部门上下文无效", status_code=409)
 
     _full_key, key_hash, key_prefix = AuthUtils.derive_api_key(
         f"cli-session:{session.device_code_hash}",
@@ -179,9 +206,10 @@ async def exchange_cli_auth_token(db: AsyncSession, device_code: str) -> dict:
             request_id=f"c:{session.device_code_hash[:62]}",
             name=session.key_name,
             user_id=session.approved_user_id,
-            department_id=None,
+            department_id=session.approved_department_id,
             expires_at=None,
             created_by=str(session.approved_user_id),
+            creator_is_superadmin=context.account_role == "superadmin",
         )
     except APIKeySubjectUnavailable as exc:
         raise CLIAuthError("invalid_user", "授权用户不存在", status_code=409) from exc

@@ -50,12 +50,13 @@ async def test_create_task_locks_active_agent_before_writing_reference(monkeypat
     service = agent_task_crud_service.AgentTaskCRUDService(FakeDb())
 
     task = await service.create_task(
-        user=SimpleNamespace(uid="user-1"),
+        user=SimpleNamespace(uid="user-1", department_id=11),
         payload={"name": "task", "agent_slug": "agent-a", "prompt": "run"},
     )
 
     assert calls == ["agent-a"]
     assert task.agent_id == 7
+    assert task.department_id == 11
 
 
 @pytest.mark.asyncio

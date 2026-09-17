@@ -1014,6 +1014,7 @@ class AgentScopeChannelBinding(Base):
         return {
             "id": self.id,
             "owner_uid": self.owner_uid,
+            "department_id": self.department_id,
             "agent_slug": self.agent_slug,
             "name": self.name,
             "channel_type": self.channel_type,

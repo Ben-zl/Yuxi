@@ -80,8 +80,8 @@ class _FakeMemoryClient:
             "scope": {"enabled": False, "last_memory_at": None},
         }
 
-    async def delete_memory_item(self, uid, agent_slug, memory_id):
-        self.events.append(f"delete:{uid}:{agent_slug}:{memory_id}")
+    async def delete_memory_item(self, uid, agent_slug, memory_id, *, department_id=None):
+        self.events.append(f"delete:{uid}:{agent_slug}:{memory_id}:{department_id}")
         if self.error:
             raise self.error
 

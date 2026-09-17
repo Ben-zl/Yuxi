@@ -21,6 +21,7 @@ def active_run(monkeypatch):
     run = SimpleNamespace(
         id="current-run",
         status="running",
+        department_id=11,
         manifest=manifest,
         manifest_fingerprint=compute_manifest_fingerprint(manifest),
     )

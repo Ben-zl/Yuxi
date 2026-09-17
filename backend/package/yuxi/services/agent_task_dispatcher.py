@@ -87,12 +87,20 @@ class AgentTaskDispatcher:
     async def _submit(self, execution: TaskExecution) -> dict[str, Any]:
         """以标准提交链路创建 AgentRun；幂等由 submit_run_command 保证。"""
         from yuxi.services.agent_task_trigger_service import TRIGGER_CHANNELS
+        from yuxi.services.department_context_service import DepartmentContextError, resolve_department_context
 
         principal = await self._principal(execution.execution_principal_uid)
-        # 过渡：执行记录固定部门优先；未迁移的旧任务暂以 principal 旧部门字段兜底（任务6 收口拒绝）
-        actor_department_id = execution.department_id or principal.department_id
+        # 部门事实来自 execution 创建时复制的任务部门；无绑定旧执行明确拒绝
+        if execution.department_id is None:
+            raise HTTPException(status_code=422, detail="任务执行未绑定部门，不能派发")
+        try:
+            actor = await resolve_department_context(
+                self.db, user_id=principal.id, department_id=execution.department_id, strict=True
+            )
+        except DepartmentContextError as exc:
+            raise HTTPException(status_code=403, detail=f"任务执行部门上下文无效: {exc}") from exc
         command = RunSubmissionCommand(
-            department_id=actor_department_id,
+            department_id=execution.department_id,
             agent_slug=execution.agent_slug,
             thread_id=execution_thread_id(execution.id),
             request_id=execution.id,
@@ -106,7 +114,7 @@ class AgentTaskDispatcher:
             create_conversation=True,
             conversation_title=f"任务执行 {execution.id[:8]}",
         )
-        result = await submit_run_command(command=command, current_user=principal, db=self.db)
+        result = await submit_run_command(command=command, current_user=actor, db=self.db)
         conversation_id = result.get("conversation_id")
         if conversation_id is None and result.get("thread_id"):
             from yuxi.repositories.conversation_repository import ConversationRepository

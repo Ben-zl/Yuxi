@@ -284,7 +284,7 @@ projection = await project_runtime(db, uid=context.uid, agent_slug=run.agent_slu
 
 **Interfaces:** API Key 继续以已有 `APIKey.department_id` 绑定；CLI 登录批准时保存 `CLIAuthSession.approved_department_id`；exchange 根据该字段重新校验有效成员关系，再将部门写入最终 API Key，后续不跟随批准者 Web 会话。兑换重放复用同一 api_key_id 与原绑定部门，不生成不同部门的新 key。Channel binding 和 AgentTask 创建时记录 context.department_id，TaskExecution 创建时复制 task.department_id，所有提交构造必填 command.department_id。绑定部门变更不重写已生成 execution。
 
-- [ ] 用真实 HTTP/服务调用建立 API Key、CLI凭证、Channel binding、定时任务四条测试路径，随后切换 Web 部门；逐项回读请求部门：
+- [x] 用真实 HTTP/服务调用建立 API Key、CLI凭证、Channel binding、定时任务四条测试路径，随后切换 Web 部门；逐项回读请求部门：
 
 ```python
 assert api_key_request.department_id == original_department_id
@@ -295,20 +295,27 @@ assert scheduled_request.department_id == original_department_id
 
 这四个 request 均由对应入口真实提交后按 request_id 从 AgentRunRequestRepository 回读；无部门绑定各执行一次并断言请求未创建。
 
-- [ ] 运行 `docker compose exec api uv run --group test pytest test/integration/services/test_noninteractive_department_context.py -v`，预期旧入口无固定字段/依赖 User.department_id 失败。
-- [ ] `verify_api_key` 先检查 key 状态和账号，再用 key.department_id 构建上下文并实时验证 membership；key 不保存有效角色。CLI/OIDC 区分交互 session 和独立凭证，保留登录协议但不复用活动部门作为长期授权事实。
-- [ ] 同步修改 `agent_task_router.py` 的 `POST /{task_id}/trigger`：接收 `verify_api_key` 返回的context与key，将context而非ORM User传给 `AgentTaskTriggerService.trigger`；保留仅API Key、Idempotency-Key及202响应契约。service校验key绑定部门与task固定部门一致，并保留owner限制，不以Web活动部门覆盖任一绑定。真实HTTP覆盖同部门触发成功、跨部门触发拒绝且不创建execution/request、撤权后拒绝，以及切换Web部门后原key仍按原部门触发。用 `rg -n "verify_api_key\(" backend/server backend/package/yuxi` 审计手动认证入口，不只检查Depends。
-- [ ] `APIKeyRepository.create` 删除 `department_id == subject.department_id` 旧检查，改为在账号与成员事实锁内验证绑定权限，超管验证部门存在即可。CLI 测试覆盖A批准→Web切B→兑换仍A、批准后撤销A→兑换拒绝、重放兑换同一key；拒绝没有 approved_department_id 的旧批准记录，不读取当前会话补齐。
-- [ ] Memory维护明确使用 `AgentMemoryScope.maintenance_department_id`：新 scope 创建时从创建它的实际运行上下文记录，后续运行与 Web 切换不自动改写。`AgentMemoryService._load_projection` 和 Dream scheduler 从scope读取绑定并实时授权；用户显式重建索引可用该次请求的有效部门在成功事务中重新绑定，后台调度不得自行重新绑定。旧scope无绑定时跳过自动Dream并写入现有 dream_status/dream_error 的明确失败原因，重建接口要求有效部门；不删除或迁移记忆内容，不猜测旧部门。补测A创建scope→切B→后台仍A、无绑定不调用模型、撤权后Dream/重建拒绝、显式有效重建后的绑定回读。compaction沿触发运行的固定部门，不能读取用户当前会话。
-- [ ] 替换 dispatcher 和 WPS ingress 中直接 `get_by_uid` 后作为授权 user 的行为。核心构造如下，binding/task/execution 各读取自己的字段：
+- [x] 运行 `docker compose exec api uv run --group test pytest test/integration/services/test_noninteractive_department_context.py -v`，预期旧入口无固定字段/依赖 User.department_id 失败。
+- [x] `verify_api_key` 先检查 key 状态和账号，再用 key.department_id 构建上下文并实时验证 membership；key 不保存有效角色。CLI/OIDC 区分交互 session 和独立凭证，保留登录协议但不复用活动部门作为长期授权事实。
+- [x] 同步修改 `agent_task_router.py` 的 `POST /{task_id}/trigger`：接收 `verify_api_key` 返回的context与key，将context而非ORM User传给 `AgentTaskTriggerService.trigger`；保留仅API Key、Idempotency-Key及202响应契约。service校验key绑定部门与task固定部门一致，并保留owner限制，不以Web活动部门覆盖任一绑定。真实HTTP覆盖同部门触发成功、跨部门触发拒绝且不创建execution/request、撤权后拒绝，以及切换Web部门后原key仍按原部门触发。用 `rg -n "verify_api_key\(" backend/server backend/package/yuxi` 审计手动认证入口，不只检查Depends。
+- [x] `APIKeyRepository.create` 删除 `department_id == subject.department_id` 旧检查，改为在账号与成员事实锁内验证绑定权限，超管验证部门存在即可。CLI 测试覆盖A批准→Web切B→兑换仍A、批准后撤销A→兑换拒绝、重放兑换同一key；拒绝没有 approved_department_id 的旧批准记录，不读取当前会话补齐。
+- [x] Memory维护明确使用 `AgentMemoryScope.maintenance_department_id`：新 scope 创建时从创建它的实际运行上下文记录，后续运行与 Web 切换不自动改写。`AgentMemoryService._load_projection` 和 Dream scheduler 从scope读取绑定并实时授权；用户显式重建索引可用该次请求的有效部门在成功事务中重新绑定，后台调度不得自行重新绑定。旧scope无绑定时跳过自动Dream并写入现有 dream_status/dream_error 的明确失败原因，重建接口要求有效部门；不删除或迁移记忆内容，不猜测旧部门。补测A创建scope→切B→后台仍A、无绑定不调用模型、撤权后Dream/重建拒绝、显式有效重建后的绑定回读。compaction沿触发运行的固定部门，不能读取用户当前会话。
+- [x] 替换 dispatcher 和 WPS ingress 中直接 `get_by_uid` 后作为授权 user 的行为。核心构造如下，binding/task/execution 各读取自己的字段：
 
 ```python
 actor = await resolve_department_context(db, user_id=owner.id, department_id=binding.department_id)
 # 构造既有 RunSubmissionCommand 时：department_id=actor.department_id
 ```
 
-- [ ] 未绑定部门的旧任务、Channel 或 key 不自动迁移/猜测；部门级执行明确拒绝并沿既有错误/失败状态展示。创建或重新配置这些入口要求有效当前部门。检查全部 `RunSubmissionCommand(` 生产调用，不能只改 Web 路由。
-- [ ] 验证撤权后 key/CLI/Channel/定时任务不能执行、超级管理员可显式绑定任意存在部门，运行本任务测试与既有 API key lifecycle 测试；审查后提交 `fix: 为非交互入口绑定独立部门上下文`。
+- [x] 未绑定部门的旧任务、Channel 或 key 不自动迁移/猜测；部门级执行明确拒绝并沿既有错误/失败状态展示。创建或重新配置这些入口要求有效当前部门。检查全部 `RunSubmissionCommand(` 生产调用，不能只改 Web 路由。
+- [x] 验证撤权后 key/CLI/Channel/定时任务不能执行、超级管理员可显式绑定任意存在部门，运行本任务测试与既有 API key lifecycle 测试；审查后提交 `fix: 为非交互入口绑定独立部门上下文`。
+
+**执行记录（2026-09-18）：**
+- 实现（本任务由子代理按计划实施、开发者复核验证）：API Key 创建即绑定当前有效部门，`APIKeyRepository.create` 旧一致性检查改为锁内绑定验证（普通创建者验成员、超管验部门存在）；CLI approve 保存 `approved_department_id`（批准者有效部门），exchange 拒绝无绑定旧批准（409）、strict 实时校验成员、部门写入最终 key，重放复用同 key 与原部门；Channel binding 创建记录部门、reconcile 按 binding 部门；AgentTask 创建记录部门、TaskExecution 复制、scheduler 按任务固定部门 strict resolve 所有者（失效跳过+告警）；`POST /agent-tasks/{id}/trigger` 以 key.department_id 构建 context 并校验 key 与任务部门一致；wps ingress/dispatcher 过渡兜底删除，无绑定明确拒绝；Memory：scope 首创记录 `maintenance_department_id`（已存在不改写）、显式重建按请求部门在成功事务重绑、后台 Dream 只读 scope 绑定（无绑定明确失败不调模型）、compaction 沿触发运行固定部门；`project_runtime` 的 department_id 收紧为必填（三过渡调用点全部传值），并修复 context 变量遮蔽缺陷、RuntimeProjection 携带部门供 scope 创建消费。
+- 顺带修复预存缺陷（测试实证暴露）：`agent_task_schedule_service._next_fire_times` 把 naive UTC `next_run_at` 按容器本地时区解释导致 8 小时回溯、定时扫描事务回滚永不推进（HEAD 即如此）——修复为按 UTC 解释，定时执行与部门回读恢复。
+- 测试：`test_noninteractive_department_context.py` 5 passed——四条路径（key 创建即绑定+提交回读、CLI 全生命周期含 A批→切B→兑换仍A/撤A拒绝/旧批准拒绝/重放同key、binding 创建+真实 ingress 提交回读、任务创建+手动/API触发 execution 复制+定时扫描执行回读）+ 无绑定拒绝（key 403/CLI 409/binding ValueError/任务零执行）；既有 `test_apikey_router` 15 passed（Task 3 记录的红测试转绿，无需改断言）；全量 unit 2004 passed（新增 7：CLI 绑定/旧记录拒绝、调度无绑定跳过、撤权 Dream 拒绝、超管绑定任意部门、显式重绑、后台无绑定不调模型）。
+- 覆盖形态标注：计划"A创建scope→切B→后台仍A"未以真实 A/B 切换集成场景落地，现为 unit 级数据流覆盖 + 后台路径结构性不接触会话（审查确认语义闭合），Task 10 验收时补真实切换场景或保持本标注。
+- 回归：agent_task_center 10+11ERROR（=基线）、agent_memory 3、locked token 3、部门相关 24、channel api 1、CLI/wps/key security/memory 全绿。ruff：31 个改动文件 check/format 通过；`git diff --check`、`verify_engineering_contracts.py` + 61 tests 通过。
 
 ## Task 7：删除部门边界（条件任务）
 

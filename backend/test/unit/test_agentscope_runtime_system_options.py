@@ -10,6 +10,22 @@ from yuxi.agentscope import tools
 from yuxi.config import UserConfig, config
 from yuxi.config.options import Option
 from yuxi.models.providers.cache import model_cache
+from yuxi.services.department_context_service import DepartmentContext
+
+
+def _department_context() -> DepartmentContext:
+    """构造投影测试用的固定部门上下文。"""
+    return DepartmentContext(
+        id=1,
+        uid="u",
+        username="u",
+        account_role="user",
+        department_id=11,
+        department_name="投影部门",
+        role="user",
+        session_id=None,
+        revision=0,
+    )
 
 
 @pytest.mark.asyncio
@@ -26,8 +42,9 @@ async def test_runtime_uses_persisted_memory_and_default_models(monkeypatch, req
     db = object()
     agent = SimpleNamespace(name="test", config_json={"context": {"skills": [], "tools": [], "mcps": []}})
     agent.config_json["context"]["model"] = configured
-    monkeypatch.setattr(projection, "_load_user", AsyncMock(return_value=object()))
+    monkeypatch.setattr(projection, "_load_user", AsyncMock(return_value=SimpleNamespace(id=1)))
     monkeypatch.setattr(projection, "_load_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(projection, "resolve_department_context", AsyncMock(return_value=_department_context()))
     monkeypatch.setattr(config, "default_model", "stale:chat")
     monkeypatch.setattr(config, "fast_model", "stale:fast")
     monkeypatch.setattr(config, "embed_model", "stale:embed")
@@ -61,7 +78,7 @@ async def test_runtime_uses_persisted_memory_and_default_models(monkeypatch, req
     monkeypatch.setattr(projection, "get_tool_metadata", lambda: [])
     monkeypatch.setattr("yuxi.agents.mcp.service.load_enabled_mcp_server_configs", AsyncMock(return_value={}))
     monkeypatch.setattr(projection.AgentRepository, "list_visible_subagents", AsyncMock(return_value=[]))
-    result = await projection.project_runtime(db, uid="u", agent_slug="test", model_spec=requested)
+    result = await projection.project_runtime(db, uid="u", agent_slug="test", model_spec=requested, department_id=11)
     assert result.model_spec == expected
     assert result.memory_chat_model_config["model_config"]["model"] == "fast"
     assert result.memory_embedding_model_config["model"] == "embed"
@@ -77,7 +94,7 @@ async def test_preloaded_external_dependency_is_only_exposed_through_gateway(mon
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("# Question skill\n", encoding="utf-8")
     db = object()
-    user = object()
+    user = SimpleNamespace(id=1)
     agent = SimpleNamespace(
         name="test",
         config_json={
@@ -113,6 +130,7 @@ async def test_preloaded_external_dependency_is_only_exposed_through_gateway(mon
     )
     monkeypatch.setattr(projection, "_load_user", AsyncMock(return_value=user))
     monkeypatch.setattr(projection, "_load_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(projection, "resolve_department_context", AsyncMock(return_value=_department_context()))
     monkeypatch.setattr(Option, "get", AsyncMock(return_value={"default_model": "saved:chat"}))
     monkeypatch.setattr(model_cache, "canonicalize_spec", lambda spec: spec)
     monkeypatch.setattr(
@@ -127,7 +145,7 @@ async def test_preloaded_external_dependency_is_only_exposed_through_gateway(mon
     )
     monkeypatch.setattr("yuxi.agents.mcp.service.load_enabled_mcp_server_configs", AsyncMock(return_value={}))
     monkeypatch.setattr(projection.AgentRepository, "list_visible_subagents", AsyncMock(return_value=[]))
-    runtime = await projection.project_runtime(db, uid="u", agent_slug="test")
+    runtime = await projection.project_runtime(db, uid="u", agent_slug="test", department_id=11)
 
     monkeypatch.setattr(tools, "_ensure_kb_manager_ready", AsyncMock(return_value=False))
     monkeypatch.setattr(tools, "build_mcp_tools", AsyncMock(return_value=[]))

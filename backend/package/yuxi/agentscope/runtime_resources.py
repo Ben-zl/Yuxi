@@ -94,9 +94,12 @@ async def resolve_runtime_projection(
         raise ValueError("AgentScope 会话缺少正在执行的 Yuxi Run")
     if compute_manifest_fingerprint(run.manifest) != run.manifest_fingerprint:
         raise ValueError("Run 运行清单指纹不一致")
-    return await load_run_resources(
+    projection = await load_run_resources(
         db,
         uid=user_id,
         manifest=run.manifest,
         agent_slug=runtime_agent_slug or mapping.agent_slug,
     )
+    # 运行时消费方（Memory scope 创建等）需要本次运行提交时固定的部门
+    projection.department_id = run.department_id
+    return projection

@@ -178,13 +178,18 @@ class AgentScopeServiceClient:
         )
         return resp.json()
 
-    async def delete_memory_item(self, uid: str, agent_slug: str, memory_id: str) -> None:
-        """删除一张长期记忆卡片并重建索引。"""
+    async def delete_memory_item(
+        self, uid: str, agent_slug: str, memory_id: str, *, department_id: int | None = None
+    ) -> None:
+        """删除一张长期记忆卡片并重建索引；department_id 为请求有效部门时显式重绑。"""
+        params: dict = {"agent_slug": agent_slug, "memory_id": memory_id}
+        if department_id is not None:
+            params["department_id"] = department_id
         await self._request(
             "DELETE",
             "/yuxi/memory/item",
             uid,
-            params={"agent_slug": agent_slug, "memory_id": memory_id},
+            params=params,
         )
 
     async def clear_memory_scope(self, uid: str, agent_slug: str) -> None:

@@ -135,6 +135,7 @@ async def _build_extra_agent_middlewares(user_id: str, agent_id: str, session_id
                 user_id,
                 projection.agent_slug,
                 memory_scope_identity(user_id, projection.agent_slug),
+                department_id=projection.department_id,
             )
             await db.commit()
 
@@ -449,16 +450,26 @@ async def list_yuxi_memories(
 async def delete_yuxi_memory_item(
     agent_slug: str = Query(...),
     memory_id: str = Query(..., pattern="^[0-9a-f]{64}$"),
+    department_id: int | None = Query(None),
     x_user_id: str = Header(...),
 ) -> dict:
-    """删除一张记忆卡片，并在提交文件删除前完成完整 reindex。"""
+    """删除一张记忆卡片，并在提交文件删除前完成完整 reindex。
+
+    department_id 为用户显式请求携带的有效部门：重建成功后重绑 scope
+    维护部门；后台调用不传值，只消费 scope 既有绑定。
+    """
     from urllib.parse import unquote
 
     from yuxi.agentscope.memory import MemoryScopeBusyError
 
     uid = unquote(x_user_id)
     try:
-        await app.state.agent_memory_service.delete_item(uid, agent_slug, memory_id)
+        await app.state.agent_memory_service.delete_item(
+            uid,
+            agent_slug,
+            memory_id,
+            department_id=department_id,
+        )
     except MemoryScopeBusyError as exc:
         raise _memory_busy() from exc
     except FileNotFoundError as exc:

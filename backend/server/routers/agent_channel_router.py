@@ -70,12 +70,18 @@ async def create_channel(
     current_user: User = Depends(get_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """创建 binding intent 并立即 reconcile。"""
+    """创建 binding intent 并立即 reconcile；部门取创建者当前有效部门。"""
+    if current_user.department_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "department_context_invalid", "message": "创建 Channel 需要有效部门上下文"},
+        )
     owner_uid = payload.owner_uid or str(current_user.uid)
     binding = await _service(db).create_intent(
         **payload.model_dump(exclude={"owner_uid"}),
         owner_uid=owner_uid,
         actor_uid=str(current_user.uid),
+        department_id=current_user.department_id,
     )
     return {"success": binding.sync_status == "synced", "data": binding.to_dict()}
 

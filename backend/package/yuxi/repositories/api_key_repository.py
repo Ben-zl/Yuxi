@@ -30,7 +30,7 @@ class APIKeySubjectUnavailable(Exception):
 
 
 class APIKeyDepartmentConflict(Exception):
-    """API Key 部门与关联用户当前部门不一致。"""
+    """API Key 绑定部门无效（部门不存在或关联用户不是成员）。"""
 
 
 class APIKeyRepository:
@@ -108,8 +108,13 @@ class APIKeyRepository:
         department_id: int | None,
         expires_at: datetime | None,
         created_by: str,
+        creator_is_superadmin: bool = False,
     ) -> APIKey:
-        """在幂等锁内创建或重放同一 API Key 事实。"""
+        """在幂等锁内创建或重放同一 API Key 事实。
+
+        绑定权限在账号锁内验证成员事实（成员关系由各 key 消费点实时校验兜底）：普通创建者要求 key 主体是绑定
+        部门成员；超级管理员可显式绑定任意存在部门。
+        """
 
         bind = self.db_session.get_bind()
         if bind.dialect.name == "postgresql":
@@ -123,8 +128,12 @@ class APIKeyRepository:
         )
         if subject is None:
             raise APIKeySubjectUnavailable("关联的用户不存在")
-        if department_id is not None and department_id != subject.department_id:
-            raise APIKeyDepartmentConflict("API Key 部门必须与关联用户部门一致")
+        if department_id is not None:
+            await self._validate_department_binding(
+                user_id=subject.id,
+                department_id=department_id,
+                creator_is_superadmin=creator_is_superadmin,
+            )
 
         intent_hash = self._intent_hash(
             name=name,
@@ -171,6 +180,26 @@ class APIKeyRepository:
         await self.db_session.flush()
         await self.db_session.refresh(api_key)
         return api_key
+
+    async def _validate_department_binding(
+        self, *, user_id: int, department_id: int, creator_is_superadmin: bool
+    ) -> None:
+        """在既有账号锁内验证绑定部门有效；超管只验证部门存在。"""
+        from yuxi.storage.postgres.models_business import Department, DepartmentMembership
+
+        department = await self.db_session.scalar(select(Department).where(Department.id == department_id))
+        if department is None:
+            raise APIKeyDepartmentConflict("API Key 绑定部门不存在")
+        if creator_is_superadmin:
+            return
+        membership = await self.db_session.scalar(
+            select(DepartmentMembership).where(
+                DepartmentMembership.user_id == user_id,
+                DepartmentMembership.department_id == department_id,
+            )
+        )
+        if membership is None:
+            raise APIKeyDepartmentConflict("API Key 关联用户不是绑定部门成员")
 
     async def update(self, api_key: APIKey, data: dict[str, Any]) -> APIKey:
         """更新并提交 API Key。"""

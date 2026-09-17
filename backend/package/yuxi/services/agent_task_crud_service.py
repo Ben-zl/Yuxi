@@ -109,12 +109,15 @@ class AgentTaskCRUDService:
         approval_mode = payload.get("tool_approval_mode") or "always_trust"
         if approval_mode not in TASK_TOOL_APPROVAL_MODES:
             raise HTTPException(status_code=422, detail="无效的工具审批模式")
+        if user.department_id is None:
+            raise HTTPException(status_code=403, detail="创建任务需要有效部门上下文")
 
         fields = apply_schedule_fields(payload)  # 校验并编译定时配置；未启用返回空
         task = await self.tasks.create(
             id=new_uuid(),
             name=str(payload.get("name") or "").strip(),
             owner_uid=str(user.uid),
+            department_id=user.department_id,
             agent_id=agent.id,
             agent_name_snapshot=agent.name,
             agent_slug_snapshot=agent.slug,

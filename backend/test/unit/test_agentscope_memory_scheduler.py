@@ -135,6 +135,7 @@ async def test_scheduler_skips_disabled_scope_but_processes_enabled_scope(tmp_pa
             last_memory_at=None,
             dream_status=None,
             dream_attempted_at=None,
+            maintenance_department_id=None,
         ),
         SimpleNamespace(
             uid="enabled",
@@ -143,6 +144,7 @@ async def test_scheduler_skips_disabled_scope_but_processes_enabled_scope(tmp_pa
             last_memory_at=None,
             dream_status=None,
             dream_attempted_at=None,
+            maintenance_department_id=11,
         ),
     ]
 
@@ -166,7 +168,7 @@ async def test_scheduler_skips_disabled_scope_but_processes_enabled_scope(tmp_pa
 
     await scheduler.run_due_once(datetime(2026, 8, 31, 23, 30, tzinfo=ZoneInfo("Asia/Shanghai")))
 
-    scheduler._process_scope.assert_awaited_once_with("enabled", "a", [date(2026, 8, 31)])
+    scheduler._process_scope.assert_awaited_once_with("enabled", "a", [date(2026, 8, 31)], 11)
 
 
 async def test_scheduler_skips_scope_with_active_reply(tmp_path):
@@ -177,7 +179,7 @@ async def test_scheduler_skips_scope_with_active_reply(tmp_path):
     )
     scheduler = MemoryDreamScheduler(registry=registry, base_dir=tmp_path)
 
-    await scheduler._process_scope("u", "a", [date(2026, 8, 31)])
+    await scheduler._process_scope("u", "a", [date(2026, 8, 31)], 11)
 
     registry.acquire_exclusive.assert_not_called()
 
@@ -203,7 +205,7 @@ async def test_scheduler_missing_workspace_records_failure(tmp_path, monkeypatch
     monkeypatch.setattr(scheduler_module, "project_runtime", AsyncMock(return_value=object()))
     monkeypatch.setattr(scheduler_module, "build_memory_models", lambda _projection: (object(), object(), "v1"))
 
-    await scheduler._process_scope("u", "a", [date(2026, 8, 31)])
+    await scheduler._process_scope("u", "a", [date(2026, 8, 31)], 11)
 
     scheduler._record_result.assert_awaited_once()
     args, kwargs = scheduler._record_result.await_args
@@ -268,6 +270,7 @@ async def test_scheduler_partial_catch_up_keeps_last_success_before_failure(tmp_
         "u",
         "a",
         [date(2026, 8, 30), date(2026, 8, 31), date(2026, 9, 1)],
+        11,
     )
 
     assert scheduler._record_result.await_args_list[0].args == (
@@ -279,3 +282,91 @@ async def test_scheduler_partial_catch_up_keeps_last_success_before_failure(tmp_
     assert scheduler._record_result.await_args_list[1].args == ("u", "a", "failed")
     assert "second day failed" in scheduler._record_result.await_args_list[1].kwargs["error"]
     assert maintenance.run_job.await_count == 3
+
+
+async def _no_op_commit() -> None:
+    return None
+
+
+async def test_scheduler_unbound_scope_skips_dream_without_model(tmp_path, monkeypatch):
+    """无维护部门绑定的旧 scope 跳过自动 Dream：写明确失败原因，不调用模型。"""
+    scheduler = MemoryDreamScheduler(registry=SimpleNamespace(), base_dir=tmp_path)
+    scheduler._process_scope = AsyncMock()
+    failures = []
+    record = SimpleNamespace(
+        uid="unbound",
+        agent_slug="a",
+        last_dream_date=date(2026, 8, 30),
+        last_memory_at=None,
+        dream_status=None,
+        dream_attempted_at=None,
+        maintenance_department_id=None,
+    )
+
+    @asynccontextmanager
+    async def fake_session_context():
+        yield SimpleNamespace(commit=_no_op_commit)
+
+    class FakeRepository:
+        def __init__(self, _db):
+            pass
+
+        async def list_all(self):
+            return [record]
+
+        async def set_dream_result(self, _record, **kwargs):
+            failures.append(kwargs)
+
+    monkeypatch.setattr(scheduler_module.pg_manager, "get_async_session_context", fake_session_context)
+    monkeypatch.setattr(scheduler_module, "AgentMemoryScopeRepository", FakeRepository)
+    monkeypatch.setattr(
+        scheduler_module.UserConfig,
+        "load",
+        AsyncMock(return_value=SimpleNamespace(schema=SimpleNamespace(enable_memory=True))),
+    )
+
+    await scheduler.run_due_once(datetime(2026, 8, 31, 23, 30, tzinfo=ZoneInfo("Asia/Shanghai")))
+
+    scheduler._process_scope.assert_not_awaited()
+    assert len(failures) == 1
+    assert failures[0]["status"] == "failed"
+    assert "未绑定维护部门" in failures[0]["error"]
+
+
+async def test_scheduler_revoked_membership_records_failure_without_model(tmp_path, monkeypatch):
+    """撤权后固定部门解析失败：Dream 记录失败原因，不调用模型。"""
+
+    class FakeRegistry:
+        async def is_busy(self, _uid, _agent_slug):
+            return False
+
+        @asynccontextmanager
+        async def acquire_exclusive(self, _uid, _agent_slug):
+            yield None
+
+    @asynccontextmanager
+    async def fake_session_context():
+        yield object()
+
+    scheduler = MemoryDreamScheduler(registry=FakeRegistry(), base_dir=tmp_path)
+    scheduler._record_result = AsyncMock()
+    model_calls = []
+    monkeypatch.setattr(scheduler_module.pg_manager, "get_async_session_context", fake_session_context)
+    monkeypatch.setattr(
+        scheduler_module,
+        "project_runtime",
+        AsyncMock(side_effect=ValueError("运行部门上下文无效: 非目标部门成员")),
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "build_memory_models",
+        lambda _projection: model_calls.append("model") or (object(), object(), "v1"),
+    )
+
+    await scheduler._process_scope("u", "a", [date(2026, 8, 31)], 11)
+
+    scheduler._record_result.assert_awaited_once()
+    args, kwargs = scheduler._record_result.await_args
+    assert args == ("u", "a", "failed")
+    assert "非目标部门成员" in kwargs["error"]
+    assert model_calls == []

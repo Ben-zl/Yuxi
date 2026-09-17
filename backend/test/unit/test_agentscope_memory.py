@@ -883,3 +883,81 @@ async def test_deleting_canonical_keeps_archived_sources_and_transcripts(tmp_pat
     assert not canonical.exists()
     assert source.exists()
     assert transcript.exists()
+
+
+async def test_reindex_scope_with_request_department_rebinds_on_success(tmp_path, monkeypatch):
+    """显式重建按请求有效部门投影，成功事务内重绑维护部门。"""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    service = AgentMemoryService(registry=SimpleNamespace(), base_dir=tmp_path)
+    events = []
+    rebound = []
+
+    @asynccontextmanager
+    async def fake_session_context():
+        yield SimpleNamespace(commit=_noop_commit)
+
+    class FakeRepo:
+        def __init__(self, _db):
+            pass
+
+        async def rebind_maintenance_department(self, uid, agent_slug, department_id):
+            rebound.append((uid, agent_slug, department_id))
+
+    async def fake_projection(_self, uid, agent_slug, *, department_id):
+        events.append(("project", department_id))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(memory_service_module.pg_manager, "get_async_session_context", fake_session_context)
+    monkeypatch.setattr(memory_service_module, "AgentMemoryScopeRepository", FakeRepo)
+    monkeypatch.setattr(AgentMemoryService, "_load_projection", fake_projection)
+    monkeypatch.setattr(memory_service_module, "build_memory_models", lambda _projection: (object(), object(), "v1"))
+
+    @asynccontextmanager
+    async def fake_maintenance(**_kwargs):
+        events.append(("reindex", None))
+        yield SimpleNamespace(run_job=AsyncMock(return_value=SimpleNamespace(success=True)))
+
+    monkeypatch.setattr(memory_service_module, "reme_maintenance_app", fake_maintenance)
+
+    await service.reindex_scope("u", "a", workspace, department_id=12)
+
+    assert ("project", 12) in events
+    assert ("reindex", None) in events
+    assert rebound == [("u", "a", 12)]
+
+
+async def test_reindex_scope_without_binding_fails_before_model(tmp_path, monkeypatch):
+    """后台重建在无维护部门绑定时明确失败，不解析模型。"""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    service = AgentMemoryService(registry=SimpleNamespace(), base_dir=tmp_path)
+
+    @asynccontextmanager
+    async def fake_session_context():
+        yield SimpleNamespace()
+
+    class FakeRepo:
+        def __init__(self, _db):
+            pass
+
+        async def get(self, _uid, _agent_slug):
+            return SimpleNamespace(maintenance_department_id=None)
+
+    monkeypatch.setattr(memory_service_module.pg_manager, "get_async_session_context", fake_session_context)
+    monkeypatch.setattr(memory_service_module, "AgentMemoryScopeRepository", FakeRepo)
+    projection_calls = []
+    monkeypatch.setattr(
+        AgentMemoryService,
+        "_load_projection",
+        AsyncMock(side_effect=lambda *args, **kwargs: projection_calls.append(kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="未绑定维护部门"):
+        await service.reindex_scope("u", "a", workspace)
+
+    assert projection_calls == []
+
+
+async def _noop_commit() -> None:
+    return None

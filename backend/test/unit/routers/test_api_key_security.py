@@ -14,7 +14,8 @@ from server.utils.auth_middleware import verify_api_key
 from yuxi.repositories import user_repository as user_repository_module
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.agentscope.client import AgentScopeServiceError
-from yuxi.storage.postgres.models_business import APIKey, Base, Department, User
+from yuxi.services.department_context_service import DepartmentContext
+from yuxi.storage.postgres.models_business import APIKey, Base, Department, DepartmentMembership, User
 from yuxi.utils.auth_utils import AuthUtils
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
@@ -77,6 +78,8 @@ async def session():
             is_deleted=1,
         )
         db.add_all([dept_a, dept_b, superadmin, dept_b_admin, regular_user, deleted_user])
+        await db.flush()
+        db.add(DepartmentMembership(user_id=regular_user.id, department_id=dept_a.id, role="user"))
         await db.commit()
         for item in [dept_a, dept_b, superadmin, dept_b_admin, regular_user, deleted_user]:
             await db.refresh(item)
@@ -131,17 +134,31 @@ async def test_api_key_without_user_binding_is_rejected_before_department_mappin
     assert fake_db.execute_calls == 1
 
 
-async def test_create_api_key_rejects_mismatched_department(session):
+def _context(
+    user: User, department_id: int | None, *, account_role: str = "user", role: str = "user"
+) -> DepartmentContext:
+    """构造与认证边界同构的创建者上下文。"""
+    return DepartmentContext(
+        id=user.id,
+        uid=str(user.uid),
+        username=user.username,
+        account_role=account_role,
+        department_id=department_id,
+        department_name=None,
+        role=role,
+        session_id=None,
+        revision=0,
+    )
+
+
+async def test_create_api_key_rejects_non_member_binding(session):
+    """锁内守卫：非超管创建者绑定的部门必须是 key 主体的成员部门。"""
     db = session["db"]
 
     with pytest.raises(HTTPException) as exc:
         await create_api_key(
-            APIKeyCreate(
-                request_id="wrong-department",
-                name="wrong department",
-                department_id=session["dept_b"].id,
-            ),
-            current_user=session["regular_user"],
+            APIKeyCreate(request_id="wrong-department", name="wrong department"),
+            current_user=_context(session["regular_user"], session["dept_b"].id),
             db=db,
         )
 
@@ -152,18 +169,37 @@ async def test_create_api_key_allows_current_user_department(session):
     db = session["db"]
 
     response = await create_api_key(
-        APIKeyCreate(
-            request_id="own-department",
-            name="own department",
-            department_id=session["dept_a"].id,
-        ),
-        current_user=session["regular_user"],
+        APIKeyCreate(request_id="own-department", name="own department"),
+        current_user=_context(session["regular_user"], session["dept_a"].id),
         db=db,
     )
 
     assert response.api_key.user_id == session["regular_user"].id
     assert response.api_key.department_id == session["dept_a"].id
     assert response.secret.startswith(response.api_key.key_prefix)
+
+
+async def test_create_api_key_superadmin_binds_any_existing_department(session):
+    """超管验证部门存在即可，为目标用户显式绑定任意存在部门。"""
+    db = session["db"]
+
+    response = await create_api_key(
+        APIKeyCreate(
+            request_id="superadmin-bind",
+            name="superadmin bind",
+            user_id=session["regular_user"].id,
+        ),
+        current_user=_context(
+            session["superadmin"],
+            session["dept_b"].id,
+            account_role="superadmin",
+            role="superadmin",
+        ),
+        db=db,
+    )
+
+    assert response.api_key.user_id == session["regular_user"].id
+    assert response.api_key.department_id == session["dept_b"].id
 
 
 async def test_delete_user_disables_owned_api_keys(session, monkeypatch):

@@ -26,8 +26,19 @@ class AgentMemoryScopeRepository:
         )
         return result.scalar_one_or_none()
 
-    async def ensure(self, uid: str, agent_slug: str, workspace_id: str) -> AgentMemoryScope:
-        """幂等创建 scope catalog，并与 Agent 删除屏障串行。"""
+    async def ensure(
+        self,
+        uid: str,
+        agent_slug: str,
+        workspace_id: str,
+        *,
+        department_id: int | None = None,
+    ) -> AgentMemoryScope:
+        """幂等创建 scope catalog，并与 Agent 删除屏障串行。
+
+        maintenance_department_id 只在首次创建时从创建它的运行上下文记录；
+        已存在 scope 的绑定不由 ensure 改写（重绑只走显式重建事务）。
+        """
         active_agent = await self.db.scalar(
             select(Agent)
             .where(
@@ -45,6 +56,7 @@ class AgentMemoryScopeRepository:
                 uid=uid,
                 agent_slug=agent_slug,
                 workspace_id=workspace_id,
+                maintenance_department_id=department_id,
                 created_at=now,
                 updated_at=now,
             )
@@ -56,6 +68,18 @@ class AgentMemoryScopeRepository:
         if record.workspace_id != workspace_id:
             raise ValueError("Memory scope workspace_id 与确定性标识不一致")
         record.updated_at = now
+        await self.db.flush()
+        return record
+
+    async def rebind_maintenance_department(
+        self, uid: str, agent_slug: str, department_id: int
+    ) -> AgentMemoryScope | None:
+        """显式重建成功后重绑维护部门；后台调度不得调用。"""
+        record = await self.get(uid, agent_slug)
+        if record is None:
+            return None
+        record.maintenance_department_id = department_id
+        record.updated_at = utc_now()
         await self.db.flush()
         return record
 

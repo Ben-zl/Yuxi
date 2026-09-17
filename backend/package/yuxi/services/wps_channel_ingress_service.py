@@ -9,6 +9,7 @@ from yuxi.repositories.agent_run_request_repository import AgentRunRequestReposi
 from yuxi.repositories.agentscope_channel_bindings import AgentScopeChannelBindingRepository
 from yuxi.repositories.channel_delivery_repository import ChannelDeliveryRepository
 from yuxi.repositories.user_repository import UserRepository
+from yuxi.services.department_context_service import DepartmentContextError, resolve_department_context
 from yuxi.services.input_message_service import build_chat_input_message
 from yuxi.services.run_submission_service import (
     RunOrigin,
@@ -33,9 +34,20 @@ async def submit_wps_channel_event(binding_id: str, event: WPSChannelEvent) -> d
         if not allowed_senders or sender_id not in allowed_senders:
             raise ValueError("WPS Channel sender 不在 binding allow_from 白名单中")
 
-        current_user = await UserRepository(db).get_by_uid(binding.owner_uid)
-        if current_user is None or current_user.is_deleted:
+        if binding.department_id is None:
+            raise ValueError("WPS Channel binding 未绑定部门，消息不能提交执行")
+
+        owner = await UserRepository(db).get_by_uid(binding.owner_uid)
+        if owner is None or owner.is_deleted:
             raise ValueError("WPS Channel owner 不存在或已停用")
+
+        # 非交互入口不读会话活动部门：按 binding 固定部门实时解析执行身份
+        try:
+            current_user = await resolve_department_context(
+                db, user_id=owner.id, department_id=binding.department_id, strict=True
+            )
+        except DepartmentContextError as exc:
+            raise ValueError(f"WPS Channel 绑定部门上下文无效: {exc}") from exc
 
         message_id = str(event.channel_message_id or "").strip()
         chat_id = str(event.chat_id or "").strip()
@@ -76,12 +88,11 @@ async def submit_wps_channel_event(binding_id: str, event: WPSChannelEvent) -> d
         await db.commit()
         existing_request = await AgentRunRequestRepository(db).get_by_request_id(request_id)
 
-        # 过渡：Channel 绑定部门优先；未迁移的旧绑定暂以 owner 旧部门字段兜底（任务6 收口拒绝）
-        actor_department_id = binding.department_id or current_user.department_id
+        # 部门事实来自 binding 创建时记录的固定部门，不读 owner 会话活动部门
         try:
             return await submit_run_command(
                 command=RunSubmissionCommand(
-                    department_id=actor_department_id,
+                    department_id=binding.department_id,
                     agent_slug=binding.agent_slug,
                     thread_id=thread_id,
                     request_id=request_id,

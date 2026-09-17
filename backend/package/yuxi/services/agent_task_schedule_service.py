@@ -7,12 +7,11 @@ apscheduler 是 Yuxi 的直接依赖（父规格 #958）。
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from fastapi import HTTPException
 
-from yuxi.utils.datetime_utils import utc_now_naive
 
 MIN_SCHEDULE_INTERVAL_SECONDS = 300  # 最短间隔 5 分钟
 PREVIEW_COUNT = 5
@@ -126,9 +125,18 @@ def _build_trigger(cron: str, timezone_name: str):
 
 
 def _next_fire_times(cron: str, timezone_name: str, count: int, after: datetime | None = None) -> list[datetime]:
-    """从 after（UTC aware，默认当前）起计算后续 count 次触发时间。"""
+    """从 after（UTC，naive 视为 UTC，默认当前）起计算后续 count 次触发时间。
+
+    持久化的 next_run_at 是 naive UTC：按本地时区解释会造成 8 小时级偏移，
+    使停机补发把大量历史周期误记 missed。
+    """
     trigger = _build_trigger(cron, timezone_name)
-    current = after.astimezone(timezone.utc) if after else datetime.now(timezone.utc)
+    if after is None:
+        current = datetime.now(UTC)
+    elif after.tzinfo is None:
+        current = after.replace(tzinfo=UTC)
+    else:
+        current = after.astimezone(UTC)
     times: list[datetime] = []
     for _ in range(count * 48):  # 防御极端稀疏规则
         fire = trigger.get_next_fire_time(current, current)
@@ -179,7 +187,7 @@ def apply_schedule_fields(payload: dict[str, Any]) -> dict[str, Any]:
 def compute_next_run(cron: str, timezone_name: str, after: datetime | None = None) -> datetime:
     """计算下次运行时间（UTC naive，供扫描回写）。"""
     fire = _next_fire_times(cron, timezone_name, 1, after=after)[0]
-    return fire.astimezone(timezone.utc).replace(tzinfo=None)
+    return fire.astimezone(UTC).replace(tzinfo=None)
 
 
 def schedule_idempotency_key(task_id: str, scheduled_at_utc, timezone_name: str) -> str:
@@ -192,6 +200,6 @@ def schedule_idempotency_key(task_id: str, scheduled_at_utc, timezone_name: str)
 
     if scheduled_at_utc is None:
         return f"schedule:{task_id}:none"
-    aware = scheduled_at_utc.replace(tzinfo=timezone.utc) if scheduled_at_utc.tzinfo is None else scheduled_at_utc
+    aware = scheduled_at_utc.replace(tzinfo=UTC) if scheduled_at_utc.tzinfo is None else scheduled_at_utc
     local = aware.astimezone(ZoneInfo(timezone_name))
     return f"schedule:{task_id}:{local.strftime('%Y-%m-%d %H:%M')}"

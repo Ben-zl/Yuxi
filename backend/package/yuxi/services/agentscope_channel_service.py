@@ -70,11 +70,13 @@ class AgentScopeChannelService:
         group_reply_policy: str,
         enabled: bool,
         actor_uid: str,
+        department_id: int,
     ) -> AgentScopeChannelBinding:
         """提交本地 binding，并验证其 AgentScope 运行时投影。"""
         binding = await self.bindings.create(
             id=str(uuid.uuid4()),
             owner_uid=owner_uid,
+            department_id=department_id,
             agent_slug=agent_slug,
             name=name.strip(),
             channel_type="wps_xiezuo",
@@ -110,12 +112,16 @@ class AgentScopeChannelService:
     async def reconcile(self, binding: AgentScopeChannelBinding) -> AgentScopeChannelBinding:
         """验证凭据和 Agent 投影，不创建 AgentScope 原生 Channel。"""
         try:
+            if binding.department_id is None:
+                # 未绑定部门的旧 binding 不猜测归属，沿既有 error 状态展示
+                raise ValueError("Channel binding 未绑定部门，请重新创建以固定部门")
             _validate_ciphertext(binding.encrypted_app_secret)
             await project_runtime(
                 self.db,
                 uid=binding.owner_uid,
                 agent_slug=binding.agent_slug,
                 model_spec=None,
+                department_id=binding.department_id,
             )
             binding.model_spec = None
             binding.agentscope_channel_id = None

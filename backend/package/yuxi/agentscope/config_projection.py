@@ -64,6 +64,8 @@ class RuntimeProjection:
     memory_chat_model_config: dict | None = None
     memory_embedding_model_config: dict | None = None
     is_team_worker: bool = False
+    # 本次投影固定部门（运行提交时记录；Memory scope 创建等消费此事实）
+    department_id: int | None = None
 
 
 def adapt_prompt_paths_for_agentscope(prompt: str) -> str:
@@ -115,22 +117,23 @@ async def project_runtime(
     thread_id: str | None = None,
     is_team_worker: bool = False,
     include_memory_models: bool = False,
-    department_id: int | None = None,
+    department_id: int,
 ) -> RuntimeProjection:
     """统一投影入口：读取 yuxi 配置并产出该线程运行的全部运行时对象。
 
-    department_id 为运行提交时固定的部门：非空时按实时成员关系解析为不可变
-    权限上下文后再投影；为空仅限尚未绑定部门的过渡路径（Memory 维护等）。
+    department_id 为运行/维护提交时固定的部门：按实时成员关系解析为不可变
+    权限上下文后再投影；无部门的旧事实不得进入投影（由调用方明确拒绝）。
     """
     user = await _load_user(db, uid)
-    if department_id is not None:
-        try:
-            context = await resolve_department_context(db, user_id=user.id, department_id=department_id, strict=True)
-        except DepartmentContextError as exc:
-            raise ValueError(f"运行部门上下文无效: {exc}") from exc
-        if context.department_id is None:
-            raise ValueError("运行部门上下文无效")
-        user = context
+    try:
+        context = await resolve_department_context(db, user_id=user.id, department_id=department_id, strict=True)
+    except DepartmentContextError as exc:
+        raise ValueError(f"运行部门上下文无效: {exc}") from exc
+    if context.department_id is None:
+        raise ValueError("运行部门上下文无效")
+    # 固定部门事实在 agent_context 重绑定 context 前捕获
+    actor_department_id = context.department_id
+    user = context
     agent = await _load_agent(db, agent_slug, user)
     context = agent_context(agent)
     settings = await system_options.get(db)
@@ -180,6 +183,7 @@ async def project_runtime(
         credential_data=credential_data,
         chat_model_config=chat_model_config,
         is_team_worker=is_team_worker,
+        department_id=actor_department_id,
     )
 
     from yuxi.config import UserConfig

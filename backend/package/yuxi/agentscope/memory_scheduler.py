@@ -114,11 +114,23 @@ class MemoryDreamScheduler:
                 dates = self._due_dates(record, target)
                 if not dates:
                     continue
-                due.append((record.uid, record.agent_slug, dates))
-        await asyncio.gather(*(self._process_scope(uid, slug, dates) for uid, slug, dates in due))
+                if record.maintenance_department_id is None:
+                    # 旧 scope 无维护部门绑定：跳过自动 Dream 并写明确失败原因，不调用模型
+                    await AgentMemoryScopeRepository(db).set_dream_result(
+                        record,
+                        attempted_at=utc_now(),
+                        status="failed",
+                        error="Memory scope 未绑定维护部门，已跳过自动 Dream；请通过显式重建索引绑定有效部门",
+                    )
+                    await db.commit()
+                    continue
+                due.append((record.uid, record.agent_slug, dates, record.maintenance_department_id))
+        await asyncio.gather(
+            *(self._process_scope(uid, slug, dates, department_id) for uid, slug, dates, department_id in due)
+        )
 
-    async def _process_scope(self, uid: str, agent_slug: str, dates: list[date]) -> None:
-        """独占一个 scope 顺序执行待补日期。"""
+    async def _process_scope(self, uid: str, agent_slug: str, dates: list[date], department_id: int) -> None:
+        """独占一个 scope 顺序执行待补日期；投影按 scope 固定维护部门。"""
         async with self._semaphore:
             if await self.registry.is_busy(uid, agent_slug):
                 return
@@ -130,6 +142,7 @@ class MemoryDreamScheduler:
                             uid=uid,
                             agent_slug=agent_slug,
                             include_memory_models=True,
+                            department_id=department_id,
                         )
                     chat_model, embedding_model, _fingerprint = build_memory_models(projection)
                     workspace = validate_memory_workspace(self.base_dir, uid, agent_slug)

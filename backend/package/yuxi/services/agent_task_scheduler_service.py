@@ -21,7 +21,7 @@ from yuxi.services.agent_task_schedule_service import (
     compute_next_run,
     schedule_idempotency_key,
 )
-from yuxi.storage.postgres.models_business import AgentTask, User
+from yuxi.storage.postgres.models_business import AgentTask
 from yuxi.utils.datetime_utils import utc_now_naive
 from yuxi.utils.ids import new_uuid
 from yuxi.utils.logging_config import logger
@@ -38,13 +38,20 @@ class AgentTaskSchedulerService:
         self.tasks = AgentTaskRepository(db)
         self.executions = TaskExecutionRepository(db)
 
-    async def _owner(self, owner_uid: str) -> User | None:
+    async def _owner_context(self, owner_uid: str, department_id: int | None):
+        """按任务固定部门解析所有者执行身份；无绑定或成员失效明确拒绝。"""
         from yuxi.repositories.user_repository import UserRepository
+        from yuxi.services.department_context_service import DepartmentContextError, resolve_department_context
 
         user = await UserRepository(self.db).get_by_uid(owner_uid)
         if user is None or user.is_deleted:
             return None
-        return user
+        if department_id is None:
+            return None
+        try:
+            return await resolve_department_context(self.db, user_id=user.id, department_id=department_id, strict=True)
+        except DepartmentContextError:
+            return None
 
     async def scan_due(self) -> dict[str, int]:
         """扫描一轮：触发到期任务 + 记录 missed + 回写 next_run_at。"""
@@ -79,38 +86,38 @@ class AgentTaskSchedulerService:
         from yuxi.services.agent_task_trigger_service import AgentTaskTriggerService
 
         counts = {"triggered": 0, "skipped": 0, "missed": 0}
-        owner = await self._owner(task.owner_uid)
-        if owner is None:
-            logger.warning(f"定时任务所有者不存在 task={task.id}")
+        # 无绑定部门的旧任务不猜测归属：成员失效或无部门均拒绝派发
+        actor = await self._owner_context(task.owner_uid, task.department_id)
+        if actor is None:
+            logger.warning(f"定时任务执行身份不可用（所有者失效或部门无绑定）task={task.id} dept={task.department_id}")
             return counts
 
         if scheduled_at is not None and now - scheduled_at > RECOVERY_GRACE:
             # 宽限窗外：不补发陈旧周期，记 missed（工单 08）
-            await self._record_missed(task, owner, scheduled_at)
+            await self._record_missed(task, actor, scheduled_at)
             counts["missed"] = 1
             return counts
 
         service = AgentTaskTriggerService(self.db)
         execution, created = await service.trigger(
             task_id=task.id,
-            user=owner,
+            user=actor,
             trigger_type="schedule",
-            idempotency_key=schedule_idempotency_key(
-                task.id, scheduled_at, task.schedule_timezone or "UTC"
-            ),
+            idempotency_key=schedule_idempotency_key(task.id, scheduled_at, task.schedule_timezone or "UTC"),
             scheduled_at=scheduled_at,
         )
         counts["triggered"] = 1 if created and execution.status == "queued" else 0
         counts["skipped"] = 1 if created and execution.status == "skipped" else 0
         return counts
 
-    async def _record_missed(self, task: AgentTask, owner: User, scheduled_at) -> None:
+    async def _record_missed(self, task: AgentTask, owner, scheduled_at) -> None:
         await self.executions.create(
             id=new_uuid(),
             task_id=task.id,
             trigger_type="schedule",
             triggered_by_uid=str(owner.uid),
             execution_principal_uid=str(owner.uid),
+            department_id=task.department_id,
             agent_id=task.agent_id,
             agent_slug=task.agent_slug_snapshot or "",
             prompt=task.prompt,
@@ -130,7 +137,7 @@ class AgentTaskSchedulerService:
         if not task.schedule_cron or not task.schedule_timezone:
             task.next_run_at = None
             return
-        owner = await self._owner(task.owner_uid)
+        owner = await self._owner_context(task.owner_uid, task.department_id)
         try:
             next_run = compute_next_run(task.schedule_cron, task.schedule_timezone, after=fired_at)
         except Exception as exc:  # noqa: BLE001 - 非法规则停摆该任务定时

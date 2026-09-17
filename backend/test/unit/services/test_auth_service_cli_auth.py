@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from yuxi.services.department_context_service import DepartmentContext
 from yuxi.services.auth_service import (
     CLIAuthError,
     approve_cli_auth_session,
@@ -46,6 +47,24 @@ async def session():
     await engine.dispose()
 
 
+async def _approver(db, user: User) -> DepartmentContext:
+    """构造与 approve 路由同构的批准者上下文（绑定第一个部门）。"""
+    from sqlalchemy import select
+
+    dept_id = await db.scalar(select(Department.id).limit(1))
+    return DepartmentContext(
+        id=user.id,
+        uid=str(user.uid),
+        username=user.username,
+        account_role="superadmin",
+        department_id=dept_id,
+        department_name=None,
+        role="superadmin",
+        session_id=None,
+        revision=0,
+    )
+
+
 async def test_cli_auth_session_pending_then_exchange(session):
     db, user = session
     auth_session, device_code = await create_cli_auth_session(db)
@@ -60,7 +79,7 @@ async def test_cli_auth_session_pending_then_exchange(session):
     loaded = await get_cli_auth_session_for_user(db, auth_session.user_code)
     assert loaded.status == "pending"
 
-    await approve_cli_auth_session(db, auth_session.user_code, user)
+    await approve_cli_auth_session(db, auth_session.user_code, await _approver(db, user))
     token_data = await exchange_cli_auth_token(db, device_code)
 
     assert token_data["secret"].startswith("yxkey_")
@@ -72,7 +91,7 @@ async def test_cli_auth_session_token_exchange_replays_same_committed_secret(ses
     db, user = session
     auth_session, device_code = await create_cli_auth_session(db)
 
-    await approve_cli_auth_session(db, auth_session.user_code, user)
+    await approve_cli_auth_session(db, auth_session.user_code, await _approver(db, user))
     first = await exchange_cli_auth_token(db, device_code)
     replay = await exchange_cli_auth_token(db, device_code)
 
@@ -83,7 +102,7 @@ async def test_cli_auth_session_token_exchange_replays_same_committed_secret(ses
 async def test_cli_auth_session_does_not_republish_revoked_secret(session):
     db, user = session
     auth_session, device_code = await create_cli_auth_session(db)
-    await approve_cli_auth_session(db, auth_session.user_code, user)
+    await approve_cli_auth_session(db, auth_session.user_code, await _approver(db, user))
     first = await exchange_cli_auth_token(db, device_code)
     api_key = await db.get(APIKey, first["api_key"]["id"])
     api_key.is_enabled = False
@@ -100,7 +119,7 @@ async def test_cli_auth_session_does_not_republish_revoked_secret(session):
 async def test_cli_auth_session_replay_expires_with_original_session_window(session):
     db, user = session
     auth_session, device_code = await create_cli_auth_session(db)
-    await approve_cli_auth_session(db, auth_session.user_code, user)
+    await approve_cli_auth_session(db, auth_session.user_code, await _approver(db, user))
     await exchange_cli_auth_token(db, device_code)
 
     auth_session.expires_at = auth_session.created_at - timedelta(seconds=1)
@@ -118,3 +137,31 @@ async def test_cli_auth_session_rejects_unknown_user_code(session):
     with pytest.raises(CLIAuthError) as missing:
         await get_cli_auth_session_for_user(db, "NOPE-NOPE")
     assert missing.value.code == "not_found"
+
+
+async def test_cli_approve_records_department_and_exchange_binds_key(session):
+    """批准固定部门，兑换把该部门写入最终 API Key。"""
+    db, user = session
+    auth_session, device_code = await create_cli_auth_session(db)
+
+    await approve_cli_auth_session(db, auth_session.user_code, await _approver(db, user))
+    await db.refresh(auth_session)
+    assert auth_session.approved_department_id is not None
+
+    token_data = await exchange_cli_auth_token(db, device_code)
+    assert token_data["api_key"]["department_id"] == auth_session.approved_department_id
+
+
+async def test_cli_exchange_rejects_legacy_approval_without_department(session):
+    """旧批准记录缺少 approved_department_id：409 拒绝，不读会话活动部门补齐。"""
+    db, user = session
+    auth_session, device_code = await create_cli_auth_session(db)
+
+    await approve_cli_auth_session(db, auth_session.user_code, await _approver(db, user))
+    auth_session.approved_department_id = None
+    await db.commit()
+
+    with pytest.raises(CLIAuthError) as rejected:
+        await exchange_cli_auth_token(db, device_code)
+    assert rejected.value.code == "department_binding_missing"
+    assert rejected.value.status_code == 409

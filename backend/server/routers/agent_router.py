@@ -324,12 +324,17 @@ async def delete_agent_memory(
     current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """删除当前用户的一张 Agent 长期记忆。"""
+    """删除当前用户的一张 Agent 长期记忆，并按请求有效部门重建索引。"""
     item = await AgentRepository(db).get_visible_by_slug(slug=agent_slug, user=current_user, kind="any")
     if item is None:
         raise HTTPException(status_code=404, detail="智能体不存在")
     try:
-        await _memory_client().delete_memory_item(str(current_user.uid), agent_slug, memory_id)
+        await _memory_client().delete_memory_item(
+            str(current_user.uid),
+            agent_slug,
+            memory_id,
+            department_id=current_user.department_id,
+        )
     except AgentScopeServiceError as exc:
         _raise_memory_service_error(exc)
     return {"success": True}
