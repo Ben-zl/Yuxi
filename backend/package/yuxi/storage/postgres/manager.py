@@ -23,7 +23,7 @@ from yuxi.utils.singleton import SingletonMeta
 # 合并两个 Base
 CombinedBase = declarative_base()
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
-BUSINESS_SCHEMA_VERSION = 13
+BUSINESS_SCHEMA_VERSION = 14
 KNOWLEDGE_SCHEMA_VERSION = 4
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
@@ -1555,6 +1555,53 @@ class PostgresManager(metaclass=SingletonMeta):
                 "WHERE model_spec IS NOT NULL OR agentscope_channel_id IS NOT NULL "
                 "OR agentscope_agent_id IS NOT NULL OR agentscope_credential_id IS NOT NULL"
             ),
+            # 部门成员关系、登录会话与运行提交部门（business v14）
+            "ALTER TABLE IF EXISTS agent_run_requests ADD COLUMN IF NOT EXISTS department_id INTEGER",
+            "CREATE INDEX IF NOT EXISTS ix_agent_run_requests_department_id ON agent_run_requests(department_id)",
+            "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS department_id INTEGER",
+            "CREATE INDEX IF NOT EXISTS ix_agent_runs_department_id ON agent_runs(department_id)",
+            "ALTER TABLE IF EXISTS agent_tasks ADD COLUMN IF NOT EXISTS department_id INTEGER",
+            "CREATE INDEX IF NOT EXISTS ix_agent_tasks_department_id ON agent_tasks(department_id)",
+            "ALTER TABLE IF EXISTS task_executions ADD COLUMN IF NOT EXISTS department_id INTEGER",
+            "CREATE INDEX IF NOT EXISTS ix_task_executions_department_id ON task_executions(department_id)",
+            "ALTER TABLE IF EXISTS agentscope_channel_bindings ADD COLUMN IF NOT EXISTS department_id INTEGER",
+            (
+                "CREATE INDEX IF NOT EXISTS ix_agentscope_channel_bindings_department_id "
+                "ON agentscope_channel_bindings(department_id)"
+            ),
+            "ALTER TABLE IF EXISTS cli_auth_sessions ADD COLUMN IF NOT EXISTS approved_department_id INTEGER",
+            (
+                "CREATE INDEX IF NOT EXISTS ix_cli_auth_sessions_approved_department_id "
+                "ON cli_auth_sessions(approved_department_id)"
+            ),
+            "ALTER TABLE IF EXISTS agent_memory_scopes ADD COLUMN IF NOT EXISTS maintenance_department_id INTEGER",
+            (
+                "CREATE INDEX IF NOT EXISTS ix_agent_memory_scopes_maintenance_department_id "
+                "ON agent_memory_scopes(maintenance_department_id)"
+            ),
+            """
+            CREATE TABLE IF NOT EXISTS department_memberships (
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                department_id INTEGER NOT NULL REFERENCES departments(id),
+                role VARCHAR(16) NOT NULL DEFAULT 'user',
+                created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+                CONSTRAINT ck_department_membership_role CHECK (role IN ('admin', 'user')),
+                CONSTRAINT department_memberships_pkey PRIMARY KEY (user_id, department_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                id VARCHAR(36) NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                active_department_id INTEGER REFERENCES departments(id),
+                revision INTEGER NOT NULL DEFAULT 0,
+                expires_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+                revoked_at TIMESTAMP WITHOUT TIME ZONE,
+                created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+                CONSTRAINT auth_sessions_pkey PRIMARY KEY (id)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_auth_sessions_user_expires ON auth_sessions(user_id, expires_at)",
         ]
         async with self.async_engine.begin() as conn:
             await conn.run_sync(BusinessBase.metadata.tables["run_resource_snapshots"].create, checkfirst=True)

@@ -138,7 +138,7 @@ async def main() -> None:
                 "business",
                 business_version,
                 BUSINESS_SCHEMA_VERSION,
-                upgrade_from=(1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+                upgrade_from=(1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13),
             )
             if not lite_mode_enabled():
                 _require_supported_version(

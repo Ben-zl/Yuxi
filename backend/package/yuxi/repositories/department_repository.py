@@ -5,12 +5,29 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import APIKey, Department, User
+from yuxi.storage.postgres.models_business import (
+    AgentMemoryScope,
+    AgentRun,
+    AgentRunRequest,
+    AgentScopeChannelBinding,
+    AgentTask,
+    APIKey,
+    AuthSession,
+    CLIAuthSession,
+    Department,
+    DepartmentMembership,
+    TaskExecution,
+    User,
+)
 from yuxi.utils.datetime_utils import utc_now_naive
+
+
+class DepartmentDeletionConflict(ValueError):
+    """部门仍存在部门权限上下文引用，不能按旧路径删除。"""
 
 
 @dataclass(frozen=True)
@@ -127,12 +144,21 @@ class DepartmentRepository:
     async def delete_and_migrate_users(
         self, id: int, *, default_department_id: int = 1
     ) -> DepartmentDeletionResult | None:
-        """迁移部门用户、删除关联 API Key，并原子删除部门。"""
+        """迁移部门用户、删除关联 API Key，并原子删除部门。
+
+        部门成员等新引用存在时抛出 DepartmentDeletionConflict，不产生任何写入；
+        无新引用时保留旧删除语义，最终删除策略由部门边界决策接管。
+        """
         async with self._session() as session:
-            result = await session.execute(select(Department).where(Department.id == id))
+            # 先锁部门行，与新增引用写入使用一致的锁序，防止检查后并发插入
+            result = await session.execute(select(Department).where(Department.id == id).with_for_update())
             department = result.scalar_one_or_none()
             if department is None:
                 return None
+
+            reference = await self._find_context_reference(session, id)
+            if reference is not None:
+                raise DepartmentDeletionConflict(f"部门仍存在{reference}引用，不能删除")
 
             user_result = await session.execute(select(User).where(User.department_id == id))
             users = list(user_result.scalars().all())
@@ -147,6 +173,26 @@ class DepartmentRepository:
             await session.delete(department)
             await session.flush()
             return DepartmentDeletionResult(name=department.name, migrated_user_count=len(users))
+
+    @staticmethod
+    async def _find_context_reference(session: AsyncSession, department_id: int) -> str | None:
+        """返回任意一类部门权限上下文引用的说明；无引用时为 None。"""
+        checks = (
+            ("部门成员关系", DepartmentMembership.department_id),
+            ("登录会话活动部门", AuthSession.active_department_id),
+            ("CLI 批准部门", CLIAuthSession.approved_department_id),
+            ("Memory 维护绑定", AgentMemoryScope.maintenance_department_id),
+            ("运行请求", AgentRunRequest.department_id),
+            ("运行", AgentRun.department_id),
+            ("定时任务", AgentTask.department_id),
+            ("任务执行", TaskExecution.department_id),
+            ("Channel 绑定", AgentScopeChannelBinding.department_id),
+        )
+        for label, column in checks:
+            has_reference = await session.scalar(select(exists().where(column == department_id)))
+            if has_reference:
+                return label
+        return None
 
     async def count_users(self, id: int) -> int:
         """统计部门用户数量"""

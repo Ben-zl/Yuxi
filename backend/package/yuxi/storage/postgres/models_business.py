@@ -134,8 +134,8 @@ class Department(Base):
     description = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=utc_now_naive)
 
-    # 关联关系
-    users = relationship("User", back_populates="department", cascade="all, delete-orphan")
+    # 关联关系：账号与部门的授权归属由 DepartmentMembership 承担，删除部门不再级联处置账号
+    users = relationship("User", back_populates="department")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -231,6 +231,41 @@ class User(Base):
         self.login_locked_until = None
 
 
+class DepartmentMembership(Base):
+    """账号与部门的成员关系；部门内角色独立于全局账号身份。"""
+
+    __tablename__ = "department_memberships"
+    __table_args__ = (CheckConstraint("role IN ('admin', 'user')", name="ck_department_membership_role"),)
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    department_id = Column(Integer, ForeignKey("departments.id"), primary_key=True)
+    role = Column(String(16), nullable=False, default="user")
+    created_at = Column(DateTime, default=utc_now_naive, nullable=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "user_id": self.user_id,
+            "department_id": self.department_id,
+            "role": self.role,
+            "created_at": format_utc_datetime(self.created_at),
+        }
+
+
+class AuthSession(Base):
+    """交互登录会话：当前活动部门属于会话，不属于账号全局字段。"""
+
+    __tablename__ = "auth_sessions"
+    __table_args__ = (Index("ix_auth_sessions_user_expires", "user_id", "expires_at"),)
+
+    id = Column(String(36), primary_key=True)  # UUID 字符串
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    active_department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
+    revision = Column(Integer, nullable=False, default=0)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utc_now_naive, nullable=False)
+
+
 class AgentEnv(Base):
     """用户级 Agent 沙盒环境变量"""
 
@@ -283,6 +318,7 @@ class AgentMemoryScope(Base):
     uid = Column(String, ForeignKey("users.uid", ondelete="CASCADE"), primary_key=True)
     agent_slug = Column(String(80), primary_key=True)
     workspace_id = Column(String(64), nullable=False, unique=True, index=True)
+    maintenance_department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True)
     last_memory_at = Column(DateTime(timezone=True), nullable=True)
     last_dream_date = Column(Date, nullable=True)
     dream_status = Column(String(16), nullable=True)
@@ -953,6 +989,7 @@ class AgentScopeChannelBinding(Base):
 
     id = Column(String(36), primary_key=True)
     owner_uid = Column(String(64), nullable=False, index=True)
+    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True)
     agent_slug = Column(String(64), nullable=False, index=True)
     name = Column(String(128), nullable=False)
     channel_type = Column(String(32), nullable=False, default="wps_xiezuo")
@@ -1162,6 +1199,7 @@ class CLIAuthSession(Base):
     key_name = Column(String(100), nullable=False)
 
     approved_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    approved_department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True)
     api_key_id = Column(Integer, ForeignKey("api_keys.id"), nullable=True, index=True)
 
     created_at = Column(DateTime, default=utc_now_naive, nullable=False)
@@ -1205,6 +1243,7 @@ class AgentRun(Base):
     )
     agent_slug = Column(String(64), index=True, nullable=False, comment="Agent slug")
     uid = Column(String(64), index=True, nullable=False, comment="UID")
+    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True, comment="提交时固定部门")
     status = Column(
         String(32),
         index=True,
@@ -1336,6 +1375,7 @@ class AgentRunRequest(Base):
     id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
     request_id = Column(String(64), unique=True, index=True, nullable=False, comment="幂等请求 ID")
     uid = Column(String(64), nullable=False, comment="UID")
+    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True, comment="提交时固定部门")
     agent_slug = Column(String(64), nullable=False, comment="Agent slug")
     conversation_thread_id = Column(String(64), nullable=False, comment="Conversation thread ID")
     source = Column(String(32), nullable=False, default="chat", comment="请求来源: chat/agent_call/eval")
@@ -1412,6 +1452,7 @@ class AgentTask(Base):
     id = Column(String(36), primary_key=True, comment="Task ID (UUID)")
     name = Column(String(128), nullable=False, comment="任务名称")
     owner_uid = Column(String(64), index=True, nullable=False, comment="创建者 UID")
+    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True, comment="创建时固定部门")
     agent_id = Column(Integer, nullable=True, index=True, comment="引用智能体 ID；删除后置空")
     agent_name_snapshot = Column(String(128), nullable=True, comment="智能体名称展示快照")
     agent_slug_snapshot = Column(String(64), nullable=True, comment="智能体 slug 展示快照")
@@ -1478,6 +1519,7 @@ class TaskExecution(Base):
     task_id = Column(String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), index=True, nullable=False)
     trigger_type = Column(String(16), nullable=False, comment="触发方式: manual/api/schedule")
     triggered_by_uid = Column(String(64), nullable=False, comment="触发者 UID")
+    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True, comment="复制自任务的部门")
     execution_principal_uid = Column(String(64), nullable=False, comment="执行身份 UID")
     agent_id = Column(Integer, nullable=True, comment="触发时固定的智能体 ID；删除后置空")
     agent_slug = Column(String(64), nullable=False, comment="触发时固定的智能体 slug")

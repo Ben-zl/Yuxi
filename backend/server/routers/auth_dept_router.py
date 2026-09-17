@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.utils.auth_middleware import get_admin_user, get_db, get_superadmin_user
-from yuxi.repositories.department_repository import DepartmentRepository
+from yuxi.repositories.department_repository import DepartmentDeletionConflict, DepartmentRepository
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.services.identity_admin_service import IdentityConflictError, create_department_with_admin
 from yuxi.services.operation_log_service import log_operation
@@ -201,7 +201,10 @@ async def delete_department(
     if department.id == 1:  # 默认部门的ID为1
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="默认部门不允许删除")
 
-    deletion = await repository.delete_and_migrate_users(department_id)
+    try:
+        deletion = await repository.delete_and_migrate_users(department_id)
+    except DepartmentDeletionConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if deletion is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="部门不存在")
 
