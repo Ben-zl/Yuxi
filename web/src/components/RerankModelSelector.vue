@@ -14,7 +14,7 @@
       <a-menu class="scrollable-menu">
         <a-menu-item-group v-for="(providerData, providerId) in v2Models" :key="providerId">
           <template #title>
-            <span>{{ providerId }}</span>
+            <span>{{ resolveProviderDisplayName(providerId, providerData) }}</span>
           </template>
           <a-menu-item
             v-for="model in providerData.models"
@@ -32,6 +32,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { modelProviderApi } from '@/apis/system_api'
+import { resolveProviderDisplayName } from '@/utils/modelProviderDisplay'
 
 const props = defineProps({
   value: {

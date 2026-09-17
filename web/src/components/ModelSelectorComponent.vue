@@ -152,6 +152,7 @@ import { Eye, RefreshCw, X } from '@lucide/vue'
 import { useModelStatus } from '@/composables/useModelStatus'
 import { useUserStore } from '@/stores/user'
 import { loadModelMetadataCatalog, resolveModelDisplayMetadata } from '@/utils/modelMetadata'
+import { resolveProviderDisplayName } from '@/utils/modelProviderDisplay'
 
 const props = defineProps({
   model_spec: {
@@ -236,12 +237,7 @@ const hasFilteredModels = computed(() => {
 const hasModelMetadata = computed(() => Object.keys(modelMetadataBySpec.value).length > 0)
 
 const getProviderDisplayName = (providerId, providerData = {}) => {
-  return (
-    providerData.provider_display_name ||
-    providerData.display_name ||
-    providerData.name ||
-    providerId
-  )
+  return resolveProviderDisplayName(providerId, providerData)
 }
 
 // 拉取 v2 模型列表
