@@ -56,6 +56,56 @@ async def test_list_visible_files_never_scans_internal_directories(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_visible_files_reuses_preloaded_mapping(monkeypatch):
+    """批量历史目录读取不得为每个线程再次查询映射。"""
+    calls = []
+
+    class Client:
+        async def list_workspace_files(self, uid, agent_id, session_id, *, root, max_entries=500):
+            calls.append((uid, agent_id, session_id, root))
+            return WorkspaceFileListing(items=[], truncated=False)
+
+    async def unexpected_resolve(*_args, **_kwargs):
+        raise AssertionError("preloaded mapping should avoid another repository query")
+
+    monkeypatch.setattr(service, "AgentScopeServiceClient", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(service, "resolve_thread_workspace", unexpected_resolve)
+    mapping = SimpleNamespace(
+        uid="u1",
+        thread_id="t1",
+        agentscope_agent_id="a1",
+        agentscope_session_id="s1",
+    )
+
+    await service.list_visible_files(None, uid="u1", thread_id="t1", mapping=mapping)
+
+    assert calls == [
+        ("u1", "a1", "s1", "/workspace/uploads"),
+        ("u1", "a1", "s1", "/workspace/outputs"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_visible_files_rejects_mismatched_preloaded_mapping(monkeypatch):
+    """预加载映射必须继续绑定当前用户与线程，不能绕过 repository 授权。"""
+
+    class Client:
+        async def list_workspace_files(self, *_args, **_kwargs):
+            raise AssertionError("mismatched mapping must fail before AgentScope access")
+
+    monkeypatch.setattr(service, "AgentScopeServiceClient", lambda *_args, **_kwargs: Client())
+    mapping = SimpleNamespace(
+        uid="other-user",
+        thread_id="t1",
+        agentscope_agent_id="a1",
+        agentscope_session_id="s1",
+    )
+
+    with pytest.raises(ValueError, match="mapping identity mismatch"):
+        await service.list_visible_files(None, uid="u1", thread_id="t1", mapping=mapping)
+
+
+@pytest.mark.asyncio
 async def test_artifact_manifest_maps_only_outputs(monkeypatch):
     class Client:
         async def read_workspace_file(self, *_args, **_kwargs):

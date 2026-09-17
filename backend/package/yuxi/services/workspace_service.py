@@ -54,6 +54,7 @@ MAX_WORKSPACE_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_BYTES
 MAX_WORKSPACE_UPLOAD_FILES = 50
 WORKSPACE_CHATS_DIR_NAME = "chats"
 _CHAT_READONLY_MESSAGE = "历史对话文件为只读，请在对应对话中修改"
+CHAT_WORKSPACE_LIST_CONCURRENCY = 16
 _CHAT_INTERMEDIATE_DIR_NAMES = frozenset(
     {
         LARGE_TOOL_RESULTS_DIR_NAME,
@@ -737,31 +738,65 @@ async def _list_chat_directory_agentscope(
     files_only: bool,
 ) -> tuple[list[dict], bool] | None:
     """将 AgentScope uploads/outputs 合并到历史对话目录并保留截断状态。"""
-    from yuxi.services.thread_workspace_service import list_visible_files, resolve_thread_workspace
+    from yuxi.services.thread_workspace_service import (
+        list_thread_workspaces,
+        list_visible_files,
+        resolve_thread_workspace,
+    )
 
     parts = _chat_path_parts(path)
     if parts is None:
         return None
     if not parts:
-        entries = _list_chat_directory(path, thread_titles=thread_titles, recursive=recursive, files_only=files_only)
+        entries = await asyncio.to_thread(
+            _list_chat_directory, path, thread_titles=thread_titles, recursive=recursive, files_only=files_only
+        )
         visible_threads = {entry["name"] for entry in entries if entry.get("is_dir")}
         truncated = False
-        for thread_id, title in thread_titles.items():
-            if await resolve_thread_workspace(db, uid=uid, thread_id=thread_id) is None:
-                continue
-            listing = await list_visible_files(db, uid=uid, thread_id=thread_id)
-            truncated = truncated or listing.truncated
-            files = listing.items
-            if not files:
-                continue
-            if not files_only and thread_id not in visible_threads:
-                entries.append(_virtual_entry(f"/agents/chats/{thread_id}", name=thread_id, title=title, is_dir=True))
-            if recursive:
-                entries.extend(
-                    _agentscope_chat_entries(
-                        thread_id, files, path=f"/agents/chats/{thread_id}", recursive=True, files_only=files_only
+        mappings = await list_thread_workspaces(db, uid=uid, thread_ids=list(thread_titles))
+        if not recursive:
+            if not files_only:
+                for mapping in mappings:
+                    thread_id = mapping.thread_id
+                    if thread_id not in visible_threads:
+                        entries.append(
+                            _virtual_entry(
+                                f"/agents/chats/{thread_id}",
+                                name=thread_id,
+                                title=thread_titles[thread_id],
+                                is_dir=True,
+                            )
+                        )
+            return _sort_chat_entries(list({entry["path"]: entry for entry in entries}.values())), False
+        for start in range(0, len(mappings), CHAT_WORKSPACE_LIST_CONCURRENCY):
+            batch = mappings[start : start + CHAT_WORKSPACE_LIST_CONCURRENCY]
+            listings = await asyncio.gather(
+                *(list_visible_files(db, uid=uid, thread_id=mapping.thread_id, mapping=mapping) for mapping in batch)
+            )
+            for mapping, listing in zip(batch, listings):
+                truncated = truncated or listing.truncated
+                if not listing.items:
+                    continue
+                thread_id = mapping.thread_id
+                if not files_only and thread_id not in visible_threads:
+                    entries.append(
+                        _virtual_entry(
+                            f"/agents/chats/{thread_id}",
+                            name=thread_id,
+                            title=thread_titles[thread_id],
+                            is_dir=True,
+                        )
                     )
-                )
+                if recursive:
+                    entries.extend(
+                        _agentscope_chat_entries(
+                            thread_id,
+                            listing.items,
+                            path=f"/agents/chats/{thread_id}",
+                            recursive=True,
+                            files_only=files_only,
+                        )
+                    )
         return _sort_chat_entries(list({entry["path"]: entry for entry in entries}.values())), truncated
 
     thread_id = parts[0]

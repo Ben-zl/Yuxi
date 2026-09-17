@@ -781,3 +781,82 @@ async def test_agentscope_history_lists_and_reads_output(monkeypatch) -> None:
     assert [entry["name"] for entry in tree["entries"]] == ["nested"]
     assert tree["truncated"] is True
     assert preview["content"] == "report"
+
+
+@pytest.mark.asyncio
+async def test_chat_root_lists_mapped_threads_without_remote_roundtrips(monkeypatch, tmp_path) -> None:
+    """非递归历史目录直接列映射会话，不为筛空目录访问远端。"""
+    from yuxi.services import thread_workspace_service
+
+    monkeypatch.setattr(workspace_paths.conf, "save_dir", str(tmp_path))
+    titles = {f"thread-{index}": f"2026-09-16-{index}" for index in range(3)}
+    mappings = {thread: SimpleNamespace(thread_id=thread) for thread in titles}
+
+    async def batch(*_args, **_kwargs):
+        return list(mappings.values())
+
+    async def visible(*_args, **_kwargs):
+        raise AssertionError("non-recursive root listing must not call AgentScope")
+
+    monkeypatch.setattr(thread_workspace_service, "list_thread_workspaces", batch, raising=False)
+    monkeypatch.setattr(thread_workspace_service, "list_visible_files", visible)
+
+    result = await svc.list_workspace_tree(
+        path="/agents/chats", current_user=_user(), thread_titles=titles, db=object()
+    )
+    assert [entry["name"] for entry in result["entries"]] == ["thread-2", "thread-1", "thread-0"]
+
+
+@pytest.mark.asyncio
+async def test_recursive_chat_root_batches_remote_workspace_reads(monkeypatch, tmp_path) -> None:
+    """递归读取最多并发 16 个会话，并聚合所有批次的截断状态。"""
+    import asyncio
+
+    from yuxi.services import thread_workspace_service
+
+    monkeypatch.setattr(workspace_paths.conf, "save_dir", str(tmp_path))
+    titles = {f"thread-{index:02d}": f"2026-09-16-{index:02d}" for index in range(17)}
+    mappings = [
+        SimpleNamespace(uid="user-1", thread_id=thread_id)
+        for thread_id in titles
+    ]
+    active = 0
+    max_active = 0
+    completed = []
+
+    async def batch(*_args, **_kwargs):
+        return mappings
+
+    async def visible(*_args, thread_id, **_kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        completed.append(thread_id)
+        return SimpleNamespace(
+            items=[
+                {
+                    "path": "/home/gem/user-data/outputs/result.txt",
+                    "is_dir": False,
+                    "size_bytes": 1,
+                }
+            ],
+            truncated=thread_id == "thread-16",
+        )
+
+    monkeypatch.setattr(thread_workspace_service, "list_thread_workspaces", batch)
+    monkeypatch.setattr(thread_workspace_service, "list_visible_files", visible)
+
+    result = await svc.list_workspace_tree(
+        path="/agents/chats",
+        current_user=_user(),
+        thread_titles=titles,
+        db=object(),
+        recursive=True,
+    )
+
+    assert max_active == 16
+    assert len(completed) == 17
+    assert completed[-1] == "thread-16"
+    assert result["truncated"] is True

@@ -7,7 +7,8 @@ import os
 from pathlib import PurePosixPath
 
 from yuxi.agentscope.client import AgentScopeServiceClient, AgentScopeServiceError, WorkspaceFileListing
-from yuxi.repositories.agentscope_thread_sessions import get_thread_session
+from yuxi.repositories.agentscope_thread_sessions import get_thread_session, list_thread_sessions
+from yuxi.storage.postgres.models_business import AgentScopeThreadSession
 
 VIRTUAL_USER_DATA_ROOT = PurePosixPath("/home/gem/user-data")
 WORKSPACE_ROOT = PurePosixPath("/workspace")
@@ -46,12 +47,29 @@ async def resolve_thread_workspace(db, *, uid: str, thread_id: str):
     return client, mapping
 
 
-async def list_visible_files(db, *, uid: str, thread_id: str, max_entries: int = 500) -> WorkspaceFileListing:
+async def list_thread_workspaces(db, *, uid: str, thread_ids: list[str]) -> list[AgentScopeThreadSession]:
+    """一次读取当前用户可见历史线程的 AgentScope 映射。"""
+    return await list_thread_sessions(db, uid=uid, thread_ids=thread_ids)
+
+
+async def list_visible_files(
+    db,
+    *,
+    uid: str,
+    thread_id: str,
+    max_entries: int = 500,
+    mapping: AgentScopeThreadSession | None = None,
+) -> WorkspaceFileListing:
     """仅列出文件树可见的 uploads/outputs，并保留目录和完整性标记。"""
-    context = await resolve_thread_workspace(db, uid=uid, thread_id=thread_id)
-    if context is None:
-        return WorkspaceFileListing(items=[])
-    client, mapping = context
+    if mapping is None:
+        context = await resolve_thread_workspace(db, uid=uid, thread_id=thread_id)
+        if context is None:
+            return WorkspaceFileListing(items=[])
+        client, mapping = context
+    else:
+        if mapping.uid != uid or mapping.thread_id != thread_id:
+            raise ValueError("mapping identity mismatch")
+        client = AgentScopeServiceClient(os.getenv("AGENTSCOPE_BASE_URL", "http://agentscope:8100"))
     files: list[dict] = []
     truncated = False
     for namespace in VISIBLE_NAMESPACES:

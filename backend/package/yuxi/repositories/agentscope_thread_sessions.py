@@ -17,6 +17,24 @@ async def get_thread_session(db: AsyncSession, *, uid: str, thread_id: str) -> A
     return result.scalar_one_or_none()
 
 
+async def list_thread_sessions(
+    db: AsyncSession,
+    *,
+    uid: str,
+    thread_ids: list[str],
+) -> list[AgentScopeThreadSession]:
+    """按用户批量读取指定线程映射；空线程集合不访问数据库。"""
+    if not thread_ids:
+        return []
+    result = await db.execute(
+        select(AgentScopeThreadSession).where(
+            AgentScopeThreadSession.uid == uid,
+            AgentScopeThreadSession.thread_id.in_(thread_ids),
+        )
+    )
+    return list(result.scalars().all())
+
+
 async def create_thread_session(
     db: AsyncSession,
     *,
