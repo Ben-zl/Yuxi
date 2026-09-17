@@ -48,6 +48,12 @@ export const useProjectsStore = defineStore('projects', () => {
     projects.value = projects.value.filter((project) => project.id !== projectId)
   }
 
+  // 清空部门资源缓存；切换部门或上下文失效时调用，列表由视图重新加载
+  const resetProjects = () => {
+    invalidatePendingLoad()
+    projects.value = []
+  }
+
   return {
     projects,
     isLoading,
@@ -55,6 +61,7 @@ export const useProjectsStore = defineStore('projects', () => {
     loadProjects,
     upsertProject,
     replaceProject,
-    removeProject
+    removeProject,
+    resetProjects
   }
 })

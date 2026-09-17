@@ -2,6 +2,16 @@ import { agentApi } from '@/apis'
 import { processRunSseResponse } from '@/composables/useAgentRunStream'
 import { IDLE_QUEUE_SNAPSHOT } from '@/composables/useAgentThreadState'
 import { handleChatError } from '@/utils/errorHandler'
+import { useUserStore } from '@/stores/user'
+
+// 无激活 Pinia 的测试环境下降级为不做部门 epoch 检查
+const getUserStore = () => {
+  try {
+    return useUserStore()
+  } catch {
+    return null
+  }
+}
 
 export function useAgentRequestQueue({
   getThreadState,
@@ -72,16 +82,30 @@ export function useAgentRequestQueue({
     const controller = new AbortController()
     const entry = { controller, position: 0, status: 'queued' }
     ts.requestStreams[requestId] = entry
+    // 部门切换时统一中止旧订阅；逐事件写 store 前检查 epoch
+    const userStore = getUserStore()
+    const departmentEpoch = userStore?.departmentEpoch.current() ?? null
+    const unregisterStream = userStore?.registerDepartmentStreamController(controller) || null
+    const isDepartmentStale = () =>
+      departmentEpoch !== null && !userStore.departmentEpoch.accept(departmentEpoch)
 
     try {
       const response = await agentApi.streamRequestEvents(requestId, {
         signal: controller.signal
       })
+      if (isDepartmentStale()) {
+        controller.abort()
+        return
+      }
       if (!response.ok) {
         throw new Error(`Request SSE response not ok: ${response.status}`)
       }
 
       const handleEvent = (event, data) => {
+        if (isDepartmentStale()) {
+          controller.abort()
+          return
+        }
         // 一次性取 ts/entry，避免每个分支重复 getThreadState 触发响应式追踪。
         const tsInner = getThreadState(threadId)
         const innerEntry = tsInner?.requestStreams?.[requestId]
@@ -121,11 +145,12 @@ export function useAgentRequestQueue({
 
       await processRunSseResponse(response, handleEvent)
     } catch (error) {
-      if (error?.name !== 'AbortError') {
+      if (error?.name !== 'AbortError' && error?.code !== 'department_context_stale') {
         console.error('Request SSE stream error:', error)
         handleChatError(error, 'stream')
       }
     } finally {
+      unregisterStream?.()
       const tsFinal = getThreadState(threadId)
       if (tsFinal?.requestStreams?.[requestId]?.controller === controller) {
         delete tsFinal.requestStreams[requestId]

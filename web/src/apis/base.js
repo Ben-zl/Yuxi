@@ -1,6 +1,42 @@
 import { useUserStore, checkAdminPermission, checkSuperAdminPermission } from '@/stores/user'
 import { message } from 'ant-design-vue'
 
+// 部门上下文白名单错误码：只刷新身份与视图并要求重选，不触发退出登录
+const DEPARTMENT_CONTEXT_ERROR_CODES = new Set([
+  'department_context_invalid',
+  'department_context_stale'
+])
+
+// 部门切换期间的静默错误码：不写浏览器错误日志
+const SILENT_ERROR_CODES = new Set(['department_context_stale', 'department_switching'])
+
+// 身份请求不使用资源 epoch 拒绝规则；其响应由 store 的登录世代/revision 规则裁决
+const IDENTITY_API_PATHS = new Set([
+  '/api/auth/me',
+  '/api/auth/department-context',
+  '/api/auth/profile',
+  '/api/auth/upload-avatar',
+  '/api/auth/token',
+  '/api/auth/initialize',
+  '/api/auth/logout'
+])
+
+const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+function requestPath(url) {
+  try {
+    return new URL(url, 'http://yuxi.local').pathname
+  } catch {
+    return '[invalid-url]'
+  }
+}
+
+function staleDepartmentResponse() {
+  const error = new Error('部门上下文已切换，响应已丢弃')
+  error.code = 'department_context_stale'
+  return error
+}
+
 function safeRequestMetadata(url, requestOptions, response = null) {
   let path = '[invalid-url]'
   try {
@@ -82,6 +118,10 @@ function publicErrorMessage(url, status, headers, requiresAuth) {
  * @returns {Promise} - 请求结果
  */
 export async function apiRequest(url, options = {}, requiresAuth = true, responseType = 'json') {
+  // 本地引用，避免外层 catch 读取未初始化变量
+  let userStore = null
+  let capturedEpoch = null
+  const isIdentityRequest = IDENTITY_API_PATHS.has(requestPath(url))
   try {
     const isFormData = options?.body instanceof FormData
     // 默认请求配置
@@ -95,12 +135,26 @@ export async function apiRequest(url, options = {}, requiresAuth = true, respons
 
     // 如果需要认证，添加认证头
     if (requiresAuth) {
-      const userStore = useUserStore()
+      userStore = useUserStore()
       if (!userStore.isLoggedIn) {
         throw new Error('用户未登录')
       }
 
       Object.assign(requestOptions.headers, userStore.getAuthHeaders())
+      capturedEpoch = userStore.departmentEpoch.current()
+
+      // 部门级请求携带当前会话 revision；服务端据此拒绝旧页面的部门写请求
+      if (userStore.departmentId !== null && userStore.contextRevision !== null) {
+        requestOptions.headers['X-Department-Revision'] = String(userStore.contextRevision)
+      }
+
+      // 切换期间禁用部门写操作，防止旧页面数据写入新部门上下文
+      const method = (requestOptions.method || 'GET').toUpperCase()
+      if (userStore.switchingDepartment && !isIdentityRequest && WRITE_METHODS.has(method)) {
+        const switchingError = new Error('部门切换中，请稍后重试')
+        switchingError.code = 'department_switching'
+        throw switchingError
+      }
     }
 
     // 发送请求
@@ -130,10 +184,36 @@ export async function apiRequest(url, options = {}, requiresAuth = true, respons
       const error = new Error(errorMessage)
       error.status = response.status
       error.headers = safeResponseHeaders(response.headers)
+      const detail = errorData?.detail
+      const errorCode =
+        detail && typeof detail === 'object' && typeof detail.code === 'string' ? detail.code : null
+      if (errorCode) error.code = errorCode
       error.response = {
         status: response.status,
         data: safeErrorData(errorData, response.status, errorMessage),
         headers: error.headers
+      }
+
+      // 本页已切换部门：旧上下文请求的错误响应同样作废，静默丢弃
+      if (
+        capturedEpoch !== null &&
+        !isIdentityRequest &&
+        !userStore.departmentEpoch.accept(capturedEpoch)
+      ) {
+        throw staleDepartmentResponse()
+      }
+
+      // 部门上下文白名单错误码：刷新身份与视图并要求重选，不变成退出登录
+      if (errorCode && DEPARTMENT_CONTEXT_ERROR_CODES.has(errorCode)) {
+        message.info(
+          errorCode === 'department_context_stale'
+            ? '部门上下文已变更，正在刷新'
+            : '当前部门上下文已失效，正在刷新部门信息'
+        )
+        if (userStore) {
+          void userStore.refreshIdentity().catch(() => {})
+        }
+        throw error
       }
 
       if (response.status === 401 && requiresAuth) {
@@ -164,21 +244,27 @@ export async function apiRequest(url, options = {}, requiresAuth = true, respons
 
     // 根据responseType处理响应
     if (responseType === 'blob') {
+      assertFreshDepartmentEpoch()
       return response
     } else if (responseType === 'json') {
       // 检查Content-Type以确定如何处理响应
       const contentType = response.headers.get('Content-Type')
-      if (contentType && contentType.includes('application/json')) {
-        return await response.json()
-      }
-      return await response.text()
+      const decoded =
+        contentType && contentType.includes('application/json')
+          ? await response.json()
+          : await response.text()
+      assertFreshDepartmentEpoch()
+      return decoded
     } else if (responseType === 'text') {
-      return await response.text()
+      const decoded = await response.text()
+      assertFreshDepartmentEpoch()
+      return decoded
     } else {
+      assertFreshDepartmentEpoch()
       return response
     }
   } catch (error) {
-    if (error.name !== 'AbortError') {
+    if (error.name !== 'AbortError' && !SILENT_ERROR_CODES.has(error.code)) {
       console.error('API请求异常:', {
         ...safeRequestMetadata(url, options),
         status: error?.status ?? null,
@@ -186,6 +272,20 @@ export async function apiRequest(url, options = {}, requiresAuth = true, respons
       })
     }
     throw error
+  }
+
+  /**
+   * 响应解码后、交给调用者前比对部门 epoch；
+   * 过期结果用带 code 的 Error 拒绝，不弹 toast、不清空新部门数据。
+   */
+  function assertFreshDepartmentEpoch() {
+    if (
+      capturedEpoch !== null &&
+      !isIdentityRequest &&
+      !userStore.departmentEpoch.accept(capturedEpoch)
+    ) {
+      throw staleDepartmentResponse()
+    }
   }
 }
 

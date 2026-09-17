@@ -4,11 +4,21 @@ import { handleChatError } from '@/utils/errorHandler'
 import { isSteerableMainChatRun } from '@/utils/agentRun'
 import { compareRunSeq, normalizeRunSeq, resolveRunResumeAfterSeq } from '@/utils/runStreamResume'
 import { hasPendingInterruptPayload } from '@/utils/toolApproval'
+import { useUserStore } from '@/stores/user'
 
 const RUN_INTERRUPTED_STATUS = 'interrupted'
 const RUN_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled'])
 const ACTIVE_RUN_STORAGE_TTL_MS = 60 * 60 * 1000
 const ACTIVE_RUN_CLIENT_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+
+// 无激活 Pinia 的测试环境下降级为不做部门 epoch 检查
+const getUserStore = () => {
+  try {
+    return useUserStore()
+  } catch {
+    return null
+  }
+}
 
 const getActiveRunStorageKey = (threadId) => `active_run:${threadId}`
 
@@ -246,10 +256,11 @@ export function useAgentRunStream({
     return true
   }
 
-  const scheduleRunReconnect = (threadId, runId, delay = 500) => {
+  const scheduleRunReconnect = (threadId, runId, delay = 500, isDepartmentStale = null) => {
     const ts = getThreadState(threadId)
     if (!ts || ts.activeRunId !== runId) return
     setTimeout(() => {
+      if (isDepartmentStale?.()) return
       const latest = getThreadState(threadId)
       if (latest?.activeRunId === runId && !latest.runStreamAbortController) {
         void startRunStream(threadId, runId, latest.runLastSeq)
@@ -274,6 +285,12 @@ export function useAgentRunStream({
     ts.lastRetryableJobTry = null
     ts.isStreaming = true
     saveActiveRunSnapshot(threadId, runId, ts.runLastSeq)
+    // 部门切换时统一中止旧流；逐事件写 store 前检查 epoch
+    const userStore = getUserStore()
+    const departmentEpoch = userStore?.departmentEpoch.current() ?? null
+    const unregisterStream = userStore?.registerDepartmentStreamController(runController) || null
+    const isDepartmentStale = () =>
+      departmentEpoch !== null && !userStore.departmentEpoch.accept(departmentEpoch)
     if (typeof onRunStarted === 'function') {
       onRunStarted({ threadId, runId })
     }
@@ -284,11 +301,19 @@ export function useAgentRunStream({
       const response = await agentApi.streamAgentRunEvents(runId, ts.runLastSeq, {
         signal: runController.signal
       })
+      if (isDepartmentStale()) {
+        runController.abort()
+        return
+      }
       if (!response.ok) {
         throw new Error(`SSE response not ok: ${response.status}`)
       }
 
       await processRunSseResponse(response, (event, data, eventId) => {
+        if (isDepartmentStale()) {
+          runController.abort()
+          return
+        }
         if (!data || ts.activeRunId !== runId) return
 
         if (eventId) {
@@ -396,29 +421,34 @@ export function useAgentRunStream({
           } else if (run && RUN_TERMINAL_STATUSES.has(run.status)) {
             finalizeRunStream(threadId, runId, touchedThreadIds, { status: run.status })
           } else {
-            scheduleRunReconnect(threadId, runId)
+            scheduleRunReconnect(threadId, runId, 500, isDepartmentStale)
           }
         } catch (e) {
+          if (e?.code === 'department_context_stale') return
           console.warn(
             'Run SSE closed before terminal event; reconnecting after status check failed:',
             e
           )
-          scheduleRunReconnect(threadId, runId)
+          scheduleRunReconnect(threadId, runId, 500, isDepartmentStale)
         }
       }
     } catch (error) {
       if (error?.name === 'AbortError') {
         if (!runController.signal.aborted) {
           streamSmoother?.flushThread(threadId)
-          scheduleRunReconnect(threadId, runId)
+          scheduleRunReconnect(threadId, runId, 500, isDepartmentStale)
         }
+      } else if (error?.code === 'department_context_stale') {
+        // 部门已切换：旧运行流静默终止，不重连也不提示
+        streamSmoother?.flushThread(threadId)
       } else {
         streamSmoother?.flushThread(threadId)
         console.error('Run SSE stream error:', error)
         handleChatError(error, 'stream')
-        scheduleRunReconnect(threadId, runId)
+        scheduleRunReconnect(threadId, runId, 500, isDepartmentStale)
       }
     } finally {
+      unregisterStream?.()
       if (ts.runStreamAbortController === runController) {
         ts.runStreamAbortController = null
       }

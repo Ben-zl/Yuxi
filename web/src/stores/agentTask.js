@@ -100,6 +100,15 @@ export const useAgentTaskStore = defineStore('agentTask', () => {
     }
   }
 
+  // 清空部门内任务缓存并停止轮询；切换部门或上下文失效时调用，不取消已提交任务
+  function resetTasks() {
+    stopPolling()
+    tasks.value = []
+    currentTask.value = null
+    executions.value = []
+    executionsLoading.value = false
+  }
+
   return {
     tasks,
     loading,
@@ -117,6 +126,7 @@ export const useAgentTaskStore = defineStore('agentTask', () => {
     submitApproval,
     previewSchedule,
     startPolling,
-    stopPolling
+    stopPolling,
+    resetTasks
   }
 })

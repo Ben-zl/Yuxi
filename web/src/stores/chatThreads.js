@@ -86,7 +86,9 @@ export const useChatThreadsStore = defineStore('chatThreads', () => {
     try {
       const fetchedThreads = await threadApi.getThreads(agentId, PAGE_SIZE, 0)
       threads.value = fetchedThreads || []
-      hasMoreThreads.value = Boolean(fetchedThreads && countNonPinnedThreads(fetchedThreads) >= PAGE_SIZE)
+      hasMoreThreads.value = Boolean(
+        fetchedThreads && countNonPinnedThreads(fetchedThreads) >= PAGE_SIZE
+      )
       if (
         currentThreadId.value &&
         !threads.value.find((thread) => thread.id === currentThreadId.value)
@@ -203,6 +205,15 @@ export const useChatThreadsStore = defineStore('chatThreads', () => {
     }
   }
 
+  // 清空部门内对话列表与选择；切换部门或上下文失效时调用，不触碰后端数据
+  const resetThreads = () => {
+    threads.value = []
+    setCurrentThreadId(null, { force: true })
+    threadCreationInFlight.value = false
+    hasMoreThreads.value = true
+    isLoadingMoreThreads.value = false
+  }
+
   return {
     threads,
     currentThreadId,
@@ -221,6 +232,7 @@ export const useChatThreadsStore = defineStore('chatThreads', () => {
     createThread,
     deleteThread,
     removeThreadsByProject,
-    updateThread
+    updateThread,
+    resetThreads
   }
 })

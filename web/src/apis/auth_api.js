@@ -108,6 +108,31 @@ async function getCurrentUser() {
   return apiGet('/api/auth/me')
 }
 
+/**
+ * 获取当前账号可切换的部门及实时角色
+ * @returns {Promise<{items: Array<{id: number, name: string, role: string}>}>}
+ */
+async function getMyDepartments() {
+  return apiGet('/api/auth/my-departments')
+}
+
+/**
+ * 切换当前登录会话的活动部门
+ * @param {Object} payload - { department_id, expected_revision }
+ * @returns {Promise<Object>} 与 /api/auth/me 同一身份结构
+ */
+async function switchDepartmentContext(payload) {
+  return apiPost('/api/auth/department-context', payload)
+}
+
+/**
+ * 撤销当前登录会话；成功返回 204 空响应
+ * @returns {Promise<string>} 空文本
+ */
+async function logoutSession() {
+  return apiPost('/api/auth/logout', {})
+}
+
 async function updateProfile(profileData) {
   return apiPut('/api/auth/profile', profileData)
 }
@@ -142,6 +167,9 @@ export const authApi = {
   validateUsername,
   uploadAvatar,
   getCurrentUser,
+  getMyDepartments,
+  switchDepartmentContext,
+  logoutSession,
   updateProfile,
   checkUid,
   impersonateUser,

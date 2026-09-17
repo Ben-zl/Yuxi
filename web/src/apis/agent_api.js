@@ -175,7 +175,7 @@ export const agentApi = {
    */
   streamRequestEvents: (requestId, options = {}) => {
     const { signal } = options
-    const headers = { ...useUserStore().getAuthHeaders() }
+    const headers = { ...useUserStore().getStreamAuthHeaders() }
     return fetch(`/api/agent/requests/${requestId}/events`, {
       method: 'GET',
       headers,
@@ -221,7 +221,7 @@ export const agentApi = {
   streamAgentRunEvents: (runId, afterSeq = '0-0', options = {}) => {
     const { signal, verbose = false } = options
     const headers = {
-      ...useUserStore().getAuthHeaders()
+      ...useUserStore().getStreamAuthHeaders()
     }
     const cursor = String(afterSeq || '0-0')
     if (cursor && cursor !== '0-0') {

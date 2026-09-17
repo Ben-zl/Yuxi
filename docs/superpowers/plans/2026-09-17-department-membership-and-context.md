@@ -345,7 +345,7 @@ assert default_membership_after is None
 
 **Interfaces:** user store 新增 `availableDepartments`、`contextRevision`、`departmentEpoch` 与 `switchDepartment(departmentId)`；统一 `applySession` 接收后端 account_role、role、department_id、department_name、context_revision。工具函数 `createDepartmentEpoch()` 返回 `{current(),advance(),accept(epoch)}`。切换 POST 成功后再替换可见上下文；失败保留原有效上下文。
 
-- [ ] 用 Node 原生 test runner 编写真实行为测试：
+- [x] 用 Node 原生 test runner 编写真实行为测试：
 
 ```javascript
 import assert from 'node:assert/strict'
@@ -360,8 +360,8 @@ test('切换后拒绝旧请求结果', () => {
 })
 ```
 
-- [ ] 运行 `cd web && node --test test/unit/department_context.test.js`；预期缺少模块失败。
-- [ ] 实现 epoch gate 并接入 API 结果消费，而非只写工具函数：
+- [x] 运行 `cd web && node --test test/unit/department_context.test.js`；预期缺少模块失败。
+- [x] 实现 epoch gate 并接入 API 结果消费，而非只写工具函数：
 
 ```javascript
 export function createDepartmentEpoch() {
@@ -372,12 +372,17 @@ export function createDepartmentEpoch() {
 
 `apiRequest` 请求前捕获 epoch，响应解码后、交给调用者前比对；过期结果用带 `code='department_context_stale'` 的 Error 拒绝，不弹失败 toast、不清空新部门数据。切换和个人资料请求不使用普通资源epoch拒绝规则，但身份响应必须使用下述独立规则；SSE实际走 `agent_api.js` 的fetch与 `useAgentRunStream.js`，不经过base.js；两处必须捕获epoch、传递revision并在逐事件写store前检查epoch，切换时abort旧流。下载及其他直接组件请求沿 `rg -n 'fetch\(|localStorage|sessionStorage' web/src` 补充审计，不能只覆盖wrapper，也不新增EventSource。
 
-- [ ] `applySession` 接收请求开始时捕获的登录世代与响应session_id/revision：换凭证时递增登录世代，拒绝旧世代响应；同session拒绝小于已接收revision的响应；相同revision的并发 `/me` 按请求序号只接受较新的结果。登录世代由store本地维护，不从响应覆盖。身份更新发现部门/角色变化或失效时也递增departmentEpoch、清缓存，不能只有显式切换才清理。增加旧 `/me` 在切换成功后返回、其他标签页切换后本页旧 `/me` 返回、更换凭证后旧 `/me` 返回三项竞态测试。
-- [ ] 切换成功递增 epoch，终止旧请求/订阅，清空部门资源、聊天选择/视图和列表缓存，再刷新权限与资源。不删除后端运行、不取消已提交任务。切换期间禁用部门写操作，防止页面旧数据发出新上下文写请求。
-- [ ] `base.js` 只保留白名单错误码 `department_context_invalid` 与 `department_context_stale`，收到后刷新 `/me`、清理旧视图并要求重选，不将其变成退出登录；其他403保留普通禁止访问。前端按任务2已有契约为部门请求发送 `X-Department-Revision`，包括直接fetch流入口；409 `department_context_stale` 只刷新身份和视图，不自动重放写请求。无需在任务8反向新增后端契约。
-- [ ] 显式退出接入任务2的POST logout，使用现有凭证完成调用后在finally清本地token/身份并递增登录世代和epoch；自动处理401只清本地状态，不递归调用logout。验证离线本地退出不误报服务端撤销，以及其他登录不被撤销。
-- [ ] 用 BroadcastChannel 通知同凭证其他标签页重读 `/me`；仅传播当前会话标识及revision，不广播token。标签页恢复焦点也重读，跨浏览器独立登录不受影响。旧token不从localStorage复制到新会话。
-- [ ] UserInfo 菜单显示部门/有效角色与切换入口，支持无部门、加载、失败、超管所有部门、普通账号仅成员部门。用延迟响应测试验证A慢请求→切B→A返回不污染，以及切换失败、成员移除、同token两标签。运行 unit、lint:check、build；真实浏览器行为在任务10验收，审查后提交 `feat: 增加部门切换并隔离前端缓存`。
+- [x] `applySession` 接收请求开始时捕获的登录世代与响应session_id/revision：换凭证时递增登录世代，拒绝旧世代响应；同session拒绝小于已接收revision的响应；相同revision的并发 `/me` 按请求序号只接受较新的结果。登录世代由store本地维护，不从响应覆盖。身份更新发现部门/角色变化或失效时也递增departmentEpoch、清缓存，不能只有显式切换才清理。增加旧 `/me` 在切换成功后返回、其他标签页切换后本页旧 `/me` 返回、更换凭证后旧 `/me` 返回三项竞态测试。
+- [x] 切换成功递增 epoch，终止旧请求/订阅，清空部门资源、聊天选择/视图和列表缓存，再刷新权限与资源。不删除后端运行、不取消已提交任务。切换期间禁用部门写操作，防止页面旧数据发出新上下文写请求。
+- [x] `base.js` 只保留白名单错误码 `department_context_invalid` 与 `department_context_stale`，收到后刷新 `/me`、清理旧视图并要求重选，不将其变成退出登录；其他403保留普通禁止访问。前端按任务2已有契约为部门请求发送 `X-Department-Revision`，包括直接fetch流入口；409 `department_context_stale` 只刷新身份和视图，不自动重放写请求。无需在任务8反向新增后端契约。
+- [x] 显式退出接入任务2的POST logout，使用现有凭证完成调用后在finally清本地token/身份并递增登录世代和epoch；自动处理401只清本地状态，不递归调用logout。验证离线本地退出不误报服务端撤销，以及其他登录不被撤销。
+- [x] 用 BroadcastChannel 通知同凭证其他标签页重读 `/me`；仅传播当前会话标识及revision，不广播token。标签页恢复焦点也重读，跨浏览器独立登录不受影响。旧token不从localStorage复制到新会话。
+- [x] UserInfo 菜单显示部门/有效角色与切换入口，支持无部门、加载、失败、超管所有部门、普通账号仅成员部门。用延迟响应测试验证A慢请求→切B→A返回不污染，以及切换失败、成员移除、同token两标签。运行 unit、lint:check、build；真实浏览器行为在任务10验收，审查后提交 `feat: 增加部门切换并隔离前端缓存`。
+
+**执行记录（2026-09-18，子代理实施+开发者复核）：**
+- 实现：`departmentContext.js`（epoch gate + memberActions 预实现）；user store 统一 applySession（登录世代/revision 序号拒绝旧响应）、departmentEpoch、switchDepartment（成功后 advance+abort 旧流+清 agent/projects/database/chatThreads/agentTask 缓存+刷新身份，切换期间写门禁）、logoutSession（显式退出调后端 204 后清本地，401 自动仅本地清理不递归）；base.js epoch 捕获比对（stale 静默 Error 不弹 toast）、X-Department-Revision 头、白名单错误码（invalid/stale→refreshIdentity 不登出）；SSE 三处消费点（agent_api/useAgentRunStream/useAgentRequestQueue/SubagentThreadView）逐事件 epoch 检查+revision 头+切换 abort；BroadcastChannel 仅传 session_id+revision；OIDCCallback 凭证更换统一走 applyNewCredentials（审计发现的原绕过点）；UserInfo 菜单显示部门/有效角色/切换子菜单（超管全部部门、普通成员部门、无部门态、切换中禁用、失败重试）。
+- 测试：red 阶段实测（新文件首跑因模块缺失整文件失败后实现）；green 后 `node --test department_context.test.js` 10 pass（两个计划代码块 verbatim + 8 个 store/base 行为）；`pnpm run test:unit` 253/253 pass；lint:check 与 build exit 0（容器内跑，test 目录 docker cp 同步后全量）。真实后端契约冒烟（47050）：登录/me 字段、my-departments（超管 183 部门）、切换 rev 递增、旧 revision 409 stale、成员写无头 422/旧头 409、logout 幂等 204、web dev server 热加载 transform 200。
+- Not run：真实浏览器验证（A/B 切换、双标签、慢响应截图）——计划归属任务10 验收。审计后不接：AppLayout GitHub 公共 fetch、MarkdownPreview 只读图片 fetch（有 isConnected 兜底）。DebugComponent 模拟登录直写 localStorage（reload 重建世代，语义安全）未列 Files 保持不动。
 
 ## Task 9：设置成员管理与超级管理员专属账号页面
 

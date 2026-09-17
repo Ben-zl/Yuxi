@@ -763,6 +763,25 @@ export const useDatabaseStore = defineStore('database', () => {
     }
   }
 
+  // 清空部门内知识库视图与缓存并停止自动轮询；切换部门或上下文失效时调用
+  function resetDepartmentData() {
+    stopAutoRefresh()
+    state.autoRefresh = false
+    autoRefreshSource = null
+    state.listLoading = false
+    state.databaseLoading = false
+    state.fileDetailModalVisible = false
+    state.batchDeleting = false
+    state.queryParamsLoading = false
+    databases.value = []
+    database.value = {}
+    kbId.value = null
+    fileDetailFileId.value = null
+    documentFiles.value = []
+    queryParams.value = []
+    resetFileBrowser()
+  }
+
   // 延时刷新文件理解（延迟1秒后刷新）
   async function delayedRefresh() {
     await new Promise((resolve) => setTimeout(resolve, 1000))
@@ -851,6 +870,7 @@ export const useDatabaseStore = defineStore('database', () => {
     stopAutoRefresh,
     toggleAutoRefresh,
     selectAllFailedFiles,
-    getDatabaseNameById
+    getDatabaseNameById,
+    resetDepartmentData
   }
 })

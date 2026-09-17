@@ -30,8 +30,53 @@
                 <span class="user-menu-info">ID: {{ userStore.uid }}</span>
                 <span class="user-menu-role">{{ userRoleText }}</span>
               </div>
+              <div class="user-menu-department">
+                {{
+                  userStore.departmentId
+                    ? `当前部门：${userStore.departmentName}`
+                    : '当前未加入任何部门'
+                }}
+              </div>
             </div>
           </a-menu-item>
+          <a-menu-divider />
+          <a-sub-menu key="department-switch" title="切换部门">
+            <template #icon><Building2 :size="16" /></template>
+            <a-menu-item v-if="userStore.departmentsLoading" key="departments-loading" disabled>
+              <span class="menu-text">部门列表加载中…</span>
+            </a-menu-item>
+            <a-menu-item
+              v-else-if="userStore.departmentsError"
+              key="departments-error"
+              @click="reloadDepartments"
+            >
+              <span class="menu-text department-error">{{ userStore.departmentsError }}</span>
+              <span class="menu-text retry-text">点击重试</span>
+            </a-menu-item>
+            <a-menu-item
+              v-else-if="switchableDepartments.length === 0"
+              key="no-department"
+              disabled
+            >
+              <span class="menu-text">暂无可切换的部门</span>
+            </a-menu-item>
+            <template v-else>
+              <a-menu-item
+                v-for="dept in switchableDepartments"
+                :key="`dept-${dept.id}`"
+                :disabled="userStore.switchingDepartment || dept.id === userStore.departmentId"
+                @click="switchDepartment(dept)"
+              >
+                <span class="menu-text department-name">{{ dept.name }}</span>
+                <span class="menu-text department-role">{{ departmentRoleText(dept.role) }}</span>
+                <Check
+                  v-if="dept.id === userStore.departmentId"
+                  :size="14"
+                  class="department-current"
+                />
+              </a-menu-item>
+            </template>
+          </a-sub-menu>
           <a-menu-divider />
           <a-menu-item key="docs" @click="openDocs">
             <template #icon><BookOpen :size="16" /></template>
@@ -70,13 +115,13 @@
 </template>
 
 <script setup>
-import { computed, inject, useSlots } from 'vue'
+import { computed, inject, onMounted, useSlots } from 'vue'
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { useInfoStore } from '@/stores/info'
 import DebugComponent from '@/components/DebugComponent.vue'
 import { message } from 'ant-design-vue'
-import { BookOpen, Sun, Moon, LogOut, Settings, Terminal } from '@lucide/vue'
+import { BookOpen, Building2, Check, Sun, Moon, LogOut, Settings, Terminal } from '@lucide/vue'
 import { useThemeStore } from '@/stores/theme'
 import { generatePixelAvatar } from '@/utils/pixelAvatar'
 import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
@@ -117,10 +162,51 @@ const userRoleText = computed(() => {
   }
 })
 
-// 退出登录
-const logout = () => {
-  userStore.logout()
-  message.success('已退出登录')
+// 部门内角色显示文本
+const departmentRoleText = (role) => {
+  switch (role) {
+    case 'superadmin':
+      return '超级管理员'
+    case 'admin':
+      return '管理员'
+    default:
+      return '成员'
+  }
+}
+
+// 超级管理员由后端返回全部部门，普通账号仅成员部门
+const switchableDepartments = computed(() => userStore.availableDepartments)
+
+const reloadDepartments = () => {
+  if (userStore.isLoggedIn) {
+    void userStore.loadAvailableDepartments()
+  }
+}
+
+const switchDepartment = async (dept) => {
+  if (userStore.switchingDepartment || dept.id === userStore.departmentId) return
+  try {
+    await userStore.switchDepartment(dept.id)
+    message.success(`已切换到 ${dept.name}`)
+  } catch (error) {
+    // 白名单错误码已由请求层提示并刷新身份，这里不重复弹窗
+    if (
+      error?.code !== 'department_context_stale' &&
+      error?.code !== 'department_context_invalid'
+    ) {
+      message.error(error.message || '切换部门失败')
+    }
+  }
+}
+
+onMounted(() => {
+  reloadDepartments()
+})
+
+// 退出登录：先撤销服务端会话，再清本地状态
+const logout = async () => {
+  const revoked = await userStore.logoutSession()
+  message.success(revoked ? '已退出登录' : '已退出本地登录')
   // 跳转到首页
   router.push('/login')
 }
@@ -272,6 +358,40 @@ const openProfile = () => {
 .user-menu-role {
   font-size: 12px;
   color: var(--gray-500);
+}
+
+.user-menu-department {
+  font-size: 12px;
+  color: var(--gray-500);
+  margin-top: 2px;
+}
+
+.department-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.department-role {
+  font-size: 12px;
+  color: var(--gray-500);
+}
+
+.department-current {
+  color: var(--main-color);
+  flex: none;
+}
+
+.department-error {
+  color: var(--color-danger-500, #d93026);
+}
+
+.retry-text {
+  font-size: 12px;
+  color: var(--gray-500);
+  margin-left: 8px;
 }
 
 .login-icon {

@@ -23,6 +23,7 @@ import { agentApi } from '@/apis'
 import { processRunSseResponse } from '@/composables/useAgentRunStream'
 import { useAgentStreamHandler } from '@/composables/useAgentStreamHandler'
 import { useStreamSmoother } from '@/composables/useStreamSmoother'
+import { useUserStore } from '@/stores/user'
 import ThreadMessageList from '@/components/ThreadMessageList.vue'
 import { MessageProcessor } from '@/utils/messageProcessor'
 import ScrollController from '@/utils/scrollController'
@@ -188,13 +189,26 @@ const startRunStream = async (runId, afterSeq = '0-0', resetMessages = false) =>
   streamAbortController = controller
   streamActive.value = true
   getStreamThreadState(props.threadId).isStreaming = true
+  // 部门切换时统一中止旧流；逐事件写状态前检查 epoch
+  const userStore = useUserStore()
+  const departmentEpoch = userStore.departmentEpoch.current()
+  const unregisterStream = userStore.registerDepartmentStreamController(controller)
+  const isDepartmentStale = () => !userStore.departmentEpoch.accept(departmentEpoch)
 
   try {
     const response = await agentApi.streamAgentRunEvents(runId, afterSeq, {
       signal: controller.signal
     })
+    if (isDepartmentStale()) {
+      controller.abort()
+      return
+    }
     if (!response.ok) throw new Error(`SSE response not ok: ${response.status}`)
     await processRunSseResponse(response, (event, data, eventId) => {
+      if (isDepartmentStale()) {
+        controller.abort()
+        return
+      }
       if (!data) return
       if (eventId) lastEventId.value = String(eventId)
       const payload = data.payload || {}
@@ -228,13 +242,14 @@ const startRunStream = async (runId, afterSeq = '0-0', resetMessages = false) =>
       if (event === 'end') streamActive.value = false
     })
   } catch (streamError) {
-    if (streamError?.name !== 'AbortError') {
+    if (streamError?.name !== 'AbortError' && streamError?.code !== 'department_context_stale') {
       console.error('Failed to stream subagent run messages:', streamError)
     }
   } finally {
+    unregisterStream()
     if (streamAbortController === controller) streamAbortController = null
     streamActive.value = false
-    if (!controller.signal.aborted && !disposed) {
+    if (!controller.signal.aborted && !disposed && !isDepartmentStale()) {
       streamSmoother.flushThread(props.threadId)
       try {
         const runResponse = await agentApi.getAgentRun(runId)
