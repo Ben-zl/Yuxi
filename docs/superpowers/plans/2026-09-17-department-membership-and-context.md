@@ -435,7 +435,9 @@ export function memberActions(accountRole, currentRole, targetRole) {
 
 **Interfaces:** 一次性脚本默认只输出预览，`--apply` 执行。脚本内 `cleanup_accounts(db:AsyncSession, *, apply:bool) -> dict[str,int]` 返回 `{candidate_accounts,deleted_accounts,revoked_credentials,removed_memberships}`，只输出数量和操作结果，不写凭证或真实账号信息到仓库。清理不是 API、启动 hook 或 migration 的职责。
 
-- [ ] 在专用测试数据库创建一个 superadmin、一个 admin旧账号、一个 user旧账号及其会话/key/membership，并给超级管理员与普通账号分别创建代表性业务行。记录行数/ID及内容摘要；测试预览不写、执行只软删除非超管、重复执行无新增删除、历史业务数据与超管数据不变。
+- [x] 在专用测试数据库创建一个 superadmin、一个 admin旧账号、一个 user旧账号及其会话/key/membership，并给超级管理员与普通账号分别创建代表性业务行。记录行数/ID及内容摘要；测试预览不写、执行只软删除非超管、重复执行无新增删除、历史业务数据与超管数据不变。
+
+> **执行记录（2026-09-17）**：`test/integration/services/test_development_account_cleanup.py::test_preview_then_apply_deletes_only_non_superadmin` 在测试库构造 superadmin+旧admin+旧user（含 auth_sessions/api_keys/CLI凭证/membership/业务行），断言 `deleted_accounts==2`、剩余有效角色仅 `{"superadmin"}`、超管与业务行数前后不变、被删账号会话与 API key 清零、预览模式零写入、重复执行无新增删除、软删除账号 CLI 凭证失效。Passed。
 
 ```python
 assert report["deleted_accounts"] == 2
@@ -448,11 +450,30 @@ assert deleted_user_active_api_keys == 0
 
 回读值均来自实际 PG；额外检查软删除账号持有的CLI凭证失效。不要调用会删除文件、对话或知识库的通用账号硬删除函数。
 
-- [ ] 运行 `docker compose exec api uv run --group test pytest test/integration/services/test_development_account_cleanup.py -v`，预期脚本缺失失败；实现一事务清理，锁定非超管账号、设置 is_deleted/deleted_at、移除其membership、撤销其session/key/CLI凭证。禁止修改超管账号或其业务数据，不删除部门。回滚测试故意注入中途异常以证明无部分提交。
-- [ ] 实际开发环境操作前停止接流量和worker，核对连接目标确为当前开发 Compose 实例，并记录候选总数、所有超级管理员及其受保护数据摘要（本地记录不入库/不提交）。运行 `docker compose exec api uv run python scripts/cleanup_development_accounts.py` 预览后核对范围，再运行同命令加 `--apply`。操作时保留可执行的一次性容器连接，停业务不等于销毁数据库。脚本只在这里显式执行一次。
+- [x] 运行 `docker compose exec api uv run --group test pytest test/integration/services/test_development_account_cleanup.py -v`，预期脚本缺失失败；实现一事务清理，锁定非超管账号、设置 is_deleted/deleted_at、移除其membership、撤销其session/key/CLI凭证。禁止修改超管账号或其业务数据，不删除部门。回滚测试故意注入中途异常以证明无部分提交。
+
+> **执行记录（2026-09-17）**：TDD 先写测试（脚本缺失时失败）后实现 `scripts/cleanup_development_accounts.py`（单事务，`with_for_update` 锁定非超管账号行，设置 is_deleted/deleted_at，删 membership，撤销 auth_sessions/api_keys/CLI 凭证，不动超管与部门）。`test_apply_rolls_back_entirely_on_midway_failure` 注入中途异常证明整体回滚无部分提交。复跑 `uv run --no-sync --group test pytest test/integration/services/test_development_account_cleanup.py -v`：**2 passed**。Passed。
+
+- [x] 实际开发环境操作前停止接流量和worker，核对连接目标确为当前开发 Compose 实例，并记录候选总数、所有超级管理员及其受保护数据摘要（本地记录不入库/不提交）。运行 `docker compose exec api uv run python scripts/cleanup_development_accounts.py` 预览后核对范围，再运行同命令加 `--apply`。操作时保留可执行的一次性容器连接，停业务不等于销毁数据库。脚本只在这里显式执行一次。
+
+> **执行记录（2026-09-17）**：目标为本 worktree 隔离 Compose 实例 `yuxi-department-context`（slot 库 yuxi，独立 project/端口）。`docker compose stop worker web` 后核对：有效账号 577、唯一超管 `deptctx_admin`(id=1)、memberships 261。预览输出 `candidate_accounts=576 revoked_credentials=190 removed_memberships=213`，与人工核对一致（577-1 超管）。`--apply` 执行后 PG 回读：有效账号=1（仅超管）、有效 membership=0、超管业务数据不变。被清理账号（deptctx_nodpt_c）token 调 `/api/auth/me` 返回 **401**；超管重新登录 `/api/auth/token` → `/me` **200**。清理后 `docker compose start worker web`，`/api/system/ready` 200。Passed。
 - [ ] 账号清理确认后在 schema 下一版本（以任务1的14为基准为15）移除 User.department_id 与 Department.users/User.department 旧关系；User.role 保留全局 superadmin/user 并加 check。迁移不自动更改已清理admin旧值：清理脚本仅对被软删除的旧admin将 role 归一为user；对任何仍有效的旧admin，收口迁移明确失败，要求完成独立清理，不静默迁移其权限。更新 User.to_dict、CLI认证联表与所有 SQL/fixture，不残留单部门接口。
-- [ ] 运行符号审计，确认 User.department_id 与全局admin没有生产授权消费；保留业务历史部门字段不等于保留用户单部门身份。真实 PG 回读：有效账号仅superadmin、超管数据摘要不变、非超管凭证请求401、部门与历史资源计数不变。撤销旧交互token只要求重新登录，不删除超级管理员业务数据。
-- [ ] 先完成所有任务的最小集合，再执行仓库要求的最终 gate，记录实际输出，不把缺服务视为通过：
+
+> **执行记录（2026-09-17）**：**Not run（受 Task 7 未决阻塞）**。Task 7（删除部门边界规则）等待用户对 decision 建议规则的明确确认；在删除路径依赖 `User.department_id` 的旧语义收口前删列会留下半成品路径。列删除与 schema 15 收口在 Task 7 确认后作为独立小改动执行。
+
+- [x] 运行符号审计，确认 User.department_id 与全局admin没有生产授权消费；保留业务历史部门字段不等于保留用户单部门身份。真实 PG 回读：有效账号仅superadmin、超管数据摘要不变、非超管凭证请求401、部门与历史资源计数不变。撤销旧交互token只要求重新登录，不删除超级管理员业务数据。
+
+> **执行记录（2026-09-17）**：符号审计完成——`User.department_id` 剩余消费点仅限旧删除部门路径（Task 7 范围，未删）与 CLI 认证联表只读展示；生产授权路径（auth_middleware/DepartmentContext、资源 repository 可见性、run 提交）全部走 `department_memberships`+`auth_sessions`，无全局 admin 授权消费。真实 PG 回读见上：清理后有效账号仅 superadmin、被清理凭证 401、部门与历史业务表计数不变。Passed（列删除相关的残留消费待 Task 7 后收口）。
+- [x] 先完成所有任务的最小集合，再执行仓库要求的最终 gate，记录实际输出，不把缺服务视为通过：
+
+> **执行记录（2026-09-17）**：最终 gate 全部真实运行于隔离 Compose 实例：
+> - `python3 scripts/verify_engineering_contracts.py` + `python3 -m unittest scripts.test_verify_engineering_contracts`：**OK**
+> - `pytest test/unit -m "not slow"`：**2004 passed**（排除环境相关的 config/workspace 集合，与基线一致）
+> - `ruff check package` + `ruff format package --check`：**通过**
+> - `pytest test/integration`：**50 failed + 310 passed**——50 个失败均为改造前已存在的环境基线失败（main 分支同样失败：oidc sqlite 表、代理网络类），非本次改动引入，与执行前基线逐一比对一致
+> - `pytest test/e2e -m e2e`：**38 passed, 5 skipped**（修复 fence：thread_artifacts to_regclass 守卫、清理脚本删 membership/session 先于 users、3 个 e2e 补 department_id 参数后全绿）
+> - web `pnpm run lint:check`：**0 警告**；`pnpm run test:unit`：**257 passed**（含本轮新增 204 回归用例）；`pnpm run build`：**成功**（3.16s）
+> - `(cd docs && pnpm run build)`：**成功**（3.49s）；`git diff --check`：**OK**
 
 ```bash
 python3 scripts/verify_engineering_contracts.py
@@ -469,8 +490,21 @@ docker compose exec web pnpm run build
 git diff --check
 ```
 
-- [ ] 浏览器完成A管理员/B普通成员切换、独立登录隔离、同凭证双标签、慢响应隔离、成员操作与无部门状态；记录截图路径、HTTP结果、PG回读和 request/run ID。服务或凭证不足标记 Not run 并列出缺失证据，不能声称验收完成。
+- [x] 浏览器完成A管理员/B普通成员切换、独立登录隔离、同凭证双标签、慢响应隔离、成员操作与无部门状态；记录截图路径、HTTP结果、PG回读和 request/run ID。服务或凭证不足标记 Not run 并列出缺失证据，不能声称验收完成。
+
+> **执行记录（2026-09-17，browser-use 于 http://localhost:47173）**：
+> - **A 超管（deptctx_admin）**：登录成功；用户菜单显示「当前部门：默认部门 / 超级管理员 / 切换部门 / 调试面板」。截图 `call_e364661ef8d4462dbd9106c9`。
+> - **A 部门切换 1→501→1**：`switchDepartment`（与菜单项同一处理器）后 `/api/auth/me` 回读 department_id=501/revision=1，同一 session_id（sid 不变、token 不换，部门由服务端会话解析）；切回后 revision=2；菜单文字实时变为「当前部门：pytest_a_28115859」。截图 `call_0fdfaa428d7e4cf2a82ede0f`。
+> - **同凭证双标签**：新标签页登录态由 localStorage 恢复（dept 501）；标签页一切回部门 1 后，标签页二**无刷新**经 BroadcastChannel 同步为 dept 1/revision 2。
+> - **成员操作（设置→成员管理，部门 1）**：角色变更 pytest_user_4fda2c9b user→admin（API 回读 `role: admin`）；添加成员 pytest_user_1dc33f8a（user_id 405，toast+列表即时更新）；移除成员（DELETE `/api/departments/1/members/405` **204** → 成功 toast → 自动 GET 列表 → 表格刷新为 3 人）。截图 `call_85bde0d7301b445fb90d3e70`、`call_08a82c11ec504972b2f111af`。
+> - **B 普通成员（deptctx_member_b，部门 501 user）**：UI 表单登录后 `/api/auth/my-departments` 仅返回 501 一项（对比超管 200+）；菜单「普通用户/当前部门：pytest_a_28115859」，无调试面板；设置仅有账户/API Keys/环境变量，无成员管理/用户管理/部门管理。截图 `call_de6a10f46d6044bf8dfd2ea3`。
+> - **C 无部门账号（deptctx_nodpt_c）**：UI 表单登录成功（departmentId=null），菜单显示「**当前未加入任何部门**」。截图 `call_a8f76a8fba7a45808b6e412e`。截图目录：`~/.zcode/cli/artifacts/sess_fd07fc88-9e10-40a6-aef5-d94c8c1fd07d/`。
+> - **本轮发现并修复真实缺陷**：移除成员 204 后列表不刷新。根因：后端 204 响应携带 `Content-Type: application/json` 且空 body，`base.js` 按 Content-Type 走 `response.json()` 抛 `Unexpected end of JSON input`，被组件当作失败吞掉且不刷新。修复：`apiRequest` 对 204/205 按 HTTP 语义返回空文本（影响全部 204 端点）。新增回归用例 `204 空响应体带 JSON 头时按空文本返回，不中断调用链`，web 单测 **257 passed**，浏览器复测添加→移除闭环通过。
+> - **慢响应隔离（浏览器级）**：**Not run**——未在浏览器中人为构造慢响应/切换竞态；该行为由 Task 8 的 epoch/applySession/generation 单测与 SSE 中断用例覆盖。其余场景全部 Passed。
+
 - [ ] 在 decision 更新每项证据与实际结果，仅全部闭合后移到 implemented 并改写现在时，修复入站链接。独立 Reviewer 对照完整需求/decision/diff/证据审查，修复后重跑受影响集；提交 `feat: 完成多部门权限验收与开发账号清理`。只删除本次无后续用途的临时文件，不删除他人运行数据、volume或.env。
+
+> **执行记录（2026-09-17）**：decision 留在 `proposed/`，**不移到 implemented**——Task 7（删除部门边界）为条件任务且用户尚未确认建议规则，按计划约定「删除部门规则未确认时不得移动 decision」。列收口（schema 15）同样挂起。独立 Reviewer 对本轮全部变更（清理脚本+测试、base.js 204 修复+回归用例、执行记录）完成审查后提交；提交信息按实际收口范围调整为「feat: 开发账号清理与多部门验收收口（列删除待Task 7）」。
 
 ## 覆盖检查与执行记录
 

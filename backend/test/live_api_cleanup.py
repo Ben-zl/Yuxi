@@ -988,7 +988,12 @@ async def _delete_static_test_user_record(owner_uid: str) -> None:
                 "DELETE FROM agents WHERE created_by = $1 AND is_default IS NOT TRUE",
                 owner_uid,
             )
-            await conn.execute("DELETE FROM thread_artifacts WHERE uid = $1", owner_uid)
+            # thread_artifacts 属运行时扩展表，部分环境未建；缺表时跳过该段清理
+            thread_artifacts_exists = await conn.fetchval(
+                "SELECT to_regclass('thread_artifacts') IS NOT NULL"
+            )
+            if thread_artifacts_exists:
+                await conn.execute("DELETE FROM thread_artifacts WHERE uid = $1", owner_uid)
             await conn.execute("DELETE FROM run_resource_snapshots WHERE uid = $1", owner_uid)
             await conn.execute("DELETE FROM agent_memory_scopes WHERE uid = $1", owner_uid)
             await conn.execute("DELETE FROM agent_envs WHERE uid = $1", owner_uid)
@@ -1003,6 +1008,14 @@ async def _delete_static_test_user_record(owner_uid: str) -> None:
                 )
                 await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
                 await conn.execute("DELETE FROM operation_logs WHERE user_id = $1", user_id)
+            await conn.execute(
+                "DELETE FROM department_memberships WHERE user_id IN (SELECT id FROM users WHERE uid = $1)",
+                owner_uid,
+            )
+            await conn.execute(
+                "DELETE FROM auth_sessions WHERE user_id IN (SELECT id FROM users WHERE uid = $1)",
+                owner_uid,
+            )
             await conn.execute("DELETE FROM users WHERE uid = $1", owner_uid)
 
             remaining = await conn.fetchrow(

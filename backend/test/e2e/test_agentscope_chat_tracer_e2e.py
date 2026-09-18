@@ -136,7 +136,7 @@ async def test_thread_session_isolated_per_user(db_session, client):
     other_uid = "e2e-tracer-b"
     thread_id = f"e2e-tracer-{uuid.uuid4().hex[:12]}"
 
-    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG)
+    mapping = await ensure_thread_session(db_session, client, uid=uid, thread_id=thread_id, agent_slug=CHATBOT_SLUG, department_id=1)
 
     # 其他用户读取同一线程映射：yuxi 侧按 uid 隔离，查不到记录
     other_mapping = await get_thread_session(db_session, uid=other_uid, thread_id=thread_id)

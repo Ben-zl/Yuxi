@@ -291,7 +291,7 @@ async def test_mcp_config_changes_apply_on_next_tool_build(db_session):
     assert user is not None
 
     async def project_tools():
-        projection = await project_runtime(db_session, uid=USER_ID, agent_slug=CHATBOT_SLUG)
+        projection = await project_runtime(db_session, uid=USER_ID, agent_slug=CHATBOT_SLUG, department_id=1)
         return await build_mcp_tools(mcp_servers=projection.mcp_servers, user=user)
 
     server = await db_session.scalar(select(MCPServer).where(MCPServer.slug == MCP_SLUG))
@@ -352,7 +352,7 @@ async def test_stdio_and_disabled_mcps_not_exposed(db_session):
         agent.config_json["context"]["mcps"] = ["e2e-stdio-mcp", "e2e-disabled-mcp"]
         await session.commit()
         with pytest.raises(ValueError, match="不存在、未启用"):
-            await project_runtime(session, uid=USER_ID, agent_slug=CHATBOT_SLUG)
+            await project_runtime(session, uid=USER_ID, agent_slug=CHATBOT_SLUG, department_id=1)
 
         await session.execute(delete(MCPServer).where(MCPServer.slug.in_(["e2e-stdio-mcp", "e2e-disabled-mcp"])))
         await session.commit()

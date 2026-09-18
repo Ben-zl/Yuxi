@@ -368,3 +368,29 @@ test('工具元数据 API 使用普通用户认证且普通用户可正常请求
     assert.equal(result.data[0].slug, 'web_search')
   })
 })
+
+test('204 空响应体带 JSON 头时按空文本返回，不中断调用链', async () => {
+  await withServer(async (server) => {
+    storageValues.clear()
+    storageValues.set('user_token', 'token-204')
+    globalThis.__apiBoundaryMessages = []
+    globalThis.window = { location: { href: '/agent' } }
+    // 后端 204 仍可能携带 application/json 头；按 HTTP 语义该响应没有体
+    globalThis.fetch = async () =>
+      new Response(null, {
+        status: 204,
+        headers: { 'content-type': 'application/json' }
+      })
+
+    setActivePinia(createPinia())
+    const { apiDelete } = await server.ssrLoadModule('/src/apis/base.js')
+    const { useUserStore } = await server.ssrLoadModule('/src/stores/user.js')
+    const userStore = useUserStore()
+    userStore.token = 'token-204'
+    userStore.userId = 1
+
+    const result = await apiDelete('/api/departments/1/members/405')
+    assert.equal(result, '')
+    assert.deepEqual(globalThis.__apiBoundaryMessages, [])
+  })
+})

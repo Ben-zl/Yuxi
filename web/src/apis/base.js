@@ -247,12 +247,14 @@ export async function apiRequest(url, options = {}, requiresAuth = true, respons
       assertFreshDepartmentEpoch()
       return response
     } else if (responseType === 'json') {
-      // 检查Content-Type以确定如何处理响应
+      // 204/205 按规范没有响应体（后端仍可能带 application/json 头），解析空体会抛错
       const contentType = response.headers.get('Content-Type')
       const decoded =
-        contentType && contentType.includes('application/json')
-          ? await response.json()
-          : await response.text()
+        response.status === 204 || response.status === 205
+          ? ''
+          : contentType && contentType.includes('application/json')
+            ? await response.json()
+            : await response.text()
       assertFreshDepartmentEpoch()
       return decoded
     } else if (responseType === 'text') {
