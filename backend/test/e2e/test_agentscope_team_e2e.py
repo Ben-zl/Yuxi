@@ -141,3 +141,132 @@ async def test_team_choreography_with_custom_template(db_session):
         assert worker_sessions >= 1, "worker 应有独立会话"
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_team_worker_run_inherits_parent_department(db_session):
+    """Team 父子部门固化：超管切到部门 A 后提交团队任务，worker Run 继承 A 的固化部门。
+
+    覆盖计划欠账「Team 父子部门 E2E」：team_lifecycle 创建 worker Run/线程关系时
+    必须携带父 Run 的 department_id，而不是读取当时的会话活动部门。
+    """
+    suffix = uuid.uuid4().hex[:8]
+    department_name = f"团队部门-{suffix}"
+    client, headers = await open_fixture_http_client(USER_ID)
+    department_id = None
+    import asyncpg
+
+    from test.e2e.agentscope_e2e_fixtures import FIXTURE_PASSWORD
+
+    conn = await asyncpg.connect(
+        os.getenv("POSTGRES_URL", "postgresql+asyncpg://postgres:postgres@postgres:5432/yuxi").replace("+asyncpg", "")
+    )
+    try:
+        # 超管建部门并切换活动部门到 A（超管无需成员关系）
+        created = await client.post(
+            "/api/departments",
+            headers=headers,
+            json={
+                "name": department_name,
+                "description": "team dept e2e",
+                "admin_uid": f"teamdepta{suffix}",
+                "admin_password": FIXTURE_PASSWORD,
+                "admin_phone": None,
+            },
+        )
+        assert created.status_code in (200, 201), created.text
+        department_id = created.json()["id"]
+        me = await client.get("/api/auth/me", headers=headers)
+        assert me.status_code == 200, me.text
+        switched = await client.post(
+            "/api/auth/department-context",
+            headers=headers,
+            json={"department_id": department_id, "expected_revision": me.json()["context_revision"]},
+        )
+        assert switched.status_code == 200, switched.text
+
+        thread_response = await client.post(
+            "/api/chat/thread",
+            json={"agent_id": CHATBOT_SLUG, "title": f"team-dept-{suffix}"},
+            headers=headers,
+        )
+        assert thread_response.status_code == 200, thread_response.text
+        thread_id = str(thread_response.json().get("thread_id") or thread_response.json().get("id"))
+        run_response = await client.post(
+            "/api/agent/runs",
+            json={
+                "query": "请组建团队完成示例任务",
+                "agent_slug": CHATBOT_SLUG,
+                "thread_id": thread_id,
+                "tool_approval_mode": "always_trust",
+                "meta": {"request_id": f"team-dept-{uuid.uuid4().hex[:8]}"},
+            },
+            headers=headers,
+        )
+        assert run_response.status_code == 200, run_response.text
+        run_id = str(run_response.json()["run_id"])
+        run = await wait_for_run(client, headers, run_id)
+        assert run["status"] == "completed", run
+
+        # 父 Run 与 worker Run 的固化部门都必须是 A
+        parent_dept = await conn.fetchval(
+            "SELECT department_id FROM agent_runs WHERE id = $1", run_id
+        )
+        assert parent_dept == department_id, (run_id, parent_dept, department_id)
+        worker_rows = await conn.fetch(
+            "SELECT r.id, r.department_id FROM agent_runs r "
+            "JOIN subagent_threads s ON s.child_thread_id = r.conversation_thread_id "
+            "WHERE s.uid = $1 AND r.agent_slug = $2 ORDER BY r.created_at DESC LIMIT 3",
+            USER_ID,
+            SUBAGENT_SLUG,
+        )
+        assert worker_rows, "team worker run 未落库"
+        for row in worker_rows:
+            assert row["department_id"] == department_id, dict(row)
+    finally:
+        await client.aclose()
+        if department_id is not None:
+            # 清理顺序：先解引用 Run→线程关系，再删 Run，最后删绑定与线程关系
+            await conn.execute(
+                "UPDATE agent_runs SET subagent_thread_relation_id = NULL "
+                "WHERE subagent_thread_relation_id IN (SELECT id FROM subagent_threads WHERE uid = $1)",
+                USER_ID,
+            )
+            await conn.execute(
+                "DELETE FROM tool_calls WHERE message_id IN (SELECT id FROM messages WHERE run_id IN "
+                "(SELECT id FROM agent_runs WHERE uid = $1 AND (department_id = $2 OR agent_slug = $3)))",
+                USER_ID,
+                department_id,
+                SUBAGENT_SLUG,
+            )
+            await conn.execute(
+                "DELETE FROM agent_run_requests WHERE uid = $1 AND department_id = $2",
+                USER_ID,
+                department_id,
+            )
+            await conn.execute(
+                "DELETE FROM messages WHERE run_id IN "
+                "(SELECT id FROM agent_runs WHERE uid = $1 AND (department_id = $2 OR agent_slug = $3))",
+                USER_ID,
+                department_id,
+                SUBAGENT_SLUG,
+            )
+            await conn.execute(
+                "DELETE FROM agent_runs WHERE uid = $1 AND (department_id = $2 OR agent_slug = $3)",
+                USER_ID,
+                department_id,
+                SUBAGENT_SLUG,
+            )
+            await conn.execute(
+                "DELETE FROM agentscope_team_worker_bindings WHERE subagent_thread_relation_id IN "
+                "(SELECT id FROM subagent_threads WHERE uid = $1)",
+                USER_ID,
+            )
+            await conn.execute("DELETE FROM subagent_threads WHERE uid = $1", USER_ID)
+            await conn.execute("DELETE FROM department_memberships WHERE department_id = $1", department_id)
+            await conn.execute(
+                "UPDATE auth_sessions SET active_department_id = NULL WHERE active_department_id = $1",
+                department_id,
+            )
+            await conn.execute("DELETE FROM departments WHERE id = $1", department_id)
+        await conn.close()

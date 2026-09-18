@@ -47,23 +47,45 @@ _SHARE_CONFIG_MODELS: tuple[tuple[str, Any], ...] = (
 )
 
 
-async def lock_share_departments(db: AsyncSession, share_config: dict | None) -> None:
-    """共享配置写入前以部门行锁验证引用部门存在。
+async def lock_department_ids(db: AsyncSession, ids: set[int]) -> None:
+    """按 id 升序锁定部门行并验证全部存在，缺失时抛 ValueError。
 
-    与删除部门使用同一锁序，防止“删除检查通过→并发写入引用→部门被删”的孤儿共享引用。
+    与删除部门使用同一锁序；升序获取多行锁避免不同写入方以不同顺序
+    锁定同一批部门造成 AB-BA 死锁。
     """
+    if not ids:
+        return
+    rows = await db.execute(
+        select(Department.id).where(Department.id.in_(ids)).order_by(Department.id).with_for_update()
+    )
+    found = set(rows.scalars().all())
+    if found != ids:
+        raise ValueError("部门不存在")
+
+
+def share_department_ids(share_config: dict | None) -> set[int]:
+    """提取共享配置 read/manage scope 引用的部门 ID 集合。"""
     config = share_config if isinstance(share_config, dict) else {}
     ids: set[int] = set()
     for scope_key in ("read_scope", "manage_scope"):
         scope = config.get(scope_key) or {}
         if scope.get("access_level") == "department":
             ids.update(int(v) for v in scope.get("department_ids") or [])
+    return ids
+
+
+async def lock_share_departments(db: AsyncSession, share_config: dict | None) -> None:
+    """共享配置写入前以部门行锁验证引用部门存在。
+
+    与删除部门使用同一锁序，防止“删除检查通过→并发写入引用→部门被删”的孤儿共享引用。
+    """
+    ids = share_department_ids(share_config)
     if not ids:
         return
-    rows = await db.execute(select(Department.id).where(Department.id.in_(ids)).with_for_update())
-    found = set(rows.scalars().all())
-    if found != ids:
-        raise ValueError("共享范围引用的部门不存在")
+    try:
+        await lock_department_ids(db, ids)
+    except ValueError as exc:
+        raise ValueError("共享范围引用的部门不存在") from exc
 
 
 class DepartmentRepository:

@@ -122,12 +122,20 @@ async def cleanup_accounts(db: AsyncSession, *, apply: bool) -> dict[str, int]:
         stale_admins = (
             await db.scalar(select(func.count()).select_from(User).where(User.role == "admin", User.is_deleted == 1))
         ) or 0
+        stale_session_count = (
+            await db.scalar(
+                select(func.count())
+                .select_from(AuthSession)
+                .where(User.is_deleted == 1, User.id == AuthSession.user_id, AuthSession.revoked_at.is_(None))
+            )
+        ) or 0
         return {
             "candidate_accounts": candidate_total,
             "deleted_accounts": 0,
             "revoked_credentials": active_sessions + revocable_keys,
             "removed_memberships": memberships,
             "normalized_admin_roles": stale_admins,
+            "revoked_stale_sessions": stale_session_count,
         }
 
     candidates = (
@@ -156,6 +164,16 @@ async def cleanup_accounts(db: AsyncSession, *, apply: bool) -> dict[str, int]:
         )
     ).rowcount or 0
     report["normalized_admin_roles"] = int(normalized_roles)
+    # 历史软删除账号遗留的未撤销会话一并撤销（认证已 fail-closed，此处清理数据残留）
+    stale_sessions = (
+        await db.execute(
+            update(AuthSession)
+            .where(User.is_deleted == 1, User.id == AuthSession.user_id, AuthSession.revoked_at.is_(None))
+            .values(revoked_at=utc_now_naive())
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount or 0
+    report["revoked_stale_sessions"] = int(stale_sessions)
     return report
 
 
@@ -190,7 +208,8 @@ def main() -> int:
         f"deleted_accounts={report['deleted_accounts']} "
         f"revoked_credentials={report['revoked_credentials']} "
         f"removed_memberships={report['removed_memberships']} "
-        f"normalized_admin_roles={report['normalized_admin_roles']}"
+        f"normalized_admin_roles={report['normalized_admin_roles']} "
+        f"revoked_stale_sessions={report['revoked_stale_sessions']}"
     )
     print("超级管理员账号与其业务数据不受影响；部门与历史业务数据保持不变。")
     return 0

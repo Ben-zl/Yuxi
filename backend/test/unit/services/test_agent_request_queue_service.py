@@ -19,7 +19,7 @@ from yuxi.services.agent_request_queue_service import (
     steer_queued_request,
     validate_queue_policy,
 )
-from yuxi.storage.postgres.models_business import AgentRunRequest, Base, Message
+from yuxi.storage.postgres.models_business import Department, AgentRunRequest, Base, Message
 from yuxi.utils.datetime_utils import utc_now_naive
 
 pytestmark = [pytest.mark.unit]
@@ -210,6 +210,9 @@ async def session():
         await conn.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with factory() as db:
+        # 派发前会锁请求所属部门行；用例统一使用 department_id=11
+        db.add(Department(id=11, name="队列测试部门"))
+        await db.commit()
         yield db
     await engine.dispose()
 

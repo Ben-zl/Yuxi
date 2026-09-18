@@ -961,6 +961,18 @@ async def _dispatch_locked_head(
     repo = AgentRunRequestRepository(db)
     run_repo = AgentRunRepository(db)
     run_id = str(uuid.uuid4())
+    # 派发前锁部门行：与删除部门互斥，避免“删除检查看不到未提交的新 Run”
+    # 的竞态产生归属已删部门的活跃 Run；部门已被删除时拒绝该排队请求。
+    if head.department_id is not None:
+        from yuxi.repositories.department_repository import lock_department_ids
+
+        try:
+            await lock_department_ids(db, {int(head.department_id)})
+        except ValueError:
+            head.status = REQUEST_STATUS_REJECTED
+            await db.flush()
+            logger.info(f"Rejecting queued request {head.request_id}: department {head.department_id} no longer exists")
+            return None
     try:
         async with db.begin_nested():
             await run_repo.create_run(

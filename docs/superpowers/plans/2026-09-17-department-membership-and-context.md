@@ -352,6 +352,23 @@ assert default_membership_after is None
 
 > **执行记录（2026-09-18）**：并发测试：删除事务持部门行锁未提交时，`asyncio.wait_for(add_member, 0.8)` 超时证明成员写入阻塞在同行锁；回滚后部门仍在。共享写入负向：部门删除后 PUT share_config 引用该部门被拒（400 且文案含「部门」）。审查：全新 Reviewer 首轮 BLOCK（技能/知识库/任务共享与 API Key 部门校验四处写入锁缺口+标签语义），修复后终审通过；提交 `fix: 删除部门时保留账号并阻止资源孤立`。
 
+## 遗留项清偿执行记录（2026-09-18，用户指示“都处理了”后实施）
+
+| 遗留项 | 处置 | 证据 |
+|---|---|---|
+| 删除边界阻断矩阵覆盖补强 | delete_boundary 新增归档任务/终态执行/rejected 请求种子与 queued 请求阻断、终态+dispatched 放行断言（13P） | `test_department_delete_boundary.py` |
+| integration 旧测试 department_id 适配债（27 个） | 适配 worker_job(15P)/queue_execution(4P+1 环境基线)/request_queue_concurrency(7P)/config_projection(4P) 四文件：种子建部门、intake/project_runtime 补必填 department_id、teardown 清理 | 单文件复跑全绿 |
+| create_task AB-BA 死锁窗口 | 抽出 `lock_department_ids`（升序 FOR UPDATE），归属与共享部门合并一次锁定；`lock_share_departments` 复用 | 锁单测 2P |
+| dispatch 不持部门锁竞态 | `_dispatch_locked_head` 派发前锁部门行；部门已删 → 请求标 rejected 并跳过派发（日志留痕） | concurrency 7P |
+| OIDC 死配置 | 删 `default_department`/`fetch_department_info`/`department_claim` 配置与 department 提取；`default_role` 描述标注 v15 角色约束 | lint 通过、oidc 邻接单测 10P |
+| 历史软删会话残留 | 清理脚本新增 `revoked_stale_sessions`（撤销软删账号全部未撤销会话）；开发库执行 659 条，回读 0 | 脚本预览/apply 输出+PG 回读 |
+| Team 父子部门 E2E | 新增 `test_team_worker_run_inherits_parent_department`：超管切 A 提交团队任务，断言父/worker Run 固化部门均=A | e2e passed |
+| resume 挂起中切部门 E2E | 新增 `test_resume_uses_original_department_after_switch`：A 中断→切 B→resume，固化部门仍=A（resume 跳过 request 入队，断言 run 行） | e2e passed |
+| Memory A/B 真实切换场景 | 新增 `test_memory_maintenance_rebinds_after_department_switch`（共享记忆目录部署下运行；api/agentscope 分卷拓扑如实 skip，本体交付） | skip-if 表达前提 |
+| 慢响应隔离浏览器级 | 浏览器等价验证：伪造旧 revision 的成员写请求 → 服务端 409 `department_context_stale`；base.js 统一附当前 revision（防伪造）+白名单刷新身份不退出登录（token/登录态不变） | 浏览器 HTTP 结果+登录态回读 |
+
+净效果：e2e **40 passed / 6 skipped**（新增 Team 部门用例计入 passed，Memory 重绑按前提计入 skipped）；相关集成/单测全绿；contracts/web lint+257 tests+build 通过。
+
 ## Task 8：前端部门上下文与登录菜单切换
 
 **Files:** 新增 `web/src/utils/departmentContext.js`、`web/test/unit/department_context.test.js`；修改 `web/src/stores/user.js`、`web/src/apis/auth_api.js`、`web/src/apis/base.js`、`web/src/apis/agent_api.js`、`web/src/composables/useAgentRunStream.js`、`web/src/components/UserInfoComponent.vue`，按实际缓存修改 `web/src/stores/agent.js`、`projects.js`、`database.js`、`chatThreads.js`、`agentTask.js`（均为 stores 目录）。

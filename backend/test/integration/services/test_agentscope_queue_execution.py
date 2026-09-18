@@ -26,6 +26,7 @@ from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.services import agent_request_queue_service
 from yuxi.services.input_message_service import build_chat_input_message
 from yuxi.storage.postgres.models_business import (
+    Department,
     Agent,
     AgentRun,
     AgentRunRequest,
@@ -69,6 +70,8 @@ async def env(monkeypatch):
                 role="superadmin",
             )
         )
+        department = Department(name=f"queue-exec-{uuid.uuid4().hex[:8]}")
+        db.add(department)
         await db.flush()
         db.add(
             Project(
@@ -121,6 +124,7 @@ async def env(monkeypatch):
         "project_id": project_id,
         "session_factory": session_factory,
         "enqueued": enqueued,
+        "department_id": department.id,
     }
 
     async with session_factory() as db:
@@ -133,6 +137,7 @@ async def env(monkeypatch):
         await db.execute(delete(Project).where(Project.id == project_id))
         await db.execute(delete(Agent).where(Agent.slug == agent_slug))
         await db.execute(delete(User).where(User.uid == uid))
+        await db.execute(delete(Department).where(Department.id == department.id))
         await db.commit()
     await engine.dispose()
     # 复位跨测试事件循环的共享单例（PG 管理器与 Redis 客户端）
@@ -160,6 +165,7 @@ async def _intake(env, request_id: str, text: str):
             agent_item=agent_item,
             agent_backend=agent_manager.get_agent(agent_item.backend_id),
             user=user,
+            department_id=env["department_id"],
         )
         await agent_request_queue_service.finalize_intake(
             db=db,

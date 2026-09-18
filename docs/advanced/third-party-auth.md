@@ -46,20 +46,17 @@ OIDC_REDIRECT_URI=https://<your-yuxi-host>/api/auth/oidc/callback
 | --- | --- | --- |
 | `OIDC_SCOPES` | `openid profile email` | 请求的 scope |
 | `OIDC_AUTO_CREATE_USER` | `true` | 找不到本地账号时是否创建用户 |
-| `OIDC_DEFAULT_ROLE` | `user` | 自动创建用户的角色 |
-| `OIDC_DEFAULT_DEPARTMENT` | `OIDC用户` | 自动创建用户没有部门信息时使用的部门 |
+| `OIDC_DEFAULT_ROLE` | `user` | 自动创建用户的角色；仅支持 `user`/`superadmin`，配置 `admin` 会因全局角色约束创建失败 |
 | `OIDC_USERNAME_CLAIM` | `preferred_username` | 用户名字段 |
 | `OIDC_EMAIL_CLAIM` | `email` | 邮箱字段 |
 | `OIDC_NAME_CLAIM` | `name` | 展示名称字段 |
 | `OIDC_FORCE_PROMPT_LOGIN` | `true` | 是否在授权请求中加入 `prompt=login` |
 
-可选的账号绑定和部门映射：
+可选的账号绑定：
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
 | `OIDC_USE_RAW_USERNAME` | `false` | 是否用 OIDC 用户名作为 Yuxi 的 `uid` |
-| `OIDC_FETCH_DEPARTMENT_INFO` | `false` | 是否读取 UserInfo 中的部门并创建/关联部门 |
-| `OIDC_DEPARTMENT_CLAIM` | `department` | 部门名称字段 |
 
 `OIDC_CLIENT_SECRET` 和其他凭证只能放在受保护的运行环境中，不要提交到仓库或打印到日志。生产环境的 Issuer、回调地址和端点使用可信的 HTTPS 地址；本机开发只使用 localhost HTTP。
 
@@ -93,16 +90,6 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --force-rec
 
 如果同一个 OIDC `sub` 已绑定到其他用户，登录会被拒绝，防止因为用户名相同而接管账号。启用此模式前，请确认 OIDC 用户名在身份提供商中稳定且唯一，并提前创建需要绑定的 Yuxi 用户。
 
-## 从 UserInfo 获取部门
-
-开启 `OIDC_FETCH_DEPARTMENT_INFO=true` 后，系统从 `OIDC_DEPARTMENT_CLAIM` 读取部门名称：
-
-- 部门名称会去除首尾空格并截断为 50 个字符；
-- 部门描述会截断为 255 个字符；
-- 部门名称为空时使用 `OIDC_DEFAULT_DEPARTMENT`；
-- 不存在的部门会自动创建，并把新用户关联到该部门。
-
-如果组织的部门字段不是字符串或需要复杂的层级映射，请先在测试环境验证，必要时在身份提供商侧提供稳定的扁平字段。
 
 ## 排查登录失败
 

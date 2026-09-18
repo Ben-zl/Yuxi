@@ -13,8 +13,8 @@ class FakeDb:
     def __init__(self):
         self.commit = AsyncMock()
         self.refresh = AsyncMock()
-        # 部门存在性锁查询：返回部门 id 表示存在
-        self.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: 11))
+        # 部门行锁查询（lock_department_ids）：按序返回锁定的部门 id
+        self.execute = AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [11])))
 
 
 class FakeTaskRepository:

@@ -292,3 +292,131 @@ async def test_submission_rejected_after_membership_removal(e2e_client, e2e_head
             admin_uids=admin_uids,
             user_ids=user_ids,
         )
+
+
+async def test_resume_uses_original_department_after_switch(db_session, e2e_client, e2e_headers, e2e_mock_model_spec):
+    """挂起 Run 恢复固定原部门：A 上下文中断后切到 B，resume Run 的固化部门仍是 A。
+
+    覆盖计划欠账「resume 挂起中切部门 E2E」：恢复不得把当前会话活动部门当作原任务部门。
+    """
+    import asyncio as _asyncio
+
+    suffix = uuid.uuid4().hex[:8]
+    # 只开放主动提问工具的智能体：首轮触发 interrupted
+    question_agent_slug = f"e2e-dept-question-{suffix}"
+    agent_created = await e2e_client.post(
+        "/api/agent",
+        headers=e2e_headers,
+        json={
+            "name": f"部门恢复提问 {suffix}",
+            "slug": question_agent_slug,
+            "backend_id": "ChatbotAgent",
+            "description": "部门 resume e2e",
+            "config_json": {
+                "context": {
+                    "model": e2e_mock_model_spec,
+                    "system_prompt": "需要用户选择时必须调用 ask_user_question；得到回答后简短确认。",
+                    "tools": ["ask_user_question"],
+                    "knowledges": [],
+                    "mcps": [],
+                    "skills": [],
+                    "subagents": [],
+                }
+            },
+            "share_config": {
+                "version": 2,
+                "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+                "manage_scope": None,
+            },
+        },
+    )
+    assert agent_created.status_code in (200, 201), agent_created.text
+
+    department_a = await _create_department(e2e_client, e2e_headers, tag="ra", suffix=suffix)
+    department_b = await _create_department(e2e_client, e2e_headers, tag="rb", suffix=suffix)
+    department_ids = [department_a["id"], department_b["id"]]
+    admin_uids = [f"deptctxadmra{suffix}", f"deptctxadmrb{suffix}"]
+    try:
+        # 超管切到 A
+        me = await e2e_client.get("/api/auth/me", headers=e2e_headers)
+        assert me.status_code == 200, me.text
+        switched_a = await e2e_client.post(
+            "/api/auth/department-context",
+            headers=e2e_headers,
+            json={"department_id": department_a["id"], "expected_revision": me.json()["context_revision"]},
+        )
+        assert switched_a.status_code == 200, switched_a.text
+
+        thread_created = await e2e_client.post(
+            "/api/chat/thread",
+            headers=e2e_headers,
+            json={"agent_id": question_agent_slug, "title": f"dept-resume-{suffix}"},
+        )
+        assert thread_created.status_code == 200, thread_created.text
+        thread_id = str(thread_created.json().get("thread_id") or thread_created.json().get("id"))
+
+        request_id = f"dept-resume-{suffix}"
+        # mock 模型按最后一条用户消息的关键词触发 ask_user_question
+        submitted = await e2e_client.post(
+            "/api/agent/runs",
+            headers=e2e_headers,
+            json={
+                "query": "这个任务需要确认方案后再继续",
+                "agent_slug": question_agent_slug,
+                "thread_id": thread_id,
+                "meta": {"request_id": request_id},
+            },
+        )
+        assert submitted.status_code == 200, submitted.text
+        interrupted_run_id = str(submitted.json()["run_id"])
+
+        from e2e_helpers import consume_events
+
+        events = await _asyncio.wait_for(
+            consume_events(e2e_client, e2e_headers, interrupted_run_id), timeout=180
+        )
+        interrupted = await wait_for_run(e2e_client, e2e_headers, interrupted_run_id)
+        assert interrupted["status"] == "interrupted", (interrupted, events)
+
+        request_dept, run_dept = await _read_run_department_ids(request_id, interrupted_run_id)
+        assert request_dept == department_a["id"], (request_id, request_dept)
+        assert run_dept == department_a["id"], (interrupted_run_id, run_dept)
+
+        # 挂起期间切换到 B：恢复必须仍用 A
+        me_b = await e2e_client.get("/api/auth/me", headers=e2e_headers)
+        switched_b = await e2e_client.post(
+            "/api/auth/department-context",
+            headers=e2e_headers,
+            json={"department_id": department_b["id"], "expected_revision": me_b.json()["context_revision"]},
+        )
+        assert switched_b.status_code == 200, switched_b.text
+
+        resume_response = await e2e_client.post(
+            "/api/agent/runs",
+            json={
+                "agent_slug": question_agent_slug,
+                "thread_id": thread_id,
+                "resume": {"answer": {"希望采用哪种交付方式？": "分步交付"}},
+                "created_by_run_id": interrupted_run_id,
+                "meta": {"request_id": f"dept-resume-r-{suffix}"},
+            },
+            headers=e2e_headers,
+        )
+        assert resume_response.status_code == 200, resume_response.text
+        resume_run_id = str(resume_response.json()["run_id"])
+        await _asyncio.wait_for(consume_events(e2e_client, e2e_headers, resume_run_id), timeout=180)
+        resumed = await wait_for_run(e2e_client, e2e_headers, resume_run_id)
+        assert resumed["status"] == "completed", resumed
+
+        # resume 路径跳过 request 入队（router 直接建 run），固化部门只看 run 行
+        _, resume_run_dept = await _read_run_department_ids(f"dept-resume-r-{suffix}", resume_run_id)
+        assert resume_run_dept == department_a["id"], (resume_run_id, resume_run_dept)
+    finally:
+        await e2e_client.delete(f"/api/agent/{question_agent_slug}", headers=e2e_headers)
+        await _cleanup_departments(
+            e2e_client,
+            e2e_headers,
+            department_ids=department_ids,
+            admin_uids=admin_uids,
+            user_ids=[],
+        )

@@ -49,14 +49,14 @@ class OIDCConfig(BaseModel):
     provider_name: str = Field(default="OIDC登录", description="认证源名称，显示在登录按钮上的文字")
     scopes: str = Field(default="openid profile email", description="请求的 scope")
     auto_create_user: bool = Field(default=True, description="是否自动创建用户")
-    default_role: str = Field(default="user", description="OIDC 用户的默认角色")
-    default_department: str = Field(default="OIDC用户", description="OIDC 用户的默认部门")
+    default_role: str = Field(
+        default="user",
+        description="OIDC 用户的默认角色；仅支持 superadmin/user，配置 admin 会因全局角色约束插入失败",
+    )
     username_claim: str = Field(default="preferred_username", description="用户名映射字段")
     email_claim: str = Field(default="email", description="邮箱映射字段")
     name_claim: str = Field(default="name", description="姓名映射字段")
     use_raw_username: bool = Field(default=False, description="是否使用原始用户名（不带oidc前缀）")
-    fetch_department_info: bool = Field(default=False, description="是否从OIDC中获取部门信息")
-    department_claim: str = Field(default="department", description="部门信息映射字段")
     force_prompt_login: bool = Field(default=False, description="是否强制用户重新登录（添加prompt=login参数）")
 
     @classmethod
@@ -85,13 +85,10 @@ class OIDCConfig(BaseModel):
             scopes=_env("OIDC_SCOPES", "openid profile email"),
             auto_create_user=os.environ.get("OIDC_AUTO_CREATE_USER", "true").lower() == "true",
             default_role=_env("OIDC_DEFAULT_ROLE", "user"),
-            default_department=_env("OIDC_DEFAULT_DEPARTMENT", "OIDC用户"),
             username_claim=_env("OIDC_USERNAME_CLAIM", "preferred_username"),
             email_claim=_env("OIDC_EMAIL_CLAIM", "email"),
             name_claim=_env("OIDC_NAME_CLAIM", "name"),
             use_raw_username=os.environ.get("OIDC_USE_RAW_USERNAME", "false").lower() == "true",
-            fetch_department_info=os.environ.get("OIDC_FETCH_DEPARTMENT_INFO", "false").lower() == "true",
-            department_claim=_env("OIDC_DEPARTMENT_CLAIM", "department"),
             force_prompt_login=os.environ.get("OIDC_FORCE_PROMPT_LOGIN", "true").lower() == "true",
         )
 
@@ -389,25 +386,11 @@ class OIDCUtils:
         if not name:
             name = username
 
-        department_name = None
-        department_description = None
-        if oidc_config.fetch_department_info:
-            department_name = userinfo.get(oidc_config.department_claim)
-            if not department_name:
-                department_name = userinfo.get("department")
-
-            # 获取部门描述
-            department_description = userinfo.get("department_description")
-            if not department_description:
-                department_description = userinfo.get("department_desc")
-
         return {
             "sub": sub,
             "username": username,
             "email": email,
             "name": name,
-            "department_name": department_name,
-            "department_description": department_description,
             "raw": userinfo,
         }
 

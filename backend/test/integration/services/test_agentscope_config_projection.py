@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from yuxi.agentscope.config_projection import project_runtime
 from yuxi.config.options import ensure_options_in_db
 from yuxi.repositories.agent_repository import DEFAULT_SHARE_CONFIG
-from yuxi.storage.postgres.models_business import Agent, Base, MCPServer, ModelProvider, Skill, User
+from yuxi.storage.postgres.models_business import Agent, Base, Department, MCPServer, ModelProvider, Skill, User
 
 CHATBOT_SLUG = "it-proj-chatbot"
 SUBAGENT_SLUG = "it-proj-subagent"
@@ -74,6 +74,11 @@ async def db_session():
         next(option for option in options if option.key == "system_options").value = {
             "default_model": MODEL_SPEC,
         }
+        projection_department = Department(name="it-proj-department")
+        session.add(projection_department)
+        await session.flush()
+        global _PROJECTION_DEPARTMENT_ID
+        _PROJECTION_DEPARTMENT_ID = projection_department.id
         session.add_all(
             [
                 User(
@@ -156,14 +161,18 @@ async def db_session():
         await session.execute(delete(MCPServer).where(MCPServer.slug == "it-proj-mcp"))
         await session.execute(delete(Skill).where(Skill.slug == "it-proj-skill"))
         await session.execute(delete(User).where(User.uid == "it-proj-user"))
+        await session.execute(delete(Department).where(Department.name == "it-proj-department"))
         await session.commit()
     from yuxi.storage.redis.manager import close_async_redis_client
 
     await close_async_redis_client()
 
 
+_PROJECTION_DEPARTMENT_ID: int | None = None
+
+
 async def test_project_runtime_covers_all_components(db_session):
-    projection = await project_runtime(db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
+    projection = await project_runtime(db_session, department_id=_PROJECTION_DEPARTMENT_ID, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
 
     assert projection.model_spec == MODEL_SPEC
     assert projection.agent_request["name"] == "投影测试智能体"
@@ -223,7 +232,7 @@ async def test_projection_duplicate_logical_slugs_resolve_only_by_resource_id(db
     agent.config_json = {"context": context}
     skill.mcp_dependencies = [second_id]
     await db_session.commit()
-    projection = await project_runtime(db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
+    projection = await project_runtime(db_session, department_id=_PROJECTION_DEPARTMENT_ID, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
     assert [item["resource_id"] for item in projection.mcp_servers] == [MCP_RESOURCE_ID, second_id]
     assert {item["slug"] for item in projection.mcp_servers} == {"it-proj-mcp"}
     assert projection.skill_mcp_dependencies["it-proj-skill"] == [second_id]
@@ -231,12 +240,12 @@ async def test_projection_duplicate_logical_slugs_resolve_only_by_resource_id(db
     agent.config_json = {"context": {**context, "mcps": ["it-proj-mcp"]}}
     await db_session.commit()
     with pytest.raises(ValueError, match="MCP"):
-        await project_runtime(db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
+        await project_runtime(db_session, department_id=_PROJECTION_DEPARTMENT_ID, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
 
 
 async def test_project_runtime_lite_trims_knowledge(db_session, monkeypatch):
     monkeypatch.setenv("LITE_MODE", "true")
-    projection = await project_runtime(db_session, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
+    projection = await project_runtime(db_session, department_id=_PROJECTION_DEPARTMENT_ID, uid="it-proj-user", agent_slug=CHATBOT_SLUG)
     assert projection.knowledge_slugs == []
     # 纯聊天核心不受 LITE 影响
     assert projection.chat_model_config["model"] == "mock-chat-model"
@@ -245,17 +254,18 @@ async def test_project_runtime_lite_trims_knowledge(db_session, monkeypatch):
 
 async def test_project_runtime_fails_explicitly(db_session, monkeypatch):
     with pytest.raises(ValueError, match="不存在"):
-        await project_runtime(db_session, uid="it-proj-user", agent_slug="no-such-agent")
+        await project_runtime(db_session, department_id=_PROJECTION_DEPARTMENT_ID, uid="it-proj-user", agent_slug="no-such-agent")
     # 无模型智能体回落系统默认对话模型（与旧栈一致）；
     # 默认模型的 key 由环境提供，测试内打桩避免依赖本地 .env
     from yuxi.agentscope import projection as proj
 
     monkeypatch.setattr(proj, "_resolve_api_key", lambda provider: "test-key")
-    projection = await project_runtime(db_session, uid="it-proj-user", agent_slug=SUBAGENT_SLUG)
+    projection = await project_runtime(db_session, department_id=_PROJECTION_DEPARTMENT_ID, uid="it-proj-user", agent_slug=SUBAGENT_SLUG)
     assert projection.model_spec == MODEL_SPEC
     with pytest.raises(ValueError, match="不存在"):
         await project_runtime(
             db_session,
+            department_id=_PROJECTION_DEPARTMENT_ID,
             uid="it-proj-user",
             agent_slug=CHATBOT_SLUG,
             model_spec="no-such-provider:m",

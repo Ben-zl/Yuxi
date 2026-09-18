@@ -112,20 +112,15 @@ class AgentTaskCRUDService:
         if user.department_id is None:
             raise HTTPException(status_code=403, detail="创建任务需要有效部门上下文")
 
-        # 与删除部门共用行锁：部门被并发删除时拒绝创建，不产生孤儿任务归属
-        from sqlalchemy import select as _select
+        # 与删除部门共用行锁：归属部门与共享部门合并一次按升序锁定，
+        # 部门被并发删除时拒绝创建（不产生孤儿任务归属），也避免多方交叉锁死锁
+        from yuxi.repositories.department_repository import lock_department_ids, share_department_ids
 
-        from yuxi.storage.postgres.models_business import Department as _Department
-
-        locked = await self.db.execute(
-            _select(_Department.id).where(_Department.id == user.department_id).with_for_update()
-        )
-        if locked.scalar_one_or_none() is None:
-            raise HTTPException(status_code=404, detail="所属部门不存在")
-
-        from yuxi.repositories.department_repository import lock_share_departments
-
-        await lock_share_departments(self.db, share_config)
+        lock_ids = {int(user.department_id)} | share_department_ids(share_config)
+        try:
+            await lock_department_ids(self.db, lock_ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="所属或共享部门不存在") from exc
 
         fields = apply_schedule_fields(payload)  # 校验并编译定时配置；未启用返回空
         task = await self.tasks.create(

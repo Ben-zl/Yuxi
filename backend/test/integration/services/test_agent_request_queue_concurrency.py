@@ -19,6 +19,8 @@ from yuxi.repositories.agent_run_request_repository import AgentRunRequestReposi
 from yuxi.services import agent_request_queue_service
 from yuxi.services.input_message_service import build_chat_input_message
 from yuxi.storage.postgres.models_business import (
+    Department,
+
     AgentRun,
     AgentRunRequest,
     Conversation,
@@ -73,15 +75,19 @@ async def _cleanup_queue_test_thread(session_factory, engine, thread_id: str) ->
             await db.execute(delete(Project).where(Project.id == project_id))
         if uid is not None:
             await db.execute(delete(User).where(User.uid == uid))
+        await db.execute(delete(Department).where(Department.name.like("queue-conc-%")))
         await db.commit()
     await engine.dispose()
 
 
-async def _add_project_and_user(db, uid: str) -> str:
+async def _add_project_and_user(db, uid: str) -> tuple[str, int]:
     project_id = str(uuid.uuid4())
+    department = Department(name=f"queue-conc-{uuid.uuid4().hex[:8]}")
+    db.add(department)
     db.add(User(username=uid, uid=uid, password_hash="test"))
     await db.flush()
-    return await _add_project(db, uid, project_id)
+    project = await _add_project(db, uid, project_id)
+    return project, department.id
 
 
 async def _add_project(db, uid: str, project_id: str | None = None) -> str:
@@ -109,7 +115,7 @@ async def test_concurrent_reject_requests_never_enter_queue(monkeypatch: pytest.
     _patch_intake_runtime_boundaries(monkeypatch)
 
     async with session_factory() as db:
-        project_id = await _add_project_and_user(db, uid)
+        project_id, department_id = await _add_project_and_user(db, uid)
         conversation = Conversation(
             thread_id=thread_id,
             uid=uid,
@@ -134,6 +140,7 @@ async def test_concurrent_reject_requests_never_enter_queue(monkeypatch: pytest.
                 agent_item=MagicMock(),
                 agent_backend=MagicMock(),
                 user=user,
+                department_id=department_id,
             )
             await db.commit()
             return result
@@ -189,7 +196,7 @@ async def test_concurrent_steer_requests_keep_one_pending(monkeypatch: pytest.Mo
     _patch_intake_runtime_boundaries(monkeypatch)
 
     async with session_factory() as db:
-        project_id = await _add_project_and_user(db, uid)
+        project_id, department_id = await _add_project_and_user(db, uid)
         conversation = Conversation(
             thread_id=thread_id,
             uid=uid,
@@ -252,6 +259,7 @@ async def test_concurrent_steer_requests_keep_one_pending(monkeypatch: pytest.Mo
                     agent_item=MagicMock(),
                     agent_backend=MagicMock(),
                     user=user,
+                    department_id=department_id,
                 )
                 await db.commit()
                 return result
@@ -309,7 +317,7 @@ async def test_concurrent_enqueue_dispatches_fifo_head(monkeypatch: pytest.Monke
     monkeypatch.setattr(AgentRunRequestRepository, "create", controlled_create)
 
     async with session_factory() as db:
-        project_id = await _add_project_and_user(db, uid)
+        project_id, department_id = await _add_project_and_user(db, uid)
         db.add(
             Conversation(
                 thread_id=thread_id,
@@ -335,6 +343,7 @@ async def test_concurrent_enqueue_dispatches_fifo_head(monkeypatch: pytest.Monke
                 agent_item=MagicMock(),
                 agent_backend=MagicMock(),
                 user=user,
+                department_id=department_id,
             )
             await db.commit()
             if request_id == request_ids[1]:
@@ -399,7 +408,7 @@ async def test_dispatch_retry_reenqueues_existing_pending_run(monkeypatch: pytes
     monkeypatch.setattr(agent_request_queue_service.pg_manager, "get_async_session_context", session_context)
 
     async with session_factory() as db:
-        project_id = await _add_project_and_user(db, uid)
+        project_id, department_id = await _add_project_and_user(db, uid)
         conversation = Conversation(
             thread_id=thread_id,
             uid=uid,
@@ -424,6 +433,7 @@ async def test_dispatch_retry_reenqueues_existing_pending_run(monkeypatch: pytes
             agent_slug="main",
             conversation_thread_id=thread_id,
             input_message_id=message.id,
+            department_id=department_id,
             input_payload={"model_spec": "model", "tool_approval_mode": "default"},
         )
         await db.commit()
@@ -482,8 +492,11 @@ async def test_startup_recovery_reenqueues_pending_runs_without_queue_requests(m
     monkeypatch.setattr(agent_request_queue_service.pg_manager, "get_async_session_context", session_context)
 
     async with session_factory() as db:
+        department = Department(name=f"queue-conc-{uuid.uuid4().hex[:8]}")
+        db.add(department)
         db.add(User(username=uid, uid=uid, password_hash="test"))
         await db.flush()
+        department_id = department.id
         project_ids = [await _add_project(db, uid) for _ in run_specs]
         conversations = [
             Conversation(
@@ -587,7 +600,7 @@ async def test_terminal_status_loser_does_not_change_message_delivery_status(mon
                 raise
 
     async with session_factory() as db:
-        project_id = await _add_project_and_user(db, uid)
+        project_id, department_id = await _add_project_and_user(db, uid)
         conversation = Conversation(
             thread_id=thread_id,
             uid=uid,
@@ -691,8 +704,11 @@ async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict
     _patch_intake_runtime_boundaries(monkeypatch)
 
     async with session_factory() as db:
+        department = Department(name=f"queue-conc-{uuid.uuid4().hex[:8]}")
+        db.add(department)
         db.add(User(username=uid, uid=uid, password_hash="test"))
         await db.flush()
+        department_id = department.id
         project_ids = [await _add_project(db, uid) for _ in thread_ids]
         db.add_all(
             [
@@ -723,6 +739,7 @@ async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict
                     agent_item=MagicMock(),
                     agent_backend=MagicMock(),
                     user=user,
+                    department_id=department_id,
                 )
                 await db.commit()
                 return result

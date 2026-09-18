@@ -28,6 +28,7 @@ from yuxi.services.department_membership_service import DepartmentMembershipServ
 from yuxi.storage.postgres.models_business import (
     AgentMemoryScope,
     AgentRunRequest,
+    TaskExecution,
     AgentRun,
     AgentScopeChannelBinding,
     AgentTask,
@@ -120,6 +121,9 @@ async def boundary_case(test_client, admin_headers, db_engine, pg_pool):
             )
             await conn.execute(
                 AgentScopeChannelBinding.__table__.delete().where(AgentScopeChannelBinding.department_id == dept_id)
+            )
+            await conn.execute(
+                TaskExecution.__table__.delete().where(TaskExecution.department_id == dept_id)
             )
             await conn.execute(AgentTask.__table__.delete().where(AgentTask.department_id == dept_id))
             await conn.execute(AgentRun.__table__.delete().where(AgentRun.department_id == dept_id))
@@ -293,6 +297,91 @@ async def _seed_reference_rows(engine, department_id: int, uid: str, kinds: tupl
                             },
                             "manage_scope": None,
                         },
+                    )
+                )
+
+            if "archived_task" in kinds:
+                session.add(
+                    AgentTask(
+                        id=str(uuid.uuid4()),
+                        name="删除边界归档任务",
+                        owner_uid=user.uid,
+                        department_id=department_id,
+                        prompt="pytest",
+                        enabled=False,
+                        archived_at=utc_now_naive(),
+                        share_config={
+                            "version": 2,
+                            "read_scope": {
+                                "access_level": "user",
+                                "department_ids": [],
+                                "user_uids": [user.uid],
+                            },
+                            "manage_scope": None,
+                        },
+                    )
+                )
+
+            if "terminal_execution" in kinds:
+                # 宿主任务归档停用：本分支只验证终态执行记录的放行语义
+                task = AgentTask(
+                    id=str(uuid.uuid4()),
+                    name="删除边界执行任务",
+                    owner_uid=user.uid,
+                    department_id=department_id,
+                    prompt="pytest",
+                    enabled=False,
+                    archived_at=utc_now_naive(),
+                )
+                session.add(task)
+                await session.flush()
+                session.add(
+                    TaskExecution(
+                        id=str(uuid.uuid4()),
+                        task_id=task.id,
+                        trigger_type="manual",
+                        triggered_by_uid=user.uid,
+                        department_id=department_id,
+                        execution_principal_uid=user.uid,
+                        agent_slug="boundary-agent",
+                        prompt="pytest",
+                        tool_approval_mode="always_trust",
+                        idempotency_key=f"exec-{uuid.uuid4().hex[:12]}",
+                        status="succeeded",
+                    )
+                )
+
+            if "rejected_request" in kinds:
+                project = Project(
+                    id=f"proj-{uuid.uuid4().hex[:10]}",
+                    uid=user.uid,
+                    selection_status="implicit",
+                    workdir_path=f"workdir/{user.uid}-{uuid.uuid4().hex[:4]}",
+                    directory_mode="managed",
+                )
+                conversation = Conversation(
+                    thread_id=f"thread-{uuid.uuid4().hex[:12]}",
+                    uid=user.uid,
+                    agent_id="boundary-agent",
+                    title="删除边界拒绝请求对话",
+                    project_id=project.id,
+                )
+                session.add_all([project, conversation])
+                await session.flush()
+                from yuxi.storage.postgres.models_business import Message
+
+                message = Message(conversation_id=conversation.id, role="user", content="seed")
+                session.add(message)
+                await session.flush()
+                session.add(
+                    AgentRunRequest(
+                        request_id=f"req-{uuid.uuid4().hex[:12]}",
+                        uid=user.uid,
+                        department_id=department_id,
+                        agent_slug="boundary-agent",
+                        conversation_thread_id=conversation.thread_id,
+                        input_message_id=message.id,
+                        status="rejected",
                     )
                 )
 
@@ -534,7 +623,7 @@ async def test_delete_department_with_terminal_run_keeps_audit_marker(
         db_engine,
         department_id,
         boundary_case["admin_uid"],
-        ("terminal_run", "dispatched_request"),
+        ("terminal_run", "dispatched_request", "archived_task", "terminal_execution", "rejected_request"),
     )
     assert facts == {}
 

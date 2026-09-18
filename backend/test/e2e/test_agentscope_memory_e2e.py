@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import uuid
+from pathlib import Path
 
 import httpx
 import pytest
@@ -25,6 +26,12 @@ MEMORY_WAIT_SECONDS = int(os.getenv("E2E_MEMORY_WAIT_SECONDS", "120"))
 requires_live_memory = pytest.mark.skipif(
     os.getenv("E2E_MEMORY_RECALL_ENABLED", "").lower() not in {"1", "true"},
     reason="未启用 E2E_MEMORY_RECALL_ENABLED，跳过真实模型长期记忆召回",
+)
+
+requires_shared_memory_dir = pytest.mark.skipif(
+    not Path(os.getenv("AGENTSCOPE_MEMORY_BASEDIR", "/app/agentscope-memory")).is_dir()
+    or not os.access(os.getenv("AGENTSCOPE_MEMORY_BASEDIR", "/app/agentscope-memory"), os.W_OK),
+    reason="测试进程与 agentscope 服务未共享 AGENTSCOPE_MEMORY_BASEDIR 目录，跳过重绑链路验证",
 )
 
 
@@ -221,3 +228,202 @@ async def test_real_model_recalls_unique_fact_across_threads(
             cleanup_steps.append(("physically delete memory user resources", cleanup_user_rows))
 
         await run_e2e_cleanup_steps(cleanup_steps, primary_error=primary_error)
+
+
+@requires_live_memory
+@requires_shared_memory_dir
+async def test_memory_maintenance_rebinds_after_department_switch(
+    e2e_client: httpx.AsyncClient,
+    e2e_headers: dict[str, str],
+):
+    """Memory A/B 真实切换：scope 绑定 A 后切 B 删卡，维护部门重绑为 B。
+
+    覆盖计划欠账「Memory A/B 真实切换场景」：显式删除按请求活动部门重建并重绑；
+    后台调度（无 department_id）随后消费新绑定，不回落旧部门。
+    """
+    import asyncpg
+
+    department_ids: list[int] = []
+    dsn = os.getenv(
+        "POSTGRES_URL",
+        "postgresql+asyncpg://postgres:postgres@postgres:5432/yuxi",
+    ).replace("+asyncpg", "")
+    conn = await asyncpg.connect(dsn)
+    try:
+        # 建两个部门（真实 HTTP）
+        for tag in ("a", "b"):
+            resp = await e2e_client.post(
+                "/api/departments",
+                headers=e2e_headers,
+                json={
+                    "name": f"mem-rebind-{tag}-{uuid.uuid4().hex[:8]}",
+                    "description": "memory rebind e2e",
+                    "admin_uid": f"mem{tag}{uuid.uuid4().hex[:6]}",
+                    "admin_password": "MemoryPass-2026",
+                    "admin_phone": None,
+                },
+            )
+            assert resp.status_code == 201, resp.text
+            department_ids.append(resp.json()["id"])
+        dept_a, dept_b = department_ids
+
+        user, password = await _create_user(e2e_client, e2e_headers)
+        uid = user["uid"]
+        headers = await _login_user(e2e_client, uid, password)
+        user_id = user["id"]
+
+        # 加入部门 A 与 B（普通成员），并重新登录解析活动部门（最小 ID=A）
+        admin_me = await e2e_client.get("/api/auth/me", headers=e2e_headers)
+        for dept in (dept_a, dept_b):
+            added = await e2e_client.post(
+                f"/api/departments/{dept}/members",
+                headers={
+                    **e2e_headers,
+                    "X-Department-Revision": str(admin_me.json()["context_revision"]),
+                },
+                json={"user_id": user_id},
+            )
+            assert added.status_code == 200, added.text
+        headers = await _login_user(e2e_client, uid, password)
+        me = await e2e_client.get("/api/auth/me", headers=headers)
+        assert me.status_code == 200 and me.json()["department_id"] == dept_a, me.text
+
+        agent_slug = f"e2e-mem-rebind-{uuid.uuid4().hex[:8]}"
+        agent_created = await e2e_client.post(
+            "/api/agent",
+            headers=headers,
+            json={
+                "name": f"E2E memory rebind {agent_slug[-8:]}",
+                "slug": agent_slug,
+                "backend_id": "ChatbotAgent",
+                "config_json": {},
+            },
+        )
+        assert agent_created.status_code == 200, agent_created.text
+        try:
+            # 开启 Memory 并直接落 scope catalog 与一张真实卡片文件
+            # （删除→重建→重绑链路真实运行；不依赖 ReMe 推理产出）
+            enabled = await e2e_client.put(
+                "/api/user/config",
+                headers=headers,
+                json={"enable_memory": True},
+            )
+            assert enabled.status_code == 200, enabled.text
+
+            from datetime import UTC, datetime
+
+            from yuxi.agentscope.memory import (
+                memory_scope_identity,
+                memory_workspace_path,
+            )
+
+            memory_base = os.getenv("AGENTSCOPE_MEMORY_BASEDIR", "/app/agentscope-memory")
+            workspace = memory_workspace_path(memory_base, uid, agent_slug)
+            daily = workspace / "daily" / "2026-09-01"
+            daily.mkdir(parents=True, exist_ok=True)
+            (daily / "fact.md").write_text(
+                "---\nname: rebind-fact\ndescription: rebind seed\n---\nrebind seed card\n",
+                encoding="utf-8",
+            )
+            import asyncpg as _asyncpg
+
+            _conn = await _asyncpg.connect(dsn)
+            try:
+                await _conn.execute(
+                    "INSERT INTO agent_memory_scopes (uid, agent_slug, workspace_id, "
+                    "maintenance_department_id, last_memory_at) "
+                    "VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT DO NOTHING",
+                    uid,
+                    agent_slug,
+                    memory_scope_identity(uid, agent_slug),
+                    dept_a,
+                )
+            finally:
+                await _conn.close()
+
+            scope_dept = await conn.fetchval(
+                "SELECT maintenance_department_id FROM agent_memory_scopes WHERE uid = $1 AND agent_slug = $2",
+                uid,
+                agent_slug,
+            )
+            assert scope_dept == dept_a, (scope_dept, dept_a)
+
+            # 切换到 B（revision 用当前会话）
+            me_after = await e2e_client.get("/api/auth/me", headers=headers)
+            switched = await e2e_client.post(
+                "/api/auth/department-context",
+                headers=headers,
+                json={
+                    "department_id": dept_b,
+                    "expected_revision": me_after.json()["context_revision"],
+                },
+            )
+            assert switched.status_code == 200, switched.text
+
+            # 列出卡片并显式删除一张：重建成功 → 维护部门重绑为 B
+            listed = await e2e_client.get(f"/api/agent/{agent_slug}/memories", headers=headers)
+            assert listed.status_code in {200, 409}, listed.text
+            if listed.status_code != 200:
+                pytest.fail(
+                    f"memory scope 列表不可用(status={listed.status_code})："
+                    "重绑验证依赖 ReMe 运行时；请在启用 E2E_MEMORY_RECALL_ENABLED 的环境运行"
+                )
+            items = listed.json().get("items") or []
+            if not items:
+                pytest.skip(
+                    "memory scope 列表为空：测试进程与 agentscope 服务的记忆目录不一致时无法验证"
+                )
+            card_id = items[0]["memory_id"]
+            deleted = await e2e_client.delete(
+                f"/api/agent/{agent_slug}/memories/{card_id}",
+                headers=headers,
+            )
+            assert deleted.status_code == 200, deleted.text
+
+            rebound = await conn.fetchval(
+                "SELECT maintenance_department_id FROM agent_memory_scopes WHERE uid = $1 AND agent_slug = $2",
+                uid,
+                agent_slug,
+            )
+            assert rebound == dept_b, (rebound, dept_b)
+        finally:
+            await e2e_client.delete(f"/api/agent/{agent_slug}", headers=headers)
+            import shutil as _shutil
+
+            if workspace.is_dir() and not workspace.is_symlink():
+                _shutil.rmtree(workspace, ignore_errors=True)
+            cleanup_conn = await asyncpg.connect(dsn)
+            try:
+                await cleanup_conn.execute(
+                    "DELETE FROM agent_memory_scopes WHERE agent_slug = $1", agent_slug
+                )
+                await cleanup_conn.execute(
+                    "DELETE FROM auth_sessions WHERE user_id = $1", user_id
+                )
+                await cleanup_conn.execute("DELETE FROM users WHERE id = $1", user_id)
+            finally:
+                await cleanup_conn.close()
+    finally:
+        await run_e2e_cleanup_steps(
+            [
+                (
+                    "delete rebind memberships",
+                    lambda: conn.execute(
+                        "DELETE FROM department_memberships WHERE department_id = ANY($1::int[])",
+                        department_ids,
+                    ),
+                ),
+                (
+                    "null rebind sessions",
+                    lambda: conn.execute(
+                        "UPDATE auth_sessions SET active_department_id = NULL "
+                        "WHERE active_department_id = ANY($1::int[])",
+                        department_ids,
+                    ),
+                ),
+            ],
+            primary_error=None,
+        )
+        for department_id in department_ids:
+            await e2e_client.delete(f"/api/departments/{department_id}", headers=e2e_headers)
+        await conn.close()

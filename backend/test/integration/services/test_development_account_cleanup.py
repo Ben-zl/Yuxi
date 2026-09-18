@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy import text
 
@@ -321,7 +321,41 @@ async def test_preview_then_apply_deletes_only_non_superadmin() -> None:
             "removed_memberships": 0,
             # 首轮已把软删除旧 admin 归一为 user，重复执行不再有归一
             "normalized_admin_roles": 0,
+            "revoked_stale_sessions": 0,
         }
+
+        # 正向补例：预置软删用户+未撤销会话，再次 apply 必须撤销且只撤销一次
+        async with factory() as session:
+            async with session.begin():
+                stale_user = User(
+                    username="清理历史会话", uid="cleanup_stale", password_hash="hash", role="user", is_deleted=1
+                )
+                session.add(stale_user)
+                await session.flush()
+                session.add(
+                    AuthSession(
+                        id=str(uuid.uuid4()),
+                        user_id=stale_user.id,
+                        expires_at=datetime.now() + timedelta(hours=1),
+                    )
+                )
+        async with factory() as session:
+            async with session.begin():
+                forward = await cleanup_script.cleanup_accounts(session, apply=True)
+        assert forward["revoked_stale_sessions"] == 1
+        async with factory() as session:
+            async with session.begin():
+                again = await cleanup_script.cleanup_accounts(session, apply=True)
+        assert again["revoked_stale_sessions"] == 0
+        # 补例数据自清：恢复整库快照等价断言的前提（快照含 users 全表）
+        async with factory() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(AuthSession).where(
+                        AuthSession.user_id.in_(select(User.id).where(User.uid == "cleanup_stale"))
+                    )
+                )
+                await session.execute(delete(User).where(User.uid == "cleanup_stale"))
         async with factory() as session:
             after_repeat = await _database_snapshot(session, seed)
         assert after_repeat == after
