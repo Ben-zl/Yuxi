@@ -73,7 +73,6 @@ async def db_session():
                     username=REAL_UID,
                     password_hash=AuthUtils.hash_password("test-only"),
                     role="superadmin",
-                    department_id=1,
                 ),
                 ModelProvider(
                     resource_id=PROVIDER_RESOURCE_ID,

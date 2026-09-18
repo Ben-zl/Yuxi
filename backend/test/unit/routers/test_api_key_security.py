@@ -53,28 +53,24 @@ async def session():
             uid="superadmin",
             password_hash="$argon2id$placeholder",
             role="superadmin",
-            department=dept_a,
         )
         dept_b_admin = User(
             username="Dept B Admin",
             uid="dept_b_admin",
             password_hash="$argon2id$placeholder",
             role="admin",
-            department=dept_b,
         )
         regular_user = User(
             username="Regular",
             uid="regular",
             password_hash="$argon2id$placeholder",
             role="user",
-            department=dept_a,
         )
         deleted_user = User(
             username="Deleted",
             uid="deleted",
             password_hash="$argon2id$placeholder",
             role="user",
-            department=dept_a,
             is_deleted=1,
         )
         db.add_all([dept_a, dept_b, superadmin, dept_b_admin, regular_user, deleted_user])

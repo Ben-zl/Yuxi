@@ -384,7 +384,6 @@ async def test_department_admin_is_rejected_from_account_management(test_client,
                 conn = await asyncpg.connect(dsn)
                 try:
                     await conn.execute("DELETE FROM auth_sessions WHERE active_department_id = $1", department_id)
-                    await conn.execute("UPDATE users SET department_id = NULL WHERE department_id = $1", department_id)
                 finally:
                     await conn.close()
             deletion = await test_client.delete(f"/api/departments/{department_id}", headers=admin_headers)

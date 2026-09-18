@@ -201,7 +201,7 @@ async def test_create_agent_allows_explicit_global_scope_for_admin(monkeypatch):
 
 
 def test_user_shared_agent_is_manageable_for_normal_user():
-    user = User(username="user", uid="user", password_hash="x", role="user", department_id=1)
+    user = User(username="user", uid="user", password_hash="x", role="user")
     agent = Agent(
         slug="shared-bot",
         name="Shared Bot",

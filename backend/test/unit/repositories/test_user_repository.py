@@ -9,7 +9,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.repositories.user_repository import UserRepository
-from yuxi.storage.postgres.models_business import APIKey, Base, Department, User
+from yuxi.storage.postgres.models_business import APIKey, Base, Department, DepartmentMembership, User
 from yuxi.utils.auth_utils import AuthUtils
 from yuxi.utils.datetime_utils import utc_now_naive
 
@@ -67,13 +67,18 @@ async def test_user_page_filters_before_pagination_and_excludes_deleted_users(us
             uid=f"page_user_{index}",
             phone_number=f"1380000000{index}",
             password_hash="$argon2id$placeholder",
-            role="user" if index < 3 else "admin",
-            department_id=department.id,
+            role="user" if index < 3 else "superadmin",
             is_deleted=1 if index == 1 else 0,
         )
         for index in range(4)
     ]
     session.add_all(users)
+    await session.flush()
+    # 部门过滤按成员关系判定：page_user_0（已删）、page_user_2、page_user_3 是部门成员
+    session.add_all(
+        DepartmentMembership(user_id=users[index].id, department_id=department.id, role="user")
+        for index in (0, 2, 3)
+    )
     await session.commit()
 
     rows, total = await UserRepository(session).list_page_with_department(

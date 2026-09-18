@@ -69,6 +69,9 @@ async def _create_scoped_schema() -> tuple[create_async_engine, create_async_eng
     )
     manager = _scoped_manager(scoped_engine)
     await manager.create_business_tables()
+    # 模拟 v15 前的库：旧全局 admin 行必须可存在（目标库的 CHECK 尚未约束存量）
+    async with scoped_engine.begin() as connection:
+        await connection.execute(text("ALTER TABLE users DROP CONSTRAINT IF EXISTS ck_users_role_global"))
     return admin_engine, scoped_engine, schema
 
 
@@ -167,7 +170,6 @@ async def _seed_accounts(factory) -> SimpleNamespace:
                 )
 
             return SimpleNamespace(
-                department_id=department.id,
                 superadmin_id=superadmin.id,
                 legacy_admin_id=legacy_admin.id,
                 legacy_user_id=legacy_user.id,
@@ -215,7 +217,7 @@ async def _database_snapshot(session, seed: SimpleNamespace) -> dict:
     )
     superadmin_row = (
         await session.execute(
-            select(User.role, User.is_deleted, User.department_id).where(User.id == seed.superadmin_id)
+            select(User.role, User.is_deleted).where(User.id == seed.superadmin_id)
         )
     ).one()
     business_run_ids = (await session.execute(select(AgentRun.id).order_by(AgentRun.id))).scalars().all()
@@ -281,7 +283,7 @@ async def test_preview_then_apply_deletes_only_non_superadmin() -> None:
         assert after["active_roles"] == ["superadmin"]
         remaining_user_states = {(uid, role, deleted) for uid, role, deleted in after["users"]}
         assert ("cleanup_super", "superadmin", 0) in remaining_user_states
-        assert ("cleanup_admin", "admin", 1) in remaining_user_states  # 软删除不改角色值
+        assert ("cleanup_admin", "user", 1) in remaining_user_states  # 软删除旧 admin 同轮归一为 user
         assert ("cleanup_user", "user", 1) in remaining_user_states
 
         # 计划验收断言：被删账号活跃会话/Key 归零，超管与业务数据不变
@@ -317,6 +319,8 @@ async def test_preview_then_apply_deletes_only_non_superadmin() -> None:
             "deleted_accounts": 0,
             "revoked_credentials": 0,
             "removed_memberships": 0,
+            # 首轮已把软删除旧 admin 归一为 user，重复执行不再有归一
+            "normalized_admin_roles": 0,
         }
         async with factory() as session:
             after_repeat = await _database_snapshot(session, seed)

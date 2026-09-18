@@ -148,7 +148,6 @@ class UserAccessOption(BaseModel):
     uid: str
     username: str
     role: str
-    department_id: int | None = None
     department_name: str | None = None
 
 
@@ -728,7 +727,6 @@ async def create_user(
             "phone_number": user_data.phone_number,
             "password_hash": hashed_password,
             "role": "user",
-            "department_id": None,
         }
     )
 
@@ -795,7 +793,7 @@ async def read_user_access_options(
             "uid": user.uid,
             "username": user.username,
             "role": user.role,
-            "department_id": user.department_id,
+            # 展示用途：最小部门 ID 的成员关系（账号可属多部门）
             "department_name": dept_name,
         }
         for user, dept_name in users_with_dept

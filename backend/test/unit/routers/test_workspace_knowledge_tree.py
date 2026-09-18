@@ -80,7 +80,19 @@ def _build_client(monkeypatch, fake_kb: FakeKnowledgeBase) -> TestClient:
     app.include_router(workspace_knowledge, prefix="/api")
 
     async def fake_required_user():
-        return User(username="user", uid="user", password_hash="x", role="user", department_id=1)
+        from yuxi.services.department_context_service import DepartmentContext
+
+        return DepartmentContext(
+            id=1,
+            uid="user",
+            username="user",
+            account_role="user",
+            department_id=None,
+            department_name=None,
+            role="user",
+            session_id=None,
+            revision=0,
+        )
 
     app.dependency_overrides[get_required_user] = fake_required_user
     monkeypatch.setattr(workspace_router, "_get_knowledge_base", lambda: fake_kb)

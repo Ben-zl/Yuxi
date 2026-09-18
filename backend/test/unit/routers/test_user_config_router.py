@@ -24,14 +24,12 @@ async def session():
             uid="user_a",
             password_hash="$argon2id$placeholder",
             role="user",
-            department=department,
         )
         user_b = User(
             username="User B",
             uid="user_b",
             password_hash="$argon2id$placeholder",
             role="user",
-            department=department,
         )
         db.add_all([department, user_a, user_b])
         await db.commit()

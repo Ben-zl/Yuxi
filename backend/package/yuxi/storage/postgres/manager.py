@@ -23,7 +23,7 @@ from yuxi.utils.singleton import SingletonMeta
 # 合并两个 Base
 CombinedBase = declarative_base()
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
-BUSINESS_SCHEMA_VERSION = 14
+BUSINESS_SCHEMA_VERSION = 15
 KNOWLEDGE_SCHEMA_VERSION = 4
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
@@ -1602,6 +1602,27 @@ class PostgresManager(metaclass=SingletonMeta):
             )
             """,
             "CREATE INDEX IF NOT EXISTS ix_auth_sessions_user_expires ON auth_sessions(user_id, expires_at)",
+            # 单部门旧列与运行表部门外键收口（business v15）
+            # 仍有效的旧 admin 必须先独立清理，迁移不静默迁移其权限
+            (
+                "DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM users WHERE is_deleted = 0 AND role = 'admin') THEN "
+                "RAISE EXCEPTION '存在仍有效的旧 admin 账号，请先完成独立账号清理再执行 v15 收口'; "
+                "END IF; END $$"
+            ),
+            "ALTER TABLE IF EXISTS users DROP CONSTRAINT IF EXISTS users_department_id_fkey",
+            "ALTER TABLE IF EXISTS users DROP COLUMN IF EXISTS department_id",
+            # 运行/请求/任务/执行的部门标识转为审计列：历史终态记录不再被外键阻止部门删除
+            "ALTER TABLE IF EXISTS agent_runs DROP CONSTRAINT IF EXISTS agent_runs_department_id_fkey",
+            "ALTER TABLE IF EXISTS agent_run_requests DROP CONSTRAINT IF EXISTS agent_run_requests_department_id_fkey",
+            "ALTER TABLE IF EXISTS agent_tasks DROP CONSTRAINT IF EXISTS agent_tasks_department_id_fkey",
+            "ALTER TABLE IF EXISTS task_executions DROP CONSTRAINT IF EXISTS task_executions_department_id_fkey",
+            # 存量软删除旧 admin 的 role 归一由清理脚本负责；CHECK NOT VALID 只约束新写入
+            "ALTER TABLE IF EXISTS users DROP CONSTRAINT IF EXISTS ck_users_role_global",
+            (
+                "ALTER TABLE IF EXISTS users ADD CONSTRAINT ck_users_role_global "
+                "CHECK (role IN ('superadmin', 'user')) NOT VALID"
+            ),
         ]
         async with self.async_engine.begin() as conn:
             await conn.run_sync(BusinessBase.metadata.tables["run_resource_snapshots"].create, checkfirst=True)

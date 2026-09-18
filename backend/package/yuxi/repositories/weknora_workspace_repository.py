@@ -20,17 +20,34 @@ class WeknoraWorkspaceRepository:
             )
             return result.scalar_one_or_none()
 
-    async def create(self, data: dict[str, Any]) -> WeknoraDepartmentWorkspace:
+    async def create(self, data: dict[str, Any], *, db=None) -> WeknoraDepartmentWorkspace:
         """新建映射;department_id 唯一冲突抛 IntegrityError(并发开通收敛)。"""
 
         row = WeknoraDepartmentWorkspace(**data)
-        async with pg_manager.get_async_session_context() as session:
-            session.add(row)
+        if db is not None:
+            db.add(row)
+        else:
+            async with pg_manager.get_async_session_context() as session:
+                session.add(row)
         return row
 
-    async def replace_for_department(self, department_id: int, data: dict[str, Any]) -> WeknoraDepartmentWorkspace:
+    async def replace_for_department(
+        self, department_id: int, data: dict[str, Any], *, db=None
+    ) -> WeknoraDepartmentWorkspace:
         """以新开通结果覆盖该部门映射;旧 workspace 由调用方记录残留供人工清理。"""
 
+        session = db
+        if session is not None:
+            result = await session.execute(
+                select(WeknoraDepartmentWorkspace).where(WeknoraDepartmentWorkspace.department_id == int(department_id))
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                row = WeknoraDepartmentWorkspace(department_id=int(department_id))
+                session.add(row)
+            for key, value in data.items():
+                setattr(row, key, value)
+            return row
         async with pg_manager.get_async_session_context() as session:
             result = await session.execute(
                 select(WeknoraDepartmentWorkspace).where(WeknoraDepartmentWorkspace.department_id == int(department_id))

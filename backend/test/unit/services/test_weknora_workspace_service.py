@@ -19,6 +19,15 @@ SETTINGS = SimpleNamespace(
 )
 
 
+def _patch_department_lock(monkeypatch) -> None:
+    """单元库不连 PG：部门存在性锁以 no-op 替代（集成路径由真实库覆盖）。"""
+
+    async def _noop(_session, _department_id: int) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_lock_department_row", _noop)
+
+
 @pytest.fixture
 def credential_env(monkeypatch):
     key = Fernet.generate_key().decode()
@@ -53,7 +62,7 @@ class FakeWorkspaceRepos:
                 return None
             return repos.rows.get(int(department_id))
 
-        async def fake_create(self, data):
+        async def fake_create(self, data, db=None):
             if repos.conflict or repos.race_winner is not None:
                 from sqlalchemy.exc import IntegrityError
 
@@ -65,7 +74,7 @@ class FakeWorkspaceRepos:
             repos.rows[data["department_id"]] = row
             return row
 
-        async def fake_replace(self, department_id, data):
+        async def fake_replace(self, department_id, data, db=None):
             repos.replaced.append(dict(data))
             row = SimpleNamespace(department_id=int(department_id), **data)
             repos.rows[int(department_id)] = row
@@ -153,6 +162,7 @@ async def test_ensure_reuses_confirmed_mapping_without_remote_call(
 async def test_ensure_provisions_self_checks_and_persists(credential_env, settings_env, monkeypatch) -> None:
     repos = FakeWorkspaceRepos().install(monkeypatch)
     _patch_department_name(monkeypatch)
+    _patch_department_lock(monkeypatch)
     requests = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -183,6 +193,7 @@ async def test_ensure_provisions_self_checks_and_persists(credential_env, settin
 async def test_ensure_missing_api_key_in_response_is_uncertain(credential_env, settings_env, monkeypatch) -> None:
     FakeWorkspaceRepos().install(monkeypatch)
     _patch_department_name(monkeypatch)
+    _patch_department_lock(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": {"id": 10036, "name": "研发一部"}})
@@ -195,6 +206,7 @@ async def test_ensure_missing_api_key_in_response_is_uncertain(credential_env, s
 async def test_ensure_self_check_failure_marks_pending_review(credential_env, settings_env, monkeypatch) -> None:
     repos = FakeWorkspaceRepos().install(monkeypatch)
     _patch_department_name(monkeypatch)
+    _patch_department_lock(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
@@ -223,6 +235,7 @@ async def test_ensure_concurrent_create_reuses_winner(credential_env, settings_e
     )
     FakeWorkspaceRepos(race_winner=winner).install(monkeypatch)
     _patch_department_name(monkeypatch)
+    _patch_department_lock(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
@@ -252,6 +265,7 @@ async def test_ensure_reprovision_replaces_unusable_mapping(credential_env, sett
     )
     repos = FakeWorkspaceRepos(initial=[stale]).install(monkeypatch)
     _patch_department_name(monkeypatch)
+    _patch_department_lock(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":

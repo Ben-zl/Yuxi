@@ -73,7 +73,6 @@ async def db_session():
                     username=USER_ID,
                     password_hash=AuthUtils.hash_password("e2e-fixture-password"),
                     role="superadmin",
-                    department_id=1,
                 ),
                 Agent(
                     slug=CHATBOT_SLUG,

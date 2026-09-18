@@ -134,9 +134,6 @@ class Department(Base):
     description = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=utc_now_naive)
 
-    # 关联关系：账号与部门的授权归属由 DepartmentMembership 承担，删除部门不再级联处置账号
-    users = relationship("User", back_populates="department")
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -150,6 +147,9 @@ class User(Base):
     """用户模型"""
 
     __tablename__ = "users"
+    # 全局账号身份只有超管与普通账号两种；部门内角色由 DepartmentMembership 承担。
+    # CHECK 约束由 ensure_business_schema 以 NOT VALID 落库（约束新写入、不改写历史），
+    # 不在 ORM 层声明，避免与历史 admin 存量的单元测试构造冲突。
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String, nullable=False, unique=True, index=True)  # 显示名称
@@ -157,8 +157,7 @@ class User(Base):
     phone_number = Column(String, nullable=True, unique=True, index=True)  # 手机号
     avatar = Column(String, nullable=True)  # 头像URL
     password_hash = Column(String, nullable=False)
-    role = Column(String, nullable=False, default="user")  # 角色: superadmin, admin, user
-    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)  # 部门ID
+    role = Column(String, nullable=False, default="user")  # 角色: superadmin, user
     created_at = Column(DateTime, default=utc_now_naive)
     last_login = Column(DateTime, nullable=True)
 
@@ -174,9 +173,6 @@ class User(Base):
     # 关联操作日志
     operation_logs = relationship("OperationLog", back_populates="user", cascade="all, delete-orphan")
 
-    # 关联部门
-    department = relationship("Department", back_populates="users")
-
     # 关联 API Keys
     api_keys = relationship("APIKey", back_populates="user", cascade="all, delete-orphan")
 
@@ -191,7 +187,6 @@ class User(Base):
             "phone_number": self.phone_number,
             "avatar": normalize_public_minio_url(self.avatar),
             "role": self.role,
-            "department_id": self.department_id,
             "created_at": format_utc_datetime(self.created_at),
             "last_login": format_utc_datetime(self.last_login),
             "login_failed_count": self.login_failed_count,
@@ -1244,7 +1239,8 @@ class AgentRun(Base):
     )
     agent_slug = Column(String(64), index=True, nullable=False, comment="Agent slug")
     uid = Column(String(64), index=True, nullable=False, comment="UID")
-    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True, comment="提交时固定部门")
+    # 提交时固定部门的审计标识；部门删除后保留原值（终态历史不阻断删除、不级联清理）
+    department_id = Column(Integer, nullable=True, index=True, comment="提交时固定部门")
     status = Column(
         String(32),
         index=True,
@@ -1376,7 +1372,8 @@ class AgentRunRequest(Base):
     id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
     request_id = Column(String(64), unique=True, index=True, nullable=False, comment="幂等请求 ID")
     uid = Column(String(64), nullable=False, comment="UID")
-    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True, comment="提交时固定部门")
+    # 提交时固定部门的审计标识；部门删除后保留原值（终态历史不阻断删除、不级联清理）
+    department_id = Column(Integer, nullable=True, index=True, comment="提交时固定部门")
     agent_slug = Column(String(64), nullable=False, comment="Agent slug")
     conversation_thread_id = Column(String(64), nullable=False, comment="Conversation thread ID")
     source = Column(String(32), nullable=False, default="chat", comment="请求来源: chat/agent_call/eval")
@@ -1453,7 +1450,8 @@ class AgentTask(Base):
     id = Column(String(36), primary_key=True, comment="Task ID (UUID)")
     name = Column(String(128), nullable=False, comment="任务名称")
     owner_uid = Column(String(64), index=True, nullable=False, comment="创建者 UID")
-    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True, comment="创建时固定部门")
+    # 创建时固定部门的审计标识；部门删除后保留原值
+    department_id = Column(Integer, nullable=True, index=True, comment="创建时固定部门")
     agent_id = Column(Integer, nullable=True, index=True, comment="引用智能体 ID；删除后置空")
     agent_name_snapshot = Column(String(128), nullable=True, comment="智能体名称展示快照")
     agent_slug_snapshot = Column(String(64), nullable=True, comment="智能体 slug 展示快照")
@@ -1520,7 +1518,8 @@ class TaskExecution(Base):
     task_id = Column(String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), index=True, nullable=False)
     trigger_type = Column(String(16), nullable=False, comment="触发方式: manual/api/schedule")
     triggered_by_uid = Column(String(64), nullable=False, comment="触发者 UID")
-    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True, comment="复制自任务的部门")
+    # 复制自任务的部门审计标识；部门删除后保留原值
+    department_id = Column(Integer, nullable=True, index=True, comment="复制自任务的部门")
     execution_principal_uid = Column(String(64), nullable=False, comment="执行身份 UID")
     agent_id = Column(Integer, nullable=True, comment="触发时固定的智能体 ID；删除后置空")
     agent_slug = Column(String(64), nullable=False, comment="触发时固定的智能体 slug")

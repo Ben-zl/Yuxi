@@ -90,7 +90,7 @@ def _build_zip(files: dict[str, str]) -> bytes:
 
 
 def _user(uid: str = "root", role: str = "admin") -> User:
-    return User(username=uid, uid=uid, password_hash="x", role=role, department_id=1)
+    return User(username=uid, uid=uid, password_hash="x", role=role)
 
 
 class _UnitOfWork:

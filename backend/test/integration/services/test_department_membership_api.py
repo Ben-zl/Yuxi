@@ -105,10 +105,6 @@ async def membership_case(test_client, admin_headers):
                         "DELETE FROM auth_sessions WHERE user_id = ANY($1::int[])",
                         [department_admin_id, member_id],
                     )
-                    await conn.execute(
-                        "UPDATE users SET department_id = NULL WHERE id = ANY($1::int[])",
-                        [department_admin_id, member_id],
-                    )
             finally:
                 await conn.close()
             if department_id is not None:

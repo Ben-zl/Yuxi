@@ -31,7 +31,6 @@ async def app_client():
             uid="admin",
             password_hash="$argon2id$placeholder",
             role="superadmin",
-            department=dept,
         )
         db.add_all([dept, user])
         await db.commit()
@@ -44,7 +43,19 @@ async def app_client():
             yield db
 
         async def override_user():
-            return user
+            from yuxi.services.department_context_service import DepartmentContext
+
+            return DepartmentContext(
+                id=user.id,
+                uid=user.uid,
+                username=user.username,
+                account_role="superadmin",
+                department_id=dept.id,
+                department_name=dept.name,
+                role="superadmin",
+                session_id=None,
+                revision=0,
+            )
 
         app.dependency_overrides[get_db] = override_db
         app.dependency_overrides[get_required_user] = override_user

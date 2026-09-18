@@ -27,6 +27,7 @@ from yuxi.services.department_context_service import DepartmentContext
 from yuxi.services.department_membership_service import DepartmentMembershipService
 from yuxi.storage.postgres.models_business import (
     AgentMemoryScope,
+    AgentRunRequest,
     AgentRun,
     AgentScopeChannelBinding,
     AgentTask,
@@ -105,9 +106,6 @@ async def boundary_case(test_client, admin_headers, db_engine, pg_pool):
         dept_id = created[label]["id"]
         async with db_engine.begin() as conn:
             await conn.execute(
-                User.__table__.update().where(User.department_id == dept_id).values(department_id=None)
-            )
-            await conn.execute(
                 AuthSession.__table__.update()
                 .where(AuthSession.active_department_id == dept_id)
                 .values(active_department_id=None)
@@ -125,6 +123,9 @@ async def boundary_case(test_client, admin_headers, db_engine, pg_pool):
             )
             await conn.execute(AgentTask.__table__.delete().where(AgentTask.department_id == dept_id))
             await conn.execute(AgentRun.__table__.delete().where(AgentRun.department_id == dept_id))
+            await conn.execute(
+                AgentRunRequest.__table__.delete().where(AgentRunRequest.department_id == dept_id)
+            )
             await conn.execute(
                 WeknoraDepartmentWorkspace.__table__.delete().where(WeknoraDepartmentWorkspace.department_id == dept_id)
             )
@@ -235,6 +236,45 @@ async def _seed_reference_rows(engine, department_id: int, uid: str, kinds: tupl
                     )
                 )
 
+            if set(kinds) & {"queued_request", "dispatched_request"}:
+                status = "queued" if "queued_request" in kinds else "dispatched"
+                project = Project(
+                    id=f"proj-{uuid.uuid4().hex[:10]}",
+                    uid=user.uid,
+                    selection_status="implicit",
+                    workdir_path=f"workdir/{user.uid}-{uuid.uuid4().hex[:4]}",
+                    directory_mode="managed",
+                )
+                conversation = Conversation(
+                    thread_id=f"thread-{uuid.uuid4().hex[:12]}",
+                    uid=user.uid,
+                    agent_id="boundary-agent",
+                    title="删除边界请求对话",
+                    project_id=project.id,
+                )
+                session.add_all([project, conversation])
+                await session.flush()
+                from yuxi.storage.postgres.models_business import Message
+
+                message = Message(
+                    conversation_id=conversation.id,
+                    role="user",
+                    content="seed",
+                )
+                session.add(message)
+                await session.flush()
+                session.add(
+                    AgentRunRequest(
+                        request_id=f"req-{uuid.uuid4().hex[:12]}",
+                        uid=user.uid,
+                        department_id=department_id,
+                        agent_slug="boundary-agent",
+                        conversation_thread_id=conversation.thread_id,
+                        input_message_id=message.id,
+                        status=status,
+                    )
+                )
+
             if "task" in kinds:
                 session.add(
                     AgentTask(
@@ -244,6 +284,15 @@ async def _seed_reference_rows(engine, department_id: int, uid: str, kinds: tupl
                         department_id=department_id,
                         prompt="pytest",
                         enabled=True,
+                        share_config={
+                            "version": 2,
+                            "read_scope": {
+                                "access_level": "user",
+                                "department_ids": [],
+                                "user_uids": [user.uid],
+                            },
+                            "manage_scope": None,
+                        },
                     )
                 )
 
@@ -365,10 +414,6 @@ async def test_delete_success_retains_account_and_revokes_bindings(
         )
         == 0
     )
-    # 旧单部门列不再指向已删部门（账号保留，不迁移）
-    assert (
-        await _fetch_val(pg_pool, "SELECT department_id FROM users WHERE id = $1", admin_user_id) is None
-    )
     # API Key 撤销并解绑
     key = await _fetch_one(
         pg_pool, "SELECT is_enabled, revoked_at, department_id FROM api_keys WHERE id = $1", facts["api_key_id"]
@@ -411,10 +456,9 @@ async def test_delete_success_retains_account_and_revokes_bindings(
 @pytest.mark.parametrize(
     "kinds,label",
     [
-        (("running_run",), "运行记录"),
-        # schema 14 阶段历史终态运行也阻断（外键仍在）；schema 15 移除外键后移入成功路径
-        (("terminal_run",), "运行记录"),
-        (("task",), "任务"),
+        (("running_run",), "未结束运行"),
+        (("queued_request",), "排队中请求"),
+        (("task",), "未归档任务"),
         (("channel",), "Channel"),
         (("share",), "共享"),
         (("workspace",), "工作区"),
@@ -475,6 +519,46 @@ async def test_delete_requires_superadmin(test_client, admin_headers, boundary_c
 async def test_delete_unknown_department_404(test_client, admin_headers):
     resp = await test_client.delete("/api/departments/999999999", headers=admin_headers)
     assert resp.status_code == 404, resp.text
+
+
+# ---------------------------------------------------------------------------
+# 终态历史：运行记录部门标识保留审计语义（v15 起不阻断删除、不级联清理）
+# ---------------------------------------------------------------------------
+
+
+async def test_delete_department_with_terminal_run_keeps_audit_marker(
+    test_client, admin_headers, boundary_case, db_engine, pg_pool
+):
+    department_id = boundary_case["department_id"]
+    facts = await _seed_reference_rows(
+        db_engine,
+        department_id,
+        boundary_case["admin_uid"],
+        ("terminal_run", "dispatched_request"),
+    )
+    assert facts == {}
+
+    deleted = await test_client.delete(f"/api/departments/{department_id}", headers=admin_headers)
+    assert deleted.status_code == 204, deleted.text
+
+    # 终态运行的 department_id 保留原值（审计），不被外键或删除流程清除
+    assert (
+        await _fetch_val(
+            pg_pool,
+            "SELECT count(*) FROM agent_runs WHERE department_id = $1",
+            department_id,
+        )
+        == 1
+    )
+    # 已派发请求是历史事实：保留审计值且不阻断删除
+    assert (
+        await _fetch_val(
+            pg_pool,
+            "SELECT count(*) FROM agent_run_requests WHERE department_id = $1 AND status = 'dispatched'",
+            department_id,
+        )
+        == 1
+    )
 
 
 # ---------------------------------------------------------------------------

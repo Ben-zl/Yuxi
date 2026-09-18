@@ -208,9 +208,7 @@ async def delete_department(
 ):
     """删除部门（超管）：按删除边界只删部门与成员关系并撤销绑定凭证；阻断引用 409。"""
     try:
-        await delete_department_use_case(
-            db, actor=current_user, department_id=department_id, request=request
-        )
+        await delete_department_use_case(db, actor=current_user, department_id=department_id, request=request)
     except DepartmentDeletionConflict as exc:
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc

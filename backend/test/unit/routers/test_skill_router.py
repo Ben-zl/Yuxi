@@ -22,7 +22,6 @@ def _build_app(*, role: str = "admin") -> FastAPI:
             uid=role,
             password_hash="x",
             role=role,
-            department_id=1,
         )
 
     async def fake_admin_user():

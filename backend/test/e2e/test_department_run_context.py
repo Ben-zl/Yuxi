@@ -108,7 +108,6 @@ async def _cleanup_departments(
             )
         if all_user_ids:
             await conn.execute("DELETE FROM auth_sessions WHERE user_id = ANY($1::int[])", all_user_ids)
-            await conn.execute("UPDATE users SET department_id = NULL WHERE id = ANY($1::int[])", all_user_ids)
     finally:
         await conn.close()
     for user_id in user_ids + admin_user_ids:

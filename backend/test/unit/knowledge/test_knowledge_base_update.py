@@ -148,6 +148,16 @@ def make_file_records(files: dict[str, dict]) -> dict[str, types.SimpleNamespace
     return {file_id: make_file_record(file_id, meta) for file_id, meta in files.items()}
 
 
+@pytest.fixture(autouse=True)
+def _noop_share_department_lock(monkeypatch):
+    """单元库不连 PG：共享配置的部门存在性锁以 no-op 替代（真实路径由集成测试覆盖）。"""
+
+    async def _noop(_db, _share_config):
+        return None
+
+    monkeypatch.setattr("yuxi.repositories.department_repository.lock_share_departments", _noop)
+
+
 async def test_create_database_persists_allowed_record_fields(tmp_path, monkeypatch):
     created_payloads = []
 
@@ -155,11 +165,11 @@ async def test_create_database_persists_allowed_record_fields(tmp_path, monkeypa
         async def get_by_kb_id(self, kb_id):
             return None
 
-        async def create(self, payload):
+        async def create(self, payload, db=None):
             created_payloads.append(payload)
             return types.SimpleNamespace(**payload)
 
-        async def update(self, kb_id, data):
+        async def update(self, kb_id, data, db=None):
             raise AssertionError("create_database should insert new database metadata")
 
     monkeypatch.setattr(
@@ -492,7 +502,7 @@ async def test_update_database_reauthorizes_existing_models_for_expanded_scope(t
         async def get_by_kb_id(self, kb_id):
             return row if kb_id == "db" else None
 
-        async def update(self, kb_id, payload):
+        async def update(self, kb_id, payload, db=None):
             assert kb_id == "db"
             updated_payloads.append(payload)
 

@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.services.operation_log_service import log_operation
-from yuxi.storage.postgres.models_business import Department, User
+from yuxi.storage.postgres.models_business import User
 from yuxi.services.department_context_service import (
     create_session_for_login,
     resolve_department_context,
@@ -412,67 +412,6 @@ class OIDCUtils:
         }
 
 
-async def get_or_create_oidc_department(
-    db,
-    dept_name_from_oidc: str | None = None,
-    dept_desc_from_oidc: str | None = None,
-) -> Department | None:
-    """获取或创建 OIDC 用户的部门"""
-    # 清理并验证从 OIDC 获取的部门名称
-    processed_dept_name = None
-    processed_dept_desc = None
-
-    if dept_name_from_oidc:
-        # 去除首尾空格
-        processed_dept_name = dept_name_from_oidc.strip()
-        # 截断到 50 字符（匹配数据库限制）
-        if len(processed_dept_name) > 50:
-            processed_dept_name = processed_dept_name[:50]
-        # 如果处理后为空，放弃使用
-        if not processed_dept_name:
-            processed_dept_name = None
-
-    # 清理并验证从 OIDC 获取的部门描述
-    if dept_desc_from_oidc:
-        processed_dept_desc = dept_desc_from_oidc.strip()
-        # 截断到 255 字符（匹配数据库限制）
-        if len(processed_dept_desc) > 255:
-            processed_dept_desc = processed_dept_desc[:255]
-        if not processed_dept_desc:
-            processed_dept_desc = None
-
-    # 最终确定部门名称：优先使用处理后的OIDC部门名称，否则使用默认部门名称
-    final_dept_name = processed_dept_name or oidc_config.default_department
-    # 最终确定部门描述：优先使用处理后的OIDC部门描述，否则使用默认描述
-    final_dept_desc = processed_dept_desc or f"{final_dept_name}部门"
-
-    result = await db.execute(select(Department).filter(Department.name == final_dept_name))
-    dept = result.scalar_one_or_none()
-
-    if dept:
-        # 部门已存在，直接返回
-        logger.info(f"Using existing department: {final_dept_name}")
-        return dept
-
-    # 部门不存在，创建新部门
-    dept = Department(
-        name=final_dept_name,
-        description=final_dept_desc,
-    )
-    db.add(dept)
-    try:
-        await db.commit()
-        await db.refresh(dept)
-        logger.info(f"Created OIDC department: {final_dept_name}")
-    except IntegrityError:
-        # 并发创建时部门可能已存在，再次查询
-        await db.rollback()
-        result = await db.execute(select(Department).filter(Department.name == final_dept_name))
-        dept = result.scalar_one_or_none()
-
-    return dept
-
-
 async def find_user_by_oidc_sub(db, sub: str) -> User | None:
     """通过 OIDC sub 查找用户"""
     # 方法1: 检查是否有用户的 uid 直接等于 "oidc:{sub}"（标准 OIDC 用户）
@@ -576,7 +515,6 @@ async def _create_oidc_binding_placeholder(db, sub: str, target_user: User) -> N
         avatar=None,
         password_hash=password_hash,
         role=target_user.role,
-        department_id=target_user.department_id,
         is_deleted=1,  # 标记为deleted，不参与实际登录
         last_login=utc_now_naive(),
     )
@@ -621,7 +559,7 @@ async def build_unique_oidc_username(db, preferred_username: str, sub: str) -> s
     )
 
 
-async def create_oidc_user(db, user_info: dict, department_id: int | None = None) -> User:
+async def create_oidc_user(db, user_info: dict) -> User:
     """创建 OIDC 用户"""
     user_repo = UserRepository()
 
@@ -674,7 +612,6 @@ async def create_oidc_user(db, user_info: dict, department_id: int | None = None
                     "avatar": None,
                     "password_hash": password_hash,
                     "role": oidc_config.default_role,
-                    "department_id": department_id,
                     "last_login": utc_now_naive(),
                 }
             )
@@ -832,11 +769,8 @@ async def oidc_callback_handler(code: str, state: str, db, request: Request | No
             logger.info(f"OIDC deleted user restored and logged in: {user.username}")
         else:
             # 从用户信息中获取部门信息
-            dept_name = extracted_info.get("department_name")
-            dept_desc = extracted_info.get("department_description")
-            dept = await get_or_create_oidc_department(db, dept_name, dept_desc)
-            department_id = dept.id if dept else None
-            user = await create_oidc_user(db, extracted_info, department_id)
+            # OIDC 目录中的部门仅作为展示事实保留；账号与部门的绑定走成员管理
+            user = await create_oidc_user(db, extracted_info)
     else:
         return _redirect_to_login_with_error("用户未注册，请联系管理员开通账号")
 

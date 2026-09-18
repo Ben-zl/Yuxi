@@ -57,7 +57,6 @@ async def test_run_observability_api_never_reads_another_runs_assistant_message(
                 uid=uid,
                 password_hash="integration-api-key-only",
                 role="superadmin",
-                department_id=department.id,
             )
             db.add(user)
             await db.flush()
@@ -82,7 +81,6 @@ async def test_run_observability_api_never_reads_another_runs_assistant_message(
                 uid=other_uid,
                 password_hash="integration-api-key-only",
                 role="superadmin",
-                department_id=department.id,
             )
             db.add(other_user)
             await db.flush()

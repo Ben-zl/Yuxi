@@ -110,7 +110,6 @@ async def test_membership_independent_roles_per_department() -> None:
                     (dept_b.id, "user"),
                 ]
                 assert user.role == "user"
-                assert user.department_id is None
         # 事务回滚后不残留成员关系
         async with factory() as session:
             remaining = await session.execute(DepartmentMembership.__table__.select())
@@ -265,15 +264,14 @@ async def test_delete_boundary_removes_membership_but_retains_account() -> None:
                 )
                 assert membership is None
                 assert user.is_deleted == 0
-                assert user.department_id is None
                 assert await session.get(Department, dept_a.id) is None
     finally:
         await scoped_engine.dispose()
         await _drop_scoped_schema(admin_engine, schema)
 
 
-async def test_business_schema_v13_upgrades_to_v14_idempotently(monkeypatch) -> None:
-    """v13 库升级到 v14 后新列/新表存在，旧行保留，重复执行幂等。"""
+async def test_business_schema_v13_upgrades_to_v15_idempotently(monkeypatch) -> None:
+    """v13 库升级到 v15 后新列/新表存在，旧行保留，重复执行幂等。"""
     admin_engine, scoped_engine, schema = await _create_scoped_schema()
     try:
         manager = _scoped_manager(scoped_engine)
@@ -281,6 +279,8 @@ async def test_business_schema_v13_upgrades_to_v14_idempotently(monkeypatch) -> 
 
         # 模拟 v13 形态：移除本版本新增的列与表，并保留一行历史账号数据
         async with scoped_engine.begin() as connection:
+            # v13/v14 库没有全局角色 CHECK；scoped schema 由 v15 元数据建表，先移除以模拟旧库
+            await connection.execute(text("ALTER TABLE users DROP CONSTRAINT IF EXISTS ck_users_role_global"))
             await connection.execute(
                 text(
                     "INSERT INTO users (username, uid, password_hash, role, is_deleted, "
@@ -324,6 +324,16 @@ async def test_business_schema_v13_upgrades_to_v14_idempotently(monkeypatch) -> 
         monkeypatch.setattr(storage_migration, "mark_v071_skills_migrated", lambda: None)
         monkeypatch.setattr(storage_migration, "migrate_runtime_storage_identity", lambda: None)
 
+        # v15 收口：仍有效的旧 admin 必须让迁移明确失败，不静默迁移其权限
+        with pytest.raises(Exception, match="旧 admin"):
+            await storage_migration.main()
+
+        async with scoped_engine.connect() as connection:
+            await connection.execute(
+                text("UPDATE users SET is_deleted = 1 WHERE uid = 'legacy_admin'")
+            )
+            await connection.commit()
+
         await storage_migration.main()
         await storage_migration.main()
 
@@ -348,6 +358,25 @@ async def test_business_schema_v13_upgrades_to_v14_idempotently(monkeypatch) -> 
                     {"schema": schema, "table": table},
                 )
                 assert column_exists is True, table
+            # v15 收口：users 单部门列删除；全局角色 CHECK 以 NOT VALID 存在
+            users_dept_column = await connection.scalar(
+                text(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = :schema AND table_name = 'users' "
+                    "AND column_name = 'department_id')"
+                ),
+                {"schema": schema},
+            )
+            assert users_dept_column is False
+            role_check = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM pg_constraint "
+                    "WHERE conname = 'ck_users_role_global' AND convalidated = false "
+                    "AND connamespace = cast(:schema as regnamespace)"
+                ),
+                {"schema": schema},
+            )
+            assert role_check == 1
             for table, column in (
                 ("cli_auth_sessions", "approved_department_id"),
                 ("agent_memory_scopes", "maintenance_department_id"),
@@ -471,7 +500,7 @@ async def test_delete_http_removes_membership_but_retains_account(test_client, a
             )
             department_id = row.scalar_one()
             admin_row = await connection.execute(
-                text("SELECT id, role, department_id, is_deleted FROM users WHERE is_deleted = 0 ORDER BY id LIMIT 1")
+                text("SELECT id, role, is_deleted FROM users WHERE is_deleted = 0 ORDER BY id LIMIT 1")
             )
             admin = admin_row.one()
             admin_id = admin.id
@@ -505,10 +534,10 @@ async def test_delete_http_removes_membership_but_retains_account(test_client, a
             )
             assert dept_gone == 0
             admin_after_result = await connection.execute(
-                text("SELECT role, department_id, is_deleted FROM users WHERE id = :id"), {"id": admin_id}
+                text("SELECT role, is_deleted FROM users WHERE id = :id"), {"id": admin_id}
             )
             admin_after = admin_after_result.one()
-            assert tuple(admin_after) == (admin.role, admin.department_id, admin.is_deleted)
+            assert tuple(admin_after) == (admin.role, admin.is_deleted)
             key_state_after = await connection.scalar(
                 text("SELECT count(*) FROM api_keys WHERE department_id = :id AND revoked_at IS NULL"),
                 {"id": department_id},

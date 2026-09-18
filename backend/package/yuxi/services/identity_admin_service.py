@@ -92,7 +92,6 @@ async def create_department_with_admin(
                     "phone_number": admin_phone,
                     "password_hash": password_hash,
                     "role": "user",
-                    "department_id": department.id,
                 }
             )
             await DepartmentMembershipRepository(db).add(admin.id, department.id, role="admin")
@@ -146,7 +145,6 @@ async def initialize_system_admin(
                     "avatar": None,
                     "password_hash": password_hash,
                     "role": "superadmin",
-                    "department_id": department.id,
                     "last_login": utc_now_naive(),
                 }
             )

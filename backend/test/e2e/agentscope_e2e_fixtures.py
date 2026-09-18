@@ -117,7 +117,6 @@ async def seed_test_users(db: AsyncSession, *uids: str) -> None:
             username=uid,
             password_hash=AuthUtils.hash_password(FIXTURE_PASSWORD),
             role="superadmin",
-            department_id=1,
         )
         for uid in uids
     )

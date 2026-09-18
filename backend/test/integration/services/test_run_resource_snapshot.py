@@ -22,7 +22,7 @@ async def test_snapshot_survives_revocation_without_exposing_credentials(monkeyp
             db.add_all([department, other_department])
             await db.flush()
             uid = f"snapshot-{suffix}"
-            user = User(uid=uid, username=uid, role="user", department_id=department.id, password_hash="unused")
+            user = User(uid=uid, username=uid, role="user", password_hash="unused")
             db.add(user)
             await db.flush()
             share = {

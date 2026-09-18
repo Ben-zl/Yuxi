@@ -38,7 +38,6 @@ async def session():
             uid="admin",
             password_hash="$argon2id$placeholder",
             role="superadmin",
-            department=dept,
         )
         db.add_all([dept, user])
         await db.commit()

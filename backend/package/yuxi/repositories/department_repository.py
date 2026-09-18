@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import (
+    AGENT_RUN_TERMINAL_STATUSES,
+    TASK_EXECUTION_TERMINAL_STATUSES,
     Agent,
     AgentMemoryScope,
     AgentRun,
@@ -92,14 +94,18 @@ class DepartmentRepository:
             return result.scalar_one_or_none()
 
     async def get_with_user_count(self, id: int) -> dict[str, Any] | None:
-        """获取部门及其未删除用户数量。"""
+        """获取部门及其未删除成员数量（按成员关系统计）。"""
         async with self._session() as session:
             result = await session.execute(select(Department).where(Department.id == id))
             department = result.scalar_one_or_none()
             if department is None:
                 return None
             count_result = await session.execute(
-                select(func.count(User.id)).where(User.department_id == id, User.is_deleted == 0)
+                select(func.count(DepartmentMembership.user_id)).where(
+                    DepartmentMembership.department_id == id,
+                    User.is_deleted == 0,
+                    User.id == DepartmentMembership.user_id,
+                )
             )
             return {**department.to_dict(), "user_count": count_result.scalar() or 0}
 
@@ -124,7 +130,11 @@ class DepartmentRepository:
             department_list = []
             for dep in departments:
                 user_count_result = await session.execute(
-                    select(func.count(User.id)).where(User.department_id == dep.id, User.is_deleted == 0)
+                    select(func.count(DepartmentMembership.user_id)).where(
+                        DepartmentMembership.department_id == dep.id,
+                        User.is_deleted == 0,
+                        User.id == DepartmentMembership.user_id,
+                    )
                 )
                 user_count = user_count_result.scalar()
                 dep_dict = dep.to_dict()
@@ -177,9 +187,7 @@ class DepartmentRepository:
         """
         async with self._session() as session:
             # 先锁部门行，与资源/绑定写入使用一致的锁序，防止检查后并发插入引用
-            result = await session.execute(
-                select(Department).where(Department.id == department_id).with_for_update()
-            )
+            result = await session.execute(select(Department).where(Department.id == department_id).with_for_update())
             department = result.scalar_one_or_none()
             if department is None:
                 return
@@ -212,10 +220,6 @@ class DepartmentRepository:
                 .where(AuthSession.active_department_id == department_id)
                 .values(active_department_id=None, revision=AuthSession.revision + 1)
             )
-            # 旧单部门列在 schema 15 前仍带外键：只清空指向，不迁移默认部门；列删除时移除本句
-            await session.execute(
-                update(User).where(User.department_id == department_id).values(department_id=None)
-            )
             await session.delete(department)
             await session.flush()
 
@@ -228,12 +232,26 @@ class DepartmentRepository:
         kb_table_present = await DepartmentRepository._table_present(session, "knowledge_bases")
         checks: tuple[tuple[str, Any], ...] = (
             ("Channel 绑定", AgentScopeChannelBinding.department_id == department_id),
-            # 运行/请求/执行/任务在 schema 15 移除外键前全量阻断（历史行会触发外键，
-            # 故标签用中性词）；外键移除后放宽为仅未终态记录阻断并精确化标签
-            ("运行记录", AgentRun.department_id == department_id),
-            ("请求记录", AgentRunRequest.department_id == department_id),
-            ("任务记录", AgentTask.department_id == department_id),
-            ("任务执行记录", TaskExecution.department_id == department_id),
+            # schema 15 起运行/请求/执行/任务的部门标识是审计列：历史终态记录保留原值不阻断，
+            # 仅未终态记录与未归档任务阻断删除
+            (
+                "未结束运行",
+                (AgentRun.department_id == department_id) & AgentRun.status.notin_(AGENT_RUN_TERMINAL_STATUSES),
+            ),
+            # dispatched 请求的活跃性由“未结束运行”检查覆盖（派发即有 Run 跟踪终态）；
+            # 已派发请求本身保留为历史事实，不阻断删除
+            ("排队中请求", (AgentRunRequest.department_id == department_id) & (AgentRunRequest.status == "queued")),
+            (
+                "未归档任务",
+                (AgentTask.department_id == department_id)
+                & AgentTask.enabled.is_(True)
+                & AgentTask.archived_at.is_(None),
+            ),
+            (
+                "未结束任务执行",
+                (TaskExecution.department_id == department_id)
+                & TaskExecution.status.notin_(TASK_EXECUTION_TERMINAL_STATUSES),
+            ),
         )
         if workspace_present:
             checks = (
@@ -263,9 +281,7 @@ class DepartmentRepository:
         return regclass is not None
 
     @staticmethod
-    async def _share_config_references(
-        session: AsyncSession, share_column: Any, department_id: int
-    ) -> bool:
+    async def _share_config_references(session: AsyncSession, share_column: Any, department_id: int) -> bool:
         """判断任一 read/manage scope 的 department_ids 是否包含目标部门。
 
         JSON 包含查询依赖 PostgreSQL JSONB；SQLite 单元库不支持该运算，
@@ -275,18 +291,20 @@ class DepartmentRepository:
         if bind.dialect.name != "postgresql":
             return False
         for scope_key in ("read_scope", "manage_scope"):
-            condition = cast(share_column, JSONB).contains(
-                {scope_key: {"department_ids": [department_id]}}
-            )
+            condition = cast(share_column, JSONB).contains({scope_key: {"department_ids": [department_id]}})
             if await session.scalar(select(exists().where(condition))):
                 return True
         return False
 
     async def count_users(self, id: int) -> int:
-        """统计部门用户数量"""
+        """统计部门未删除成员数量（按成员关系统计）"""
         async with self._session() as session:
             result = await session.execute(
-                select(func.count(User.id)).where(User.department_id == id, User.is_deleted == 0)
+                select(func.count(DepartmentMembership.user_id)).where(
+                    DepartmentMembership.department_id == id,
+                    User.is_deleted == 0,
+                    User.id == DepartmentMembership.user_id,
+                )
             )
             return result.scalar() or 0
 

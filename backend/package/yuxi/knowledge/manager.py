@@ -480,10 +480,10 @@ class KnowledgeBaseManager:
         if isinstance(user, dict):
             user_info = user
         else:
+            # User ORM 对象不再携带活动部门；部门上下文由 dict 调用方传入
             user_info = {
                 "uid": user.uid,
                 "role": user.role,
-                "department_id": user.department_id,
             }
 
         user_role = user_info.get("role")

@@ -61,7 +61,7 @@ async def ensure_uninitialized(session) -> None:
 async def seed_initial_users() -> None:
     from yuxi.utils.auth_utils import AuthUtils
     from yuxi.storage.postgres.manager import pg_manager
-    from yuxi.storage.postgres.models_business import Department, User
+    from yuxi.storage.postgres.models_business import Department, DepartmentMembership, User
     from yuxi.utils.datetime_utils import utc_now_naive
 
     try:
@@ -83,6 +83,7 @@ async def seed_initial_users() -> None:
 
             await session.flush()
 
+            # 全局身份只有 superadmin/user；部门管理员身份落在成员关系上
             users = [
                 User(
                     username=SUPERADMIN_NAME,
@@ -90,35 +91,38 @@ async def seed_initial_users() -> None:
                     phone_number=SUPERADMIN_PHONE_NUMBER,
                     password_hash=AuthUtils.hash_password(SUPERADMIN_PASSWORD),
                     role="superadmin",
-                    department_id=departments["dev"].id,
                     last_login=utc_now_naive(),
                 )
             ]
+            member_seeds: list[tuple[User, str, str]] = []
 
             for department_seed in DEPARTMENTS:
                 department = departments[department_seed["prefix"]]
                 for index in range(1, 3):
-                    users.append(
-                        User(
-                            username=f"{department_seed['name']}管理员{index}",
-                            uid=f"{department_seed['prefix']}_admin_{index}",
-                            password_hash=AuthUtils.hash_password(DEFAULT_USER_PASSWORD),
-                            role="admin",
-                            department_id=department.id,
-                        )
+                    admin = User(
+                        username=f"{department_seed['name']}管理员{index}",
+                        uid=f"{department_seed['prefix']}_admin_{index}",
+                        password_hash=AuthUtils.hash_password(DEFAULT_USER_PASSWORD),
+                        role="user",
                     )
+                    users.append(admin)
+                    member_seeds.append((admin, department.id, "admin"))
                 for index in range(1, department_seed["normal_count"] + 1):
-                    users.append(
-                        User(
-                            username=f"{department_seed['name']}用户{index}",
-                            uid=f"{department_seed['prefix']}_user_{index:02d}",
-                            password_hash=AuthUtils.hash_password(DEFAULT_USER_PASSWORD),
-                            role="user",
-                            department_id=department.id,
-                        )
+                    member = User(
+                        username=f"{department_seed['name']}用户{index}",
+                        uid=f"{department_seed['prefix']}_user_{index:02d}",
+                        password_hash=AuthUtils.hash_password(DEFAULT_USER_PASSWORD),
+                        role="user",
                     )
+                    users.append(member)
+                    member_seeds.append((member, department.id, "user"))
 
             session.add_all(users)
+            await session.flush()
+            session.add_all(
+                DepartmentMembership(user_id=user.id, department_id=dept_id, role=role)
+                for user, dept_id, role in member_seeds
+            )
     finally:
         await pg_manager.close()
 

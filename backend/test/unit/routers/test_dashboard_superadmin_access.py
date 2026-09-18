@@ -35,35 +35,30 @@ async def dashboard_session():
             uid="superadmin",
             password_hash="$argon2id$placeholder",
             role="superadmin",
-            department=dept_a,
         )
         admin_a = User(
             username="Admin A",
             uid="admin_a",
             password_hash="$argon2id$placeholder",
             role="admin",
-            department=dept_a,
         )
         user_a = User(
             username="User A",
             uid="user_a",
             password_hash="$argon2id$placeholder",
             role="user",
-            department=dept_a,
         )
         admin_b = User(
             username="Admin B",
             uid="admin_b",
             password_hash="$argon2id$placeholder",
             role="admin",
-            department=dept_b,
         )
         user_b = User(
             username="User B",
             uid="user_b",
             password_hash="$argon2id$placeholder",
             role="user",
-            department=dept_b,
         )
         agent = Agent(
             slug="agent-shared",
@@ -147,7 +142,7 @@ async def test_dashboard_dependency_rejects_department_admin(dashboard_session):
         uid=admin_a.uid,
         username=admin_a.username,
         account_role="user",
-        department_id=admin_a.department_id,
+        department_id=None,
         department_name=None,
         role="admin",
         session_id=None,

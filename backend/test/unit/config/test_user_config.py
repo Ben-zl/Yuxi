@@ -25,7 +25,6 @@ async def session():
             uid="config_user",
             password_hash="$argon2id$placeholder",
             role="user",
-            department=department,
         )
         db.add_all([department, user])
         await db.commit()

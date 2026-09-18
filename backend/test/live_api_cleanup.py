@@ -354,19 +354,17 @@ async def ensure_static_test_admin_identity(uid: str, password: str) -> None:
     conn = await asyncpg.connect(_postgres_dsn())
     try:
         async with conn.transaction():
-            department_id = await conn.fetchval("SELECT id FROM departments ORDER BY id LIMIT 1")
             await conn.execute(
                 """
                 INSERT INTO users (
-                    username, uid, password_hash, role, department_id,
+                    username, uid, password_hash, role,
                     login_failed_count, is_deleted, deleted_at, created_at
                 )
-                VALUES ($1, $1, $2, 'superadmin', $3, 0, 0, NULL, NOW())
+                VALUES ($1, $1, $2, 'superadmin', 0, 0, NULL, NOW())
                 ON CONFLICT (uid) DO UPDATE SET
                     username = EXCLUDED.username,
                     password_hash = EXCLUDED.password_hash,
                     role = 'superadmin',
-                    department_id = COALESCE(users.department_id, EXCLUDED.department_id),
                     login_failed_count = 0,
                     last_failed_login = NULL,
                     login_locked_until = NULL,
@@ -376,7 +374,6 @@ async def ensure_static_test_admin_identity(uid: str, password: str) -> None:
                 """,
                 uid,
                 AuthUtils.hash_password(password),
-                department_id,
             )
     finally:
         await conn.close()
@@ -904,7 +901,7 @@ async def cleanup_orphaned_static_test_departments() -> None:
                 await conn.execute(
                     "DELETE FROM departments AS department "
                     "WHERE department.id = $1 "
-                    "AND NOT EXISTS (SELECT 1 FROM users WHERE department_id = department.id) "
+                    "AND NOT EXISTS (SELECT 1 FROM department_memberships WHERE department_id = department.id) "
                     "AND NOT EXISTS (SELECT 1 FROM api_keys WHERE department_id = department.id)",
                     int(row["id"]),
                 )

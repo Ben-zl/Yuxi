@@ -152,12 +152,21 @@ async def ensure_department_workspace(
         "instance": fingerprint,
         "status": WORKSPACE_CONFIRMED,
     }
-    if existing is not None:
-        # 重新开通:覆盖不可用旧行(待核对或旧实例),旧空间由上方告警留档
-        row = await repo.replace_for_department(department_id, payload)
-        return api_key, row
+    # 落库前在同一会话内锁部门行（远端开通已完成，不包进锁窗口）：与删除部门共用
+    # 锁序，部门不存在或并发删除时不产生孤儿 workspace 映射
+    from yuxi.storage.postgres.manager import pg_manager as _pg_manager
+
     try:
-        row = await repo.create({"department_id": department_id, **payload})
+        async with _pg_manager.get_async_session_context() as session:
+            await _lock_department_row(session, department_id)
+            if existing is not None:
+                # 重新开通:覆盖不可用旧行(待核对或旧实例),旧空间由上方告警留档
+                row = await repo.replace_for_department(department_id, payload, db=session)
+            else:
+                row = await repo.create({"department_id": department_id, **payload}, db=session)
+        return api_key, row
+    except KBOperationError:
+        raise
     except Exception as error:  # noqa: BLE001
         from sqlalchemy.exc import IntegrityError
 
@@ -207,3 +216,15 @@ async def resolve_department_settings(department_id: int) -> tuple[object, objec
     except RuntimeError as error:
         raise KBOperationError(f"部门 {department_id} 的 workspace 专属 Key 解密失败: {error}") from error
     return settings.with_api_key(api_key), mapping
+
+
+async def _lock_department_row(session, department_id: int) -> None:
+    """在调用方事务内以部门行锁确认归属部门存在；与删除部门共用锁序。"""
+
+    from sqlalchemy import select as _select
+
+    from yuxi.storage.postgres.models_business import Department as _Department
+
+    locked = await session.execute(_select(_Department.id).where(_Department.id == department_id).with_for_update())
+    if locked.scalar_one_or_none() is None:
+        raise KBOperationError(f"归属部门 {department_id} 不存在，workspace 开通终止")

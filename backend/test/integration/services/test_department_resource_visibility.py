@@ -88,15 +88,11 @@ async def visibility_case(test_client, admin_headers):
                 if user_id is not None:
                     await conn.execute(text("DELETE FROM department_memberships WHERE user_id = :u"), {"u": user_id})
                     await conn.execute(text("DELETE FROM auth_sessions WHERE user_id = :u"), {"u": user_id})
-                    await conn.execute(text("UPDATE users SET department_id = NULL WHERE id = :u"), {"u": user_id})
                 for dep_id in department_ids:
                     await conn.execute(
                         text("DELETE FROM department_memberships WHERE department_id = :d"), {"d": dep_id}
                     )
                     await conn.execute(text("DELETE FROM auth_sessions WHERE active_department_id = :d"), {"d": dep_id})
-                    await conn.execute(
-                        text("UPDATE users SET department_id = NULL WHERE department_id = :d"), {"d": dep_id}
-                    )
             if user_id is not None:
                 await test_client.delete(f"/api/auth/users/{user_id}", headers=admin_headers)
             for dep_id in department_ids:

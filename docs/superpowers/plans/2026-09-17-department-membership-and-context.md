@@ -8,7 +8,7 @@
 
 **Tech Stack:** FastAPI、SQLAlchemy async、PostgreSQL、AgentScope、Vue 3、Pinia、Ant Design Vue、pytest、Node.js 原生 test runner、Docker Compose；不增加依赖。
 
-**Spec:** [多部门成员关系与当前部门权限](../../develop-guides/decisions/proposed/2026-09-17-department-membership-and-context.md)。产品边界由该 decision 拥有，本计划只定义实现顺序与验证方法。
+**Spec:** [多部门成员关系与当前部门权限](../../develop-guides/decisions/implemented/2026-09-17-department-membership-and-context.md)。产品边界由该 decision 拥有，本计划只定义实现顺序与验证方法。
 
 ## Global Constraints
 
@@ -470,9 +470,9 @@ assert deleted_user_active_api_keys == 0
 - [x] 实际开发环境操作前停止接流量和worker，核对连接目标确为当前开发 Compose 实例，并记录候选总数、所有超级管理员及其受保护数据摘要（本地记录不入库/不提交）。运行 `docker compose exec api uv run python scripts/cleanup_development_accounts.py` 预览后核对范围，再运行同命令加 `--apply`。操作时保留可执行的一次性容器连接，停业务不等于销毁数据库。脚本只在这里显式执行一次。
 
 > **执行记录（2026-09-17）**：目标为本 worktree 隔离 Compose 实例 `yuxi-department-context`（slot 库 yuxi，独立 project/端口）。`docker compose stop worker web` 后核对：有效账号 577、唯一超管 `deptctx_admin`(id=1)、memberships 261。预览输出 `candidate_accounts=576 revoked_credentials=190 removed_memberships=213`，与人工核对一致（577-1 超管）。`--apply` 执行后 PG 回读：有效账号=1（仅超管）、有效 membership=0、超管业务数据不变。被清理账号（deptctx_nodpt_c）token 调 `/api/auth/me` 返回 **401**；超管重新登录 `/api/auth/token` → `/me` **200**。清理后 `docker compose start worker web`，`/api/system/ready` 200。Passed。
-- [ ] 账号清理确认后在 schema 下一版本（以任务1的14为基准为15）移除 User.department_id 与 Department.users/User.department 旧关系；User.role 保留全局 superadmin/user 并加 check。迁移不自动更改已清理admin旧值：清理脚本仅对被软删除的旧admin将 role 归一为user；对任何仍有效的旧admin，收口迁移明确失败，要求完成独立清理，不静默迁移其权限。更新 User.to_dict、CLI认证联表与所有 SQL/fixture，不残留单部门接口。
+- [x] 账号清理确认后在 schema 下一版本（以任务1的14为基准为15）移除 User.department_id 与 Department.users/User.department 旧关系；User.role 保留全局 superadmin/user 并加 check。迁移不自动更改已清理admin旧值：清理脚本仅对被软删除的旧admin将 role 归一为user；对任何仍有效的旧admin，收口迁移明确失败，要求完成独立清理，不静默迁移其权限。更新 User.to_dict、CLI认证联表与所有 SQL/fixture，不残留单部门接口。
 
-> **执行记录（2026-09-17）**：**Not run（受 Task 7 未决阻塞）**。Task 7（删除部门边界规则）等待用户对 decision 建议规则的明确确认；在删除路径依赖 `User.department_id` 的旧语义收口前删列会留下半成品路径。列删除与 schema 15 收口在 Task 7 确认后作为独立小改动执行。
+> **执行记录（2026-09-18，Task 7 用户确认后实施）**：business schema v15 收口完成——迁移 DDL：DO guard（仍有效旧 admin 抛错要求独立清理）→ `DROP COLUMN users.department_id`（含外键）→ 四张运行/任务表（agent_runs/agent_run_requests/agent_tasks/task_executions）对 departments 的外键移除（部门标识转审计列，终态历史不阻断删除）→ `ck_users_role_global CHECK (role IN ('superadmin','user')) NOT VALID`（只约束新写入，不改写历史；不在 ORM 层声明以免与历史 admin 存量单测冲突）。清理脚本增加软删除旧 admin role 归一（同轮、幂等，含 `normalized_admin_roles` 计数）。代码收口：User 模型删列/关系/to_dict 字段、user_repository 列表过滤与部门名改成员关系语义（两段查询）、identity_admin 初始化/建部门不再写旧列、oidc placeholder、knowledge manager User 分支、auth_router 用户创建与 access-options（去 department_id 字段）、live fence SQL。开发库已执行迁移（business=15 回读确认）。迁移测试改写为 v13→v15（guard 拒绝→软删后成功幂等）。Passed。
 
 - [x] 运行符号审计，确认 User.department_id 与全局admin没有生产授权消费；保留业务历史部门字段不等于保留用户单部门身份。真实 PG 回读：有效账号仅superadmin、超管数据摘要不变、非超管凭证请求401、部门与历史资源计数不变。撤销旧交互token只要求重新登录，不删除超级管理员业务数据。
 
@@ -515,9 +515,9 @@ git diff --check
 > - **本轮发现并修复真实缺陷**：移除成员 204 后列表不刷新。根因：后端 204 响应携带 `Content-Type: application/json` 且空 body，`base.js` 按 Content-Type 走 `response.json()` 抛 `Unexpected end of JSON input`，被组件当作失败吞掉且不刷新。修复：`apiRequest` 对 204/205 按 HTTP 语义返回空文本（影响全部 204 端点）。新增回归用例 `204 空响应体带 JSON 头时按空文本返回，不中断调用链`，web 单测 **257 passed**，浏览器复测添加→移除闭环通过。
 > - **慢响应隔离（浏览器级）**：**Not run**——未在浏览器中人为构造慢响应/切换竞态；该行为由 Task 8 的 epoch/applySession/generation 单测与 SSE 中断用例覆盖。其余场景全部 Passed。
 
-- [ ] 在 decision 更新每项证据与实际结果，仅全部闭合后移到 implemented 并改写现在时，修复入站链接。独立 Reviewer 对照完整需求/decision/diff/证据审查，修复后重跑受影响集；提交 `feat: 完成多部门权限验收与开发账号清理`。只删除本次无后续用途的临时文件，不删除他人运行数据、volume或.env。
+- [x] 在 decision 更新每项证据与实际结果，仅全部闭合后移到 implemented 并改写现在时，修复入站链接。独立 Reviewer 对照完整需求/decision/diff/证据审查，修复后重跑受影响集；提交 `feat: 完成多部门权限验收与开发账号清理`。只删除本次无后续用途的临时文件，不删除他人运行数据、volume或.env。
 
-> **执行记录（2026-09-17）**：decision 留在 `proposed/`，**不移到 implemented**——Task 7（删除部门边界）为条件任务且用户尚未确认建议规则，按计划约定「删除部门规则未确认时不得移动 decision」。列收口（schema 15）同样挂起。独立 Reviewer 对本轮全部变更（清理脚本+测试、base.js 204 修复+回归用例、执行记录）完成审查后提交；提交信息按实际收口范围调整为「feat: 开发账号清理与多部门验收收口（列删除待Task 7）」。
+> **执行记录（2026-09-18）**：Task 7 经用户确认（“按照上述建议调整”）后完成实施与 v15 收口；decision 已移至 `implemented/` 并改写现在时，验收表 15 项全部 Passed（含证据命令与欠账标注），Spec 入站链接已修复。独立 Reviewer 完成 Task 7 与 v15 收口两轮审查（Task 7 首轮 BLOCK 四处写入锁缺口修复后 APPROVE；v15 收口审查见对应提交）。提交链：`66559677`（Task 7 删除边界）、本轮（v15 收口+decision 移交）。
 
 ## 覆盖检查与执行记录
 

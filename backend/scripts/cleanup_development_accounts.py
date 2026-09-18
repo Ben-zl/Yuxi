@@ -3,6 +3,9 @@
 默认仅预览各分类计数；显式传入 ``--apply`` 才执行写入。所有写入都发生在
 调用方开启的单个事务内，中途异常整体回滚，不产生部分提交。清理不删除部门、
 不删除任何业务历史数据，也不调用通用账号硬删除逻辑。
+
+软删除账号若仍是旧全局 admin，role 一并归一为 user（v15 CHECK 约束下的
+存量清理由本脚本负责，迁移不自动改写历史值）。
 """
 
 from __future__ import annotations
@@ -116,11 +119,15 @@ async def cleanup_accounts(db: AsyncSession, *, apply: bool) -> dict[str, int]:
             )
         ) or 0
         candidate_total = (await db.scalar(select(func.count()).select_from(User).where(_candidate_filter()))) or 0
+        stale_admins = (
+            await db.scalar(select(func.count()).select_from(User).where(User.role == "admin", User.is_deleted == 1))
+        ) or 0
         return {
             "candidate_accounts": candidate_total,
             "deleted_accounts": 0,
             "revoked_credentials": active_sessions + revocable_keys,
             "removed_memberships": memberships,
+            "normalized_admin_roles": stale_admins,
         }
 
     candidates = (
@@ -131,6 +138,7 @@ async def cleanup_accounts(db: AsyncSession, *, apply: bool) -> dict[str, int]:
         "deleted_accounts": 0,
         "revoked_credentials": 0,
         "removed_memberships": 0,
+        "normalized_admin_roles": 0,
     }
     for user in candidates:
         await _soft_delete_user(db, user)
@@ -138,6 +146,16 @@ async def cleanup_accounts(db: AsyncSession, *, apply: bool) -> dict[str, int]:
         report["removed_memberships"] += await _remove_memberships(db, user.id)
         report["revoked_credentials"] += await _revoke_auth_sessions(db, user.id)
         report["revoked_credentials"] += await _revoke_api_keys(db, user.id)
+    # 本轮与历史软删除账号中残留的旧全局 admin 归一为 user（幂等；v15 CHECK 只约束新写入）
+    normalized_roles = (
+        await db.execute(
+            update(User)
+            .where(User.role == "admin", User.is_deleted == 1)
+            .values(role="user")
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount or 0
+    report["normalized_admin_roles"] = int(normalized_roles)
     return report
 
 
@@ -171,7 +189,8 @@ def main() -> int:
         f"[{mode}] candidate_accounts={report['candidate_accounts']} "
         f"deleted_accounts={report['deleted_accounts']} "
         f"revoked_credentials={report['revoked_credentials']} "
-        f"removed_memberships={report['removed_memberships']}"
+        f"removed_memberships={report['removed_memberships']} "
+        f"normalized_admin_roles={report['normalized_admin_roles']}"
     )
     print("超级管理员账号与其业务数据不受影响；部门与历史业务数据保持不变。")
     return 0

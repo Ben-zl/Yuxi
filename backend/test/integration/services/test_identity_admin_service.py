@@ -49,14 +49,12 @@ async def test_user_conflict_rolls_back_new_department_and_audit() -> None:
                 uid=actor_uid,
                 password_hash="$argon2id$placeholder",
                 role="superadmin",
-                department_id=actor_department.id,
             )
             conflict = User(
                 username=conflicting_username,
                 uid=conflicting_uid,
                 password_hash="$argon2id$placeholder",
                 role="user",
-                department_id=actor_department.id,
             )
             db.add_all([actor, conflict])
             await db.commit()

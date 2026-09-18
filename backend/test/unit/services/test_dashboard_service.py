@@ -39,28 +39,24 @@ async def dashboard_db():
             uid="uid-superadmin",
             password_hash="$argon2id$placeholder",
             role="superadmin",
-            department=dept,
         )
         user1 = User(
             username="Alice",
             uid="uid-alice",
             password_hash="$argon2id$placeholder",
             role="user",
-            department=dept,
         )
         user2 = User(
             username="Bob",
             uid="uid-bob",
             password_hash="$argon2id$placeholder",
             role="user",
-            department=dept,
         )
         deleted_user = User(
             username="Deleted User",
             uid="uid-deleted",
             password_hash="$argon2id$placeholder",
             role="user",
-            department=dept,
             is_deleted=1,
         )
 

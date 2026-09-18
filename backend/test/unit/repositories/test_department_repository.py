@@ -38,7 +38,6 @@ async def department_session():
             uid="department_user",
             password_hash="$argon2id$placeholder",
             role="user",
-            department_id=deleted_department.id,
         )
         session.add(user)
         await session.flush()
@@ -78,7 +77,6 @@ async def test_delete_empty_department_retains_account_and_revokes_bindings(depa
 
     assert user.is_deleted == 0
     assert await session.scalar(select(User.id).where(User.id == user.id)) == user.id
-    assert user.department_id is None  # 不迁移默认部门
     assert (
         await session.scalar(
             select(DepartmentMembership).where(

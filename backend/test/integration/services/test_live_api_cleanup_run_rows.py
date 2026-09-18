@@ -28,6 +28,7 @@ from test.live_api_cleanup import (
 )
 from yuxi.services import project_service
 from yuxi.storage.postgres.models_business import (
+    DepartmentMembership,
     APIKey,
     AgentEnv,
     AgentMemoryScope,
@@ -412,7 +413,7 @@ async def test_static_test_user_cleanup_physically_deletes_user_dependencies(cle
     workspace_root.joinpath("workspace", "memory").mkdir(parents=True)
     try:
         async with session_factory() as db:
-            user = User(username=uid, uid=uid, password_hash="test", department_id=1)
+            user = User(username=uid, uid=uid, password_hash="test")
             db.add(user)
             await db.flush()
             db.add_all(
@@ -517,13 +518,15 @@ async def test_orphaned_snapshot_department_cleanup_is_exact_and_reference_safe(
                     "VALUES (:name, 'referenced snapshot-like department') RETURNING id"
                 ).bindparams(name=blocked_name)
             )
+            holder = User(
+                username=blocked_uid,
+                uid=blocked_uid,
+                password_hash="test",
+            )
+            db.add(holder)
+            await db.flush()
             db.add(
-                User(
-                    username=blocked_uid,
-                    uid=blocked_uid,
-                    password_hash="test",
-                    department_id=blocked_id,
-                )
+                DepartmentMembership(user_id=holder.id, department_id=blocked_id, role="user")
             )
             await db.commit()
 
@@ -541,6 +544,9 @@ async def test_orphaned_snapshot_department_cleanup_is_exact_and_reference_safe(
             )
     finally:
         async with session_factory() as db:
+            await db.execute(
+                delete(DepartmentMembership).where(DepartmentMembership.department_id.in_([target_id, neighbor_id, blocked_id]))
+            )
             await db.execute(delete(User).where(User.uid == blocked_uid))
             await db.execute(
                 text("DELETE FROM departments WHERE id IN (:target_id, :neighbor_id, :blocked_id)").bindparams(

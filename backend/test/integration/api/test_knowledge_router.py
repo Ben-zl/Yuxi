@@ -103,7 +103,6 @@ async def _delete_department_with_admin(test_client, admin_headers, department):
     try:
         await conn.execute("DELETE FROM department_memberships WHERE department_id = $1", department["id"])
         await conn.execute("DELETE FROM auth_sessions WHERE active_department_id = $1", department["id"])
-        await conn.execute("UPDATE users SET department_id = NULL WHERE department_id = $1", department["id"])
     finally:
         await conn.close()
     admin_user_id = await _find_user_id_by_uid(test_client, admin_headers, department["admin_uid"])
@@ -117,7 +116,6 @@ async def _delete_department_with_admin(test_client, admin_headers, department):
         conn = await asyncpg.connect(dsn)
         try:
             await conn.execute("DELETE FROM auth_sessions WHERE active_department_id = $1", department["id"])
-            await conn.execute("UPDATE users SET department_id = NULL WHERE department_id = $1", department["id"])
         finally:
             await conn.close()
         await _delete_user_by_id(test_client, admin_headers, admin_user_id)

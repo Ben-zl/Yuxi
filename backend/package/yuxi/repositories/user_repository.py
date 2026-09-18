@@ -6,7 +6,7 @@ from datetime import UTC
 from datetime import datetime as dt
 from typing import Annotated, Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.storage.postgres.manager import pg_manager
@@ -134,11 +134,16 @@ class UserRepository:
     async def list_users(
         self, skip: int = 0, limit: int = 100, department_id: int | None = None, role: str | None = None
     ) -> list[User]:
-        """获取用户列表"""
+        """获取用户列表；部门过滤按成员关系判定。"""
         async with self._session() as session:
             query = select(User).where(User.is_deleted == 0)
             if department_id is not None:
-                query = query.where(User.department_id == department_id)
+                query = query.where(
+                    exists().where(
+                        DepartmentMembership.user_id == User.id,
+                        DepartmentMembership.department_id == department_id,
+                    )
+                )
             if role is not None:
                 query = query.where(User.role == role)
             query = query.order_by(User.id.asc()).offset(skip).limit(limit)
@@ -147,23 +152,41 @@ class UserRepository:
 
     async def list_with_department(
         self, skip: int = 0, limit: int = 100, department_id: int | None = None, role: str | None = None
-    ) -> Annotated[list[tuple[User, str | None]], "用户列表，包含部门名称"]:
-        """获取用户列表，包含部门名称"""
+    ) -> Annotated[list[tuple[User, str | None]], "用户列表，包含展示部门名称"]:
+        """获取用户列表；展示部门名取最小部门 ID 的成员关系（多部门时确定性展示）。"""
         async with self._session() as session:
-            from yuxi.storage.postgres.models_business import Department
-
-            query = (
-                select(User, Department.name.label("department_name"))
-                .outerjoin(Department, User.department_id == Department.id)
-                .where(User.is_deleted == 0)
-            )
+            query = select(User).where(User.is_deleted == 0)
             if department_id is not None:
-                query = query.where(User.department_id == department_id)
+                query = query.where(
+                    exists().where(
+                        DepartmentMembership.user_id == User.id,
+                        DepartmentMembership.department_id == department_id,
+                    )
+                )
             if role is not None:
                 query = query.where(User.role == role)
             query = query.order_by(User.id.asc()).offset(skip).limit(limit)
-            result = await session.execute(query)
-            return list(result.all())
+            users = list((await session.execute(query)).scalars().all())
+            names = await self._primary_department_names(session, [u.id for u in users])
+            return [(user, names.get(user.id)) for user in users]
+
+    @staticmethod
+    async def _primary_department_names(session: AsyncSession, user_ids: list[int]) -> dict[int, str]:
+        """按用户 ID 返回最小部门 ID 成员关系的部门名（未入部门为缺省）。"""
+        from yuxi.storage.postgres.models_business import Department
+
+        if not user_ids:
+            return {}
+        rows = await session.execute(
+            select(DepartmentMembership.user_id, Department.name)
+            .join(Department, Department.id == DepartmentMembership.department_id)
+            .where(DepartmentMembership.user_id.in_(user_ids))
+            .order_by(DepartmentMembership.user_id, DepartmentMembership.department_id)
+        )
+        names: dict[int, str] = {}
+        for user_id, name in rows.all():
+            names.setdefault(user_id, name)
+        return names
 
     async def list_page_with_department(
         self,
@@ -174,13 +197,16 @@ class UserRepository:
         role: str | None = None,
         search: str | None = None,
     ) -> tuple[list[tuple[User, str | None]], int]:
-        """分页查询有效用户，并返回过滤后的总数。"""
+        """分页查询有效用户（部门过滤按成员关系），并返回过滤后的总数。"""
         async with self._session() as session:
-            from yuxi.storage.postgres.models_business import Department
-
             filters = [User.is_deleted == 0]
             if department_id is not None:
-                filters.append(User.department_id == department_id)
+                filters.append(
+                    exists().where(
+                        DepartmentMembership.user_id == User.id,
+                        DepartmentMembership.department_id == department_id,
+                    )
+                )
             if role is not None:
                 filters.append(User.role == role)
             if search:
@@ -194,14 +220,11 @@ class UserRepository:
 
             total_result = await session.execute(select(func.count(User.id)).where(*filters))
             page_result = await session.execute(
-                select(User, Department.name.label("department_name"))
-                .outerjoin(Department, User.department_id == Department.id)
-                .where(*filters)
-                .order_by(User.id.asc())
-                .offset(offset)
-                .limit(limit)
+                select(User).where(*filters).order_by(User.id.asc()).offset(offset).limit(limit)
             )
-            return list(page_result.all()), total_result.scalar() or 0
+            users = list(page_result.scalars().all())
+            names = await self._primary_department_names(session, [u.id for u in users])
+            return [(user, names.get(user.id)) for user in users], total_result.scalar() or 0
 
     async def create(self, data: dict[str, Any]) -> User:
         """创建用户"""
@@ -279,11 +302,16 @@ class UserRepository:
             return result.scalar_one_or_none() is not None
 
     async def count(self, department_id: int | None = None) -> int:
-        """统计用户数量"""
+        """统计用户数量；部门过滤按成员关系判定。"""
         async with self._session() as session:
             query = select(func.count(User.id)).where(User.is_deleted == 0)
             if department_id is not None:
-                query = query.where(User.department_id == department_id)
+                query = query.where(
+                    exists().where(
+                        DepartmentMembership.user_id == User.id,
+                        DepartmentMembership.department_id == department_id,
+                    )
+                )
             result = await session.execute(query)
             return result.scalar() or 0
 
