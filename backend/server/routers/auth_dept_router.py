@@ -218,7 +218,6 @@ async def delete_department(
     except LookupError as exc:
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    await db.commit()
     return None
 
 

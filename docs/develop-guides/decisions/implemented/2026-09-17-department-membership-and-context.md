@@ -101,17 +101,17 @@ HTTP 路由负责请求解析、认证和响应；成员添加、移除、角色
 | 成员检索只返回必要账号信息 | 复用全量用户管理接口泄漏资料 | 成员查询接口与响应模型 | 候选检索响应仅 user_id/uid/username（HTTP 断言） | 普通成员调用检索；部门管理员获取手机号或其他部门角色 | Passed |
 | 超级管理员无需加入部门即可管理 | 错误要求超级管理员成员关系 | 认证上下文与切换用例 | `test_department_session_context.py` + 浏览器超管切换 200+ 部门 | 普通账号仿造相同请求 | Passed |
 | 删除部门保留账号及其他部门关系 | 默认部门自动分配、账号级联删除、资源失去归属 | 部门删除 service、repository 与模型关系 | `test_department_delete_boundary.py`：成功路径 PG 回读（账号保留、B 关系原样、无默认迁移、凭证撤销、会话 revision+1）；阻断矩阵（未结束运行/排队中请求/未归档任务/Channel/共享/工作区）409 且数据不变；终态运行与已派发请求的部门标识保留审计值且不阻断删除 | 删除 A 导致 B 成员消失；有资源仍删除部门 | Passed |
-| 切换按当前部门角色和资源范围生效 | 合并多部门权限、缓存串部门 | 认证依赖、资源 repository、前端 store | `test_department_resource_visibility.py` 多资源列表与直接 ID；浏览器 A 切换链路；`department_context.test.js` epoch 门禁 | 切到 B 后保留 A 管理入口、资源凭据或迟到响应 | Passed |
+| 切换按当前部门角色和资源范围生效 | 合并多部门权限、缓存串部门 | 认证依赖、资源 repository、前端 store | `test_department_resource_visibility.py` 多资源列表与直接 ID；浏览器 A 切换链路；`department_context.test.js` epoch 门禁 | 切到 B 后保留 A 管理入口、资源凭据或迟到响应 | Passed（知识库/工作区/MCP/模型可见性；**Memory A/B 重绑真实链路 Not run**——重绑 E2E 已交付但依赖共享记忆目录拓扑，分卷部署下 skip，见欠账） |
 | 撤销关系及角色后旧凭证不能继续访问 | 只信任 token 内角色 | PostgreSQL 成员关系与认证依赖 | `test_department_membership_api.py::test_demoted_admin_loses_management_immediately` 等 | 旧 token 继续写成员或访问已移除部门 | Passed |
 | 独立登录会话互不改写当前部门 | 把活动部门写回 User | 会话上下文 | `test_department_session_context.py` 双会话交替请求 | A 会话切换导致 B 请求变为另一部门 | Passed |
 | 已提交和排队任务固定原部门 | worker 读取后来切换的部门 | Run 提交、持久化、配置投影 | `test_department_run_context.py` E2E：真实 worker + PG 回读，切换不影响、跨部门幂等 409、移除后 403 | 原任务使用 B 凭据、产物归入 B | Passed |
-| 挂起恢复固定原部门并检查有效权限 | resume 使用页面活动部门或绕过授权 | resume 入口与运行上下文 | `_resolve_resume_department` 原部门重授权（单测+集成）；挂起中切部门 E2E 列为欠账 | 使用 B 凭据恢复 A 任务；关系撤销后继续恢复 | Passed（欠账：挂起中切换的 E2E 场景） |
+| 挂起恢复固定原部门并检查有效权限 | resume 使用页面活动部门或绕过授权 | resume 入口与运行上下文 | `_resolve_resume_department` 原部门重授权（单测+集成）；E2E `test_resume_uses_original_department_after_switch`：A 中断→切 B→resume 固化仍=A | 使用 B 凭据恢复 A 任务；关系撤销后继续恢复 | Passed |
 | 非交互入口具有明确部门 | Web 切换改变 API Key、CLI、Channel 或定时任务 | 各入口认证、提交与执行上下文 | `test_noninteractive_department_context.py` 四入口真实提交与绑定回读；CLI 旧批准 409 | 无部门入口静默使用某次 Web 登录部门 | Passed |
 | 无部门账号保留个人登录能力 | 强制默认部门、个人接口全部报错 | 登录与个人资料用例 | 集成：无部门账号登录 200、部门资源 403/无部门上下文拒绝；浏览器 C 账号「当前未加入任何部门」 | 未加入任何部门仍能读取部门资源 | Passed |
 | 开发清理只令非超级管理员账号失效 | 级联删除业务数据、误删超级管理员 | 一次性清理操作与账号 repository | `test_development_account_cleanup.py` 2 用例（预览不写/幂等/回滚）+ 开发库真实执行回读（576 软删、被清理 token 401、超管 200） | 超级管理员数据变化，历史文件或知识库被删除 | Passed |
-| 设置与登录菜单完整可用 | 移动入口遗漏、列表不刷新 | `SettingsModal.vue`、`UserInfoComponent.vue` 与成员组件 | 浏览器验收（截图+HTTP+PG 回读）：菜单切换、成员操作闭环、B 隔离、C 无部门；web 257 tests/lint/build | 未授权直接打开成员标签；写入失败却显示成功 | Passed（修复 204 解析缺陷后闭环） |
+| 设置与登录菜单完整可用 | 移动入口遗漏、列表不刷新 | `SettingsModal.vue`、`UserInfoComponent.vue` 与成员组件 | 真实浏览器验收（截图+HTTP+PG 回读）：超管菜单/切换、成员添加改角色移除闭环、B 普通成员隔离、C 无部门；web 257 tests/lint/build。移动端窄屏手动验证未执行 | 未授权直接打开成员标签；写入失败却显示成功 | Passed（桌面端；移动端视口 Not run） |
 
-实现按[测试规范](../../testing-guidelines.md)完成：Schema 与事务使用真实 PostgreSQL，权限使用真实 HTTP，任务部门固定使用实际提交与 worker 链路，界面使用真实浏览器。最终 gate：unit 2094 passed（66 个环境基线失败与改造前一致）、e2e 38 passed/5 skipped、web 257 tests + lint + build、contracts 通过。已知欠账（不影响上述结论）：Team 父子部门 E2E、resume 挂起中切部门 E2E、Memory A/B 真实切换场景、慢响应隔离浏览器级模拟（由 Task 8 单测覆盖）。
+实现按[测试规范](../../testing-guidelines.md)完成：Schema 与事务使用真实 PostgreSQL，权限使用真实 HTTP，任务部门固定使用实际提交与 worker 链路，界面使用真实浏览器。最终 gate：unit 2094 passed（66 个环境基线失败与改造前一致）、e2e 40 passed/6 skipped、web 257 tests + lint + build、contracts 通过。Team 父子部门 E2E、resume 挂起中切部门 E2E 已补做（Passed）；慢响应隔离在浏览器完成等价验证（伪造旧 revision 写请求 409 stale、白名单处理不退出登录；真实慢响应代理模拟未做）。**唯一未闭合**：Memory A/B 重绑真实链路为 Not run——重绑 E2E 已交付但要求测试进程与 agentscope 服务共享记忆目录，当前 api/agentscope 分卷 compose 拓扑下如实 skip，需在共享卷部署环境运行后方可视为通过。
 
 ## 后果
 

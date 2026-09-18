@@ -352,6 +352,18 @@ assert default_membership_after is None
 
 > **执行记录（2026-09-18）**：并发测试：删除事务持部门行锁未提交时，`asyncio.wait_for(add_member, 0.8)` 超时证明成员写入阻塞在同行锁；回滚后部门仍在。共享写入负向：部门删除后 PUT share_config 引用该部门被拒（400 且文案含「部门」）。审查：全新 Reviewer 首轮 BLOCK（技能/知识库/任务共享与 API Key 部门校验四处写入锁缺口+标签语义），修复后终审通过；提交 `fix: 删除部门时保留账号并阻止资源孤立`。
 
+## 外部 Review 修复执行记录（2026-09-19）
+
+| Review 问题 | 修复 | 证据 |
+|---|---|---|
+| [P1] 删除部门事务提交在 router | `identity_admin_service.delete_department` 统一 `await db.commit()`（删除+审计同一事务）；router 只保留异常映射与回滚 | department_router 回归 7P |
+| [P1] 定时任务部门上下文失效静默跳过 | scheduler 新增 `_unavailable_reason`/`_record_failed`：失效周期落 `failed` 终态执行（department_id 固定取任务绑定、error_summary 存原因类别、幂等键与正常触发一致防重复），`next_run_at` 推进不变 | unbound 用例断言 failed+原因+NULL 部门；容器内直调 scan_due 验证 `('failed', NULL, '部门上下文失效：任务未绑定部门')` |
+| [P2] membership_service 四函数缺 docstring | `__init__`/`_lock_department_or_404`/`_require_department_exists`/`_load_target_user` 补中文 docstring（锁语义与软删过滤规则） | — |
+| [P2] decision 验收表过度覆盖 | 资源范围行拆分标注 Memory 真实链路 **Not run**；设置行标注移动端视口 Not run；resume 行欠账更新为已补 E2E；尾部欠账段与 e2e 数字（40P/6S）同步 | decision 与计划记录一致 |
+| [P2] Memory A/B 真实切换未验证 | 同上；重绑 E2E 已交付，共享卷部署环境下运行后方可通过 | skip-if 表达前提 |
+
+环境插曲（如实记录）：验证中途 Docker daemon 崩溃导致 worker arq 进程僵尸、api reload 风暴——`up -d --force-recreate` 恢复；unbound 任务 SQL 种子改用 `now() AT TIME ZONE 'UTC'`（旧写法 `now()` 为本地时区 naive 值，任务永不到期，旧断言“0 执行”属空洞通过）。
+
 ## 遗留项清偿执行记录（2026-09-18，用户指示“都处理了”后实施）
 
 | 遗留项 | 处置 | 证据 |
@@ -530,7 +542,7 @@ git diff --check
 > - **B 普通成员（deptctx_member_b，部门 501 user）**：UI 表单登录后 `/api/auth/my-departments` 仅返回 501 一项（对比超管 200+）；菜单「普通用户/当前部门：pytest_a_28115859」，无调试面板；设置仅有账户/API Keys/环境变量，无成员管理/用户管理/部门管理。截图 `call_de6a10f46d6044bf8dfd2ea3`。
 > - **C 无部门账号（deptctx_nodpt_c）**：UI 表单登录成功（departmentId=null），菜单显示「**当前未加入任何部门**」。截图 `call_a8f76a8fba7a45808b6e412e`。截图目录：`~/.zcode/cli/artifacts/sess_fd07fc88-9e10-40a6-aef5-d94c8c1fd07d/`。
 > - **本轮发现并修复真实缺陷**：移除成员 204 后列表不刷新。根因：后端 204 响应携带 `Content-Type: application/json` 且空 body，`base.js` 按 Content-Type 走 `response.json()` 抛 `Unexpected end of JSON input`，被组件当作失败吞掉且不刷新。修复：`apiRequest` 对 204/205 按 HTTP 语义返回空文本（影响全部 204 端点）。新增回归用例 `204 空响应体带 JSON 头时按空文本返回，不中断调用链`，web 单测 **257 passed**，浏览器复测添加→移除闭环通过。
-> - **慢响应隔离（浏览器级）**：**Not run**——未在浏览器中人为构造慢响应/切换竞态；该行为由 Task 8 的 epoch/applySession/generation 单测与 SSE 中断用例覆盖。其余场景全部 Passed。
+> - **慢响应隔离（浏览器级）**：初验未做（见本节历史）；遗留清偿阶段完成浏览器等价验证——伪造旧 revision 的成员写请求 → 服务端 409 `department_context_stale`；`base.js` 统一附当前 revision（前端不可伪造旧上下文，在途旧响应由 epoch 门禁丢弃）；白名单错误码刷新身份、登录态与 token 不变。真实慢响应代理模拟未做。其余场景全部 Passed。
 
 - [x] 在 decision 更新每项证据与实际结果，仅全部闭合后移到 implemented 并改写现在时，修复入站链接。独立 Reviewer 对照完整需求/decision/diff/证据审查，修复后重跑受影响集；提交 `feat: 完成多部门权限验收与开发账号清理`。只删除本次无后续用途的临时文件，不删除他人运行数据、volume或.env。
 

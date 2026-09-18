@@ -89,7 +89,13 @@ class AgentTaskSchedulerService:
         # 无绑定部门的旧任务不猜测归属：成员失效或无部门均拒绝派发
         actor = await self._owner_context(task.owner_uid, task.department_id)
         if actor is None:
-            logger.warning(f"定时任务执行身份不可用（所有者失效或部门无绑定）task={task.id} dept={task.department_id}")
+            reason = self._unavailable_reason(task)
+            logger.warning(
+                f"定时任务执行身份不可用（{reason}）task={task.id} dept={task.department_id}"
+            )
+            # 失败事实落库：可查询的 failed 终态；幂等键与正常触发一致，不重复创建
+            await self._record_failed(task, scheduled_at, reason)
+            counts["skipped"] = 1
             return counts
 
         if scheduled_at is not None and now - scheduled_at > RECOVERY_GRACE:
@@ -109,6 +115,35 @@ class AgentTaskSchedulerService:
         counts["triggered"] = 1 if created and execution.status == "queued" else 0
         counts["skipped"] = 1 if created and execution.status == "skipped" else 0
         return counts
+
+    @staticmethod
+    def _unavailable_reason(task: AgentTask) -> str:
+        """返回执行身份不可用的可展示原因类别。"""
+        if task.department_id is None:
+            return "任务未绑定部门"
+        return "任务所属部门的成员授权已失效或所有者已删除"
+
+    async def _record_failed(self, task: AgentTask, scheduled_at, reason: str) -> None:
+        """为部门上下文失效的到期周期落一条 failed 终态执行；幂等键与正常触发一致。"""
+        await self.executions.create(
+            id=new_uuid(),
+            task_id=task.id,
+            trigger_type="schedule",
+            triggered_by_uid=str(task.owner_uid),
+            execution_principal_uid=str(task.owner_uid),
+            department_id=task.department_id,
+            agent_id=task.agent_id,
+            agent_slug=task.agent_slug_snapshot or "",
+            prompt=task.prompt,
+            tool_approval_mode=task.tool_approval_mode,
+            scheduled_at=scheduled_at,
+            idempotency_key=schedule_idempotency_key(
+                task.id, scheduled_at, task.schedule_timezone or "UTC"
+            ),
+            status="failed",
+            error_summary=f"部门上下文失效：{reason}"[:500],
+            finished_at=utc_now_naive(),
+        )
 
     async def _record_missed(self, task: AgentTask, owner, scheduled_at) -> None:
         await self.executions.create(

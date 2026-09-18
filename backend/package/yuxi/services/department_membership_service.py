@@ -40,9 +40,11 @@ class DepartmentMembershipService:
     """部门成员列表、候选检索与成员写入用例。"""
 
     def __init__(self, db: AsyncSession):
+        """绑定用例共享的请求事务会话。"""
         self.db = db
 
     async def _lock_department_or_404(self, department_id: int) -> Department:
+        """以部门行锁验证存在后返回部门；与删除部门共用锁序，缺失按 404 语义抛错。"""
         department = (
             await self.db.execute(select(Department).where(Department.id == department_id).with_for_update())
         ).scalar_one_or_none()
@@ -72,6 +74,7 @@ class DepartmentMembershipService:
         return replace(actor, role=locked.role)
 
     async def _require_department_exists(self, department_id: int) -> None:
+        """只读确认部门存在（列表/检索类无写入路径不做行锁）；缺失按 404 语义抛错。"""
         exists_row = await self.db.scalar(select(exists().where(Department.id == department_id)))
         if not exists_row:
             raise MemberNotFoundError("部门不存在")
@@ -131,6 +134,7 @@ class DepartmentMembershipService:
         return {"items": items, "total": int(total or 0)}
 
     async def _load_target_user(self, user_id: int) -> User:
+        """行锁加载目标账号；软删除账号同样视为不存在，不参与成员操作。"""
         target = (await self.db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one_or_none()
         if target is None or target.is_deleted:
             raise MemberNotFoundError("目标账号不存在")

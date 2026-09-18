@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from datetime import timedelta
 
@@ -730,7 +731,8 @@ async def test_unbound_entries_rejected_without_request(test_client, case_env):
                 " next_run_at, tool_approval_mode, created_at, updated_at)"
                 " VALUES (:i, 'NI-无部门任务', :o, NULL, NULL, :s, 'prompt', CAST(:share AS jsonb),"
                 " true, false, 'cron', '*/5 * * * *', 'UTC',"
-                " now() - interval '2 minutes', 'always_trust', now(), now())"
+                " now() AT TIME ZONE 'UTC' - interval '2 minutes', 'always_trust',"
+                " now() AT TIME ZONE 'UTC', now() AT TIME ZONE 'UTC')"
             ),
             {"i": unbound_task_id, "o": case["uid"], "s": TEST_AGENT_SLUG, "share": share_config},
         )
@@ -739,7 +741,25 @@ async def test_unbound_entries_rejected_without_request(test_client, case_env):
 
         counts = await AgentTaskSchedulerService(db).scan_due()
         assert counts["triggered"] == 0
-        unbound_executions = await db.scalar(
-            text("SELECT count(*) FROM task_executions WHERE task_id = :t"), {"t": unbound_task_id}
-        )
-    assert unbound_executions == 0
+        # 部门上下文失效转为可查询的 failed 事实（不再静默跳过）。
+        # worker 的 cron 扫描与本测试共用入口且互为竞速：任一方先锁到任务都会
+        # 创建 failed 执行，轮询等待至多一个 worker 周期。
+        unbound_execution = None
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            unbound_execution = (
+                await db.execute(
+                    text(
+                        "SELECT status, department_id, error_summary FROM task_executions"
+                        " WHERE task_id = :t AND status = 'failed'"
+                    ),
+                    {"t": unbound_task_id},
+                )
+            ).first()
+            if unbound_execution is not None:
+                break
+            await asyncio.sleep(2)
+    assert unbound_execution is not None, "未查询到部门上下文失效的 failed 执行"
+    assert unbound_execution.status == "failed"
+    assert unbound_execution.department_id is None
+    assert "未绑定部门" in unbound_execution.error_summary

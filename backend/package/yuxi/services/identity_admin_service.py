@@ -189,3 +189,6 @@ async def delete_department(
     name = department.name
     await repository.delete_empty_department(department_id)
     await log_operation(db, actor.id, "删除部门", f"删除部门: {name}", request)
+    # 用例统一负责成功提交：删除事实与审计日志同一事务落库，
+    # router 只做异常映射与响应装配（失败路径由 router/统一异常层回滚）
+    await db.commit()
