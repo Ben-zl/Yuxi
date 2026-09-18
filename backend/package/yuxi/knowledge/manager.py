@@ -625,6 +625,12 @@ class KnowledgeBaseManager:
                 owner_uid=str(created_by or user.uid),
             )
 
+        from yuxi.repositories.department_repository import lock_share_departments
+
+        if db is not None:
+            # 与删除部门共用行锁：共享范围引用的部门被并发删除时不产生孤儿引用
+            await lock_share_departments(db, share_config)
+
         from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
 
         kb_repo = KnowledgeBaseRepository()
@@ -648,7 +654,8 @@ class KnowledgeBaseManager:
                 "additional_params": persisted_additional_params,
                 "share_config": share_config,
                 "created_by": created_by,
-            }
+            },
+            db=db,
         )
         os.makedirs(os.path.join(kb_instance.work_dir, kb_id), exist_ok=True)
 
@@ -1302,9 +1309,14 @@ class KnowledgeBaseManager:
 
         if share_config is not None:
             update_data["share_config"] = target_share_config
+            if db is not None:
+                from yuxi.repositories.department_repository import lock_share_departments
+
+                # 与删除部门共用行锁：共享范围引用的部门被并发删除时不产生孤儿引用
+                await lock_share_departments(db, target_share_config)
 
         # 保存到数据库
-        await kb_repo.update(kb_id, update_data)
+        await kb_repo.update(kb_id, update_data, db=db)
 
         database = await self.get_database_info(kb_id)
         if database is None:

@@ -187,7 +187,10 @@ class APIKeyRepository:
         """在既有账号锁内验证绑定部门有效；超管只验证部门存在。"""
         from yuxi.storage.postgres.models_business import Department, DepartmentMembership
 
-        department = await self.db_session.scalar(select(Department).where(Department.id == department_id))
+        # 行锁验证：与删除部门共用锁序，并发删除时不产生孤儿绑定
+        department = await self.db_session.scalar(
+            select(Department).where(Department.id == department_id).with_for_update()
+        )
         if department is None:
             raise APIKeyDepartmentConflict("API Key 绑定部门不存在")
         if creator_is_superadmin:

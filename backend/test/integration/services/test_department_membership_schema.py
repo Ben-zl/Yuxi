@@ -200,7 +200,7 @@ async def test_add_rejects_missing_department_and_serializes_with_deletion() -> 
             add_task = asyncio.create_task(run_add())
             await asyncio.sleep(0.5)
             assert not add_task.done(), "add 未按共享锁序等待部门删除事务"
-            await DepartmentRepository(session_a).delete_and_migrate_users(live_dept_id, default_department_id=9999)
+            await DepartmentRepository(session_a).delete_empty_department(live_dept_id)
             await tx.commit()
             with pytest.raises(ValueError, match="部门不存在"):
                 await add_task
@@ -242,31 +242,31 @@ async def test_auth_session_repository_creates_session_with_uuid_id() -> None:
         await _drop_scoped_schema(admin_engine, schema)
 
 
-async def test_old_delete_path_conflicts_on_new_references() -> None:
-    """旧删除路径在新成员关系存在时抛出冲突，不再产生任何写入。"""
+async def test_delete_boundary_removes_membership_but_retains_account() -> None:
+    """删除边界：成员关系随部门删除，账号保留且不迁入默认部门。"""
     admin_engine, scoped_engine, schema = await _create_scoped_schema()
     try:
         factory = async_sessionmaker(scoped_engine, expire_on_commit=False)
         async with factory() as session:
             async with _rollback_tx(session):
                 dept_a = Department(name="dept-del-a")
-                dept_b = Department(name="dept-del-b")
                 user = User(username="成员戊", uid="member_e", password_hash="hash", role="user")
-                session.add_all([dept_a, dept_b, user])
+                session.add_all([dept_a, user])
                 await session.flush()
                 membership_repo = DepartmentMembershipRepository(session)
                 await membership_repo.add(user.id, dept_a.id, role="user")
                 await session.flush()
 
-                department_repo = DepartmentRepository(session)
-                with pytest.raises(DepartmentDeletionConflict):
-                    await department_repo.delete_and_migrate_users(dept_a.id)
-
-                # 无新引用的部门保留旧删除语义：迁入默认部门前需要默认部门存在
-                session.add(Department(id=9999, name="默认部门"))
+                await DepartmentRepository(session).delete_empty_department(dept_a.id)
                 await session.flush()
-                result = await department_repo.delete_and_migrate_users(dept_b.id, default_department_id=9999)
-                assert result is not None and result.migrated_user_count == 0
+
+                membership = await session.scalar(
+                    select(DepartmentMembership).where(DepartmentMembership.user_id == user.id)
+                )
+                assert membership is None
+                assert user.is_deleted == 0
+                assert user.department_id is None
+                assert await session.get(Department, dept_a.id) is None
     finally:
         await scoped_engine.dispose()
         await _drop_scoped_schema(admin_engine, schema)
@@ -458,8 +458,8 @@ async def test_empty_database_initializes_to_current_business_schema(monkeypatch
         await admin_engine.dispose()
 
 
-async def test_old_delete_http_returns_409_when_membership_exists(test_client, admin_headers) -> None:
-    """旧删除路由在部门含新成员关系时返回 409，而非外键 500。"""
+async def test_delete_http_removes_membership_but_retains_account(test_client, admin_headers) -> None:
+    """删除路由按边界清理成员关系：204 且账号与其他事实不变，而非外键 500。"""
     suffix = uuid.uuid4().hex[:8]
     engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
     department_id = None
@@ -491,14 +491,19 @@ async def test_old_delete_http_returns_409_when_membership_exists(test_client, a
             f"/api/departments/{department_id}",
             headers=admin_headers,
         )
-        assert response.status_code == 409
+        assert response.status_code == 204
 
         async with engine.begin() as connection:
             still_there = await connection.scalar(
                 text("SELECT COUNT(*) FROM department_memberships WHERE department_id = :id"),
                 {"id": department_id},
             )
-            assert still_there == 1
+            assert still_there == 0
+            dept_gone = await connection.scalar(
+                text("SELECT COUNT(*) FROM departments WHERE id = :id"),
+                {"id": department_id},
+            )
+            assert dept_gone == 0
             admin_after_result = await connection.execute(
                 text("SELECT role, department_id, is_deleted FROM users WHERE id = :id"), {"id": admin_id}
             )

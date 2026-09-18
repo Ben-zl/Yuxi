@@ -122,7 +122,7 @@ async def _delete_department_with_admin(test_client, admin_headers, department):
             await conn.close()
         await _delete_user_by_id(test_client, admin_headers, admin_user_id)
     response = await test_client.delete(f"/api/departments/{department['id']}", headers=admin_headers)
-    assert response.status_code in (200, 404), response.text
+    assert response.status_code in (204, 404), response.text
 
 
 async def _create_test_database(test_client, admin_headers, share_config=None):

@@ -39,17 +39,31 @@ class KnowledgeBaseRepository:
             result = await session.execute(select(KnowledgeBase).where(KnowledgeBase.kb_id == kb_id))
             return result.scalar_one_or_none()
 
-    async def create(self, data: dict[str, Any]) -> KnowledgeBase:
+    async def create(self, data: dict[str, Any], *, db=None) -> KnowledgeBase:
+        """落库知识库；传入 db 时与部门锁同一事务内提交（保持创建即持久语义）。"""
         kb = KnowledgeBase(**data)
-        async with pg_manager.get_async_session_context() as session:
-            session.add(kb)
+        if db is not None:
+            db.add(kb)
+            await db.commit()
+        else:
+            async with pg_manager.get_async_session_context() as session:
+                session.add(kb)
         await cache_kb_config(kb)
         return kb
 
-    async def update(self, kb_id: str, data: dict[str, Any]) -> KnowledgeBase | None:
+    async def update(self, kb_id: str, data: dict[str, Any], *, db=None) -> KnowledgeBase | None:
         async with kb_config_cache_lock(kb_id):
             # 先可靠清除旧值；失败时不进入数据库事务。
             await delete_cached_kb_config(kb_id)
+            if db is not None:
+                result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.kb_id == kb_id))
+                kb = result.scalar_one_or_none()
+                if kb is None:
+                    return None
+                for key, value in data.items():
+                    setattr(kb, key, value)
+                await db.commit()
+                return kb
             async with pg_manager.get_async_session_context() as session:
                 result = await session.execute(select(KnowledgeBase).where(KnowledgeBase.kb_id == kb_id))
                 kb = result.scalar_one_or_none()

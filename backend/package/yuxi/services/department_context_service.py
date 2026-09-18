@@ -81,7 +81,11 @@ async def resolve_department_context(
     resolved_department_name: str | None = None
 
     if department_id is not None:
-        dept_result = await db.execute(select(Department).where(Department.id == department_id))
+        # strict（提交/切换）路径与删除部门共用行锁：部门被并发删除时写入在锁内失效
+        dept_query = select(Department).where(Department.id == department_id)
+        if strict:
+            dept_query = dept_query.with_for_update()
+        dept_result = await db.execute(dept_query)
         department = dept_result.scalar_one_or_none()
         if department is None:
             if strict:

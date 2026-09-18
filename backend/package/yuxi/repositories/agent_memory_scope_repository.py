@@ -39,6 +39,15 @@ class AgentMemoryScopeRepository:
         maintenance_department_id 只在首次创建时从创建它的运行上下文记录；
         已存在 scope 的绑定不由 ensure 改写（重绑只走显式重建事务）。
         """
+        if department_id is not None:
+            # 与删除部门共用行锁：绑定目标部门被并发删除时不产生孤儿维护绑定
+            from yuxi.storage.postgres.models_business import Department
+
+            locked = await self.db.scalar(
+                select(Department.id).where(Department.id == department_id).with_for_update()
+            )
+            if locked is None:
+                raise ValueError("Memory 维护部门不存在")
         active_agent = await self.db.scalar(
             select(Agent)
             .where(
@@ -75,6 +84,14 @@ class AgentMemoryScopeRepository:
         self, uid: str, agent_slug: str, department_id: int
     ) -> AgentMemoryScope | None:
         """显式重建成功后重绑维护部门；后台调度不得调用。"""
+        # 与删除部门共用行锁：重绑目标部门不存在时拒绝，避免孤儿绑定
+        from yuxi.storage.postgres.models_business import Department
+
+        locked = await self.db.scalar(
+            select(Department.id).where(Department.id == department_id).with_for_update()
+        )
+        if locked is None:
+            raise ValueError("Memory 维护部门不存在")
         record = await self.get(uid, agent_slug)
         if record is None:
             return None

@@ -325,7 +325,7 @@ actor = await resolve_department_context(db, user_id=owner.id, department_id=bin
 
 **Interfaces:** 替换 `delete_and_migrate_users` 为 repository `delete_empty_department(department_id:int) -> None`；service 新增 `delete_department(db, *, actor:DepartmentContext, department_id:int) -> None`。无权限403、默认部门409、资源引用/未终态任务409、成功204；错误响应使用类别而非私密资源内容。
 
-- [ ] 编写真实 PG/HTTP 测试：同账号加入A/B，删除无业务引用的A后断言账号未软/硬删除、B角色未变、没有新增默认部门关系、A相关key撤销、原会话下次读取无部门；有资源时409且所有数据不变。
+- [x] 编写真实 PG/HTTP 测试：同账号加入A/B，删除无业务引用的A后断言账号未软/硬删除、B角色未变、没有新增默认部门关系、A相关key撤销、原会话下次读取无部门；有资源时409且所有数据不变。
 
 ```python
 assert account_after.is_deleted is False
@@ -334,10 +334,23 @@ assert a_membership_after is None
 assert default_membership_after is None
 ```
 
-- [ ] 运行 `docker compose exec api uv run --group test pytest test/integration/services/test_department_delete_boundary.py -v`，预期旧迁移用户/级联路径失败。
-- [ ] 对照实际模型查询全部部门拥有字段、read/write scope JSON共享引用、API key、任务/运行引用。事务内锁部门，检查引用后删除关系、撤销凭证、置会话当前部门为空并递增revision，再删除部门；资源归属不改变。
-- [ ] 所有增加该部门资源引用和成员/任务绑定的写入也锁同一部门行并验证存在，防止“检查无引用→并发新建引用→删除”的竞态。历史终态运行部门标识保留审计语义，不级联删除历史运行；不允许外键迫使删除历史任务。
-- [ ] 加并发创建引用与删除测试，运行本任务测试；审查后提交 `fix: 删除部门时保留账号并阻止资源孤立`。
+> **执行记录（2026-09-18）**：用户确认 decision 推荐规则后实施。`test/integration/services/test_department_delete_boundary.py` 12 用例全绿：成功路径（204、账号 is_deleted=0、B 关系与角色原样、无默认部门关系、旧 users.department_id 置空不迁移、APIKey 撤销三字段、CLI 批准清空、Memory 解绑、会话 active_department NULL+revision 3→4、部门行删除）；阻断矩阵（运行记录[含终态，schema 14 阶段]/任务/Channel/MCP 共享/知识库工作区 → 409 类别文案且部门与成员数据不变）；默认部门 409；部门管理员 403；未知部门 404。
+
+- [x] 运行 `docker compose exec api uv run --group test pytest test/integration/services/test_department_delete_boundary.py -v`，预期旧迁移用户/级联路径失败。
+
+> **执行记录（2026-09-18）**：TDD 红→绿。红：旧路径把用户迁入默认部门（断言 department_id IS NULL 失败）；实现后全绿。附带改写 5 个旧语义测试文件（unit test_department_repository、membership_schema 锁序/HTTP 409→新语义、membership_api teardown、api test_department_router、knowledge_router/auth_router 删除断言 200→204）。
+
+- [x] 对照实际模型查询全部部门拥有字段、read/write scope JSON共享引用、API key、任务/运行引用。事务内锁部门，检查引用后删除关系、撤销凭证、置会话当前部门为空并递增revision，再删除部门；资源归属不改变。
+
+> **执行记录（2026-09-18）**：`delete_empty_department` 单事务：with_for_update 锁部门行 → 阻断检查（Channel 绑定/运行记录/请求记录/任务记录/执行记录 + JSONB `@>` 扫 Agent/Skill/MCP/ModelProvider/KnowledgeBase/AgentTask 六表 share_config 的 read/manage scope department_ids；知识表 to_regclass 探测守卫，探测与查询同 search_path 解析）→ 清理（删 membership、APIKey 撤销+解绑、CLI 批准置空、Memory 解绑、会话置空+revision+1、旧 users.department_id 置空[schema 15 删列时移除该句]）→ 删部门。Reviewer 独立核对 models 全部 11 处 departments 外键均落入阻断或清理，无 FK 500 缺口。
+
+- [x] 所有增加该部门资源引用和成员/任务绑定的写入也锁同一部门行并验证存在，防止“检查无引用→并发新建引用→删除”的竞态。历史终态运行部门标识保留审计语义，不级联删除历史运行；不允许外键迫使删除历史任务。
+
+> **执行记录（2026-09-18）**：写入侧统一接入部门行锁：成员 add（既有）、MCP/模型供应商/智能体/技能/知识库/任务的 share_config 写入（`lock_share_departments`：锁+存在校验，缺失 400「共享范围引用的部门不存在」）、Channel create_intent、任务 create（归属部门锁+共享部门锁）、Memory ensure/rebind、API Key 部门绑定校验、strict 部门解析（运行提交/切换路径 FOR UPDATE）。知识库 create/update 经仓库 db 参数与锁同事务提交。历史终态运行审计保留：schema 14 阶段全量阻断（外键仍在，标签用中性「运行记录」），schema 15 移除四表外键后放宽为仅未终态阻断——同一分支内分两个提交完成。
+
+- [x] 加并发创建引用与删除测试，运行本任务测试；审查后提交 `fix: 删除部门时保留账号并阻止资源孤立`。
+
+> **执行记录（2026-09-18）**：并发测试：删除事务持部门行锁未提交时，`asyncio.wait_for(add_member, 0.8)` 超时证明成员写入阻塞在同行锁；回滚后部门仍在。共享写入负向：部门删除后 PUT share_config 引用该部门被拒（400 且文案含「部门」）。审查：全新 Reviewer 首轮 BLOCK（技能/知识库/任务共享与 API Key 部门校验四处写入锁缺口+标签语义），修复后终审通过；提交 `fix: 删除部门时保留账号并阻止资源孤立`。
 
 ## Task 8：前端部门上下文与登录菜单切换
 

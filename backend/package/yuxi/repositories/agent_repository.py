@@ -483,6 +483,9 @@ class AgentRepository:
             share_config or default_share_config,
             allowed_access_levels=allowed_access_levels,
         )
+        from yuxi.repositories.department_repository import lock_share_departments
+
+        await lock_share_departments(self.db, normalized_share_config)
         if is_default and (normalized_share_config.get("read_scope") or {}).get("access_level") != "global":
             raise ValueError("默认智能体必须全局共享")
 
@@ -541,6 +544,9 @@ class AgentRepository:
                     share_config, allowed_access_levels=get_allowed_agent_access_levels(updater)
                 )
             )
+            from yuxi.repositories.department_repository import lock_share_departments
+
+            await lock_share_departments(self.db, candidate_share_config)
         validated_config = await authorize_agent_config_resources(
             config_json if config_json is not None else agent.config_json,
             db=self.db,

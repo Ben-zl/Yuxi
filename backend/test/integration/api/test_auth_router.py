@@ -139,7 +139,7 @@ async def _cleanup_user(test_client, headers, user_id: int) -> None:
 
 async def _cleanup_department(test_client, headers, department_id: int) -> None:
     response = await test_client.delete(f"/api/departments/{department_id}", headers=headers)
-    assert response.status_code in {200, 404}, response.text
+    assert response.status_code in {204, 404}, response.text
 
 
 async def test_login_with_invalid_credentials(test_client):
@@ -388,7 +388,7 @@ async def test_department_admin_is_rejected_from_account_management(test_client,
                 finally:
                     await conn.close()
             deletion = await test_client.delete(f"/api/departments/{department_id}", headers=admin_headers)
-            assert deletion.status_code == 200, deletion.text
+            assert deletion.status_code == 204, deletion.text
 
 
 async def test_invalid_token_is_rejected(test_client):

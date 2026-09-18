@@ -8,6 +8,7 @@ import re
 import uuid
 
 from cryptography.fernet import Fernet, InvalidToken
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.agentscope.config_projection import project_runtime
@@ -73,6 +74,14 @@ class AgentScopeChannelService:
         department_id: int,
     ) -> AgentScopeChannelBinding:
         """提交本地 binding，并验证其 AgentScope 运行时投影。"""
+        # 与删除部门共用行锁：部门不存在或删除中时拒绝创建，避免产生孤儿绑定
+        from yuxi.storage.postgres.models_business import Department
+
+        locked = await self.db.execute(
+            select(Department.id).where(Department.id == department_id).with_for_update()
+        )
+        if locked.scalar_one_or_none() is None:
+            raise LookupError("部门不存在")
         binding = await self.bindings.create(
             id=str(uuid.uuid4()),
             owner_uid=owner_uid,

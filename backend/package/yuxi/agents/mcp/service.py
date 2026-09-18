@@ -570,6 +570,9 @@ async def create_mcp_server(
     share_config = normalize_permission_config(
         share_config, allowed_access_levels={"global", "department"}, strict=True
     )
+    from yuxi.repositories.department_repository import lock_share_departments
+
+    await lock_share_departments(db, share_config)
     if share_config["read_scope"]["access_level"] == "global" and operator.role != "superadmin":
         raise PermissionError("只有超级管理员可以创建 global MCP")
     if share_config["read_scope"]["access_level"] == "department" and operator.role != "superadmin":
@@ -641,6 +644,9 @@ async def update_mcp_server(
             allowed_access_levels={"global", "department"},
             strict=True,
         )
+        from yuxi.repositories.department_repository import lock_share_departments
+
+        await lock_share_departments(db, normalized)
         if normalized["read_scope"]["access_level"] == "global" and operator.role != "superadmin":
             raise PermissionError("只有超级管理员可以修改为 global MCP")
         if normalized["read_scope"]["access_level"] == "department" and operator.role != "superadmin":

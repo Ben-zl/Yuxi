@@ -24,7 +24,11 @@ from yuxi.services.department_membership_service import (
     MemberConflictError,
     MemberNotFoundError,
 )
-from yuxi.services.identity_admin_service import IdentityConflictError, create_department_with_admin
+from yuxi.services.identity_admin_service import (
+    IdentityConflictError,
+    create_department_with_admin,
+    delete_department as delete_department_use_case,
+)
 from yuxi.services.operation_log_service import log_operation
 from yuxi.services.user_identity_service import is_valid_phone_number
 from yuxi.storage.postgres.models_business import User
@@ -195,40 +199,29 @@ async def update_department(
     return {**department.to_dict(), "user_count": user_count}
 
 
-@department.delete("/{department_id}", status_code=status.HTTP_200_OK)
+@department.delete("/{department_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_department(
     department_id: int,
     request: Request,
     current_user: User = Depends(get_superadmin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """删除部门"""
-    repository = DepartmentRepository(db)
-    # 检查部门是否存在
-    department = await repository.get_by_id(department_id)
-
-    if not department:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="部门不存在")
-
-    if department.id == 1:  # 默认部门的ID为1
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="默认部门不允许删除")
-
+    """删除部门（超管）：按删除边界只删部门与成员关系并撤销绑定凭证；阻断引用 409。"""
     try:
-        deletion = await repository.delete_and_migrate_users(department_id)
+        await delete_department_use_case(
+            db, actor=current_user, department_id=department_id, request=request
+        )
     except DepartmentDeletionConflict as exc:
+        await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    if deletion is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="部门不存在")
-
-    # 记录操作
-    if deletion.migrated_user_count:
-        detail = f"删除部门: {deletion.name}，迁移 {deletion.migrated_user_count} 个用户到默认部门"
-    else:
-        detail = f"删除部门: {deletion.name}"
-    await log_operation(db, current_user.id, "删除部门", detail, request)
+    except PermissionError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except LookupError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     await db.commit()
-
-    return {"success": True, "message": "部门已删除"}
+    return None
 
 
 # =============================================================================

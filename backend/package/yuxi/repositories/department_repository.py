@@ -2,14 +2,15 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import cast, delete, exists, func, select, text, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import (
+    Agent,
     AgentMemoryScope,
     AgentRun,
     AgentRunRequest,
@@ -20,22 +21,47 @@ from yuxi.storage.postgres.models_business import (
     CLIAuthSession,
     Department,
     DepartmentMembership,
+    MCPServer,
+    ModelProvider,
+    Skill,
     TaskExecution,
     User,
 )
+from yuxi.storage.postgres.models_knowledge import KnowledgeBase, WeknoraDepartmentWorkspace
 from yuxi.utils.datetime_utils import utc_now_naive
 
 
 class DepartmentDeletionConflict(ValueError):
-    """部门仍存在部门权限上下文引用，不能按旧路径删除。"""
+    """部门仍存在资源归属、共享引用或未终态任务，不能删除。"""
 
 
-@dataclass(frozen=True)
-class DepartmentDeletionResult:
-    """部门删除结果。"""
+# 共享配置（v2 scope JSON）中可能引用部门的资源表
+_SHARE_CONFIG_MODELS: tuple[tuple[str, Any], ...] = (
+    ("智能体共享", Agent),
+    ("技能共享", Skill),
+    ("MCP 共享", MCPServer),
+    ("模型供应商共享", ModelProvider),
+    ("知识库共享", KnowledgeBase),
+)
 
-    name: str
-    migrated_user_count: int
+
+async def lock_share_departments(db: AsyncSession, share_config: dict | None) -> None:
+    """共享配置写入前以部门行锁验证引用部门存在。
+
+    与删除部门使用同一锁序，防止“删除检查通过→并发写入引用→部门被删”的孤儿共享引用。
+    """
+    config = share_config if isinstance(share_config, dict) else {}
+    ids: set[int] = set()
+    for scope_key in ("read_scope", "manage_scope"):
+        scope = config.get(scope_key) or {}
+        if scope.get("access_level") == "department":
+            ids.update(int(v) for v in scope.get("department_ids") or [])
+    if not ids:
+        return
+    rows = await db.execute(select(Department.id).where(Department.id.in_(ids)).with_for_update())
+    found = set(rows.scalars().all())
+    if found != ids:
+        raise ValueError("共享范围引用的部门不存在")
 
 
 class DepartmentRepository:
@@ -141,58 +167,120 @@ class DepartmentRepository:
             await session.flush()
         return True
 
-    async def delete_and_migrate_users(
-        self, id: int, *, default_department_id: int = 1
-    ) -> DepartmentDeletionResult | None:
-        """迁移部门用户、删除关联 API Key，并原子删除部门。
+    async def delete_empty_department(self, department_id: int) -> None:
+        """按删除边界删除部门；部门不存在时静默返回。
 
-        部门成员等新引用存在时抛出 DepartmentDeletionConflict，不产生任何写入；
-        无新引用时保留旧删除语义，最终删除策略由部门边界决策接管。
+        存在阻断引用时抛出 DepartmentDeletionConflict 且不产生任何写入；成功时只
+        删除部门及其成员关系，撤销绑定该部门的凭证（API Key/CLI 批准），解绑 Memory
+        维护，把会话当前部门置空并递增 revision。账号与其他部门成员关系保留，
+        不迁移到默认部门；资源归属不改变。
         """
         async with self._session() as session:
-            # 先锁部门行，与新增引用写入使用一致的锁序，防止检查后并发插入
-            result = await session.execute(select(Department).where(Department.id == id).with_for_update())
+            # 先锁部门行，与资源/绑定写入使用一致的锁序，防止检查后并发插入引用
+            result = await session.execute(
+                select(Department).where(Department.id == department_id).with_for_update()
+            )
             department = result.scalar_one_or_none()
             if department is None:
-                return None
+                return
 
-            reference = await self._find_context_reference(session, id)
+            reference = await self._find_blocking_reference(session, department_id)
             if reference is not None:
                 raise DepartmentDeletionConflict(f"部门仍存在{reference}引用，不能删除")
 
-            user_result = await session.execute(select(User).where(User.department_id == id))
-            users = list(user_result.scalars().all())
-            for user in users:
-                user.department_id = default_department_id
-
+            now = utc_now_naive()
+            await session.execute(
+                delete(DepartmentMembership).where(DepartmentMembership.department_id == department_id)
+            )
             await session.execute(
                 update(APIKey)
-                .where(APIKey.department_id == id)
-                .values(is_enabled=False, revoked_at=utc_now_naive(), department_id=None)
+                .where(APIKey.department_id == department_id)
+                .values(is_enabled=False, revoked_at=now, department_id=None)
+            )
+            await session.execute(
+                update(CLIAuthSession)
+                .where(CLIAuthSession.approved_department_id == department_id)
+                .values(approved_department_id=None)
+            )
+            await session.execute(
+                update(AgentMemoryScope)
+                .where(AgentMemoryScope.maintenance_department_id == department_id)
+                .values(maintenance_department_id=None)
+            )
+            await session.execute(
+                update(AuthSession)
+                .where(AuthSession.active_department_id == department_id)
+                .values(active_department_id=None, revision=AuthSession.revision + 1)
+            )
+            # 旧单部门列在 schema 15 前仍带外键：只清空指向，不迁移默认部门；列删除时移除本句
+            await session.execute(
+                update(User).where(User.department_id == department_id).values(department_id=None)
             )
             await session.delete(department)
             await session.flush()
-            return DepartmentDeletionResult(name=department.name, migrated_user_count=len(users))
 
     @staticmethod
-    async def _find_context_reference(session: AsyncSession, department_id: int) -> str | None:
-        """返回任意一类部门权限上下文引用的说明；无引用时为 None。"""
-        checks = (
-            ("部门成员关系", DepartmentMembership.department_id),
-            ("登录会话活动部门", AuthSession.active_department_id),
-            ("CLI 批准部门", CLIAuthSession.approved_department_id),
-            ("Memory 维护绑定", AgentMemoryScope.maintenance_department_id),
-            ("运行请求", AgentRunRequest.department_id),
-            ("运行", AgentRun.department_id),
-            ("定时任务", AgentTask.department_id),
-            ("任务执行", TaskExecution.department_id),
-            ("Channel 绑定", AgentScopeChannelBinding.department_id),
+    async def _find_blocking_reference(session: AsyncSession, department_id: int) -> str | None:
+        """返回阻断删除的引用类别；无阻断引用时为 None。"""
+        # 知识层表属于独立 schema 生命周期：库未初始化知识表时跳过对应检查
+        # 探测与后续查询使用同一 search_path 解析，避免限定名探测与查询不一致
+        workspace_present = await DepartmentRepository._table_present(session, "weknora_department_workspaces")
+        kb_table_present = await DepartmentRepository._table_present(session, "knowledge_bases")
+        checks: tuple[tuple[str, Any], ...] = (
+            ("Channel 绑定", AgentScopeChannelBinding.department_id == department_id),
+            # 运行/请求/执行/任务在 schema 15 移除外键前全量阻断（历史行会触发外键，
+            # 故标签用中性词）；外键移除后放宽为仅未终态记录阻断并精确化标签
+            ("运行记录", AgentRun.department_id == department_id),
+            ("请求记录", AgentRunRequest.department_id == department_id),
+            ("任务记录", AgentTask.department_id == department_id),
+            ("任务执行记录", TaskExecution.department_id == department_id),
         )
-        for label, column in checks:
-            has_reference = await session.scalar(select(exists().where(column == department_id)))
-            if has_reference:
+        if workspace_present:
+            checks = (
+                ("知识库工作区", WeknoraDepartmentWorkspace.department_id == department_id),
+                *checks,
+            )
+        for label, condition in checks:
+            if await session.scalar(select(exists().where(condition))):
                 return label
+
+        for label, model in _SHARE_CONFIG_MODELS:
+            if label == "知识库共享" and not kb_table_present:
+                continue
+            if await DepartmentRepository._share_config_references(session, model.share_config, department_id):
+                return label
+        if await DepartmentRepository._share_config_references(session, AgentTask.share_config, department_id):
+            return "任务共享"
         return None
+
+    @staticmethod
+    async def _table_present(session: AsyncSession, qualified_name: str) -> bool:
+        """表是否已在当前库初始化（隔离 schema 测试库可能只建业务表）。"""
+        bind = session.get_bind()
+        if bind.dialect.name != "postgresql":
+            return False
+        regclass = await session.scalar(text(f"SELECT to_regclass('{qualified_name}')"))
+        return regclass is not None
+
+    @staticmethod
+    async def _share_config_references(
+        session: AsyncSession, share_column: Any, department_id: int
+    ) -> bool:
+        """判断任一 read/manage scope 的 department_ids 是否包含目标部门。
+
+        JSON 包含查询依赖 PostgreSQL JSONB；SQLite 单元库不支持该运算，
+        由真实 PG 集成测试覆盖共享引用阻断路径。
+        """
+        bind = session.get_bind()
+        if bind.dialect.name != "postgresql":
+            return False
+        for scope_key in ("read_scope", "manage_scope"):
+            condition = cast(share_column, JSONB).contains(
+                {scope_key: {"department_ids": [department_id]}}
+            )
+            if await session.scalar(select(exists().where(condition))):
+                return True
+        return False
 
     async def count_users(self, id: int) -> int:
         """统计部门用户数量"""

@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.repositories.department_membership_repository import DepartmentMembershipRepository
-from yuxi.repositories.department_repository import DepartmentRepository
+from yuxi.repositories.department_repository import DepartmentDeletionConflict, DepartmentRepository
 from yuxi.repositories.user_repository import UserRepository
 from yuxi.services.operation_log_service import log_operation
 from yuxi.storage.postgres.models_business import Department, User
@@ -162,3 +162,32 @@ async def initialize_system_admin(
     except Exception:
         await db.rollback()
         raise
+
+
+async def delete_department(
+    db: AsyncSession,
+    *,
+    actor,
+    department_id: int,
+    request: Request | None = None,
+) -> None:
+    """超级管理员按删除边界删除部门。
+
+    无权限 403、默认部门 409、阻断引用 409；成功时删除部门及其成员关系，
+    账号与其他部门关系保留。错误以类别表达，不回泄资源内容。
+    """
+    from yuxi.services.department_context_service import DepartmentContext
+
+    if not isinstance(actor, DepartmentContext) or actor.account_role != "superadmin":
+        raise PermissionError("只有超级管理员可以删除部门")
+    if department_id == 1:
+        raise DepartmentDeletionConflict("默认部门不允许删除")
+
+    repository = DepartmentRepository(db)
+    department = await repository.get_by_id(department_id)
+    if department is None:
+        raise LookupError("部门不存在")
+
+    name = department.name
+    await repository.delete_empty_department(department_id)
+    await log_operation(db, actor.id, "删除部门", f"删除部门: {name}", request)

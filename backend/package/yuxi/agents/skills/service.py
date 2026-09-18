@@ -1204,6 +1204,10 @@ async def confirm_skill_install_draft(
         allowed_access_levels=set(get_allowed_skill_access_levels(operator)),
     )
 
+    from yuxi.repositories.department_repository import lock_share_departments
+
+    await lock_share_departments(db, normalized_share_config)
+
     repo = SkillRepository(db)
     skills_root = get_skills_root_dir()
     results: list[dict[str, Any]] = []
@@ -1577,6 +1581,9 @@ async def update_skill_share_config(
         source_type=item.source_type,
         allowed_access_levels=set(get_allowed_skill_access_levels(operator)),
     )
+    from yuxi.repositories.department_repository import lock_share_departments
+
+    await lock_share_departments(db, normalized)
     repo = SkillRepository(db)
     updated = await repo.update_share_config(item, share_config=normalized, updated_by=operator.uid)
     await apply_skill_projection_policy_change(db, slug)

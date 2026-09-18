@@ -357,6 +357,9 @@ async def create_provider_config(
     payload["share_config"] = normalize_permission_config(
         payload.get("share_config"), allowed_access_levels={"global", "department"}, strict=True
     )
+    from yuxi.repositories.department_repository import lock_share_departments
+
+    await lock_share_departments(db, payload["share_config"])
     _validate_operator_share_scope(operator, payload["share_config"])
     payload["created_by"] = str(getattr(operator, "uid", None) or username)
     payload["updated_by"] = username
@@ -394,6 +397,9 @@ async def update_provider_config(
         )
     require_resource_permission(resolve_model_provider_permission(operator, provider), ResourcePermission.MANAGE)
     if "share_config" in payload:
+        from yuxi.repositories.department_repository import lock_share_departments
+
+        await lock_share_departments(db, payload["share_config"])
         _validate_operator_share_scope(operator, payload["share_config"])
     # partial 更新时仅传 enabled_models，结合 DB 中现有 capabilities 校验
     if "enabled_models" in payload and "capabilities" not in payload:

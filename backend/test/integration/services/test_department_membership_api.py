@@ -113,7 +113,7 @@ async def membership_case(test_client, admin_headers):
                 await conn.close()
             if department_id is not None:
                 deletion = await test_client.delete(f"/api/departments/{department_id}", headers=admin_headers)
-                assert deletion.status_code == 200, deletion.text
+                assert deletion.status_code == 204, deletion.text
         finally:
             await engine.dispose()
 
