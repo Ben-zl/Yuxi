@@ -7,7 +7,7 @@
 from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.repositories.auth_session_repository import AuthSessionRepository
@@ -183,11 +183,25 @@ async def switch_department(
     return context
 
 
-async def invalidate_stale_active_department(db: AsyncSession, session: AuthSession) -> None:
-    """会话活动部门失效时置空并递增 revision，使旧 revision 写请求立即失配。"""
-    session.active_department_id = None
-    session.revision += 1
-    await db.flush()
+async def invalidate_stale_active_department(
+    db: AsyncSession, session: AuthSession, *, expected_department_id: int
+) -> bool:
+    """会话活动部门失效时置空并递增 revision，使旧 revision 写请求立即失配。
+
+    条件更新只在该会话仍指向读取时的旧部门（expected_department_id）时生效：
+    期间若用户已成功切换到其他部门（或已被并发失效处理），本次不覆盖新状态，
+    防止旧请求的失效处理吞掉刚提交的切换结果。返回是否真正执行了失效。
+    """
+    result = await db.execute(
+        update(AuthSession)
+        .where(
+            AuthSession.id == session.id,
+            AuthSession.active_department_id == expected_department_id,
+        )
+        .values(active_department_id=None, revision=AuthSession.revision + 1)
+    )
+    await db.refresh(session)
+    return bool(result.rowcount)
 
 
 async def revoke_auth_session(db: AsyncSession, *, session_id: str, user_id: int) -> None:

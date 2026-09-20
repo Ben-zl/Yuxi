@@ -139,11 +139,31 @@ async def get_current_user(
         raise _context_exception(exc) from exc
 
     # 成员失效/部门消失：折叠为无部门并递增 revision，使旧 revision 写请求立即失配；
-    # 返回的上下文携带递增后的 revision，保证 /me 立即可用于后续切换/写请求
-    if context.department_id is None and session.active_department_id is not None:
-        await invalidate_stale_active_department(db, session)
+    # 返回的上下文携带递增后的 revision，保证 /me 立即可用于后续切换/写请求。
+    # 条件更新未命中说明期间已有并发切换提交：按会话现值重新解析而非覆盖
+    stale_department_id = session.active_department_id
+    if context.department_id is None and stale_department_id is not None:
+        invalidated = await invalidate_stale_active_department(
+            db, session, expected_department_id=stale_department_id
+        )
         await db.commit()
-        context = dataclasses.replace(context, revision=session.revision)
+        if invalidated:
+            context = dataclasses.replace(context, revision=session.revision)
+        else:
+            session_result = await db.execute(
+                select(AuthSession).where(AuthSession.id == session.id).execution_options(populate_existing=True)
+            )
+            session = session_result.scalar_one()
+            try:
+                context = await resolve_department_context(
+                    db,
+                    user_id=int(user_id),
+                    department_id=session.active_department_id,
+                    session_id=session.id,
+                    revision=session.revision,
+                )
+            except (AccountUnavailableError, AccountLockedError) as exc:
+                raise _context_exception(exc) from exc
     return context
 
 

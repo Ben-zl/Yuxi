@@ -344,3 +344,103 @@ async def test_expired_and_locked_sessions_rejected(test_client, session_case):
             await conn.execute(text("UPDATE users SET login_locked_until = NULL WHERE id = :u"), {"u": case.user_id})
     finally:
         await engine.dispose()
+
+
+async def test_stale_invalidation_does_not_overwrite_concurrent_switch(test_client, session_case):
+    """旧请求的失效处理不得覆盖并发成功的切换（外部评审 R2-P1c）。
+
+    存储层编排（与评审复现一致）：R1 读到会话指向 A 且成员关系已失效；
+    在 R1 提交失效前，并发切换已把会话提交为 (B, revision+1)。条件更新
+    必须未命中——会话保持 B，revision 不被 R1 的旧视图覆盖。
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from yuxi.services.department_context_service import invalidate_stale_active_department
+    from yuxi.storage.postgres.models_business import AuthSession
+
+    case = session_case
+    login = await _login(test_client, case.uid, case.password)
+    dept_a, dept_b = case.department_ids[0], case.department_ids[1]
+
+    # 切到 A 并移除其成员关系：R1 即将看到的旧状态已失效
+    switched = await test_client.post(
+        "/api/auth/department-context",
+        headers=_headers(login["access_token"]),
+        json={"department_id": dept_a, "expected_revision": login["context_revision"]},
+    )
+    assert switched.status_code == 200, switched.text
+
+    engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("DELETE FROM department_memberships WHERE user_id = :u AND department_id = :d"),
+                {"u": case.user_id, "d": dept_a},
+            )
+
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        # R1：读到会话仍指向 A（即将失效的旧状态）
+        async with factory() as db:
+            stale_row = (
+                await db.execute(
+                    text("SELECT active_department_id, revision FROM auth_sessions WHERE id = :i"),
+                    {"i": login["session_id"]},
+                )
+            ).first()
+            assert stale_row.active_department_id == dept_a
+            stale_revision = stale_row.revision
+
+            # R2：并发切换已提交为 (B, revision+1)（等价 switch_department 提交后的存储事实）
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE auth_sessions SET active_department_id = :b, revision = revision + 1"
+                        " WHERE id = :i"
+                    ),
+                    {"b": dept_b, "i": login["session_id"]},
+                )
+
+            # R1：此刻才执行失效；expected_department_id 表达先前读取的旧视图（A），
+            # 不篡改 ORM 属性（autoflush 会把脏旧值先行覆盖存储事实，制造假竞态）
+            stale_orm = await db.get(AuthSession, login["session_id"])
+            invalidated = await invalidate_stale_active_department(
+                db, stale_orm, expected_department_id=dept_a
+            )
+            await db.commit()
+            assert invalidated is False, "并发切换已提交，失效不得命中"
+
+            final = (
+                await db.execute(
+                    text("SELECT active_department_id, revision FROM auth_sessions WHERE id = :i"),
+                    {"i": login["session_id"]},
+                )
+            ).first()
+        # 会话保持切换结果：仍指向 B 且 revision 不低于并发切换提交值
+        assert final.active_department_id == dept_b, final
+        assert final.revision >= stale_revision + 1, final
+
+        # 对照：会话确仍指向旧部门时，失效必须命中（正常失效路径不回归）
+        async with factory() as db:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE auth_sessions SET active_department_id = :a WHERE id = :i"
+                    ),
+                    {"a": dept_a, "i": login["session_id"]},
+                )
+            fresh = await db.get(AuthSession, login["session_id"])
+            await db.refresh(fresh)
+            hit = await invalidate_stale_active_department(
+                db, fresh, expected_department_id=dept_a
+            )
+            await db.commit()
+            assert hit is True
+            cleared = (
+                await db.execute(
+                    text("SELECT active_department_id FROM auth_sessions WHERE id = :i"),
+                    {"i": login["session_id"]},
+                )
+            ).scalar()
+        assert cleared is None
+    finally:
+        await engine.dispose()

@@ -763,3 +763,83 @@ async def test_unbound_entries_rejected_without_request(test_client, case_env):
     assert unbound_execution.status == "failed"
     assert unbound_execution.department_id is None
     assert "未绑定部门" in unbound_execution.error_summary
+
+
+async def test_schedule_failed_fact_is_idempotent_across_dst_repeated_period(
+    test_client, case_env, admin_headers
+):
+    """DST 秋季回拨的两个周期映射同一幂等键：failed 事实只落一条且扫描不中断。
+
+    覆盖外部评审 R2-P1a：直接对同一 (task, scheduled_at) 连续执行两次失效
+    路径（等价于回拨重复周期先后到期），第二次必须复用既有事实而非触发
+    唯一约束，next_run_at 正常推进。
+    """
+    import time as _time
+
+    from sqlalchemy import text
+
+    from yuxi.services.agent_task_scheduler_service import AgentTaskSchedulerService
+    from yuxi.storage.postgres.manager import pg_manager
+
+    async with pg_manager.get_async_session_context() as db:
+        task_id = str(uuid.uuid4())
+        await db.execute(
+            text(
+                "INSERT INTO agent_tasks (id, name, owner_uid, department_id, agent_id, agent_slug_snapshot,"
+                " prompt, share_config, enabled, api_enabled, schedule_mode, schedule_cron, schedule_timezone,"
+                " next_run_at, tool_approval_mode, created_at, updated_at)"
+                " VALUES (:i, 'NI-DST幂等任务', :o, NULL, NULL, :s, 'prompt', '{}',"
+                " true, false, 'cron', '*/5 * * * *', 'America/New_York',"
+                " now() AT TIME ZONE 'UTC' - interval '2 minutes', 'always_trust',"
+                " now() AT TIME ZONE 'UTC', now() AT TIME ZONE 'UTC')"
+            ),
+            {"i": task_id, "o": case_env["uid"], "s": TEST_AGENT_SLUG},
+        )
+        await db.commit()
+
+        # 第一次到期：落 failed 事实并推进 next_run_at
+        first = await AgentTaskSchedulerService(db).scan_due()
+        assert first["triggered"] == 0
+
+        row = (
+            await db.execute(
+                text(
+                    "SELECT count(*) FROM task_executions"
+                    " WHERE task_id = :t AND status = 'failed' AND error_summary LIKE '%未绑定部门%'"
+                ),
+                {"t": task_id},
+            )
+        ).scalar()
+        assert row == 1
+
+        # 人为把 next_run_at 拉回同一时刻（等价 DST 回拨使同本地时刻再次到期）
+        from datetime import datetime as _dt
+
+        await db.execute(
+            text("UPDATE agent_tasks SET next_run_at = :past WHERE id = :t"),
+            {
+                "past": _dt.utcfromtimestamp(_time.time() - 120),
+                "t": task_id,
+            },
+        )
+        await db.commit()
+
+        # 第二次扫描：同一幂等键必须复用既有事实，事务不因唯一约束失败
+        second = await AgentTaskSchedulerService(db).scan_due()
+        assert second["triggered"] == 0
+
+        total = (
+            await db.execute(
+                text("SELECT count(*) FROM task_executions WHERE task_id = :t AND status = 'failed'"),
+                {"t": task_id},
+            )
+        ).scalar()
+        advanced = (
+            await db.execute(text("SELECT next_run_at FROM agent_tasks WHERE id = :t"), {"t": task_id})
+        ).scalar()
+        await db.execute(text("DELETE FROM task_executions WHERE task_id = :t"), {"t": task_id})
+        await db.execute(text("DELETE FROM agent_tasks WHERE id = :t"), {"t": task_id})
+        await db.commit()
+
+    assert total == 1, "DST 重复周期不得重复创建 failed 事实"
+    assert advanced is not None, "next_run_at 必须正常推进"

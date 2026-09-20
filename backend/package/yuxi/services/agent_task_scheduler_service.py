@@ -124,7 +124,22 @@ class AgentTaskSchedulerService:
         return "任务所属部门的成员授权已失效或所有者已删除"
 
     async def _record_failed(self, task: AgentTask, scheduled_at, reason: str) -> None:
-        """为部门上下文失效的到期周期落一条 failed 终态执行；幂等键与正常触发一致。"""
+        """为部门上下文失效的到期周期落一条 failed 终态执行；幂等键与正常触发一致。
+
+        DST 秋季回拨使两个周期映射到同一幂等键（与正常触发同语义：只执行一次）；
+        调用方已持任务行锁，先按幂等键复用既有执行事实，避免唯一约束冲突
+        打断扫描事务导致 next_run_at 无法推进。
+        """
+        idempotency_key = schedule_idempotency_key(
+            task.id, scheduled_at, task.schedule_timezone or "UTC"
+        )
+        existing = await self.executions.find_idempotent(
+            task_id=task.id,
+            principal_uid=str(task.owner_uid),
+            idempotency_key=idempotency_key,
+        )
+        if existing is not None:
+            return
         await self.executions.create(
             id=new_uuid(),
             task_id=task.id,
@@ -137,9 +152,7 @@ class AgentTaskSchedulerService:
             prompt=task.prompt,
             tool_approval_mode=task.tool_approval_mode,
             scheduled_at=scheduled_at,
-            idempotency_key=schedule_idempotency_key(
-                task.id, scheduled_at, task.schedule_timezone or "UTC"
-            ),
+            idempotency_key=idempotency_key,
             status="failed",
             error_summary=f"部门上下文失效：{reason}"[:500],
             finished_at=utc_now_naive(),

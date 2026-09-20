@@ -296,20 +296,40 @@ const handleRoleChange = async (record, role) => {
   }
 }
 
-// 移除前确认目标姓名；失败保留原列表并显示错误，成功后重读后端分页
+// 移除确认框持有引用：部门切换时立即作废，防止旧部门页面的确认操作
+// 携带新部门 ID 与 revision 误删另一部门的成员关系
+let removeConfirmRef = null
+const invalidateRemoveConfirm = () => {
+  if (removeConfirmRef) {
+    removeConfirmRef.destroy()
+    removeConfirmRef = null
+  }
+}
+
+// 移除前确认目标姓名；打开时捕获部门与 epoch，确认时校验未被切换
 const confirmRemoveMember = (member) => {
-  Modal.confirm({
+  const openDepartmentId = userStore.departmentId
+  const openEpoch = userStore.departmentEpoch.current()
+  if (openDepartmentId == null) return
+  removeConfirmRef = Modal.confirm({
     title: '确认移除成员',
     content: `确定要将成员 "${member.username}"（ID: ${member.uid}）移出当前部门吗？仅解除本部门成员关系，不影响其账号与其他部门。`,
     okText: '移除',
     okType: 'danger',
     cancelText: '取消',
     async onOk() {
-      const departmentId = userStore.departmentId
-      if (departmentId == null) return
+      removeConfirmRef = null
+      // 打开后部门被切换（含其他标签页广播联动）或上下文已失效：作废本次操作
+      if (
+        openDepartmentId !== userStore.departmentId ||
+        !userStore.departmentEpoch.accept(openEpoch)
+      ) {
+        message.error('部门上下文已变化，本次移除已取消')
+        return
+      }
       try {
         members.loading = true
-        await departmentApi.removeMember(departmentId, member.user_id)
+        await departmentApi.removeMember(openDepartmentId, member.user_id)
         message.success(`已移除成员 "${member.username}"`)
         if (members.items.length === 1 && members.currentPage > 1) {
           members.currentPage -= 1
@@ -322,6 +342,9 @@ const confirmRemoveMember = (member) => {
         }
         members.loading = false
       }
+    },
+    onCancel() {
+      removeConfirmRef = null
     }
   })
 }
@@ -402,6 +425,7 @@ watch(
 watch(
   () => userStore.departmentId,
   (newDepartmentId) => {
+    invalidateRemoveConfirm()
     members.currentPage = 1
     if (newDepartmentId == null) {
       members.items = []
